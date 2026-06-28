@@ -50,3 +50,24 @@ func (s *DeviceService) RevokeDevice(
         deviceID,
     )
 }
+
+// ListDevices returns all devices. Intended for admin views.
+func (s *DeviceService) ListDevices() ([]model.Device, error) {
+    return s.deviceRepo.GetAll()
+}
+
+// ListDevicesByUser returns the devices owned by a given user.
+// Used when a non-admin queries the device list.
+func (s *DeviceService) ListDevicesByUser(
+    userID uint,
+) ([]model.Device, error) {
+    return s.deviceRepo.GetByUserID(userID)
+}
+
+// GetDeviceByID returns a single device by its primary key.
+// Used for ownership checks before revocation.
+func (s *DeviceService) GetDeviceByID(
+    deviceID uint,
+) (*model.Device, error) {
+    return s.deviceRepo.GetByID(deviceID)
+}

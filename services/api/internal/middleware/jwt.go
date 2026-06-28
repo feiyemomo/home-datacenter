@@ -28,18 +28,14 @@ func JWTAuth(
 		// 1. Read Authorization header
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"message": "missing authorization header",
-			})
+			utils.Fail(c, http.StatusUnauthorized, "missing authorization header")
 			c.Abort()
 			return
 		}
 
 		// 2. Expect "Bearer <token>"
 		if !strings.HasPrefix(authHeader, "Bearer ") {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"message": "invalid authorization format",
-			})
+			utils.Fail(c, http.StatusUnauthorized, "invalid authorization format")
 			c.Abort()
 			return
 		}
@@ -49,9 +45,7 @@ func JWTAuth(
 		// 3. Parse and verify the JWT
 		claims, err := utils.ParseToken(tokenString)
 		if err != nil {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"message": "invalid token",
-			})
+			utils.Fail(c, http.StatusUnauthorized, "invalid token")
 			c.Abort()
 			return
 		}
@@ -62,15 +56,11 @@ func JWTAuth(
 		device, err := deviceRepo.GetByID(claims.DeviceID)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				c.JSON(http.StatusUnauthorized, gin.H{
-					"message": "device not found",
-				})
+				utils.Fail(c, http.StatusUnauthorized, "device not found")
 			} else {
 				// Real DB / scan error — surface a generic 500-ish
 				// auth failure rather than misleading "not found".
-				c.JSON(http.StatusUnauthorized, gin.H{
-					"message": "device lookup failed",
-				})
+				utils.Fail(c, http.StatusUnauthorized, "device lookup failed")
 			}
 			c.Abort()
 			return
@@ -79,9 +69,7 @@ func JWTAuth(
 		// 5. Enforce revocation. NullTime.Valid is true when
 		// revoked_at is not NULL, i.e. the device has been revoked.
 		if device.RevokedAt.Valid {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"message": "device revoked",
-			})
+			utils.Fail(c, http.StatusUnauthorized, "device revoked")
 			c.Abort()
 			return
 		}
