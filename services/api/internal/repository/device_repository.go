@@ -2,6 +2,7 @@ package repository
 
 import (
     "home-datacenter-api/internal/model"
+    "home-datacenter-api/internal/utils"
     "time"
     "gorm.io/gorm"
 )
@@ -86,6 +87,9 @@ func (r *DeviceRepository) Update(
     return r.db.Save(device).Error
 }
 
+// Revoke marks a device as revoked by setting revoked_at to now.
+// The column is written through utils.NullTime so it stores a real
+// SQL NULL when not revoked and a timestamp otherwise.
 func (r *DeviceRepository) Revoke(
     deviceID uint,
 ) error {
@@ -97,11 +101,13 @@ func (r *DeviceRepository) Revoke(
         Where("id = ?", deviceID).
         Update(
             "revoked_at",
-            &now,
+            utils.NullTime{Time: now, Valid: true},
         ).
         Error
 }
 
+// IsRevoked reports whether the device has been revoked.
+// Uses NullTime.Valid (true when revoked_at is not NULL).
 func (r *DeviceRepository) IsRevoked(
     deviceID uint,
 ) (bool, error) {
@@ -111,7 +117,7 @@ func (r *DeviceRepository) IsRevoked(
         return false, err
     }
 
-    return device.RevokedAt != nil, nil
+    return device.RevokedAt.Valid, nil
 }
 
 
