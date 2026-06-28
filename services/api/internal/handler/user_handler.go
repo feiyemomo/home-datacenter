@@ -1,40 +1,42 @@
 package handler
 
 import (
-    "net/http"
+	"net/http"
 
-    "github.com/gin-gonic/gin"
+	"github.com/gin-gonic/gin"
 
-    "home-datacenter-api/internal/service"
+	"home-datacenter-api/internal/service"
+	"home-datacenter-api/internal/utils"
 )
 
 type UserHandler struct {
-    userService *service.UserService
+	userService *service.UserService
 }
 
 func NewUserHandler(
-    userService *service.UserService,
+	userService *service.UserService,
 ) *UserHandler {
-    return &UserHandler{
-        userService: userService,
-    }
+	return &UserHandler{
+		userService: userService,
+	}
 }
 
+// Me returns the identity of the current (JWT-authenticated) user.
+//
+//	Route: GET /api/v1/user/me
 func (h *UserHandler) Me(c *gin.Context) {
 
-    userID := c.GetUint("user_id")
+	userID := c.GetUint("user_id")
 
-    user, err := h.userService.GetByID(userID)
-    if err != nil {
-        c.JSON(http.StatusNotFound, gin.H{
-            "message": "user not found",
-        })
-        return
-    }
+	user, err := h.userService.GetByID(userID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
 
-    c.JSON(http.StatusOK, gin.H{
-        "id":       user.ID,
-        "name":     user.Name,
-        "is_admin": user.IsAdmin,
-    })
+	utils.Success(c, gin.H{
+		"id":       user.ID,
+		"name":     user.Name,
+		"is_admin": user.IsAdmin,
+	})
 }

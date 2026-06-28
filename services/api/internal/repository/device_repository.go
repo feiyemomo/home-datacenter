@@ -43,6 +43,19 @@ func (r *DeviceRepository) GetByUserID(userID uint) ([]model.Device, error) {
     return devices, err
 }
 
+// GetAll returns every device row, ordered by id ascending.
+// Used by admins for the device management view.
+func (r *DeviceRepository) GetAll() ([]model.Device, error) {
+    var devices []model.Device
+
+    err := r.db.
+        Order("id ASC").
+        Find(&devices).
+        Error
+
+    return devices, err
+}
+
 func (r *DeviceRepository) GetByAccessKeyHash(hash string) (*model.Device, error) {
     var device model.Device
 

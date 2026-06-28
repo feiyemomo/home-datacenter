@@ -1,3 +1,12 @@
+# Home Datacenter API configuration
+#
+# Path resolution:
+#   - Default lookup: configs/config.yaml (relative to CWD)
+#   - Override via APP_CONFIG env var
+#
+# In Docker (WORKDIR /), this resolves to /configs/config.yaml,
+# which is both baked into the image and bind-mounted by compose.yaml.
+
 server:
   port: 8080
 
@@ -6,7 +15,4 @@ database:
 
 jwt:
   secret: your-secret-key
-
-  access_expire: 15m
-
-  refresh_expire: 168h
+  expire_days: 365
