@@ -16,3 +16,16 @@ database:
 jwt:
   secret: your-secret-key
   expire_days: 365
+
+# Phase 3: MQTT broker (Mosquitto)
+mqtt:
+  broker: tcp://mosquitto:1883
+  client_id: home-datacenter
+  username: ""
+  password: ""
+  qos: 1
+
+# Phase 3: WebSocket real-time push
+websocket:
+  path: /api/v1/ws
+  heartbeat_seconds: 30

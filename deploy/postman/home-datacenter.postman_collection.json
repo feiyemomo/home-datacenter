@@ -1,0 +1,353 @@
+{
+  "info": {
+    "_postman_id": "a1b2c3d4-0001-4a2b-8c3d-home00000001",
+    "name": "Home Datacenter API",
+    "description": "Postman collection for testing the Home Datacenter API (Phase 3: real-time communication).\n\nCovers:\n  - Health check\n  - AccessKey-based device bind (obtain 365-day JWT)\n  - User / Device REST endpoints (JWT-protected)\n  - WebSocket real-time channel (/api/v1/ws)\n\nAuthentication model:\n  - POST /api/v1/auth/bind exchanges (user_id, access_key) for a JWT.\n  - The \"Bind Device\" request has a Tests script that extracts\n    response.data.token and stores it in the collection variable {{token}}.\n  - All subsequent requests send Authorization: Bearer {{token}}.\n  - The WebSocket endpoint accepts the token via the ?token= query param\n    (or the Authorization header).\n\nVariables: base_url, access_key, token, device_id.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "http://{{base_url}}/health",
+          "protocol": "http",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "health"
+          ]
+        },
+        "description": "Liveness probe used by Docker HEALTHCHECK and Cloudflare Tunnel.\n\nNo authentication required.\n\nResponse: {\"status\":\"ok\"}\n(Note: /health is intentionally outside the unified envelope.)"
+      },
+      "response": [
+        {
+          "name": "200 OK — healthy",
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ],
+          "body": "{\n  \"status\": \"ok\"\n}"
+        }
+      ]
+    },
+
+    {
+      "name": "Bind Device",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Parse the unified envelope { code, message, data }.",
+              "var body = pm.response.json();",
+              "",
+              "pm.test(\"Bind returns success envelope\", function () {",
+              "    pm.expect(body.code).to.eql(0);",
+              "    pm.expect(body.message).to.eql(\"success\");",
+              "});",
+              "",
+              "// Extract the JWT from response.data.token and persist it as the",
+              "// collection variable {{token}} so every subsequent request (and the",
+              "// WebSocket URL) is automatically authenticated.",
+              "if (body && body.data && body.data.token) {",
+              "    pm.collectionVariables.set(\"token\", body.data.token);",
+              "    pm.test(\"Token extracted and saved to {{token}}\", function () {",
+              "        pm.expect(body.data.token).to.be.a(\"string\").and.not.empty;",
+              "    });",
+              "} else {",
+              "    pm.test(\"Token missing in response.data.token\", function () {",
+              "        pm.expect(body && body.data && body.data.token).to.not.be.undefined;",
+              "    });",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"user_id\": 1,\n  \"access_key\": \"{{access_key}}\"\n}",
+          "options": {
+            "raw": {
+              "language": "json"
+            }
+          }
+        },
+        "url": {
+          "raw": "http://{{base_url}}/api/v1/auth/bind",
+          "protocol": "http",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "auth",
+            "bind"
+          ]
+        },
+        "description": "Exchange (user_id, access_key) for a long-lived JWT (365 days).\n\nAccessKey is the 64-char hex string produced offline by\n`scripts/create_device.go`. The DB stores only its SHA-256 hash.\n\nOn success the Tests tab extracts response.data.token into the\ncollection variable {{token}} used by the rest of the collection.\n\nError codes:\n  400 invalid access_key       — malformed JSON / missing fields\n  401 invalid access key       — no device matches (user_id, hash)\n  401 device revoked           — device.RevokedAt is non-NULL"
+      },
+      "response": [
+        {
+          "name": "200 OK — token issued",
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ],
+          "body": "{\n  \"code\": 0,\n  \"message\": \"success\",\n  \"data\": {\n    \"token\": \"eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjoxLCJkZXZpY2VfaWQiOjMsImlhdCI6MTc4MjYxODUzMywiZXhwIjoxODE0MTU0NTMzfQ.signature-placeholder\"\n  }\n}"
+        },
+        {
+          "name": "401 Unauthorized — bad access key",
+          "status": "Unauthorized",
+          "code": 401,
+          "_postman_previewlanguage": "json",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ],
+          "body": "{\n  \"code\": 401,\n  \"message\": \"invalid access key\",\n  \"data\": null\n}"
+        }
+      ]
+    },
+
+    {
+      "name": "Get Current User",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "http://{{base_url}}/api/v1/user/me",
+          "protocol": "http",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "user",
+            "me"
+          ]
+        },
+        "description": "Return the profile of the user identified by the JWT.\n\nRequires Authorization: Bearer {{token}}.\nThe middleware rejects revoked devices immediately (401 device revoked).\n\nError codes:\n  401 missing authorization header / invalid authorization format\n  401 invalid token / device not found / device revoked\n  404 user not found"
+      },
+      "response": [
+        {
+          "name": "200 OK — admin profile",
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ],
+          "body": "{\n  \"code\": 0,\n  \"message\": \"success\",\n  \"data\": {\n    \"id\": 1,\n    \"name\": \"自己\",\n    \"is_admin\": true\n  }\n}"
+        }
+      ]
+    },
+
+    {
+      "name": "List Devices",
+      "request": {
+        "method": "GET",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "http://{{base_url}}/api/v1/device/list",
+          "protocol": "http",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "device",
+            "list"
+          ]
+        },
+        "description": "List devices visible to the current user.\n\n  Admin     -> all devices\n  Non-admin -> only devices where user_id == current user\n\nRevoked devices are included for audit. AccessKeyHash is never exposed.\n\n`last_login_at` / `revoked_at` are null when NULL in the DB.\n`created_at` / `updated_at` are formatted as \"YYYY-MM-DD HH:MM:SS\"."
+      },
+      "response": [
+        {
+          "name": "200 OK — device list",
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ],
+          "body": "{\n  \"code\": 0,\n  \"message\": \"success\",\n  \"data\": {\n    \"devices\": [\n      {\n        \"id\": 1,\n        \"user_id\": 1,\n        \"device_name\": \"MacBook-Pro\",\n        \"last_login_at\": \"2026-06-28T15:30:00Z\",\n        \"revoked_at\": null,\n        \"last_ip\": \"\",\n        \"created_at\": \"2026-06-28 15:00:00\",\n        \"updated_at\": \"2026-06-28 15:30:00\"\n      },\n      {\n        \"id\": 2,\n        \"user_id\": 1,\n        \"device_name\": \"iPhone-15\",\n        \"last_login_at\": null,\n        \"revoked_at\": \"2026-06-27T10:00:00Z\",\n        \"last_ip\": \"\",\n        \"created_at\": \"2026-06-20 10:00:00\",\n        \"updated_at\": \"2026-06-27 10:00:00\"\n      }\n    ]\n  }\n}"
+        }
+      ]
+    },
+
+    {
+      "name": "Revoke Device",
+      "request": {
+        "method": "DELETE",
+        "header": [
+          {
+            "key": "Authorization",
+            "value": "Bearer {{token}}",
+            "type": "text"
+          }
+        ],
+        "url": {
+          "raw": "http://{{base_url}}/api/v1/device/{{device_id}}",
+          "protocol": "http",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "device",
+            "{{device_id}}"
+          ]
+        },
+        "description": "Revoke a device (soft delete). Sets revoked_at = now.\n\n  Admin     -> may revoke any device\n  Non-admin -> may only revoke devices they own\n\nIdempotent: revoking an already-revoked device still returns success.\nOnce revoked, the JWT middleware immediately rejects that device's token\non the next request (no need to wait for expiry).\n\nSet the target via the {{device_id}} variable (or edit the path segment).\n\nError codes:\n  400 invalid device id\n  403 forbidden            — non-admin revoking another user's device\n  404 device not found\n  500 failed to revoke device"
+      },
+      "response": [
+        {
+          "name": "200 OK — revoked",
+          "status": "OK",
+          "code": 200,
+          "_postman_previewlanguage": "json",
+          "header": [
+            {
+              "key": "Content-Type",
+              "value": "application/json; charset=utf-8"
+            }
+          ],
+          "body": "{\n  \"code\": 0,\n  \"message\": \"success\",\n  \"data\": null\n}"
+        }
+      ]
+    },
+
+    {
+      "name": "WebSocket Connect",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "// Raw WebSocket request (Postman native WS support).",
+              "// 1. Ensure {{token}} is set (run \"Bind Device\" first).",
+              "// 2. Click \"Connect\" — the JWT is read from the ?token= query param.",
+              "// 3. Paste any of the messages below into the Message tab (JSON) and Send:",
+              "//",
+              "//    Heartbeat (server acks with {\"type\":\"heartbeat\",\"payload\":{\"status\":\"ok\"}}):",
+              "//    {\"type\":\"heartbeat\"}",
+              "//",
+              "//    Subscribe to device 1 (prefix match: device.1 catches device.1.status, etc.):",
+              "//    {\"type\":\"subscribe\",\"topic\":\"device.1\"}",
+              "//",
+              "//    Stop receiving events for device 1:",
+              "//    {\"type\":\"unsubscribe\",\"topic\":\"device.1\"}",
+              "//",
+              "// Server->client message types you will receive in the response pane:",
+              "//    {\"type\":\"online_list\",\"payload\":{\"device_ids\":[1,3],\"count\":2},\"ts\":...}",
+              "//    {\"type\":\"event\",\"topic\":\"device.status\",\"payload\":{\"device_id\":1,\"status\":\"online\",\"ts\":...},\"ts\":...}",
+              "//    {\"type\":\"event\",\"topic\":\"device.telemetry\",\"payload\":{...},\"ts\":...}",
+              "//    {\"type\":\"broadcast\",\"topic\":\"system.broadcast\",\"payload\":{...},\"ts\":...}",
+              "//    {\"type\":\"error\",\"payload\":{\"error\":\"...\"},\"ts\":...}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "WS",
+        "header": [],
+        "url": {
+          "raw": "ws://{{base_url}}/api/v1/ws?token={{token}}",
+          "protocol": "ws",
+          "host": [
+            "{{base_url}}"
+          ],
+          "path": [
+            "api",
+            "v1",
+            "ws"
+          ],
+          "query": [
+            {
+              "key": "token",
+              "value": "{{token}}"
+            }
+          ]
+        },
+        "description": "Real-time push channel (Phase 3).\n\nWire format (JSON envelope):\n    {\"type\":\"...\",\"topic\":\"...\",\"payload\":{},\"ts\":1234567890}\n\nAuth (hybrid):\n  - The HTTP upgrade must carry a valid JWT — either via the\n    ?token= query param (shown here) or Authorization: Bearer {{token}}.\n  - After upgrade, the connection is kept alive by protocol-level\n    ping/pong (server pings every ~54s) plus an optional application-level\n    heartbeat (client sends {\"type\":\"heartbeat\"}).\n\nClient -> server message types:\n  - heartbeat     keep-alive (server acks)\n  - subscribe     add a topic prefix to this connection's filter\n  - unsubscribe   remove a topic prefix\n\nServer -> client message types:\n  - heartbeat     ack for a client heartbeat\n  - event         an event from the EventBus (device.*, etc.)\n  - broadcast     system-wide announcement\n  - online_list   pushed once on connect (and on demand)\n  - error         error description\n\nTopic naming: \"<domain>.<id>.<subtype>\" (e.g. device.status,\ndevice.telemetry, device.command). Subscriptions use prefix matching:\nsubscribing to \"device.1\" receives device.1.status, device.1.telemetry, ...\nAdmins implicitly receive every device event."
+      },
+      "response": []
+    }
+  ],
+
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "localhost:8080",
+      "type": "string",
+      "description": "API host:port. Use a tunnel host (e.g. your.cloudflare.example.com) for remote testing. No scheme — it is added per-request."
+    },
+    {
+      "key": "access_key",
+      "value": "e6b9b928fc277d062943a46942c07d85b6a99ef4c4d5bc74d737c9cfd1ff304a",
+      "type": "string",
+      "description": "64-char hex AccessKey created offline by `scripts/create_device.go`. Replace with a real key from your DB."
+    },
+    {
+      "key": "token",
+      "value": "",
+      "type": "string",
+      "description": "JWT obtained from POST /api/v1/auth/bind. Auto-populated by the \"Bind Device\" Tests script."
+    },
+    {
+      "key": "device_id",
+      "value": "1",
+      "type": "string",
+      "description": "Target device id for DELETE /api/v1/device/{{device_id}}. Inspect /device/list for valid ids."
+    }
+  ]
+}

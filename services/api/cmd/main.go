@@ -9,11 +9,15 @@ import (
 
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/database"
+	"home-datacenter-api/internal/device"
+	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/handler"
 	"home-datacenter-api/internal/middleware"
+	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
+	"home-datacenter-api/internal/ws"
 )
 
 func main() {
@@ -22,12 +26,11 @@ func main() {
 	gin.SetMode(gin.ReleaseMode)
 
 	// ---- Load configuration (Step16) ----
-	// Default: configs/config.yaml (relative to CWD).
-	// Override with APP_CONFIG env var (useful for Docker / tests).
+	// Pass empty string to enable auto-detection:
+	//   1. APP_CONFIG env var (if set)
+	//   2. configs/config.local.yaml (local dev override)
+	//   3. configs/config.yaml (Docker / default)
 	configPath := os.Getenv("APP_CONFIG")
-	if configPath == "" {
-		configPath = "configs/config.yaml"
-	}
 
 	if err := config.Load(configPath); err != nil {
 		log.Fatalf("failed to load config: %v", err)
@@ -35,83 +38,81 @@ func main() {
 
 	cfg := config.AppConfig
 
-	// Apply JWT config to utils (kept as package vars to avoid
-	// changing every GenerateToken/ParseToken call site).
+	// Apply JWT config to utils
 	utils.JWTSecret = cfg.JWT.Secret
 	utils.TokenExpireDays = cfg.JWT.ExpireDays
 
 	// ---- Database ----
 	database.InitDB(cfg.Database.Path)
 
-	userRepo := repository.NewUserRepository(
-		database.DB,
-	)
+	userRepo := repository.NewUserRepository(database.DB)
 
 	// Bootstrap admin user on first run
-	bootstrapService := service.NewBootstrapService(
-		userRepo,
-	)
-
+	bootstrapService := service.NewBootstrapService(userRepo)
 	if err := bootstrapService.InitAdmin(); err != nil {
-		log.Fatalf(
-			"failed to initialize admin: %v",
-			err,
-		)
+		log.Fatalf("failed to initialize admin: %v", err)
 	}
 
 	log.Println("sqlite initialized successfully")
 	log.Println("system bootstrap completed")
 
-	deviceRepo := repository.NewDeviceRepository(
-		database.DB,
-	)
+	deviceRepo := repository.NewDeviceRepository(database.DB)
 
-	authService := service.NewAuthService(
-		userRepo,
-		deviceRepo,
-	)
+	// ---- Phase 3: Real-time communication ----
 
-	userService := service.NewUserService(
-		userRepo,
-	)
+	// EventBus is the central pub/sub bridge between MQTT and WebSocket.
+	bus := eventbus.New()
 
-	authHandler := handler.NewAuthHandler(
-		authService,
-	)
+	// DeviceManager tracks online/offline state in memory and
+	// persists LastSeen to the database.
+	deviceMgr := device.NewManager(bus, deviceRepo)
+	deviceMgr.Start()
+	defer deviceMgr.Stop()
 
-	userHandler := handler.NewUserHandler(
-		userService,
-	)
+	// MQTT client connects to Mosquitto and routes messages to
+	// the EventBus via the Handler.
+	mqttHandler := mqtt.NewHandler(bus, deviceMgr)
+	mqttClient := mqtt.NewClient(mqtt.Config{
+		Broker:   cfg.MQTT.Broker,
+		ClientID: cfg.MQTT.ClientID,
+		Username: cfg.MQTT.Username,
+		Password: cfg.MQTT.Password,
+		QoS:      cfg.MQTT.QoS,
+	}, mqttHandler)
 
-	deviceService := service.NewDeviceService(
-		deviceRepo,
-	)
+	if err := mqttClient.Start(); err != nil {
+		log.Printf("WARNING: mqtt connect failed: %v (real-time features disabled)", err)
+		// Non-fatal: the app can still serve REST APIs without MQTT.
+	} else {
+		log.Printf("mqtt connected to %s", cfg.MQTT.Broker)
+	}
+	defer mqttClient.Stop()
 
-	deviceHandler := handler.NewDeviceHandler(
-		deviceService,
-		userService,
-	)
+	// WebSocket Hub subscribes to the EventBus and pushes events to
+	// connected app clients.
+	hub := ws.NewHub(bus)
+	defer hub.Close()
+
+	// ---- Services & Handlers ----
+	authService := service.NewAuthService(userRepo, deviceRepo)
+	userService := service.NewUserService(userRepo)
+	deviceService := service.NewDeviceService(deviceRepo)
+
+	authHandler := handler.NewAuthHandler(authService)
+	userHandler := handler.NewUserHandler(userService)
+	deviceHandler := handler.NewDeviceHandler(deviceService, userService)
+	wsHandler := handler.NewWebSocketHandler(hub, deviceRepo, deviceMgr, userService)
 
 	// ---- HTTP server ----
 	r := gin.Default()
 
-	// Cloudflare Tunnel: do not trust any proxy by default
 	if err := r.SetTrustedProxies(nil); err != nil {
-		log.Fatalf(
-			"failed to set trusted proxies: %v",
-			err,
-		)
+		log.Fatalf("failed to set trusted proxies: %v", err)
 	}
 
-	// =========================
-	// Health Check
-	// (intentionally NOT using the unified response envelope
-	//  so Docker / Cloudflare probes keep working)
-	// =========================
+	// Health check (kept simple for Docker / Cloudflare probes)
 	r.GET("/health", func(c *gin.Context) {
-		c.JSON(200, gin.H{
-			"status": "ok",
-		})
+		c.JSON(200, gin.H{"status": "ok"})
 	})
 
 	api := r.Group("/api/v1")
@@ -122,33 +123,27 @@ func main() {
 		}
 
 		user := api.Group("/user")
-		user.Use(
-			middleware.JWTAuth(deviceRepo),
-		)
+		user.Use(middleware.JWTAuth(deviceRepo))
 		{
 			user.GET("/me", userHandler.Me)
 		}
 
-		// Device management (Step14)
-		//   GET    /api/v1/device/list  - list devices
-		//   DELETE /api/v1/device/:id   - revoke a device
 		device := api.Group("/device")
-		device.Use(
-			middleware.JWTAuth(deviceRepo),
-		)
+		device.Use(middleware.JWTAuth(deviceRepo))
 		{
 			device.GET("/list", deviceHandler.List)
 			device.DELETE("/:id", deviceHandler.Delete)
 		}
+
+		// Phase 3: WebSocket endpoint
+		// Auth is handled inside the handler (query param or header).
+		api.GET("/ws", wsHandler.Handle)
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("server started on %s", addr)
 
 	if err := r.Run(addr); err != nil {
-		log.Fatalf(
-			"failed to start server: %v",
-			err,
-		)
+		log.Fatalf("failed to start server: %v", err)
 	}
 }

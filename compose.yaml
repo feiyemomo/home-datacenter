@@ -9,3 +9,17 @@ services:
     volumes:
       - ./data/sqlite:/data/sqlite
       - ./services/api/configs:/configs
+    depends_on:
+      - mosquitto
+    environment:
+      - APP_CONFIG=/configs/config.yaml
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: home-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./data/mosquitto:/mosquitto/data
