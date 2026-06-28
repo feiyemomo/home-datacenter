@@ -1,82 +1,73 @@
 package service
 
 import (
-    "errors"
-    "time"
+	"errors"
+	"time"
 
-    "gorm.io/gorm"
+	"gorm.io/gorm"
 
-    "home-datacenter-api/internal/repository"
-    "home-datacenter-api/internal/utils"
+	"home-datacenter-api/internal/repository"
+	"home-datacenter-api/internal/utils"
 )
 
 type AuthService struct {
-    userRepo   *repository.UserRepository
-    deviceRepo *repository.DeviceRepository
+	userRepo   *repository.UserRepository
+	deviceRepo *repository.DeviceRepository
 }
 
 func NewAuthService(
-    userRepo *repository.UserRepository,
-    deviceRepo *repository.DeviceRepository,
+	userRepo *repository.UserRepository,
+	deviceRepo *repository.DeviceRepository,
 ) *AuthService {
-    return &AuthService{
-        userRepo:   userRepo,
-        deviceRepo: deviceRepo,
-    }
+	return &AuthService{
+		userRepo:   userRepo,
+		deviceRepo: deviceRepo,
+	}
 }
 
+// Bind exchanges an access_key for a long-lived JWT.
+// Flow: user lookup -> hash key -> find device -> revoke check ->
+// update last login -> sign JWT.
 func (s *AuthService) Bind(
-    userID uint,
-    accessKey string,
+	userID uint,
+	accessKey string,
 ) (string, error) {
 
-    // 验证用户存在
-    _, err := s.userRepo.GetByID(userID)
-    if err != nil {
-        return "", err
-    }
+	// Verify user exists
+	if _, err := s.userRepo.GetByID(userID); err != nil {
+		return "", err
+	}
 
-    // Hash AccessKey
-    hash := utils.HashAccessKey(accessKey)
+	// Hash the access key (DB stores only the hash)
+	hash := utils.HashAccessKey(accessKey)
 
-    // 查询设备
-    device, err := s.deviceRepo.GetByUserIDAndHash(
-        userID,
-        hash,
-    )
+	// Find the device by (user_id, hash)
+	device, err := s.deviceRepo.GetByUserIDAndHash(userID, hash)
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return "", errors.New("invalid access key")
+		}
+		return "", err
+	}
 
-    if err != nil {
+	// Reject revoked devices
+	if device.RevokedAt.Valid {
+		return "", errors.New("device revoked")
+	}
 
-        if errors.Is(err, gorm.ErrRecordNotFound) {
-            return "", errors.New("invalid access key")
-        }
+	// Update last login timestamp
+	now := time.Now()
+	device.LastLoginAt = utils.NullTime{Time: now, Valid: true}
 
-        return "", err
-    }
+	if err := s.deviceRepo.Update(device); err != nil {
+		return "", err
+	}
 
-    // 检查设备是否被吊销
-    if device.RevokedAt != nil {
-        return "", errors.New("device revoked")
-    }
+	// Issue a long-lived JWT (365d, see utils.TokenExpireDays)
+	token, err := utils.GenerateToken(userID, device.ID)
+	if err != nil {
+		return "", err
+	}
 
-    // 更新最后登录时间
-    now := time.Now()
-
-    device.LastLoginAt = &now
-
-    if err := s.deviceRepo.Update(device); err != nil {
-        return "", err
-    }
-
-    // 签发JWT
-    token, err := utils.GenerateToken(
-        userID,
-        device.ID,
-    )
-
-    if err != nil {
-        return "", err
-    }
-
-    return token, nil
+	return token, nil
 }
