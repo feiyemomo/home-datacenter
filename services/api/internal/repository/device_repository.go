@@ -137,3 +137,22 @@ func (r *DeviceRepository) IsRevoked(
 func (r *DeviceRepository) Delete(id uint) error {
     return r.db.Delete(&model.Device{}, id).Error
 }
+
+// UpdateLastSeen persists last_seen_at and last_ip for a device.
+// Called asynchronously by the device Manager on every heartbeat.
+func (r *DeviceRepository) UpdateLastSeen(
+    deviceID uint,
+    ip string,
+) error {
+
+    now := time.Now()
+
+    return r.db.
+        Model(&model.Device{}).
+        Where("id = ?", deviceID).
+        Updates(map[string]interface{}{
+            "last_seen_at": utils.NullTime{Time: now, Valid: true},
+            "last_ip":      ip,
+        }).
+        Error
+}

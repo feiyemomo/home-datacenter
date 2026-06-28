@@ -23,6 +23,10 @@ type Device struct {
 
 	RevokedAt utils.NullTime
 
+	// LastSeenAt is updated by the device Manager on every heartbeat /
+	// telemetry message, giving a near-real-time "last active" stamp.
+	LastSeenAt utils.NullTime
+
 	LastIP string
 
 	CreatedAt time.Time
