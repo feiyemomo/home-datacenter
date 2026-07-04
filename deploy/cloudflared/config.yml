@@ -27,7 +27,7 @@ ingress:
   # The browser POSTs SDP offers here; the answer comes back as
   # the HTTP body. HLS just works (HTTP).
   - hostname: cam.feiyemomo.top
-    service: http://home-go2rtc:1984
+    service: http://localhost:1984
 
   # Catch-all: reject unmatched hostnames
   - service: http_status:404

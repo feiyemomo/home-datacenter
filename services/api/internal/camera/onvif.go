@@ -3,6 +3,9 @@ package camera
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha1"
+	"encoding/base64"
 	"encoding/xml"
 	"fmt"
 	"io"
@@ -24,7 +27,22 @@ const (
 	PTZStop    PTZCommand = "stop"
 	PTZZoomIn  PTZCommand = "zoom_in"
 	PTZZoomOut PTZCommand = "zoom_out"
+	// PTZGotoPreset targets a named ONVIF preset (see GotoPreset).
+	PTZGotoPreset PTZCommand = "goto_preset"
 )
+
+// Profile is the trimmed projection of an ONVIF media profile —
+// only what we need (token + name) is kept.
+type Profile struct {
+	Token string `json:"token"`
+	Name  string `json:"name"`
+}
+
+// Preset is an ONVIF PTZ preset.
+type Preset struct {
+	Token string `json:"token"`
+	Name  string `json:"name"`
+}
 
 // ONVIFController dispatches PTZ commands to ONVIF-capable cameras.
 // It deliberately uses raw SOAP+HTTP for the two requests we need
@@ -100,15 +118,155 @@ func (o *ONVIFController) Forget(id uint) {
 	o.mu.Unlock()
 }
 
-// sendSoap POSTs `body` to `deviceURL` with WS-Security UsernameToken
-// digest auth, then verifies the SOAP response is a fault-free 200.
-func (o *ONVIFController) sendSoap(ctx context.Context, deviceURL, user, pass, body string) error {
+// DiscoverProfiles hits ONVIF GetProfiles and returns the list of
+// media profiles the camera exposes. Used by Registry.Register to
+// auto-pick a profile token when the caller didn't supply one.
+//
+// We parse the SOAP response with regex (instead of pulling in
+// encoding/xml round-trips for a four-line structure) to keep the
+// dependency surface flat. The trade-off is brittleness against
+// exotic namespaces — Hik/Dahua/Uniview all use the canonical
+// ONVIF namespace, so this works for the 90% case.
+func (o *ONVIFController) DiscoverProfiles(
+	ctx context.Context,
+	host string, port int, user, pass string,
+) ([]Profile, error) {
+	deviceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", host, port)
+	body := `<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:trt="http://www.onvif.org/ver10/media/wsdl">
+  <soap:Body>
+    <trt:GetProfiles/>
+  </soap:Body>
+</soap:Envelope>`
+	body = strings.Replace(body, "<soap:Body>", wsseHeader(user, pass)+"<soap:Body>", 1)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceURL, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
+	resp, err := o.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return nil, fmt.Errorf("onvif getprofiles http %d: %s", resp.StatusCode, string(buf))
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if bytes.Contains(raw, []byte("<Fault")) {
+		return nil, fmt.Errorf("onvif getprofiles fault: %s", truncate(string(raw), 256))
+	}
+	return parseProfiles(string(raw)), nil
+}
+
+// DiscoverPresets hits ONVIF GetPresets for a given media profile.
+// The caller is expected to have already called DiscoverProfiles to
+// learn a valid profile token.
+func (o *ONVIFController) DiscoverPresets(
+	ctx context.Context,
+	host string, port int, user, pass, profileToken string,
+) ([]Preset, error) {
+	deviceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", host, port)
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <soap:Body>
+    <tptz:GetPresets>
+      <tptz:ProfileToken>%s</tptz:ProfileToken>
+    </tptz:GetPresets>
+  </soap:Body>
+</soap:Envelope>`, xmlEscape(profileToken))
+	body = strings.Replace(body, "<soap:Body>", wsseHeader(user, pass)+"<soap:Body>", 1)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceURL, strings.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
+	resp, err := o.hc.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return nil, fmt.Errorf("onvif getpresets http %d: %s", resp.StatusCode, string(buf))
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if bytes.Contains(raw, []byte("<Fault")) {
+		return nil, fmt.Errorf("onvif getpresets fault: %s", truncate(string(raw), 256))
+	}
+	return parsePresets(string(raw)), nil
+}
+
+// GotoPreset issues an ONVIF GotoPreset request. The preset token
+// must be known to the camera (i.e. set up in the camera's own UI
+// first; ONVIF has no API to *create* a preset on most firmware).
+func (o *ONVIFController) GotoPreset(
+	ctx context.Context,
+	id uint,
+	host string, port int, user, pass, profileToken, presetToken string,
+	speed float64,
+) error {
+	deviceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", host, port)
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <soap:Body>
+    <tptz:GotoPreset>
+      <tptz:ProfileToken>%s</tptz:ProfileToken>
+      <tptz:PresetToken>%s</tptz:PresetToken>
+      <tptz:Speed>
+        <tt:PanTilt x="%.3f" y="%.3f" xmlns:tt="http://www.onvif.org/ver10/schema"/>
+        <tt:Zoom x="%.3f" xmlns:tt="http://www.onvif.org/ver10/schema"/>
+      </tptz:Speed>
+    </tptz:GotoPreset>
+  </soap:Body>
+</soap:Envelope>`,
+		xmlEscape(profileToken), xmlEscape(presetToken),
+		clamp(speed), 0.0, clamp(speed))
+	body = strings.Replace(body, "<soap:Body>", wsseHeader(user, pass)+"<soap:Body>", 1)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceURL, strings.NewReader(body))
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
-	req.SetBasicAuth(user, pass)
+	resp, err := o.hc.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return fmt.Errorf("onvif gotopreset http %d: %s", resp.StatusCode, string(buf))
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if bytes.Contains(raw, []byte("<Fault")) {
+		return fmt.Errorf("onvif gotopreset fault: %s", truncate(string(raw), 256))
+	}
+	// refresh cached session so the profile we just used is recorded
+	o.mu.Lock()
+	s, ok := o.cached[id]
+	if ok {
+		s.profileToken = profileToken
+	}
+	o.mu.Unlock()
+	return nil
+}
+
+// sendSoap POSTs `body` to `deviceURL` with WS-Security UsernameToken
+// auth, then verifies the SOAP response is a fault-free 200.
+func (o *ONVIFController) sendSoap(ctx context.Context, deviceURL, user, pass, body string) error {
+	// Inject WS-Security header before <soap:Body>.
+	body = strings.Replace(body, "<soap:Body>", wsseHeader(user, pass)+"<soap:Body>", 1)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceURL, strings.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
 	resp, err := o.hc.Do(req)
 	if err != nil {
 		// On any transport error, drop every cached session so the
@@ -197,6 +355,37 @@ func xmlEscape(s string) string {
 	var b strings.Builder
 	_ = xml.EscapeText(&b, []byte(s))
 	return b.String()
+}
+
+// wsseHeader returns a SOAP <soap:Header> block containing a
+// WS-Security UsernameToken with PasswordDigest. ONVIF spec requires
+// WS-Security for all authenticated requests. Most Hikvision / Dahua
+// firmware rejects PasswordText and requires the digest form:
+//
+//	digest = Base64( SHA1( nonce + created + password ) )
+//
+// The nonce is random 16 bytes; the created timestamp is UTC ISO-8601.
+func wsseHeader(user, pass string) string {
+	nonce := make([]byte, 16)
+	_, _ = rand.Read(nonce)
+	created := time.Now().UTC().Format("2006-01-02T15:04:05Z")
+	hasher := sha1.New()
+	hasher.Write(nonce)
+	hasher.Write([]byte(created))
+	hasher.Write([]byte(pass))
+	digest := base64.StdEncoding.EncodeToString(hasher.Sum(nil))
+	nonceB64 := base64.StdEncoding.EncodeToString(nonce)
+	return fmt.Sprintf(`<soap:Header>
+  <wsse:Security xmlns:wsse="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-secext-1.0.xsd" xmlns:wsu="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-wssecurity-utility-1.0.xsd">
+    <wsse:UsernameToken>
+      <wsse:Username>%s</wsse:Username>
+      <wsse:Password Type="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-username-token-profile-1.0#PasswordDigest">%s</wsse:Password>
+      <wsse:Nonce EncodingType="http://docs.oasis-open.org/wss/2004/01/oasis-200401-wss-soap-message-security-1.0#Base64Binary">%s</wsse:Nonce>
+      <wsu:Created>%s</wsu:Created>
+    </wsse:UsernameToken>
+  </wsse:Security>
+</soap:Header>
+  `, xmlEscape(user), digest, nonceB64, created)
 }
 
 func truncate(s string, n int) string {

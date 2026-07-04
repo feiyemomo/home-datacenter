@@ -86,6 +86,31 @@ type CameraConfig struct {
 	// HealthTimeoutSeconds is the per-probe TCP-dial timeout.
 	// Default 3.
 	HealthTimeoutSeconds int `mapstructure:"health_timeout_seconds"`
+
+	// RecordingDir is the on-disk root for the recorder. Must be a
+	// path that BOTH the API and go2rtc containers can reach, i.e.
+	// a shared volume mounted at the same location in both.
+	// Default: /data/recordings.
+	RecordingDir string `mapstructure:"recording_dir"`
+
+	// WebRTCPublicBase is the absolute URL prefix the front-end
+	// should hit for WebRTC SDP exchange. Three values make sense:
+	//
+	//   ""             → "lan"      — the Go API rewrites the URL to
+	//                                home-go2rtc:1984 inside the LAN.
+	//   "<public URL>" → "tunnel"   — the go2rtc ingress hostname
+	//                                (e.g. https://cam.feiyemomo.top)
+	//                                is used as-is. SDP works; UDP
+	//                                media does not.
+	//   "<turn URL>"   → "turn"     — same as tunnel + a TURN server
+	//                                injected into the ICE config.
+	WebRTCPublicBase string `mapstructure:"webrtc_public_base"`
+
+	// ICEServers is the JSON-encoded list of STUN/TURN servers
+	// returned by GET /api/v1/cameras/ice. Format follows the
+	// browser RTCIceServer shape: [{"urls":"stun:..."},
+	// {"urls":["turn:...","turns:..."],"username":"...","credential":"..."}]
+	ICEServers string `mapstructure:"ice_servers"`
 }
 
 // AppConfig is the globally accessible configuration instance,
@@ -132,6 +157,9 @@ func Load(path string) error {
 	v.SetDefault("go2rtc.base_url", "http://home-go2rtc:1984")
 	v.SetDefault("camera.health_interval_seconds", 15)
 	v.SetDefault("camera.health_timeout_seconds", 3)
+	v.SetDefault("camera.recording_dir", "/data/recordings")
+	v.SetDefault("camera.webrtc_public_base", "")
+	v.SetDefault("camera.ice_servers", "")
 
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /

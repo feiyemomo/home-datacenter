@@ -8,6 +8,8 @@
 //	home-datacenter/devices/{device_id}/command     server → device
 //	home-datacenter/devices/{device_id}/events      bidirectional
 //
+//	home-datacenter/cameras/{camera_id}/event       camera → server
+//
 //	home-datacenter/users/{user_id}/notifications   server → app
 //
 //	home-datacenter/system/broadcast                server → all
@@ -18,6 +20,7 @@
 //	home-datacenter/devices/+/status
 //	home-datacenter/devices/+/telemetry
 //	home-datacenter/devices/+/events
+//	home-datacenter/cameras/+/event
 //
 // The server publishes to:
 //
@@ -89,11 +92,16 @@ func SubscribeDeviceEvents() string {
 	return Prefix + "/devices/+/events"
 }
 
+// SubscribeCameraEvent matches motion/AI events from any camera.
+func SubscribeCameraEvent() string {
+	return Prefix + "/cameras/+/event"
+}
+
 // ParsedTopic is the result of parsing an MQTT topic string.
 type ParsedTopic struct {
-	Domain  string // "devices" | "users" | "system"
-	ID      uint   // device_id or user_id (0 for system)
-	Subtype string // "status" | "telemetry" | "command" | "events" | ...
+	Domain  string // "devices" | "cameras" | "users" | "system"
+	ID      uint   // device_id, camera_id, or user_id (0 for system)
+	Subtype string // "status" | "telemetry" | "command" | "events" | "event" | ...
 }
 
 // ParseTopic splits a topic like
@@ -113,7 +121,7 @@ func ParseTopic(topic string) (ParsedTopic, bool) {
 	pt := ParsedTopic{Domain: parts[0]}
 
 	switch parts[0] {
-	case "devices", "users":
+	case "devices", "users", "cameras":
 		if len(parts) < 3 {
 			return ParsedTopic{}, false
 		}

@@ -77,6 +77,18 @@ services:
   # container just serves what it's told. Port 1984 is bound to
   # the loopback only — the only path in is via Cloudflare Tunnel
   # (or your LAN via a manually mapped port).
+  #
+  # IMPORTANT: go2rtc.yaml is NOT bind-mounted. The Dockerfile
+  # COPYs it into the image at /etc/go2rtc.yaml, and go2rtc rewrites
+  # that file on every PUT /api/streams call (it persists in-memory
+  # streams to disk for next-boot replay). A bind-mounted file —
+  # especially on Windows / Docker Desktop — can be read-only at
+  # the filesystem level even without the :ro flag, causing the
+  # write to fail silently: the API returns 200 but the stream is
+  # never added. By relying on the Dockerfile COPY the file lives
+  # in the container's writable layer and go2rtc can save freely.
+  # The DB remains the source of truth on container restart;
+  # home-api's BootReplay re-injects all persisted streams.
   go2rtc:
     build:
       context: ./deploy/go2rtc
@@ -85,9 +97,25 @@ services:
     ports:
       - "127.0.0.1:1984:1984"
     volumes:
-      - ./deploy/go2rtc/go2rtc.yaml:/etc/go2rtc.yaml:ro
+      - ./data/go2rtc:/var/lib/go2rtc
     networks:
       - home-net
+  # coturn — optional STUN/TURN for WebRTC across the public
+  # internet. Without this, browsers can only reach go2rtc via
+  # LAN or Cloudflare Tunnel (HTTP SDP only — no UDP media).
+  # Disabled by default; uncomment the block below to enable.
+  #
+  #   coturn:
+  #     build: ./deploy/coturn
+  #     container_name: home-coturn
+  #     restart: unless-stopped
+  #     ports:
+  #       - "3478:3478/udp"      # STUN/TURN UDP
+  #       - "3478:3478"          # STUN/TURN TCP (fallback)
+  #       - "5349:5349"          # TURN over TLS
+  #       - "49160-49200:49160-49200/udp"  # relay
+  #     networks:
+  #       - home-net
 
 networks:
   home-net:

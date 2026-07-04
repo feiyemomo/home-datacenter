@@ -133,9 +133,14 @@ func main() {
 		log.Fatalf("camera: secret box init: %v", err)
 	}
 	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
-	camReg := camera.NewRegistry(database.DB, go2, box)
 	camONVIF := camera.NewONVIFController()
-	camHandler := handler.NewCameraHandler(camReg, camONVIF)
+	camReg := camera.NewRegistry(database.DB, go2, box, camONVIF, cfg.Camera.WebRTCPublicBase)
+	camRecorder := &camera.Recorder{
+		DB:        database.DB,
+		Go2:       go2,
+		OutputDir: cfg.Camera.RecordingDir,
+	}
+	camHandler := handler.NewCameraHandler(camReg, camONVIF, camRecorder, cfg.Camera.WebRTCPublicBase, cfg.Camera.ICEServers, userService)
 
 	// Replay every persisted camera to go2rtc so a container restart
 	// doesn't drop the streams. Best-effort: log and continue.
@@ -143,14 +148,16 @@ func main() {
 		log.Printf("camera: boot replay: %v", err)
 	}
 
-	// Background health probe loop.
+	// Background loops: health probes + recording roll.
 	camHealth := &camera.HealthChecker{
 		Registry: camReg,
 		Bus:      bus,
 		Interval: time.Duration(cfg.Camera.HealthIntervalSeconds) * time.Second,
 		Timeout:  time.Duration(cfg.Camera.HealthTimeoutSeconds) * time.Second,
 	}
+	camRecorder.HC = camHealth
 	go camHealth.Run(context.Background())
+	go camRecorder.Run(context.Background())
 
 	// ---- HTTP server ----
 	r := gin.Default()
@@ -202,7 +209,11 @@ func main() {
 		{
 			// Read endpoints are available to any authenticated user.
 			camGroup.GET("", camHandler.List)
+			camGroup.GET("ice", camHandler.ICE)
 			camGroup.GET(":id", camHandler.Get)
+			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
+			camGroup.GET(":id/recordings", camHandler.ListRecordings)
+			camGroup.GET(":id/recordings/:recId/file", camHandler.PlayRecording)
 			// Mutating endpoints are admin-only.
 			adminCam := camGroup.Group("")
 			adminCam.Use(middleware.RequireAdmin(database.DB))
@@ -210,6 +221,11 @@ func main() {
 				adminCam.POST("", camHandler.Register)
 				adminCam.DELETE(":id", camHandler.Delete)
 				adminCam.POST(":id/ptz", camHandler.PTZ)
+				adminCam.PUT(":id/presets/:alias", camHandler.SetPreset)
+				adminCam.DELETE(":id/presets/:alias", camHandler.DeletePreset)
+				adminCam.POST(":id/preset/:alias", camHandler.GotoPreset)
+				adminCam.PUT(":id/recording", camHandler.SetRecordingPlan)
+				adminCam.DELETE(":id/recordings/:recId", camHandler.DeleteRecording)
 			}
 		}
 
