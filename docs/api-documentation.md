@@ -457,6 +457,24 @@ Authorization: Bearer <jwt_token>
 }
 ```
 
+**Notes on `online_device_count` / `online_device_ids`:**
+
+- The list reflects `device.Manager`'s in-memory state, fed by MQTT
+  status messages, telemetry, and heartbeats. A device is considered
+  online until it has been silent for `heartbeatTimeout` (90s) or the
+  API has lost its broker connection.
+- When the API's MQTT client disconnects from the broker
+  (`OnConnectionLost`), `device.Manager.MarkAllOffline` flips every
+  online device to offline and emits a `device.status` event for each.
+  The dashboard reflects the loss immediately rather than waiting for
+  the 90s sweeper.
+- The Devices page in the dashboard updates the online set
+  optimistically from incoming `device.status` WebSocket events
+  (add on `online`/`heartbeat`, delete on `offline`) and reconciles
+  with this endpoint in the background.
+- `online_device_ids` is `null` rather than `[]` when no devices are
+  online (legacy `[]` is also tolerated by the frontend).
+
 **Error Responses:** same 401 auth errors as `/user/me`.
 
 ---
@@ -799,6 +817,38 @@ Scan error: revoked_at string -> *time.Time
 
 ---
 
+### 7. Devices Stuck Offline Despite Status Messages
+
+**Symptom:** `GET /api/v1/system/status` returns
+`online_device_count: 0` and `online_device_ids: null` even though
+`mosquitto_sub` shows the device publishing
+`home-datacenter/devices/5/status` payloads, and `docker logs home-api`
+shows the message being received.
+
+**Cause:** Two common root causes.
+
+1. The publisher sends *unquoted-key pseudo-JSON*, e.g.
+   `{status:online,ts:1234567890}`. `encoding/json` rejects it with
+   `invalid character 's' looking for beginning of object key string`,
+   so `device.Manager.SetOnline` is never called.
+2. The publisher sends valid JSON but the API is unable to see the
+   message (broker ACL, wrong topic, no default publish handler
+   registered on the paho client).
+
+**Fix:**
+
+- `mqtt.Handler.handleStatus` is now tolerant: it first tries strict
+  JSON, then a lenient re-quote pass (`lenientJSON`), and finally a
+  bareword regex fallback. The canonical parsed status is re-emitted
+  on the EventBus so downstream consumers always get strict JSON.
+- `mqtt.Client` registers a default publish handler at construction
+  so messages are never silently dropped between the broker and the
+  handler.
+- See `services/api/internal/mqtt/handler_test.go` for the payload
+  shapes that must keep working.
+
+---
+
 ## Deployment
 
 ### Docker Compose
@@ -894,6 +944,30 @@ Invoke-RestMethod -Uri http://localhost:8080/api/v1/device/1 `
 Invoke-RestMethod -Uri http://localhost:8080/api/v1/user/me -Headers $h
 # → 401 "device revoked"
 ```
+
+---
+
+# 7. Simulate a Device Going Online (Mosquitto)
+
+Useful for smoke-testing the dashboard without a real device:
+
+```bash
+# Standard JSON — preferred
+MSYS_NO_PATHCONV=1 docker exec home-mosquitto \
+  mosquitto_pub -u home-datacenter -P "$MQTT_PASSWORD" \
+    -t 'home-datacenter/devices/1/status' \
+    -m '{"status":"online","ts":1234567890}'
+
+# Loosely formatted JSON (key/value unquoted) — also accepted
+MSYS_NO_PATHCONV=1 docker exec home-mosquitto \
+  mosquitto_pub -u home-datacenter -P "$MQTT_PASSWORD" \
+    -t 'home-datacenter/devices/1/status' \
+    -m '{status:online,ts:1234567890}'
+```
+
+Then `GET /api/v1/system/status` should return
+`online_device_count: 1` and `online_device_ids: [1]` within 5s.
+Publish `{"status":"offline",...}` to flip it back.
 
 ---
 

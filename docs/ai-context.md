@@ -132,7 +132,7 @@ services/api/
 ├── internal/
 │   ├── config/config.go         // YAML loader (viper) + secret validation
 │   ├── database/sqlite.go       // DB init
-│   ├── device/manager.go        // Online/offline + heartbeat tracking
+│   ├── device/manager.go        // Online/offline + heartbeat + MarkAllOffline on disconnect
 │   ├── eventbus/                // In-memory pub/sub (MQTT ↔ WS bridge)
 │   ├── model/
 │   │   ├── user.go
@@ -259,6 +259,7 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 6. **NullTime** → never use `*time.Time` for nullable datetime columns with glebarez driver
 7. **JWT secret** → never commit a real secret; app boots only with a ≥32-char non-placeholder secret
 8. **CRLF on Windows** → `core.autocrlf=true` means gofmt may flag CRLF files locally; the canonical line ending in the repo is LF
+9. **Device status payload parsing** → `mqtt.Handler.handleStatus` accepts both strict JSON (`{"status":"online","ts":1}`) and unquoted-key pseudo-JSON (`{status:online,ts:1}`). A bare `status=...` is also tolerated as a last-ditch fallback. Canonical JSON is re-emitted on the EventBus, so downstream consumers can rely on strict JSON. Always re-emit canonical JSON when adding new publishers; do not pass the raw payload downstream.
 
 ---
 
@@ -341,6 +342,11 @@ rate limit on `/auth/bind`. Defence-in-depth layers applied:
 - The API server authenticates with the `home-datacenter` account and
   has `readwrite home-datacenter/#`; device clients need their own ACL
   entries. `$SYS/#` write is never granted.
+- On `OnConnectionLost` the MQTT client calls `device.Manager.MarkAllOffline`
+  before logging the disconnect, so the dashboard reflects the loss
+  immediately instead of waiting up to `heartbeatTimeout` (90s) for the
+  sweeper to time each device out. Devices that come back online
+  re-mark themselves via `SetOnline` / `Heartbeat`.
 
 **WebSocket**
 - JWT verified on upgrade (header preferred, `?token=` as browser fallback).
@@ -376,4 +382,4 @@ rate limit on `/auth/bind`. Defence-in-depth layers applied:
 
 ---
 
-**Last Updated:** 2026-07-04 (security hardening pass + dashboard docs)
+**Last Updated:** 2026-07-04 (security hardening pass + dashboard docs + lenient status parser + disconnect → mark-all-offline)

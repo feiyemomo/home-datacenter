@@ -199,6 +199,29 @@ func (m *Manager) sweep() {
 	}
 }
 
+// MarkAllOffline marks every tracked device as offline and emits a
+// status event for each. Used when the API loses its broker
+// connection: without this, devices that were online keep showing
+// "online" in the dashboard for up to heartbeatTimeout (90s) — the
+// full sweep window — even though the server can no longer hear them.
+//
+// Idempotent: devices already offline are left alone.
+func (m *Manager) MarkAllOffline() {
+	m.mu.Lock()
+	var online []uint
+	for id, st := range m.devices {
+		if st.Online {
+			st.Online = false
+			online = append(online, id)
+		}
+	}
+	m.mu.Unlock()
+
+	for _, id := range online {
+		m.publishStatus(id, "offline")
+	}
+}
+
 // publishStatus emits a device.status event on the EventBus.
 func (m *Manager) publishStatus(deviceID uint, status string) {
 	// Build payload manually to avoid json import cycle in events.go;
