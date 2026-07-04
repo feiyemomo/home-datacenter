@@ -11,7 +11,7 @@ import (
 // insecure placeholders — production deployments must override
 // jwt.secret in configs/config.yaml.
 var (
-	JWTSecret      = "PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET"
+	JWTSecret       = "PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET"
 	TokenExpireDays = 365
 )
 

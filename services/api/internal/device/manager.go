@@ -25,9 +25,9 @@ const offlineSweepInterval = 30 * time.Second
 
 // deviceState holds the in-memory realtime state of one device.
 type deviceState struct {
-	Online     bool
-	LastSeen   time.Time
-	LastIP     string
+	Online   bool
+	LastSeen time.Time
+	LastIP   string
 }
 
 // Manager tracks device online/offline status in memory and persists

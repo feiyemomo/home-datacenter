@@ -3,27 +3,27 @@
 //
 // Topic schema (all topics are under the "home-datacenter/" prefix):
 //
-//   home-datacenter/devices/{device_id}/status      device → server
-//   home-datacenter/devices/{device_id}/telemetry   device → server
-//   home-datacenter/devices/{device_id}/command     server → device
-//   home-datacenter/devices/{device_id}/events      bidirectional
+//	home-datacenter/devices/{device_id}/status      device → server
+//	home-datacenter/devices/{device_id}/telemetry   device → server
+//	home-datacenter/devices/{device_id}/command     server → device
+//	home-datacenter/devices/{device_id}/events      bidirectional
 //
-//   home-datacenter/users/{user_id}/notifications   server → app
+//	home-datacenter/users/{user_id}/notifications   server → app
 //
-//   home-datacenter/system/broadcast                server → all
-//   home-datacenter/system/health                   server → all
+//	home-datacenter/system/broadcast                server → all
+//	home-datacenter/system/health                   server → all
 //
 // The server subscribes to:
 //
-//   home-datacenter/devices/+/status
-//   home-datacenter/devices/+/telemetry
-//   home-datacenter/devices/+/events
+//	home-datacenter/devices/+/status
+//	home-datacenter/devices/+/telemetry
+//	home-datacenter/devices/+/events
 //
 // The server publishes to:
 //
-//   home-datacenter/devices/{device_id}/command
-//   home-datacenter/users/{user_id}/notifications
-//   home-datacenter/system/broadcast
+//	home-datacenter/devices/{device_id}/command
+//	home-datacenter/users/{user_id}/notifications
+//	home-datacenter/system/broadcast
 package mqtt
 
 import (
@@ -91,9 +91,9 @@ func SubscribeDeviceEvents() string {
 
 // ParsedTopic is the result of parsing an MQTT topic string.
 type ParsedTopic struct {
-	Domain   string // "devices" | "users" | "system"
-	ID       uint   // device_id or user_id (0 for system)
-	Subtype  string // "status" | "telemetry" | "command" | "events" | ...
+	Domain  string // "devices" | "users" | "system"
+	ID      uint   // device_id or user_id (0 for system)
+	Subtype string // "status" | "telemetry" | "command" | "events" | ...
 }
 
 // ParseTopic splits a topic like

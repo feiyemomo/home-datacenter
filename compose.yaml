@@ -15,7 +15,7 @@ services:
       - APP_CONFIG=/configs/config.yaml
 
   mosquitto:
-    image: eclipse-mosquitto:2
+    image: docker.m.daocloud.io/library/eclipse-mosquitto:2
     container_name: home-mosquitto
     restart: unless-stopped
     ports:
@@ -23,3 +23,13 @@ services:
     volumes:
       - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./data/mosquitto:/mosquitto/data
+
+  web:
+    build:
+      context: ./web
+    container_name: home-web
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      - api

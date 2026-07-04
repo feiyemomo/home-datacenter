@@ -1,6 +1,9 @@
-FROM golang:1.26-alpine AS builder
+FROM docker.m.daocloud.io/library/golang:1.26-alpine AS builder
 
 WORKDIR /app
+
+# Configure Go proxy for faster downloads in China
+ENV GOPROXY=https://goproxy.cn,https://goproxy.io,direct
 
 COPY go.mod .
 COPY go.sum .
@@ -11,7 +14,7 @@ COPY . .
 
 RUN go build -o server ./cmd
 
-FROM alpine:latest
+FROM docker.m.daocloud.io/library/alpine:latest
 
 WORKDIR /
 
