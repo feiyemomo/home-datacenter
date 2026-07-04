@@ -1,0 +1,27 @@
+# Mosquitto ACL file for Home Datacenter
+#
+# Restricts what each authenticated client may do on the broker.
+# Bound into the container at /mosquitto/config/aclfile by compose.yaml.
+#
+# Format:
+#   user <username>
+#   topic [read|write|readwrite] <topic-filter>
+#
+# The special "#" filter matches everything; "home-datacenter/#"
+# matches the whole home-datacenter namespace.
+
+# ---- API server (home-datacenter) ----
+# The backend needs full read access (to receive device telemetry /
+# status) and write access to push commands, notifications, and
+# broadcasts. It is the only client that should publish to
+# device/+/command, users/+/notifications, and system/broadcast.
+user home-datacenter
+topic readwrite home-datacenter/#
+topic read $SYS/broker/version
+# Allow subscribing to $SYS for broker health; publishing to $SYS is
+# never legitimate and is blocked by not granting write on $SYS/#.
+
+# ---- Default (anonymous / unlisted users) ----
+# With allow_anonymous=false, anonymous clients are already rejected
+# at the password check; this is a defence-in-depth no-op.
+topic deny #

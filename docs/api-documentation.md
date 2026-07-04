@@ -135,7 +135,13 @@ type NullTime struct {
 
 ### Response Envelope (Step15)
 
-All `/api/v1/*` endpoints use a unified envelope:
+All `/api/v1/*` endpoints use a unified envelope, and every response
+carries the following security headers (applied by `utils.applySecurityHeaders`):
+
+- `X-Content-Type-Options: nosniff`
+- `X-Frame-Options: DENY`
+- `Referrer-Policy: no-referrer`
+- `Cache-Control: no-store`
 
 **Success:**
 
@@ -240,9 +246,13 @@ Content-Type: application/json
 
 | Status | `message` | Scenario |
 |--------|-----------|----------|
-| 400 | `invalid access_key` | Missing/invalid JSON body |
-| 401 | `invalid access key` | No device matches (user_id, hash) |
-| 401 | `device revoked` | Device has been revoked |
+| 400 | `invalid request body` | Missing/invalid JSON body |
+| 401 | `invalid credentials` | No device matches (user_id, hash), user not found, or device revoked |
+
+> **Security note:** all bind failures return the same generic
+> `invalid credentials` to prevent user/key enumeration. The detailed
+> causes (invalid access key / device revoked / user lookup) are still
+> distinguished internally but not exposed to the client.
 
 **JWT Claims:**
 
@@ -414,6 +424,136 @@ Authorization: Bearer <jwt_token>
 
 ---
 
+### System Status (Dashboard)
+
+**Endpoint:**
+
+```
+GET /api/v1/system/status
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Purpose:** Live metrics for the web dashboard (polled every 5s).
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "mqtt_connected": true,
+    "ws_clients": 2,
+    "online_device_count": 1,
+    "online_device_ids": [1],
+    "uptime_seconds": 3600,
+    "server_time": "2026-07-04 16:00:00"
+  }
+}
+```
+
+**Error Responses:** same 401 auth errors as `/user/me`.
+
+---
+
+### MQTT Publish (Admin)
+
+**Endpoint:**
+
+```
+POST /api/v1/mqtt/publish
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Authorization:** admin only (a non-admin JWT receives 403 from the
+route guard is *not* applied here — the endpoint is JWT-only; admin
+enforcement is the caller's responsibility via the dashboard route.
+See `web/src/App.tsx` `adminOnly` on `/mqtt`).
+
+**Request Body:**
+
+```json
+{
+  "topic": "home-datacenter/devices/1/command",
+  "payload": "{\"cmd\":\"reboot\"}",
+  "qos": 1
+}
+```
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `topic` | string | Yes | Must be within the `home-datacenter/` namespace |
+| `payload` | string | Yes | Raw payload (JSON string for the dashboard) |
+| `qos` | byte | No | 0/1/2; defaults to 1 |
+
+**Topic allowlist:** the server rejects any topic that does not start
+with `home-datacenter/` or that starts with `$` (broker control topics
+like `$SYS/...`). This prevents a compromised admin token from writing
+retained messages to arbitrary broker topics.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "topic": "home-datacenter/devices/1/command",
+    "payload": "{\"cmd\":\"reboot\"}",
+    "qos": 1
+  }
+}
+```
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid request body` | Missing/invalid JSON body |
+| 400 | `topic must be within the home-datacenter/ namespace` | Topic outside allowlist |
+| 503 | `mqtt not connected` | Broker unreachable |
+
+---
+
+### WebSocket
+
+**Endpoint:**
+
+```
+GET /api/v1/ws
+```
+
+**Auth (one of):**
+
+- `Authorization: Bearer <jwt_token>` header (preferred — keeps token out of URL/logs)
+- `?token=<jwt_token>` query parameter (browser fallback; exposes token in URL/referer)
+
+**Origin policy:** when `server.allowed_origins` is configured, only
+requests whose `Origin` host is in the allowlist are upgraded. This
+blocks cross-site WebSocket hijacking (CSWSH). Empty list (local dev)
+accepts any origin.
+
+**Lifecycle:** after upgrade, the connection is kept alive by
+ping/pong (30s) and an application-level heartbeat. The JWT's
+`(user_id, device_id)` identify the connection; admins receive all
+device events, non-admins receive only events whose topic matches one
+of their subscriptions.
+
+See `docs/ai-context.md` → Phase 3 and `deploy/android/HomeDatacenterClient.kt`
+for the wire format (`{type, topic, payload, ts}`).
+
+---
+
 ## JWT Middleware Behavior
 
 **Flow:**
@@ -440,6 +580,7 @@ Once an admin calls `DELETE /api/v1/device/:id`, the next request with that devi
 ```yaml
 server:
   port: 8080
+  allowed_origins: []   # WebSocket origin allowlist (empty = dev)
 
 database:
   path: /data/sqlite/app.db
@@ -447,15 +588,42 @@ database:
 jwt:
   secret: your-secret-key
   expire_days: 365
+
+mqtt:
+  broker: tcp://mosquitto:1883
+  client_id: home-datacenter
+  username: ""
+  password: ""
+  qos: 1
+
+websocket:
+  path: /api/v1/ws
+  heartbeat_seconds: 30
 ```
 
 **Defaults:**
 
 - If a field is missing, defaults are:
   - `server.port`: 8080
+  - `server.allowed_origins`: `[]` (allow all — dev only)
   - `database.path`: `/data/sqlite/app.db`
-  - `jwt.secret`: `""` (caller should validate)
+  - `jwt.secret`: `""` (rejected at startup — see below)
   - `jwt.expire_days`: 365
+  - `mqtt.*` / `websocket.*`: see `internal/config/config.go`
+
+**Secret resolution (priority order):**
+
+1. `JWT_SECRET` env var (preferred for Docker / `.env`)
+2. `configs/config.local.yaml` `jwt.secret` (gitignored local dev)
+3. `configs/config.yaml` `jwt.secret` (placeholder)
+
+The API **refuses to start** with an empty, placeholder
+(`your-secret-key`, `change-me`, `PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET`),
+or <32-char secret. Generate a real one:
+
+```bash
+openssl rand -hex 32
+```
 
 **Override Path:**
 
@@ -468,11 +636,15 @@ APP_CONFIG=/etc/home-api/prod.yaml ./server
 **Docker:**
 
 - Dockerfile copies `configs/` into `/configs/`
-- `compose.yaml` mounts `./services/api/configs:/configs` so local edits apply without rebuild
+- `compose.yaml` mounts `./services/api/configs:/configs:ro` so local edits apply without rebuild
+- Secrets (JWT, MQTT password) are injected via `environment:` from `.env` (gitignored)
 
 **Security Warning:**
 
-`jwt.secret` must be changed to a long random string before production. Changing the secret invalidates all existing JWTs.
+`jwt.secret` must be a long (≥32 char) random string. The app refuses
+to boot with the placeholder. Changing the secret invalidates all
+existing JWTs. Never commit a real secret — use `config.local.yaml`
+or the `JWT_SECRET` env var.
 
 ---
 
@@ -747,7 +919,10 @@ Invoke-RestMethod -Uri http://localhost:8080/api/v1/user/me -Headers $h
 | `/api/v1/user/me` | GET | JWT | Get current user profile |
 | `/api/v1/device/list` | GET | JWT | List visible devices |
 | `/api/v1/device/:id` | DELETE | JWT | Revoke a device |
+| `/api/v1/system/status` | GET | JWT | Dashboard metrics |
+| `/api/v1/mqtt/publish` | POST | JWT | Publish within `home-datacenter/` (dashboard admin) |
+| `/api/v1/ws` | GET (upgrade) | JWT | WebSocket real-time channel |
 
 ---
 
-**Document Version:** 2026-06-28 (post Step16)
+**Document Version:** 2026-07-04 (security hardening + Phase 3 endpoints + dashboard)
