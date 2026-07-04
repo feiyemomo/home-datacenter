@@ -1,10 +1,10 @@
 package camera
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"time"
@@ -13,15 +13,23 @@ import (
 // Go2RTCClient is a minimal HTTP client for the go2rtc server
 // bundled in the deployment. We use the upstream "streams" API:
 //
-//	PUT    /api/streams   { "name": "cam_1", "url": "rtsp://..." }
-//	DELETE /api/streams?src=<name>
-//	GET    /api/webrtc?src=<name>     (WebRTC SDP exchange)
-//	GET    /api/stream.m3u8?src=<name> (HLS fallback)
+//	PUT    /api/streams?src=<rtsp_url>&name=<stream_name>   (create)
+//	PATCH  /api/streams?src=<rtsp_url>&name=<stream_name>   (update)
+//	DELETE /api/streams?src=<stream_name>
+//	GET    /api/webrtc?src=<name>      (WebRTC SDP exchange)
+//	GET    /api/stream.m3u8?src=<name>  (HLS fallback)
 //
-// Reference: https://github.com/AlexxIT/go2rtc
+// go2rtc's PUT /api/streams uses QUERY PARAMETERS, not a JSON body.
+// Sending a JSON body like {"cam_1": "rtsp://..."} (the old shape)
+// is silently accepted with HTTP 200, but go2rtc ignores the body
+// entirely -- the stream is never created because the required src
+// query parameter is missing. This is the root cause of the
+// "registered a camera but go2rtc's stream list is empty" symptom.
+//
+// Reference: https://go2rtc.org/api/  (OpenAPI spec)
 type Go2RTCClient struct {
-	Base string        // e.g. http://home-go2rtc:1984
-	HC   *http.Client  // overridable for tests
+	Base string       // e.g. http://home-go2rtc:1984
+	HC   *http.Client // overridable for tests
 }
 
 // NewGo2RTCClient returns a client with a sensible 5s timeout.
@@ -34,25 +42,73 @@ func NewGo2RTCClient(base string) *Go2RTCClient {
 
 // AddStream registers a stream. It is idempotent: re-adding the same
 // name with a different URL updates the source.
+//
+// go2rtc's PUT /api/streams expects two query parameters:
+//
+//	src  = the stream source URI (e.g. rtsp://user:pass@host/path)
+//	name = the stream name (e.g. cam_1)
+//
+// Both values are URL-escaped so special characters in RTSP URLs
+// (notably @ and : in credentials) don't break the query string.
+//
+// Known go2rtc quirk: after adding the stream to its in-memory state,
+// go2rtc tries to persist the config to /etc/go2rtc.yaml. If the
+// RTSP URL contains characters that go2rtc's YAML serializer doesn't
+// quote properly (notably : inside the URL), the save fails and
+// go2rtc returns HTTP 400 -- even though the stream IS live in memory.
+// We work around this by doing a GET /api/streams after a failed PUT:
+// if the stream exists, we treat it as success.
 func (c *Go2RTCClient) AddStream(ctx context.Context, name, rtspURL string) error {
-	body, _ := json.Marshal(map[string]any{
-		"name": name,
-		"url":  rtspURL,
-	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, c.Base+"/api/streams", bytes.NewReader(body))
+	u := fmt.Sprintf("%s/api/streams?src=%s&name=%s",
+		c.Base,
+		url.QueryEscape(rtspURL),
+		url.QueryEscape(name),
+	)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
 	resp, err := c.HC.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("go2rtc add stream: %s", resp.Status)
+	if resp.StatusCode < 300 {
+		return nil
 	}
-	return nil
+	// go2rtc may have added the stream to memory but failed to save
+	// the config file. Verify with a GET before returning an error.
+	if c.streamExists(ctx, name) {
+		return nil
+	}
+	return fmt.Errorf("go2rtc add stream: %s", resp.Status)
+}
+
+// streamExists checks whether a stream with the given name is
+// registered in go2rtc's in-memory state via GET /api/streams.
+func (c *Go2RTCClient) streamExists(ctx context.Context, name string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Base+"/api/streams", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return false
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return false
+	}
+	var streams map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &streams); err != nil {
+		return false
+	}
+	_, ok := streams[name]
+	return ok
 }
 
 // RemoveStream deletes a stream by name. A 404 is treated as success

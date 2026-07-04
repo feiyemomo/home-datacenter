@@ -275,3 +275,30 @@ a follow-up.
   timeout, 15-second interval). This catches "device offline"
   immediately but does not detect "RTSP auth broken". A future
   iteration can layer an ONVIF `GetSystemDateAndTime` probe on top.
+
+### go2rtc API integration
+
+* **PUT /api/streams uses query parameters**, not a JSON body. The
+  correct call is:
+  ```
+  PUT /api/streams?src=<url-encoded-rtsp-url>&name=<stream-name>
+  ```
+  The old code sent a JSON body `{"cam_1": "rtsp://..."}` which
+  go2rtc silently ignored (HTTP 200, stream never created). This was
+  the root cause of the "registered a camera but go2rtc's stream list
+  is empty" bug. See `internal/camera/go2rtc.go` AddStream.
+* **go2rtc.yaml is NOT bind-mounted** in `compose.yaml`. The
+  Dockerfile COPYs it into the image at `/etc/go2rtc.yaml`. go2rtc
+  rewrites this file on every PUT /api/streams call to persist
+  in-memory streams for next-boot replay. A bind-mounted file on
+  Windows / Docker Desktop can be read-only at the filesystem level
+  even without the `:ro` flag, causing the write to fail silently.
+  Relying on the Dockerfile COPY ensures the file lives in the
+  container's writable layer.
+* **Config save quirk**: go2rtc v1.9.5 has a YAML serialization bug
+  where RTSP URLs containing `:` (which is all of them) are not
+  properly quoted when written to the config file. The PUT returns
+  HTTP 400, but the stream IS added to go2rtc's in-memory state and
+  works for live viewing. `AddStream` works around this by doing a
+  GET /api/streams after a failed PUT: if the stream exists in the
+  response, the error is suppressed.

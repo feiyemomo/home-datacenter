@@ -3,6 +3,7 @@ package camera
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -15,13 +16,15 @@ import (
 // Registry is the camera CRUD + go2rtc sync boundary. It does NOT
 // expose HTTP — the handler layer calls it.
 type Registry struct {
-	DB  *gorm.DB
-	Go2 *Go2RTCClient
-	Box *utils.SecretBox
+	DB        *gorm.DB
+	Go2       *Go2RTCClient
+	Box       *utils.SecretBox
+	ONVIF     *ONVIFController
+	WebRTCURL string // optional public base, e.g. https://cam.feiyemomo.top
 }
 
-func NewRegistry(db *gorm.DB, g *Go2RTCClient, box *utils.SecretBox) *Registry {
-	return &Registry{DB: db, Go2: g, Box: box}
+func NewRegistry(db *gorm.DB, g *Go2RTCClient, box *utils.SecretBox, onvif *ONVIFController, webRTCURL string) *Registry {
+	return &Registry{DB: db, Go2: g, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL}
 }
 
 // RegisterInput is the wire format for POST /api/v1/cameras.
@@ -40,12 +43,17 @@ type RegisterInput struct {
 	Audio        bool
 	Motion       bool
 	ProfileToken string // optional; blank → controller picks the first profile
+	OwnerID      uint   // 0 = assign to caller from handler context
 }
 
 // Register inserts a Camera row, then asks go2rtc to start pulling
 // the RTSP stream under the name "cam_<id>". If go2rtc is down we
 // still keep the DB row (so the operator can see & retry) but bubble
 // up the error so the handler can return 502.
+//
+// When ProfileToken is empty the registry transparently issues an
+// ONVIF GetProfiles to discover the camera's first media profile,
+// so the caller doesn't need to know ONVIF at all.
 func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camera, error) {
 	if in.RTSPPort == 0 {
 		in.RTSPPort = 554
@@ -62,22 +70,31 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		return nil, err
 	}
 
+	profile := in.ProfileToken
+	if profile == "" && r.ONVIF != nil {
+		if ps, perr := r.ONVIF.DiscoverProfiles(ctx, in.Host, in.ONVIFPort, in.Username, in.Password); perr == nil && len(ps) > 0 {
+			profile = ps[0].Token
+		}
+	}
+
 	cam := &model.Camera{
-		Type:      "camera",
-		Name:      in.Name,
-		Vendor:    in.Vendor,
-		Host:      in.Host,
-		ONVIFPort: in.ONVIFPort,
-		RTSPPort:  in.RTSPPort,
-		ChannelID: in.ChannelID,
-		Status:    "unknown",
+		Type:              "camera",
+		Name:              in.Name,
+		Vendor:            in.Vendor,
+		Host:              in.Host,
+		ONVIFPort:         in.ONVIFPort,
+		RTSPPort:          in.RTSPPort,
+		ChannelID:         in.ChannelID,
+		Status:            "unknown",
+		OwnerID:           in.OwnerID,
+		OnvifProfileToken: profile,
 		Capabilities: model.JSON{
 			"ptz":    in.PTZ,
 			"audio":  in.Audio,
 			"motion": in.Motion,
 		},
 		Credentials: creds,
-		Meta:        model.JSON{"onvif_profile": in.ProfileToken},
+		Meta:        model.JSON{},
 	}
 
 	if err := r.DB.Create(cam).Error; err != nil {
@@ -131,6 +148,35 @@ func (r *Registry) List() []model.Camera {
 	return cs
 }
 
+// ListForOwner returns the cameras visible to a given user. Admins
+// (isAdmin=true) see every row; non-admins only see cameras whose
+// OwnerID matches their user id.
+func (r *Registry) ListForOwner(userID uint, isAdmin bool) []model.Camera {
+	var cs []model.Camera
+	q := r.DB.Model(&model.Camera{})
+	if !isAdmin {
+		q = q.Where("owner_id = ?", userID)
+	}
+	q.Find(&cs)
+	return cs
+}
+
+// CanRead reports whether a user is allowed to read the camera.
+// Mirrors ListForOwner: admin always, non-admin only own.
+func (r *Registry) CanRead(c *model.Camera, userID uint, isAdmin bool) bool {
+	if isAdmin {
+		return true
+	}
+	return c.OwnerID == userID
+}
+
+// SaveProfileToken persists a discovered ONVIF profile token so the
+// next PTZ call doesn't need to re-run ONVIF discovery.
+func (r *Registry) SaveProfileToken(id uint, token string) {
+	r.DB.Model(&model.Camera{}).Where("id = ?", id).
+		Update("onvif_profile_token", token)
+}
+
 // UpdateStatus is called by the HealthChecker after each probe.
 // Keeping it in the Registry means the persistence path is the same
 // whether the caller is the background loop or a manual webhook.
@@ -168,9 +214,20 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 // Most Dahua / Uniview / Ezviz devices accept the same shape; for
 // vendors that diverge (Reolink, TP-Link) we add per-vendor paths
 // later. For now this is the 90% case.
+//
+// The user and password are run through net/url so any reserved
+// character (`@`, `:`, `/`, `?`, `#`, `[`, `]`, `%`) is percent-
+// escaped. Without this, a password like "Haikang@" or "p@ss:1"
+// produces a URL that go2rtc can't parse and silently refuses to
+// add to its streams list.
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
-	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	u := url.URL{
+		Scheme: "rtsp",
+		User:   url.UserPassword(user, pass),
+		Host:   fmt.Sprintf("%s:%d", cam.Host, cam.RTSPPort),
+		Path:   fmt.Sprintf("/Streaming/Channels/%d", cam.ChannelID),
+	}
+	return u.String()
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into
@@ -205,7 +262,7 @@ func (r *Registry) DecryptCredentials(c *model.Camera) (user, pass string, err e
 	return user, pass, nil
 }
 
-// MarshalStreamConfig is a small helper for the handler layer: it
+// StreamConfig is the small helper for the handler layer: it
 // returns a JSON-safe struct describing the URLs the front-end
 // should hit for live view.
 type StreamConfig struct {
@@ -215,6 +272,16 @@ type StreamConfig struct {
 }
 
 func (r *Registry) StreamConfig(c *model.Camera) StreamConfig {
+	// If a public base is configured (tunnel / TURN), rewrite both
+	// URLs to it. Otherwise return the in-network addresses.
+	if r.WebRTCURL != "" {
+		base := r.WebRTCURL
+		return StreamConfig{
+			StreamName: c.StreamName,
+			WebRTC:     base + "/api/webrtc?src=" + c.StreamName,
+			HLS:        base + "/api/stream.m3u8?src=" + c.StreamName,
+		}
+	}
 	return StreamConfig{
 		StreamName: c.StreamName,
 		WebRTC:     r.Go2.WebRTCURL(c.StreamName),

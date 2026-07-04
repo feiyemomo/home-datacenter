@@ -44,6 +44,8 @@ func (h *Handler) OnMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	switch parsed.Domain {
 	case "devices":
 		h.handleDeviceMessage(parsed, payload)
+	case "cameras":
+		h.handleCameraMessage(parsed, payload)
 	case "system":
 		// System topics from devices are uncommon; pass through.
 		h.bus.Publish(eventbus.Event{
@@ -52,6 +54,49 @@ func (h *Handler) OnMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 			Source:  eventbus.SourceMQTT,
 		})
 	}
+}
+
+// handleCameraMessage processes messages under "cameras/{id}/*".
+// Today we only care about `event` (motion/AI). Anything else is
+// logged and dropped — cameras don't have a "status" topic of their
+// own; the platform TCP-probes them and publishes device.status.
+func (h *Handler) handleCameraMessage(pt ParsedTopic, payload []byte) {
+	switch pt.Subtype {
+	case "event":
+		h.handleCameraEvent(pt.ID, payload)
+	default:
+		log.Printf("mqtt: unknown camera subtype %q for camera %d", pt.Subtype, pt.ID)
+	}
+}
+
+// handleCameraEvent ingests a motion/AI event and re-publishes it on
+// the EventBus so the App / WebSocket layer can react. We
+// canonicalise the JSON to ensure subscribers can always json.Decode.
+func (h *Handler) handleCameraEvent(cameraID uint, payload []byte) {
+	var ev struct {
+		Event      string  `json:"event"`
+		Confidence float64 `json:"confidence,omitempty"`
+		TS         int64   `json:"ts"`
+	}
+	if err := json.Unmarshal(payload, &ev); err != nil {
+		log.Printf("mqtt: invalid camera event payload from %d: %q", cameraID, payload)
+		return
+	}
+	if ev.TS == 0 {
+		ev.TS = time.Now().Unix()
+	}
+	canonical, _ := json.Marshal(struct {
+		DeviceID   uint    `json:"device_id"`
+		Type       string  `json:"type"`
+		Event      string  `json:"event"`
+		Confidence float64 `json:"confidence,omitempty"`
+		TS         int64   `json:"ts"`
+	}{cameraID, "camera", ev.Event, ev.Confidence, ev.TS})
+	h.bus.Publish(eventbus.Event{
+		Topic:   eventbus.TopicDeviceEvent,
+		Payload: canonical,
+		Source:  eventbus.SourceMQTT,
+	})
 }
 
 // handleDeviceMessage processes messages under "devices/{id}/*".
@@ -324,6 +369,7 @@ func (h *Handler) OnConnect(client pahomqtt.Client) {
 		{SubscribeDeviceStatus(), 1},
 		{SubscribeDeviceTelemetry(), 1},
 		{SubscribeDeviceEvents(), 1},
+		{SubscribeCameraEvent(), 1},
 	}
 
 	for _, s := range subs {

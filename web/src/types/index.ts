@@ -91,3 +91,113 @@ export interface WsMessage<T = unknown> {
     payload?: T;
     ts: number;
 }
+
+// -------------------- Camera platformization (Phase 4) --------------------
+
+/** A camera row from GET /api/v1/cameras/:id. */
+export interface Camera {
+    id: number;
+    type: "camera";
+    name: string;
+    vendor: string;
+    host: string;
+    onvif_port: number;
+    rtsp_port: number;
+    channel_id: number;
+    status: "online" | "offline" | "unknown";
+    last_seen_at: string | null;
+    capabilities: CameraCapabilities;
+    meta: CameraMeta;
+    presets: Record<string, string>;
+    stream: CameraStream;
+    created_at: string;
+    updated_at: string;
+}
+
+export interface CameraCapabilities {
+    ptz?: boolean;
+    audio?: boolean;
+    motion?: boolean;
+    [k: string]: unknown;
+}
+
+export interface CameraMeta {
+    onvif_profile?: string;
+    recording?: CameraRecordingPlan;
+    [k: string]: unknown;
+}
+
+/** Canonical device.event payload (motion / AI). */
+export interface CameraEventMessage {
+    device_id: number;
+    type: "camera";
+    event: "motion" | "ai" | string;
+    confidence?: number;
+    ts: number;
+}
+
+export interface CameraStream {
+    stream_name: string;
+    webrtc_url: string;
+    hls_url: string;
+}
+
+/** Per-segment recording metadata. */
+export interface CameraRecording {
+    id: number;
+    camera_id: number;
+    start_at: string;
+    end_at: string;
+    duration_seconds: number;
+    size_bytes: number;
+    size_human: string;
+    file_path: string;
+}
+
+export interface CameraRecordingPlan {
+    enabled: boolean;
+    segment_seconds?: number;
+    retention_days?: number;
+    output_dir?: string;
+    cron?: string;
+}
+
+/** Canonical status event payload (matches the Go eventbus). */
+export interface CameraStatusEvent {
+    device_id: number;
+    type: "camera";
+    status: "online" | "offline" | "heartbeat" | string;
+    ts: number;
+}
+
+/** PTZ command string. */
+export type PTZCommand =
+    | "left"
+    | "right"
+    | "up"
+    | "down"
+    | "stop"
+    | "zoom_in"
+    | "zoom_out";
+
+/** ONVIF preset entry. */
+export interface PresetEntry {
+    token: string;
+    name: string;
+}
+
+/** ICE config returned by GET /api/v1/cameras/ice. */
+export interface IceServerConfig {
+    urls: string | string[];
+    username?: string;
+    credential?: string;
+}
+
+export interface IceConfig {
+    ice_servers: IceServerConfig[];
+    webrtc_base: string;
+}
+
+export interface SetPresetRequest {
+    token: string;
+}

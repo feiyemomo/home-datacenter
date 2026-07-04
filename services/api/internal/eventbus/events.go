@@ -19,6 +19,11 @@ const (
 	// Payload: JSON {"device_id":1,"command":"...","params":{...}}
 	TopicDeviceCommand = "device.command"
 
+	// TopicDeviceEvent — custom event from a device (e.g. motion).
+	// Payload: JSON {"device_id":1,"type":"camera","event":"motion",
+	//                 "confidence":0.9,"ts":...}
+	TopicDeviceEvent = "device.event"
+
 	// TopicUserNotification — push notification to a user's app(s).
 	// Payload: JSON {"user_id":1,"title":"...","body":"..."}
 	TopicUserNotification = "user.notification"

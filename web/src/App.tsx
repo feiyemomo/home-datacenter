@@ -4,6 +4,7 @@ import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { Layout } from "@/components/Layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
+import Cameras from "@/pages/Cameras";
 import Devices from "@/pages/Devices";
 import MqttDebug from "@/pages/MqttDebug";
 import Profile from "@/pages/Profile";
@@ -13,6 +14,7 @@ import Profile from "@/pages/Profile";
  *
  * - /login           public
  * - /dashboard       auth
+ * - /cameras         auth (admin for mutating)
  * - /devices         auth
  * - /mqtt            auth + admin
  * - /profile         auth
@@ -32,6 +34,16 @@ export default function App() {
                         <ProtectedRoute>
                             <Layout>
                                 <Dashboard />
+                            </Layout>
+                        </ProtectedRoute>
+                    }
+                />
+                <Route
+                    path="/cameras"
+                    element={
+                        <ProtectedRoute>
+                            <Layout>
+                                <Cameras />
                             </Layout>
                         </ProtectedRoute>
                     }

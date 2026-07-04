@@ -74,9 +74,26 @@ type Camera struct {
 	Status     string         `gorm:"size:16;index" json:"status"` // online/offline/unknown
 	LastSeenAt *time.Time     `json:"last_seen_at,omitempty"`
 
+	// OwnerID is the user who registered the camera. Non-admin
+	// List/Get calls are scoped to cameras whose OwnerID matches
+	// the caller's user id; admin sees all.
+	OwnerID uint `gorm:"index" json:"owner_id"`
+
 	Capabilities JSON         `gorm:"type:text" json:"capabilities"`
-	Credentials  JSON         `gorm:"type:text" json:"-"` // never serialize
+	Credentials  JSON         `gorm:"type:text" json:"-"`     // never serialize
 	Meta         JSON         `gorm:"type:text" json:"meta"`
+	// OnvifProfileToken is the profile token we use for PTZ and
+	// presets. Stored as a dedicated column (not inside Meta) so
+	// the read path is a plain `string` — GORM's JSON scanning is
+	// lossy across drivers and used to fail type-assertion in
+	// `cam.Meta["onvif_profile"].(string)`, surfacing as a
+	// spurious "missing onvif profile_token" error after register.
+	OnvifProfileToken string     `gorm:"size:64" json:"onvif_profile"`
+	// Presets maps a friendly name to an ONVIF preset token that the
+	// user has pre-set up in the camera's own UI. The API never
+	// *creates* presets (most firmware forbids it) — only stores
+	// the alias and triggers GotoPreset on demand.
+	Presets JSON             `gorm:"type:text" json:"presets"` // {"home":"Preset_1","away":"Preset_2"}
 
 	StreamName string         `gorm:"size:64;uniqueIndex" json:"stream_name"` // cam_<id>
 

@@ -54,3 +54,18 @@ camera:
   health_interval_seconds: 15
   # Per-probe dial timeout.
   health_timeout_seconds: 3
+  # Recording root. Must be a path that BOTH home-api and
+  # home-go2rtc can see — i.e. a shared volume mounted at the same
+  # location in both. Default /data/recordings assumes the bind
+  # mount in compose.yaml.
+  recording_dir: /data/recordings
+  # WebRTC public base URL. Empty = "LAN-only" (the Go API returns
+  # the in-network go2rtc URL). Set to e.g. https://cam.feiyemomo.top
+  # to make the front-end use the Cloudflare Tunnel hostname for
+  # the SDP exchange.
+  webrtc_public_base: ""
+  # ICE servers (STUN/TURN) returned to browsers. JSON array, e.g.:
+  #   ice_servers: '[{"urls":"stun:stun.cloudflare.com:3478"},
+  #                   {"urls":"turn:turn.example.com:3478",
+  #                    "username":"x","credential":"y"}]'
+  ice_servers: ""
