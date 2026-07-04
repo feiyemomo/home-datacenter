@@ -1,0 +1,23 @@
+# go2rtc static configuration.
+#
+# `streams` is intentionally empty: the home-api service populates
+# it at runtime via PUT /api/streams. A static entry here acts as a
+# fall-back / warm-up — useful for the boot window before the API
+# has replayed its DB rows, and for cameras you want to expose
+# without going through the API.
+#
+# Reference: https://github.com/AlexxIT/go2rtc
+
+api:
+  listen: ":1984"
+  # The CORS allowlist. When fronted by Cloudflare Tunnel, the
+  # browser sees the public hostname, not home-go2rtc. Replace
+  # with your dashboard / app origins in production.
+  origin: ["*"]
+
+log:
+  level: info
+  output: stderr
+
+# Empty by design — the API injects streams.
+streams: {}

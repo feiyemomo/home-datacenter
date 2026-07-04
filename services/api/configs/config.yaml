@@ -41,3 +41,16 @@ mqtt:
 websocket:
   path: /api/v1/ws
   heartbeat_seconds: 30
+
+# Phase 4: Camera platformization
+# go2rtc is reached by its Docker service name on the home-net
+# network. Override with GO2RTC_BASE_URL env var if the address
+# differs (e.g. local dev with a host-installed go2rtc on :1984).
+go2rtc:
+  base_url: http://home-go2rtc:1984
+
+camera:
+  # How often to TCP-probe each camera's RTSP port.
+  health_interval_seconds: 15
+  # Per-probe dial timeout.
+  health_timeout_seconds: 3

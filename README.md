@@ -27,6 +27,12 @@
 | API | Go 1.26 + Gin | `home-api` | `8080`（仅本地） |
 | Web | Vue 3 + Vite + Nginx | `home-web` | `80`（仅本地） |
 | MQTT Broker | Eclipse Mosquitto 2 | `home-mosquitto` | 1883（**不对外暴露**） |
+| go2rtc | AlexxIT/go2rtc | `home-go2rtc` | `1984`（仅本地） |
+
+Phase 4（摄像头平台化）新增 `home-go2rtc`：所有摄像头的 RTSP 由
+`home-api` 注册并加密入 SQLite，再以 `cam_<id>` 为名推送给
+go2rtc；前端通过 `WebRTC` 或 `HLS` 拉流。详见
+[`docs/platformization.md`](docs/platformization.md)。
 
 所有服务都在 `home-net` 内部 Docker 网络中互相通信。默认只把 `80` 和 `8080` 绑定到 `127.0.0.1`，避免直接对外暴露。
 
@@ -38,11 +44,14 @@
    ┌──────────────┐    HTTP/WS   ┌──────────────┐   MQTT  ┌──────────────┐
    │   home-web   │ ◄──────────► │   home-api   │ ◄─────► │ home-mosquitto│
    │  (nginx SPA) │              │ (Go + Gin)   │         │   (broker)   │
-   └──────────────┘              └──────────────┘         └──────────────┘
-          │                              │                          │
-       127.0.0.1:80              127.0.0.1:8080                  （内部网络）
-          │                              │
-          └────────── 外部经 Cloudflare Tunnel 暴露 ────────────────┘
+   └──────────────┘              └──────┬───────┘         └──────────────┘
+          │                              │ RTSP push             │
+       127.0.0.1:80                 127.0.0.1:8080              │
+          │                              │                ┌──────▼──────┐
+          └────── 外部经 Cloudflare Tunnel 暴露 ────────► │ home-go2rtc │
+                                                           │ :1984      │
+                                                           │ WebRTC/HLS │
+                                                           └────────────┘
 ```
 
 ---
@@ -113,6 +122,7 @@ docker compose up -d --build
 | `MQTT_CLIENT_ID` | ❌ | 默认 `home-datacenter` |
 | `SERVER_PORT` | ❌ | 默认 `8080` |
 | `DB_PATH` | ❌ | 默认 `/data/sqlite/app.db`（容器内） |
+| `GO2RTC_BASE_URL` | ❌ | go2rtc HTTP API（摄像头平台化用），默认 `http://home-go2rtc:1984` |
 
 > ⚠️ **不要把 `.env` 提交到 Git**（已经在 `.gitignore` 中忽略）。
 
@@ -223,18 +233,69 @@ docker exec -it home-mosquitto mosquitto_sub -u home-datacenter -P "$MQTT_PASSWO
 
 ## 常用运维命令
 
-| 操作 | 命令 |
-|---|---|
-| 查看所有容器 | `docker compose ps` |
-| 跟踪所有日志 | `docker compose logs -f` |
-| 跟踪单个服务日志 | `docker compose logs -f api` |
-| 重启单个服务 | `docker compose restart api` |
-| 重新构建并启动 | `docker compose up -d --build` |
-| 停止（保留数据） | `docker compose stop` |
-| 停止并删除容器（**保留数据卷**） | `docker compose down` |
-| 完全清理（**删除数据卷**，慎用） | `docker compose down -v` |
-| 进入 API 容器 | `docker exec -it home-api sh` |
-| 重置 Mosquitto 密码 | 删除 `deploy/mosquitto/passwd` 后按 [步骤 2](#2-生成-mosquitto-密码文件) 重新生成 |
+| 容器名 | 状态 | 端口 | 说明 |
+|---|---|---|---|
+| `home-api` | Up | `127.0.0.1:8080` | Go API（健康检查 `/health`） |
+| `home-web` | Up | `127.0.0.1:80` | Dashboard SPA |
+| `home-mosquitto` | Up | 仅内部 `1883` | MQTT broker |
+| `home-go2rtc` | Up | `127.0.0.1:1984` | 摄像头 RTSP→WebRTC/HLS 桥 |
+
+`/api/v1/cameras` 走完后应能看到空列表：
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/cameras
+# {"code":0,"data":[]}
+```
+
+注册一台海康摄像头：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/cameras \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name":"前门",
+    "vendor":"hikvision",
+    "host":"192.168.31.100",
+    "channel_id":101,
+    "username":"admin",
+    "password":"your-pass",
+    "ptz": true, "audio": true, "motion": true
+  }'
+# → {"code":0,"data":{"id":1,"stream":{"webrtc_url":"...","hls_url":"..."}}}
+```
+
+WebRTC 拉流（浏览器侧）：
+
+```html
+<video id="v" autoplay playsinline controls muted style="width:100%"></video>
+<script>
+  const rtc = new RTCPeerConnection({iceServers:[{urls:"stun:stun.cloudflare.com:3478"}]});
+  rtc.addTransceiver("video", {direction:"sendrecv"});
+  rtc.createOffer()
+    .then(o => rtc.setLocalDescription(o))
+    .then(() => fetch("http://localhost:1984/api/webrtc?src=cam_1", {
+      method:"POST", headers:{"Content-Type":"application/sdp"},
+      body: rtc.localDescription.sdp
+    }))
+    .then(r => r.text())
+    .then(a => rtc.setRemoteDescription({type:"answer", sdp:a}));
+  rtc.ontrack = e => document.getElementById("v").srcObject = e.streams[0];
+</script>
+```
+
+PTZ（管理员 token）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"command":"left","speed":0.5}'
+# 2 秒后自动停，需要立刻停：
+curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"command":"stop"}'
+```
+
+完整文档：[`docs/platformization.md`](docs/platformization.md)。
 
 ---
 
@@ -243,9 +304,10 @@ docker exec -it home-mosquitto mosquitto_sub -u home-datacenter -P "$MQTT_PASSWO
 仓库内 `deploy/cloudflared/` 已经预留了 Cloudflare Tunnel 接入脚本，思路如下：
 
 1. **不要**把 `8080` 端口映射到 `0.0.0.0`，只保留 `127.0.0.1:80` 给 `cloudflared`。
-2. 在 Cloudflare 控制台创建 Tunnel，把 `cloudflared` 容器加入 `home-net` 网络，并通过 `http://home-api:8080` 和 `http://home-web:80` 访问后端。
+2. 在 Cloudflare 控制台创建 Tunnel，把 `cloudflared` 容器加入 `home-net` 网络，并通过 `http://home-api:8080`、`http://home-web:80`、`http://home-go2rtc:1984` 访问后端。
 3. 在 `services/api/configs/config.yaml` 的 `server.allowed_origins` 中填入生产域名，开启 WebSocket Origin 校验，防止 CSWSH。
 4. **不要**把 Mosquitto 暴露到公网——Tunnel 也只代理 HTTP，不代理 MQTT。
+5. 摄像头经 `cam.feiyemomo.top` 暴露，仅承担 WebRTC SDP 协商 + HLS 拉流；WebRTC UDP 媒体包不走 Tunnel，需要在 LAN/直连或 TURN 方案下使用，详见 `docs/platformization.md`。
 
 > 详细配置见 `deploy/cloudflared/` 中的示例。
 

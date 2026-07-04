@@ -23,6 +23,8 @@ type Config struct {
 	JWT       JWTConfig       `mapstructure:"jwt"`
 	MQTT      MQTTConfig      `mapstructure:"mqtt"`
 	WebSocket WebSocketConfig `mapstructure:"websocket"`
+	Go2RTC    Go2RTCConfig    `mapstructure:"go2rtc"`
+	Camera    CameraConfig    `mapstructure:"camera"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -66,6 +68,26 @@ type WebSocketConfig struct {
 	HeartbeatSeconds int `mapstructure:"heartbeat_seconds"` // default 30
 }
 
+// Go2RTCConfig holds the go2rtc HTTP API endpoint. The camera module
+// pushes RTSP sources to it and uses it as a WebRTC/HLS origin.
+type Go2RTCConfig struct {
+	// BaseURL is the in-network address of the go2rtc server, e.g.
+	// "http://home-go2rtc:1984". Set GO2RTC_BASE_URL env var to
+	// override without editing the YAML.
+	BaseURL string `mapstructure:"base_url"`
+}
+
+// CameraConfig holds the camera platform settings.
+type CameraConfig struct {
+	// HealthIntervalSeconds is how often the HealthChecker dials
+	// each camera's RTSP port. Default 15.
+	HealthIntervalSeconds int `mapstructure:"health_interval_seconds"`
+
+	// HealthTimeoutSeconds is the per-probe TCP-dial timeout.
+	// Default 3.
+	HealthTimeoutSeconds int `mapstructure:"health_timeout_seconds"`
+}
+
 // AppConfig is the globally accessible configuration instance,
 // populated by Load(). It is safe to read after Load returns nil.
 var AppConfig *Config
@@ -106,12 +128,20 @@ func Load(path string) error {
 	v.SetDefault("websocket.path", "/api/v1/ws")
 	v.SetDefault("websocket.heartbeat_seconds", 30)
 
+	// Phase 4 defaults — camera platformization
+	v.SetDefault("go2rtc.base_url", "http://home-go2rtc:1984")
+	v.SetDefault("camera.health_interval_seconds", 15)
+	v.SetDefault("camera.health_timeout_seconds", 3)
+
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /
 	// .env): the value never lands in the committed config file.
 	// JWT_SECRET takes precedence over the file value.
 	if envSecret := os.Getenv("JWT_SECRET"); envSecret != "" {
 		v.Set("jwt.secret", envSecret)
+	}
+	if envURL := os.Getenv("GO2RTC_BASE_URL"); envURL != "" {
+		v.Set("go2rtc.base_url", envURL)
 	}
 
 	v.SetConfigFile(path)

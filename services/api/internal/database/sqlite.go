@@ -20,6 +20,7 @@ func InitDB(dbPath string) {
     err = db.AutoMigrate(
         &model.User{},
         &model.Device{},
+        &model.Camera{},
     )
     if err != nil {
         log.Fatalf("failed to migrate database: %v", err)
