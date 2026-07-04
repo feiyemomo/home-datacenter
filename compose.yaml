@@ -31,12 +31,14 @@ services:
       - ./services/api/configs:/configs:ro
     depends_on:
       - mosquitto
+      - go2rtc
     environment:
-      - APP_CONFIG=${APP_CONFIG:-/configs/config.local.yaml}
+      - APP_CONFIG=${APP_CONFIG:-/configs/config.yaml}
       # Secret material via env (preferred). See .env.example.
       - JWT_SECRET=${JWT_SECRET:-}
       - MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
       - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - GO2RTC_BASE_URL=${GO2RTC_BASE_URL:-http://home-go2rtc:1984}
     networks:
       - home-net
 
@@ -67,6 +69,23 @@ services:
       - "127.0.0.1:80:80"
     depends_on:
       - api
+    networks:
+      - home-net
+
+  # go2rtc — RTSP → WebRTC/HLS bridge.
+  # The API pushes stream definitions to it at runtime; this
+  # container just serves what it's told. Port 1984 is bound to
+  # the loopback only — the only path in is via Cloudflare Tunnel
+  # (or your LAN via a manually mapped port).
+  go2rtc:
+    build:
+      context: ./deploy/go2rtc
+    container_name: home-go2rtc
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:1984:1984"
+    volumes:
+      - ./deploy/go2rtc/go2rtc.yaml:/etc/go2rtc.yaml:ro
     networks:
       - home-net
 

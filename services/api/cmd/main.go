@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/camera"
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/database"
 	"home-datacenter-api/internal/device"
@@ -119,6 +122,36 @@ func main() {
 	}
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 
+	// ---- Phase 4: Camera platformization ----
+	//
+	// SecretBox derives its AES-256-GCM key from the same JWT secret
+	// we already trust (one root secret to rotate, not two). The
+	// go2rtc client talks HTTP to home-go2rtc:1984 on the internal
+	// home-net network.
+	box, err := utils.NewSecretBox(cfg.JWT.Secret)
+	if err != nil {
+		log.Fatalf("camera: secret box init: %v", err)
+	}
+	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
+	camReg := camera.NewRegistry(database.DB, go2, box)
+	camONVIF := camera.NewONVIFController()
+	camHandler := handler.NewCameraHandler(camReg, camONVIF)
+
+	// Replay every persisted camera to go2rtc so a container restart
+	// doesn't drop the streams. Best-effort: log and continue.
+	if err := camReg.BootReplay(context.Background()); err != nil {
+		log.Printf("camera: boot replay: %v", err)
+	}
+
+	// Background health probe loop.
+	camHealth := &camera.HealthChecker{
+		Registry: camReg,
+		Bus:      bus,
+		Interval: time.Duration(cfg.Camera.HealthIntervalSeconds) * time.Second,
+		Timeout:  time.Duration(cfg.Camera.HealthTimeoutSeconds) * time.Second,
+	}
+	go camHealth.Run(context.Background())
+
 	// ---- HTTP server ----
 	r := gin.Default()
 
@@ -161,6 +194,23 @@ func main() {
 		mqttGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
 			mqttGroup.POST("/publish", systemHandler.Publish)
+		}
+
+		// Phase 4: camera platformization endpoints
+		camGroup := api.Group("/cameras")
+		camGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			// Read endpoints are available to any authenticated user.
+			camGroup.GET("", camHandler.List)
+			camGroup.GET(":id", camHandler.Get)
+			// Mutating endpoints are admin-only.
+			adminCam := camGroup.Group("")
+			adminCam.Use(middleware.RequireAdmin(database.DB))
+			{
+				adminCam.POST("", camHandler.Register)
+				adminCam.DELETE(":id", camHandler.Delete)
+				adminCam.POST(":id/ptz", camHandler.PTZ)
+			}
 		}
 
 		// Phase 3: WebSocket endpoint

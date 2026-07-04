@@ -108,6 +108,11 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `DELETE /api/v1/device/:id` | JWT | Revoke device (soft delete) |
 | `GET /api/v1/system/status` | JWT | Dashboard metrics (MQTT/WS/online devices) |
 | `POST /api/v1/mqtt/publish` | JWT+admin | Publish to a `home-datacenter/` topic |
+| `GET /api/v1/cameras` | JWT | List cameras (platformized device view) |
+| `GET /api/v1/cameras/:id` | JWT | Fetch one camera + live stream URLs |
+| `POST /api/v1/cameras` | JWT+admin | Register a camera (encrypts creds, pushes RTSP to go2rtc) |
+| `DELETE /api/v1/cameras/:id` | JWT+admin | Unregister a camera (DB + go2rtc) |
+| `POST /api/v1/cameras/:id/ptz` | JWT+admin | Send ONVIF PTZ command |
 | `GET /api/v1/ws` | JWT | WebSocket upgrade (header or `?token=`) |
 
 **Response Envelope:**
@@ -133,6 +138,13 @@ services/api/
 │   ├── config/config.go         // YAML loader (viper) + secret validation
 │   ├── database/sqlite.go       // DB init
 │   ├── device/manager.go        // Online/offline + heartbeat + MarkAllOffline on disconnect
+│   ├── camera/                  // Phase 4 — camera platformization
+│   │   ├── doc.go
+│   │   ├── go2rtc.go            // HTTP client for /api/streams, /api/webrtc, /api/stream.m3u8
+│   │   ├── registry.go          // CRUD + go2rtc sync + BootReplay + UpdateStatus
+│   │   ├── onvif.go             // ONVIF PTZ dispatcher (raw SOAP, lazy-cached)
+│   │   ├── health.go            // Background TCP probe → device.status on EventBus
+│   │   └── json.go
 │   ├── eventbus/                // In-memory pub/sub (MQTT ↔ WS bridge)
 │   ├── model/
 │   │   ├── user.go
@@ -151,13 +163,17 @@ services/api/
 │   │   ├── device_handler.go
 │   │   ├── system_handler.go    // /system/status + /mqtt/publish
 │   │   ├── ws_handler.go        // WebSocket upgrade + origin check
-│   ├── middleware/jwt.go        // JWT auth + revocation check
+│   │   └── camera_handler.go    // /cameras* — register/list/get/delete/ptz
+│   ├── middleware/
+│   │   ├── jwt.go               // JWT auth + revocation check
+│   │   └── admin.go             // RequireAdmin(db) — must be installed after JWTAuth
 │   ├── mqtt/                    // Paho client, topic schema, handler
 │   ├── utils/
 │   │   ├── key.go               // AccessKey generation + hash
 │   │   ├── jwt.go               // JWT signing/parsing
 │   │   ├── nulltime.go          // Nullable time wrapper
 │   │   ├── response.go          // Unified response + security headers
+│   │   └── secret.go            // AES-256-GCM box for camera credentials
 │   ├── router/router.go         // (placeholder; routes in main.go)
 ├── scripts/create_device.go     // Offline device creation tool
 ├── configs/config.yaml          // Server/DB/JWT/MQTT/WS config (placeholders)
@@ -177,7 +193,8 @@ web/                             // React + Vite + Tailwind dashboard SPA
 
 deploy/
 ├── mosquitto/{mosquitto.conf,aclfile,passwd}  // broker + ACL + creds
-├── cloudflared/config.yml        // dashboard + api hostnames
+├── cloudflared/config.yml        // dashboard + api + cam hostnames
+├── go2rtc/{Dockerfile,go2rtc.yaml} // RTSP→WebRTC/HLS bridge
 └── android/HomeDatacenterClient.kt
 ```
 
@@ -269,7 +286,20 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 
 **Phase 2:** Complete (revocation + management API + unified response + config)
 
-**Phase 3:** Complete (MQTT real-time + WebSocket + device online/offline tracking + Web Dashboard)
+**Phase 4 (Platformization, in progress):**
+
+- Camera model + registry + go2rtc sync (RTSP → WebRTC/HLS)
+- ONVIF PTZ dispatcher (raw SOAP, no library dep)
+- Health checker (TCP probe + EventBus)
+- New routes:
+  - `POST   /api/v1/cameras`            (admin) Register
+  - `GET    /api/v1/cameras`            List
+  - `GET    /api/v1/cameras/:id`        Fetch
+  - `DELETE /api/v1/cameras/:id`        (admin) Unregister
+  - `POST   /api/v1/cameras/:id/ptz`    (admin) PTZ
+- `utils.SecretBox` (AES-256-GCM, key = SHA-256(JWT_SECRET))
+- New middleware `RequireAdmin(db)`
+- New container `home-go2rtc` + `cam.feiyemomo.top` tunnel ingress
 
 **Security hardening pass (2026-07-04):** see `docs/Security` section below.
 
