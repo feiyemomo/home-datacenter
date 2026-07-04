@@ -32,7 +32,7 @@ services:
     depends_on:
       - mosquitto
     environment:
-      - APP_CONFIG=/configs/config.yaml
+      - APP_CONFIG=${APP_CONFIG:-/configs/config.local.yaml}
       # Secret material via env (preferred). See .env.example.
       - JWT_SECRET=${JWT_SECRET:-}
       - MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
@@ -48,7 +48,9 @@ services:
     # if a local physical device needs to reach the broker from the host.
     # ports:
     #   - "127.0.0.1:${MQTT_BIND_PORT:-1883}:1883"
+    entrypoint: [ "/mosquitto/config/docker-entrypoint.sh" ]
     volumes:
+      - ./deploy/mosquitto/docker-entrypoint.sh:/mosquitto/config/docker-entrypoint.sh:ro
       - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
       - ./deploy/mosquitto/aclfile:/mosquitto/config/aclfile:ro
       - ./deploy/mosquitto/passwd:/mosquitto/config/passwd:ro

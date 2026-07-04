@@ -66,20 +66,61 @@ export default function Devices() {
         subscribe("device");
     }, [subscribe]);
 
+    // Update the in-memory online set immediately from any
+    // device.status event so the badge flips without a round-trip.
+    // Also re-fetch /system/status in the background to keep the
+    // server's view of mqtt_connected / ws_clients fresh.
+    useEffect(() => {
+        if (!lastMessage || lastMessage.type !== "event") return;
+        const topic = lastMessage.topic ?? "";
+        if (!topic.startsWith("device")) return;
+        if (topic !== "device.status") {
+            // telemetry/command — not interesting for online state.
+            getSystemStatus().then(setStatus).catch(() => undefined);
+            return;
+        }
+        const payload = (lastMessage.payload ?? {}) as {
+            device_id?: number;
+            status?: string;
+        };
+        const id = payload.device_id;
+        if (typeof id !== "number") return;
+        setStatus((prev) => {
+            if (!prev) return prev;
+            const ids = new Set(prev.online_device_ids ?? []);
+            if (payload.status === "online" || payload.status === "heartbeat") {
+                ids.add(id);
+            } else if (payload.status === "offline") {
+                ids.delete(id);
+            }
+            return {
+                ...prev,
+                online_device_ids: Array.from(ids),
+                online_device_count: ids.size,
+            };
+        });
+        // Best-effort reconcile with the server (handles edge cases
+        // like the dashboard not having seen the latest sweep).
+        getSystemStatus().then(setStatus).catch(() => undefined);
+    }, [lastMessage]);
+
     // Maintain a Set of online device IDs, updated from both polling
     // and WebSocket events.
     const onlineIds = useMemo<Set<number>>(() => {
         return new Set(status?.online_device_ids ?? []);
     }, [status]);
 
-    // Re-fetch status when we get a device.status / online_list event so
-    // the badges stay fresh without a full device list reload.
+    // Apply the initial online_list snapshot from the server (sent
+    // once on WebSocket connect) and the canonical refresh for any
+    // non-status device.* event. The device.status fast path lives
+    // in the useEffect above to avoid an extra /system/status fetch
+    // on every status flip.
     useEffect(() => {
         if (!lastMessage) return;
         if (
             lastMessage.type === "event" &&
-            (lastMessage.topic?.startsWith("device") ||
-                lastMessage.topic?.includes("status"))
+            lastMessage.topic?.startsWith("device") &&
+            lastMessage.topic !== "device.status"
         ) {
             getSystemStatus()
                 .then(setStatus)

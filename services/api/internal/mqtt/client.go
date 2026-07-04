@@ -42,12 +42,19 @@ func NewClient(cfg Config, handler *Handler) *Client {
 	opts.SetClientID(cfg.ClientID)
 	opts.SetAutoReconnect(true)
 	opts.SetMaxReconnectInterval(30 * time.Second)
-	opts.SetCleanSession(false)
+	opts.SetCleanSession(true)
 
 	if cfg.Username != "" {
 		opts.SetUsername(cfg.Username)
 		opts.SetPassword(cfg.Password)
 	}
+
+	// Wire the default publish handler BEFORE NewClient, otherwise paho
+	// silently drops every inbound message and the device Manager never
+	// sees a single status/telemetry frame. (This is the root cause of
+	// the "0 online devices" symptom: the broker accepts the connection
+	// and the subscriptions, but the handler is never invoked.)
+	opts.SetDefaultPublishHandler(handler.OnMessage)
 
 	// Wire lifecycle callbacks. The handler holds the paho client
 	// reference so it can publish; we set that in Start().
@@ -55,7 +62,14 @@ func NewClient(cfg Config, handler *Handler) *Client {
 		handler.client = cl
 		handler.OnConnect(cl)
 	}
-	opts.OnConnectionLost = handler.OnDisconnect
+	opts.OnConnectionLost = func(cl pahomqtt.Client, err error) {
+		// We can no longer reach the broker, so every device that was
+		// last-seen over this connection is effectively unknown. Mark
+		// them all offline so the dashboard reflects reality instead
+		// of waiting up to 90s for the sweeper to time them out.
+		handler.manager.MarkAllOffline()
+		handler.OnDisconnect(cl, err)
+	}
 
 	c.paho = pahomqtt.NewClient(opts)
 	return c
