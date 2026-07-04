@@ -102,6 +102,7 @@ func main() {
 	userHandler := handler.NewUserHandler(userService)
 	deviceHandler := handler.NewDeviceHandler(deviceService, userService)
 	wsHandler := handler.NewWebSocketHandler(hub, deviceRepo, deviceMgr, userService)
+	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 
 	// ---- HTTP server ----
 	r := gin.Default()
@@ -133,6 +134,18 @@ func main() {
 		{
 			device.GET("/list", deviceHandler.List)
 			device.DELETE("/:id", deviceHandler.Delete)
+		}
+
+		system := api.Group("/system")
+		system.Use(middleware.JWTAuth(deviceRepo))
+		{
+			system.GET("/status", systemHandler.Status)
+		}
+
+		mqttGroup := api.Group("/mqtt")
+		mqttGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			mqttGroup.POST("/publish", systemHandler.Publish)
 		}
 
 		// Phase 3: WebSocket endpoint

@@ -18,10 +18,10 @@ import (
 
 // Config is the root configuration object.
 type Config struct {
-	Server   ServerConfig   `mapstructure:"server"`
-	Database DatabaseConfig `mapstructure:"database"`
-	JWT      JWTConfig      `mapstructure:"jwt"`
-	MQTT     MQTTConfig     `mapstructure:"mqtt"`
+	Server    ServerConfig    `mapstructure:"server"`
+	Database  DatabaseConfig  `mapstructure:"database"`
+	JWT       JWTConfig       `mapstructure:"jwt"`
+	MQTT      MQTTConfig      `mapstructure:"mqtt"`
 	WebSocket WebSocketConfig `mapstructure:"websocket"`
 }
 

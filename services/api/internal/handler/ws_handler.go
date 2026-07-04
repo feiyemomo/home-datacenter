@@ -43,9 +43,9 @@ func NewWebSocketHandler(
 	userService UserService,
 ) *WebSocketHandler {
 	return &WebSocketHandler{
-		hub:        hub,
-		deviceRepo: deviceRepo,
-		deviceMgr:  deviceMgr,
+		hub:         hub,
+		deviceRepo:  deviceRepo,
+		deviceMgr:   deviceMgr,
 		userService: userService,
 		upgrader: websocket.Upgrader{
 			// Allow any origin in the home network. Cloudflare Tunnel
@@ -60,7 +60,9 @@ func NewWebSocketHandler(
 // Handle is the gin handler for GET /api/v1/ws.
 //
 // Query-parameter auth alternative:
-//   ws://host/api/v1/ws?token=<jwt>
+//
+//	ws://host/api/v1/ws?token=<jwt>
+//
 // is supported for browsers / clients that cannot set Authorization
 // headers on WebSocket upgrades.
 func (h *WebSocketHandler) Handle(c *gin.Context) {

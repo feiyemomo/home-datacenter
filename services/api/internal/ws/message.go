@@ -73,9 +73,9 @@ type Message struct {
 // NewMessage is a convenience constructor.
 func NewMessage(msgType string, topic string, payload interface{}) (Message, error) {
 	m := Message{
-		Type: msgType,
+		Type:  msgType,
 		Topic: topic,
-		TS:   time.Now().Unix(),
+		TS:    time.Now().Unix(),
 	}
 	if payload != nil {
 		data, err := json.Marshal(payload)

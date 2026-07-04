@@ -65,7 +65,8 @@ func (h *Handler) handleDeviceMessage(pt ParsedTopic, payload []byte) {
 }
 
 // handleStatus processes a device status message. Expected payload:
-//   {"status":"online|offline|heartbeat","ts":1234567890}
+//
+//	{"status":"online|offline|heartbeat","ts":1234567890}
 func (h *Handler) handleStatus(deviceID uint, payload []byte) {
 	var s struct {
 		Status string `json:"status"`
@@ -206,6 +207,12 @@ func (h *Handler) PublishBroadcast(message string) error {
 	}
 
 	return h.publish(SystemBroadcast(), data, 1)
+}
+
+// Publish sends a raw message to the given topic. Used by the web
+// dashboard's MQTT debug page.
+func (h *Handler) Publish(topic string, payload string, qos byte) error {
+	return h.publish(topic, []byte(payload), qos)
 }
 
 // publish is the low-level publish helper. It uses the client stored
