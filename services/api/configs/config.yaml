@@ -6,9 +6,21 @@
 #
 # In Docker (WORKDIR /), this resolves to /configs/config.yaml,
 # which is both baked into the image and bind-mounted by compose.yaml.
+#
+# SECURITY: the jwt.secret value here is a PLACEHOLDER only. The app
+# refuses to start with this value (see internal/config/config.go ->
+# validateJWTSecret). Set a real 32+ char secret via one of:
+#   1. configs/config.local.yaml (gitignored — local dev)
+#   2. the JWT_SECRET environment variable (preferred for Docker)
+# Generate with: openssl rand -hex 32
 
 server:
   port: 8080
+  # Restrict which hostnames may open a WebSocket against /api/v1/ws.
+  # Empty list = allow all (local dev). In production, list the
+  # dashboard hostname(s) to block cross-site WebSocket hijacking.
+  # allowed_origins:
+  #   - dashboard.feiyemomo.top
 
 database:
   path: /data/sqlite/app.db

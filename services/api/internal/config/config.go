@@ -28,6 +28,12 @@ type Config struct {
 // ServerConfig holds HTTP server settings.
 type ServerConfig struct {
 	Port int `mapstructure:"port"`
+
+	// AllowedOrigins restricts which hostnames may open a WebSocket
+	// against /api/v1/ws (CSWSH protection). Empty = allow all
+	// (local dev). In production list the dashboard hostname(s),
+	// e.g. ["dashboard.feiyemomo.top"].
+	AllowedOrigins []string `mapstructure:"allowed_origins"`
 }
 
 // DatabaseConfig holds database connection settings.
@@ -85,6 +91,7 @@ func Load(path string) error {
 
 	// Defaults — keep the app runnable even if a field is omitted.
 	v.SetDefault("server.port", 8080)
+	v.SetDefault("server.allowed_origins", []string{})
 	v.SetDefault("database.path", "/data/sqlite/app.db")
 	v.SetDefault("jwt.secret", "")
 	v.SetDefault("jwt.expire_days", 365)
@@ -99,6 +106,14 @@ func Load(path string) error {
 	v.SetDefault("websocket.path", "/api/v1/ws")
 	v.SetDefault("websocket.heartbeat_seconds", 30)
 
+	// Secret material may be supplied via env var instead of the YAML
+	// file. This is the preferred path for production (Docker secret /
+	// .env): the value never lands in the committed config file.
+	// JWT_SECRET takes precedence over the file value.
+	if envSecret := os.Getenv("JWT_SECRET"); envSecret != "" {
+		v.Set("jwt.secret", envSecret)
+	}
+
 	v.SetConfigFile(path)
 
 	if err := v.ReadInConfig(); err != nil {
@@ -110,6 +125,46 @@ func Load(path string) error {
 		return fmt.Errorf("parse config %q: %w", path, err)
 	}
 
+	// Refuse to boot with an insecure JWT secret. An empty or
+	// placeholder secret lets anyone forge 365-day admin tokens, which
+	// is the single highest-impact risk in the system.
+	if err := validateJWTSecret(cfg.JWT.Secret); err != nil {
+		return err
+	}
+
 	AppConfig = cfg
+	return nil
+}
+
+// insecureSecrets is the set of placeholder values that must never be
+// accepted as a real JWT signing key. They match the defaults baked into
+// configs/config.yaml and internal/utils/jwt.go.
+var insecureSecrets = map[string]struct{}{
+	"":                                 {},
+	"your-secret-key":                  {},
+	"change-me":                        {},
+	"PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET": {},
+}
+
+const minSecretLen = 32
+
+// validateJWTSecret rejects empty / placeholder / too-short secrets.
+// It does NOT log the value.
+func validateJWTSecret(secret string) error {
+	if _, bad := insecureSecrets[secret]; bad {
+		return fmt.Errorf(
+			"jwt.secret is not set (or is a placeholder). "+
+				"Generate one with `openssl rand -hex 32`, "+
+				"put it in configs/config.yaml (or config.local.yaml), "+
+				"or set the JWT_SECRET env var.",
+		)
+	}
+	if len(secret) < minSecretLen {
+		return fmt.Errorf(
+			"jwt.secret is too short (%d chars, need >= %d). "+
+				"Use `openssl rand -hex 32` to generate a strong secret.",
+			len(secret), minSecretLen,
+		)
+	}
 	return nil
 }

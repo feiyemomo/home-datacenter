@@ -1,11 +1,13 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+	"gorm.io/gorm"
 
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/repository"
@@ -15,9 +17,10 @@ import (
 
 // WebSocketHandler handles the HTTP → WebSocket upgrade.
 //
-// Auth model (hybrid):
-//   - The initial HTTP request must carry a valid 365-day JWT in
-//     the Authorization: Bearer header (same as REST endpoints).
+// Auth model:
+//   - The initial HTTP request must carry a valid JWT via the
+//     Authorization: Bearer header (preferred) or a ?token= query
+//     parameter (for browsers that cannot set headers on upgrades).
 //   - After upgrade, the connection is kept alive by ping/pong.
 //   - The JWT's (user_id, device_id) claims identify the connection.
 type WebSocketHandler struct {
@@ -26,6 +29,13 @@ type WebSocketHandler struct {
 	deviceRepo  *repository.DeviceRepository
 	deviceMgr   *device.Manager
 	userService UserService
+
+	// allowedOrigins is the allowlist of hostnames that may open a
+	// WebSocket against /api/v1/ws. Empty = allow all (local dev).
+	// In production, populate with the dashboard hostname(s) via
+	// NewWebSocketHandlerWithOrigins so cross-site WebSocket
+	// hijacking (CSWSH) is blocked at the application layer too.
+	allowedOrigins map[string]struct{}
 }
 
 // UserService is a minimal interface to avoid a circular import
@@ -36,6 +46,10 @@ type UserService interface {
 }
 
 // NewWebSocketHandler creates a handler for the /api/v1/ws endpoint.
+//
+// Origin policy: permissive (any origin). Use this for local
+// development only; for production prefer NewWebSocketHandlerWithOrigins
+// so CSWSH is blocked even if Cloudflare Tunnel is bypassed.
 func NewWebSocketHandler(
 	hub *ws.Hub,
 	deviceRepo *repository.DeviceRepository,
@@ -48,8 +62,6 @@ func NewWebSocketHandler(
 		deviceMgr:   deviceMgr,
 		userService: userService,
 		upgrader: websocket.Upgrader{
-			// Allow any origin in the home network. Cloudflare Tunnel
-			// handles origin validation at the edge.
 			CheckOrigin: func(r *http.Request) bool {
 				return true
 			},
@@ -57,14 +69,70 @@ func NewWebSocketHandler(
 	}
 }
 
+// NewWebSocketHandlerWithOrigins creates a handler that only accepts
+// WebSocket upgrades whose Origin host is in allowlist.
+//
+// Pass the dashboard's public hostname(s), e.g. {"dashboard.feiyemomo.top"}.
+// Cloudflare Tunnel validates origin at the edge, but checking it here
+// too prevents CSWSH if a tunnel misconfiguration ever exposes the
+// origin directly.
+func NewWebSocketHandlerWithOrigins(
+	hub *ws.Hub,
+	deviceRepo *repository.DeviceRepository,
+	deviceMgr *device.Manager,
+	userService UserService,
+	allowlist []string,
+) *WebSocketHandler {
+	h := &WebSocketHandler{
+		hub:            hub,
+		deviceRepo:     deviceRepo,
+		deviceMgr:      deviceMgr,
+		userService:    userService,
+		allowedOrigins: make(map[string]struct{}, len(allowlist)),
+	}
+	for _, o := range allowlist {
+		h.allowedOrigins[strings.ToLower(stripScheme(o))] = struct{}{}
+	}
+	h.upgrader = websocket.Upgrader{
+		CheckOrigin: h.checkOrigin,
+	}
+	return h
+}
+
+// checkOrigin returns true only when the request's Origin host is in
+// the allowlist. Only active when allowlist is non-empty.
+func (h *WebSocketHandler) checkOrigin(r *http.Request) bool {
+	if len(h.allowedOrigins) == 0 {
+		return true
+	}
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return false
+	}
+	host := strings.ToLower(stripScheme(origin))
+	_, ok := h.allowedOrigins[host]
+	return ok
+}
+
+// stripScheme removes the http(s)/ws(s):// prefix from a URL string.
+func stripScheme(s string) string {
+	for _, p := range []string{"https://", "http://", "wss://", "ws://"} {
+		if strings.HasPrefix(strings.ToLower(s), p) {
+			return s[len(p):]
+		}
+	}
+	return s
+}
+
 // Handle is the gin handler for GET /api/v1/ws.
 //
-// Query-parameter auth alternative:
+// Token sources (in priority order):
+//  1. Authorization: Bearer <jwt>  (preferred — keeps token out of logs)
+//  2. ?token=<jwt>                  (browser fallback)
 //
-//	ws://host/api/v1/ws?token=<jwt>
-//
-// is supported for browsers / clients that cannot set Authorization
-// headers on WebSocket upgrades.
+// The query-param form exposes the token in URL/referer/logs; the
+// no-store + no-referrer policy on API responses limits, but does not
+// eliminate, that exposure. Prefer the header form where possible.
 func (h *WebSocketHandler) Handle(c *gin.Context) {
 	// 1. Extract JWT — try header first, then ?token= query param.
 	tokenString := ""
@@ -90,7 +158,11 @@ func (h *WebSocketHandler) Handle(c *gin.Context) {
 	// 3. Verify the device is still valid and not revoked.
 	dev, err := h.deviceRepo.GetByID(claims.DeviceID)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, "device not found")
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			utils.Fail(c, http.StatusUnauthorized, "device not found")
+		} else {
+			utils.Fail(c, http.StatusUnauthorized, "device lookup failed")
+		}
 		return
 	}
 	if dev.RevokedAt.Valid {

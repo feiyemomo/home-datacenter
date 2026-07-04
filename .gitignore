@@ -1,0 +1,30 @@
+# ---- Runtime data / secrets (never commit) ----
+# SQLite database + mosquitto persistence hold live state and (in the
+# DB's case) AccessKey hashes + user identities.
+/data/
+/.env
+.env.local
+
+# Local config override holds the real jwt.secret; never commit it.
+services/api/configs/config.local.yaml
+
+# ---- IDE / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- Go ----
+services/api/server
+services/api/cmd.exe
+services/api/*.exe
+*.test
+*.out
+
+# ---- Node / web ----
+web/node_modules/
+web/dist/
+web/.npm-cache/
+web/.npm-prefix/
+web/tsconfig.tsbuildinfo
+web/tsconfig.node.tsbuildinfo

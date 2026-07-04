@@ -1,28 +1,60 @@
+# Home Datacenter — Docker Compose
+#
+# Three services: api (Go), mosquitto (MQTT broker), web (nginx SPA).
+# All secrets come from the .env file loaded by compose (see
+# .env.example). No secret material is committed to this repo.
+#
+# Network posture:
+#   - Only ports 80 (web) and 8080 (api) are published to the host,
+#     and only for local dev. In production behind Cloudflare Tunnel
+#     you can stop publishing 8080 — the tunnel reaches the api
+#     service on the internal Docker network by name (home-api).
+#   - Mosquitto port 1883 is NOT published to the host by default;
+#     the api reaches it on the internal network as "mosquitto:1883".
+#     Set MQTT_BIND_PORT below if you need host access for local
+#     device testing.
+
 services:
   api:
     build:
       context: ./services/api
     container_name: home-api
     restart: unless-stopped
+    # Default-bind to localhost only. Override with MQTT/HTTP ports
+    # for local testing; in production behind the tunnel, prefer not
+    # publishing the API port at all and letting the tunnel reach it
+    # by service name.
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     volumes:
       - ./data/sqlite:/data/sqlite
-      - ./services/api/configs:/configs
+      - ./services/api/configs:/configs:ro
     depends_on:
       - mosquitto
     environment:
       - APP_CONFIG=/configs/config.yaml
+      # Secret material via env (preferred). See .env.example.
+      - JWT_SECRET=${JWT_SECRET:-}
+      - MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+    networks:
+      - home-net
 
   mosquitto:
     image: docker.m.daocloud.io/library/eclipse-mosquitto:2
     container_name: home-mosquitto
     restart: unless-stopped
-    ports:
-      - "1883:1883"
+    # Not published by default. Uncomment and set MQTT_BIND_PORT only
+    # if a local physical device needs to reach the broker from the host.
+    # ports:
+    #   - "127.0.0.1:${MQTT_BIND_PORT:-1883}:1883"
     volumes:
       - ./deploy/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./deploy/mosquitto/aclfile:/mosquitto/config/aclfile:ro
+      - ./deploy/mosquitto/passwd:/mosquitto/config/passwd:ro
       - ./data/mosquitto:/mosquitto/data
+    networks:
+      - home-net
 
   web:
     build:
@@ -30,6 +62,12 @@ services:
     container_name: home-web
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "127.0.0.1:80:80"
     depends_on:
       - api
+    networks:
+      - home-net
+
+networks:
+  home-net:
+    driver: bridge

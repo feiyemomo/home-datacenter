@@ -101,7 +101,22 @@ func main() {
 	authHandler := handler.NewAuthHandler(authService)
 	userHandler := handler.NewUserHandler(userService)
 	deviceHandler := handler.NewDeviceHandler(deviceService, userService)
-	wsHandler := handler.NewWebSocketHandler(hub, deviceRepo, deviceMgr, userService)
+
+	// WebSocket handler. If server.allowed_origins is configured, use
+	// the origin-allowlisting constructor to block cross-site WebSocket
+	// hijacking (CSWSH) at the app layer; otherwise fall back to the
+	// permissive constructor for local dev.
+	var wsHandler *handler.WebSocketHandler
+	if len(cfg.Server.AllowedOrigins) > 0 {
+		wsHandler = handler.NewWebSocketHandlerWithOrigins(
+			hub, deviceRepo, deviceMgr, userService,
+			cfg.Server.AllowedOrigins,
+		)
+	} else {
+		wsHandler = handler.NewWebSocketHandler(
+			hub, deviceRepo, deviceMgr, userService,
+		)
+	}
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 
 	// ---- HTTP server ----

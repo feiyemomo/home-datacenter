@@ -29,18 +29,23 @@ type BindRequest struct {
 // Bind exchanges (user_id, access_key) for a long-lived JWT.
 //
 //	Route: POST /api/v1/auth/bind
+//
+// Security: deliberately returns a generic "invalid credentials" for
+// all bind failures (bad user_id, wrong key, revoked device). A
+// distinct message per failure would let an attacker enumerate which
+// user IDs exist and which keys are valid.
 func (h *AuthHandler) Bind(c *gin.Context) {
 
 	var req BindRequest
 
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 
 	token, err := h.authService.Bind(req.UserID, req.AccessKey)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, err.Error())
+		utils.Fail(c, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
 
