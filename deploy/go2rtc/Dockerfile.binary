@@ -1,0 +1,2 @@
+FROM scratch
+COPY go2rtc /go2rtc

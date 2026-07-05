@@ -1,30 +1,11 @@
-# go2rtc static configuration.
-#
-# streams is intentionally empty: the home-api service populates
-# it at runtime via PUT /api/streams. A static entry here acts as a
-# fall-back / warm-up - useful for the boot window before the API
-# has replayed its DB rows, and for cameras you want to expose
-# without going through the API.
-#
-# This file is NOT bind-mounted in compose.yaml. The Dockerfile
-# COPYs it into the image at /etc/go2rtc.yaml, and go2rtc rewrites
-# it on every PUT /api/streams call (persisting in-memory streams
-# to disk for next-boot replay). A bind-mounted file on Windows /
-# Docker Desktop can be read-only at the filesystem level even
-# without the :ro flag, causing silent write failures.
-#
-# Reference: https://github.com/AlexxIT/go2rtc
-
 api:
   listen: ":1984"
-  # CORS: when fronted by Cloudflare Tunnel, the browser sees the
-  # public hostname, not home-go2rtc. Replace with your dashboard
-  # or app origins in production.
   origin: "*"
 
 log:
   level: info
   output: stderr
 
-# Empty by design - the API injects streams.
-streams: {}
+webrtc:
+  listen: ":8555/tcp"
+  udp: ":8555"

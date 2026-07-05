@@ -112,7 +112,12 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `GET /api/v1/cameras/:id` | JWT | Fetch one camera + live stream URLs |
 | `POST /api/v1/cameras` | JWT+admin | Register a camera (encrypts creds, pushes RTSP to go2rtc) |
 | `DELETE /api/v1/cameras/:id` | JWT+admin | Unregister a camera (DB + go2rtc) |
-| `POST /api/v1/cameras/:id/ptz` | JWT+admin | Send ONVIF PTZ command |
+| `POST /api/v1/cameras/:id/ptz` | JWT+admin | Send ONVIF PTZ command (auto-discovers profile_token) |
+| `GET /api/v1/automation/rules` | JWT+admin | List automation rules |
+| `POST /api/v1/automation/rules` | JWT+admin | Create automation rule |
+| `PUT /api/v1/automation/rules/:id` | JWT+admin | Update rule |
+| `DELETE /api/v1/automation/rules/:id` | JWT+admin | Delete rule |
+| `POST /api/v1/automation/rules/:id/test` | JWT+admin | Manually fire a rule |
 | `GET /api/v1/ws` | JWT | WebSocket upgrade (header or `?token=`) |
 
 **Response Envelope:**
@@ -140,15 +145,21 @@ services/api/
 │   ├── device/manager.go        // Online/offline + heartbeat + MarkAllOffline on disconnect
 │   ├── camera/                  // Phase 4 — camera platformization
 │   │   ├── doc.go
-│   │   ├── go2rtc.go            // HTTP client for /api/streams, /api/webrtc, /api/stream.m3u8
-│   │   ├── registry.go          // CRUD + go2rtc sync + BootReplay + UpdateStatus
-│   │   ├── onvif.go             // ONVIF PTZ dispatcher (raw SOAP, lazy-cached)
-│   │   ├── health.go            // Background TCP probe → device.status on EventBus
+│   │   ├── go2rtc.go            // HTTP client for /api/streams (query params), /api/webrtc, /api/stream.m3u8
+│   │   ├── registry.go          // CRUD + go2rtc sync + BootReplay + UpdateStatus + SaveProfileToken
+│   │   ├── onvif.go             // ONVIF PTZ dispatcher (raw SOAP, WS-Security PasswordDigest, lazy-cached)
+│   │   ├── health.go            // Background TCP probe → device.status / camera.online / camera.offline on EventBus
 │   │   └── json.go
-│   ├── eventbus/                // In-memory pub/sub (MQTT ↔ WS bridge)
+│   ├── automation/              // Phase 5 — Automation Engine (rule CRUD + fire)
+│   │   ├── engine.go            // Subscribe "*" → trigger match → condition → action (notify/mqtt/webhook)
+│   │   ├── handler.go           // /api/v1/automation/rules CRUD + /test
+│   │   └── engine_test.go       // trigger / time / payload / SSRF / MQTT-topic unit tests
+│   ├── eventbus/                // In-memory pub/sub (Device/Camera/MQTT → WS + Automation)
 │   ├── model/
 │   │   ├── user.go
-│   │   └── device.go
+│   │   ├── device.go
+│   │   ├── camera.go            // Camera + stream URLs (Phase 4)
+│   │   └── automation.go        // Rule + Condition + Action (GORM, JSON TEXT columns)
 │   ├── repository/
 │   │   ├── user_repository.go
 │   │   └── device_repository.go
@@ -194,7 +205,7 @@ web/                             // React + Vite + Tailwind dashboard SPA
 deploy/
 ├── mosquitto/{mosquitto.conf,aclfile,passwd}  // broker + ACL + creds
 ├── cloudflared/config.yml        // dashboard + api + cam hostnames
-├── go2rtc/{Dockerfile,go2rtc.yaml} // RTSP→WebRTC/HLS bridge
+├── go2rtc/{Dockerfile,go2rtc.yaml} // RTSP→WebRTC/HLS bridge (go2rtc.yaml COPY'd into image, not bind-mounted)
 └── android/HomeDatacenterClient.kt
 ```
 
@@ -222,6 +233,13 @@ mqtt:
 websocket:
   path: /api/v1/ws
   heartbeat_seconds: 30
+go2rtc:
+  base_url: http://home-go2rtc:1984   # in-network Docker hostname
+camera:
+  webrtc_public_base: ""   # browser-accessible go2rtc URL; "" = LAN-only.
+                           # Set to http://localhost:1984 for local dev,
+                           # or https://cam.example.com for Cloudflare Tunnel
+  ice_servers: ""          # STUN/TURN servers for WebRTC; empty = default STUN
 ```
 
 **Secret resolution (in priority order):**
@@ -286,10 +304,12 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 
 **Phase 2:** Complete (revocation + management API + unified response + config)
 
-**Phase 4 (Platformization, in progress):**
+**Phase 4 (Platformization):** Complete
 
 - Camera model + registry + go2rtc sync (RTSP → WebRTC/HLS)
-- ONVIF PTZ dispatcher (raw SOAP, no library dep)
+- ONVIF PTZ dispatcher (raw SOAP, WS-Security PasswordDigest, auto-discover profile_token)
+- `webrtc_public_base` config for browser-accessible go2rtc URLs
+- `SaveProfileToken` for cached ONVIF profile persistence
 - Health checker (TCP probe + EventBus)
 - New routes:
   - `POST   /api/v1/cameras`            (admin) Register
@@ -300,6 +320,28 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 - `utils.SecretBox` (AES-256-GCM, key = SHA-256(JWT_SECRET))
 - New middleware `RequireAdmin(db)`
 - New container `home-go2rtc` + `cam.feiyemomo.top` tunnel ingress
+
+**Phase 5 (Event-Driven System + Automation Engine):** Complete (2026-07-05)
+
+- Unified Event model: `id / type / source / severity / payload / timestamp`
+- Enhanced EventBus: `publish` / `subscribe` / `*` wildcard / fan-out (goroutine-safe)
+- Camera events: `camera.online` / `camera.offline` on health-check transitions
+- MQTT → Event conversion (existing handler already publishes to EventBus)
+- WebSocket bridge: subscribes EventBus topics (`device`, `camera`,
+  `user.notification`, `system.broadcast`, `automation.fired`) and pushes to clients
+- Automation Engine: rule = `trigger + condition + action`
+  - Trigger: event topic prefix match (segment-boundary aware)
+  - Condition: time window (`time_gte` / `time_lte`, midnight wrap) + `payload_eq`
+  - Action: `notify` / `mqtt` / `webhook` (SSRF guard + MQTT namespace check)
+- New routes (admin-only):
+  - `GET    /api/v1/automation/rules`        List
+  - `POST   /api/v1/automation/rules`        Create
+  - `GET    /api/v1/automation/rules/:id`    Fetch
+  - `PUT    /api/v1/automation/rules/:id`    Update
+  - `DELETE /api/v1/automation/rules/:id`    Delete
+  - `POST   /api/v1/automation/rules/:id/test`  Manually fire (no fire_count bump)
+- Security: MQTT topic namespace + webhook SSRF guard (private / loopback /
+  link-local / unspecified IPs rejected at fire time); rule CRUD admin-only.
 
 **Security hardening pass (2026-07-04):** see `docs/Security` section below.
 

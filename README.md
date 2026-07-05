@@ -31,8 +31,14 @@
 
 Phase 4（摄像头平台化）新增 `home-go2rtc`：所有摄像头的 RTSP 由
 `home-api` 注册并加密入 SQLite，再以 `cam_<id>` 为名推送给
-go2rtc；前端通过 `WebRTC` 或 `HLS` 拉流。详见
+go2rtc；前端通过 **HLS（主）** 或 **WebRTC（备）** 拉流。详见
 [`docs/platformization.md`](docs/platformization.md)。
+
+Phase 5（事件驱动 + 自动化引擎）将所有 Device / Camera / MQTT 状态变化统一为
+Event 进入 EventBus，再驱动 WebSocket 推送与 Automation Engine
+（rule = trigger + condition + action，支持 notify / mqtt / webhook 三种动作）。
+详见 [`docs/platformization.md`](docs/platformization.md) 的 Phase 5 一节与
+[`docs/security.md`](docs/security.md) §11。
 
 所有服务都在 `home-net` 内部 Docker 网络中互相通信。默认只把 `80` 和 `8080` 绑定到 `127.0.0.1`，避免直接对外暴露。
 
@@ -62,6 +68,7 @@ go2rtc；前端通过 `WebRTC` 或 `HLS` 拉流。详见
 2. **Docker Compose** ≥ 2.x（`docker compose` 子命令，已内置于 Docker Desktop / 较新 docker-ce）
 3. **OpenSSL**（仅首次部署生成密钥时需要）
 4. 端口 `80`、`8080` 未被占用（本机）
+5. **HEVC-capable 浏览器**（用于查看摄像头实时画面）—— Safari / Edge / Chrome on Apple Silicon 原生支持；Chrome on Windows 11 需在 Microsoft Store 安装 [HEVC Video Extensions](https://apps.microsoft.com/detail/9n4wgh0nt6jv)；**Chrome on Linux 与 Firefox 不支持 HEVC，无法播放实时视频流**。详细说明见 [docs/platformization.md — Browser / Codec requirement](docs/platformization.md#browser--codec-requirement-hard)。
 
 检查环境：
 
@@ -123,6 +130,7 @@ docker compose up -d --build
 | `SERVER_PORT` | ❌ | 默认 `8080` |
 | `DB_PATH` | ❌ | 默认 `/data/sqlite/app.db`（容器内） |
 | `GO2RTC_BASE_URL` | ❌ | go2rtc HTTP API（摄像头平台化用），默认 `http://home-go2rtc:1984` |
+| `WEBRTC_PUBLIC_BASE` | ❌ | 浏览器拉流用的 go2rtc URL 前缀。**推荐 `/go2rtc`**（由 dashboard nginx 反代到 go2rtc，同源无 CORS）；留空 = 仅 LAN（返回 Docker 内部地址，浏览器不可达）；`https://cam.example.com` = 独立 Cloudflare Tunnel 域名 |
 
 > ⚠️ **不要把 `.env` 提交到 Git**（已经在 `.gitignore` 中忽略）。
 
@@ -295,7 +303,63 @@ curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
   -d '{"command":"stop"}'
 ```
 
+> `profile_token` 可省略——首次 PTZ 调用时自动通过 ONVIF `GetProfiles` 发现并持久化，后续调用直接复用。ONVIF 认证使用 WS-Security PasswordDigest（非 HTTP Basic Auth）。
+
 完整文档：[`docs/platformization.md`](docs/platformization.md)。
+
+### Automation Engine（Phase 5，管理员 only）
+
+所有 Device / Camera / MQTT 状态变化都进入 EventBus；Automation Engine 订阅
+`*`，按规则（trigger + condition + action）触发动作。规则 CRUD 走
+`/api/v1/automation/rules`，全部要求 admin。
+
+创建一条规则（摄像头离线时发通知）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name":"摄像头离线通知",
+    "trigger":"camera.offline",
+    "condition":{"payload_eq":{"source":"camera"}},
+    "action":{"type":"notify","user_id":1,"title":"camera offline","body":"camera went offline"},
+    "enabled": true
+  }'
+# → {"code":0,"data":{"id":1,...,"fire_count":0}}
+```
+
+晚间 22:00 之后任意设备事件触发 MQTT 发布（带时间窗口）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name":"夜间设备事件转发",
+    "trigger":"device",
+    "condition":{"time_gte":"22:00","time_lte":"06:00"},
+    "action":{"type":"mqtt","topic":"home-datacenter/automation/night","payload":"event fired","qos":1},
+    "enabled": true
+  }'
+```
+
+手动测试某条规则（不增加 `fire_count`）：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/automation/rules/1/test \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{"payload":{"source":"camera","camera_id":1}}' \
+  -H "Content-Type: application/json"
+```
+
+动作类型：
+
+| `action.type` | 行为 | 约束 |
+|---|---|---|
+| `notify` | 在 EventBus 上发 `user.notification`（前端 WS 推送） | 需 `user_id` + `title` + `body` |
+| `mqtt` | 向 Mosquitto 发布消息 | topic 必须在 `home-datacenter/` 命名空间下；`$SYS` 被拒 |
+| `webhook` | HTTP POST 到外部 URL | host 必须是公网 IP；私网 / loopback / link-local 在 fire 时被拒（SSRF 守卫） |
+
+> 安全细节见 [`docs/security.md`](docs/security.md) §11。
 
 ---
 
@@ -307,7 +371,8 @@ curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
 2. 在 Cloudflare 控制台创建 Tunnel，把 `cloudflared` 容器加入 `home-net` 网络，并通过 `http://home-api:8080`、`http://home-web:80`、`http://home-go2rtc:1984` 访问后端。
 3. 在 `services/api/configs/config.yaml` 的 `server.allowed_origins` 中填入生产域名，开启 WebSocket Origin 校验，防止 CSWSH。
 4. **不要**把 Mosquitto 暴露到公网——Tunnel 也只代理 HTTP，不代理 MQTT。
-5. 摄像头经 `cam.feiyemomo.top` 暴露，仅承担 WebRTC SDP 协商 + HLS 拉流；WebRTC UDP 媒体包不走 Tunnel，需要在 LAN/直连或 TURN 方案下使用，详见 `docs/platformization.md`。
+5. 摄像头经 `cam.feiyemomo.top` 暴露，**HLS 直接走 Tunnel**（HTTP-only，无 UDP 依赖）；WebRTC 仅在 LAN/直连或 TURN 方案下使用，详见 `docs/platformization.md`。
+6. 在 `config.yaml`（或 `.env`）中设置 `camera.webrtc_public_base=https://cam.feiyemomo.top`，使 API 返回浏览器可访问的 `webrtc_url` / `ice.webrtc_base`。
 
 > 详细配置见 `deploy/cloudflared/` 中的示例。
 
@@ -325,6 +390,8 @@ curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
 | `./deploy/mosquitto/mosquitto.conf` | `/mosquitto/config/mosquitto.conf` | Broker 配置（**只读**） |
 | `./deploy/mosquitto/aclfile` | `/mosquitto/config/aclfile` | ACL 文件（**只读**） |
 | `./services/api/configs` | `/configs` | API 配置（**只读**） |
+
+> 注：`go2rtc.yaml` **不**通过 bind mount 挂载，而是在 `deploy/go2rtc/Dockerfile` 中 `COPY` 进镜像，以保证 go2rtc 可在运行时改写该文件（Windows Docker Desktop 的单文件 bind mount 可能导致静默写入失败）。详见 `docs/platformization.md` 的 "go2rtc API integration" 一节。
 
 ### 备份建议
 

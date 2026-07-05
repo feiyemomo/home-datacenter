@@ -155,8 +155,22 @@ func (h *CameraHandler) Register(c *gin.Context) {
 		OwnerID:      uid,
 	})
 	if err != nil {
-		// 502: go2rtc didn't accept the stream
-		utils.Fail(c, http.StatusBadGateway, err.Error())
+		// Distinguish the two failure modes the registry can
+		// surface so the front-end can render a useful message.
+		//
+		//   - UNIQUE constraint on cameras.stream_name → 409
+		//     (the operator tried to register two cameras with
+		//     the same friendly name; the DB rejected the
+		//     second one before we even talked to go2rtc).
+		//   - Everything else → 502 (go2rtc rejected or was
+		//     unreachable; the underlying problem is the
+		//     go2rtc side, not the request).
+		msg := err.Error()
+		if strings.Contains(msg, "UNIQUE constraint failed") {
+			utils.Fail(c, http.StatusConflict, "a camera with this name already exists (the dashboard name is the go2rtc stream key); pick a unique name")
+			return
+		}
+		utils.Fail(c, http.StatusBadGateway, msg)
 		return
 	}
 	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam)))

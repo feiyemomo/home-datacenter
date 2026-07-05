@@ -1,0 +1,1 @@
+{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{"mediaType":"application/vnd.oci.image.index.v1+json","digest":"sha256:784fefd9a1e57658722e12d9ac9ab6f54157dfcc74482cd2109f8e906d13e793","size":856,"annotations":{"io.containerd.image.name":"docker.io/library/home-datacenter-go2rtc:latest","org.opencontainers.image.ref.name":"latest"}}]}

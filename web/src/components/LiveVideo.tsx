@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { useWebRTCStream } from "@/hooks/useWebRTCStream";
+import { useHLSStream } from "@/hooks/useHLSStream";
 import { ptzMove, gotoPreset } from "@/api/camera";
 import type { Camera, CameraEventMessage, CameraStatusEvent, WsMessage } from "@/types";
 
@@ -23,10 +23,12 @@ interface LiveVideoProps {
  * "device.<id>.status" event the parent routes in via onWsMessage.
  */
 export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
-    const videoRef = useRef<HTMLVideoElement>(null);
-    const { state, error, retry } = useWebRTCStream({
-        streamName: camera.stream.stream_name,
-        webrtcUrl: camera.stream.webrtc_url,
+    // The hook owns the videoRef; attaching the <video> to a
+    // different ref here (e.g. our own useRef) would leave the
+    // hook's internal ref null and the hook would fail with
+    // "video element not mounted". Use the one the hook returns.
+    const { videoRef, state, error, retry } = useHLSStream({
+        src: camera.stream.hls_url,
     });
 
     const [status, setStatus] = useState<"online" | "offline" | "unknown">(camera.status);
@@ -117,7 +119,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                         autoPlay
                         playsInline
                         muted
-                        controls={false}
+                        controls
                         className="h-full w-full object-contain"
                     />
                     {eventToast && (
@@ -125,22 +127,16 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             {eventToast}
                         </div>
                     )}
-                    {state === "fetching-ice" && (
+                    {state === "loading" && (
                         <Overlay>
                             <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                            fetching ICE config
-                        </Overlay>
-                    )}
-                    {state === "connecting" && (
-                        <Overlay>
-                            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                            negotiating WebRTC
+                            loading HLS stream
                         </Overlay>
                     )}
                     {state === "error" && (
                         <Overlay>
                             <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
-                            <p className="text-sm text-slate-200">
+                            <p className="px-4 text-center text-sm text-slate-200">
                                 {error ?? "playback failed"}
                             </p>
                             <Button

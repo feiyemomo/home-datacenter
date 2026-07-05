@@ -21,6 +21,7 @@ for a 365-day JWT.
 | SQLite DB | Bind-mounted volume, not exposed | Filesystem perms; not git-tracked |
 | Dashboard | Public hostname | JWT-gated routes; admin-only MQTT page |
 | API | Public hostname | JWT middleware + per-request revocation check |
+| Camera ONVIF creds | AES-GCM ciphertext in SQLite | WS-Security PasswordDigest over SOAP; key = SHA-256(JWT_SECRET) |
 
 ---
 
@@ -83,6 +84,41 @@ failures (bad user_id, wrong key, revoked) instead of distinct messages.
   persistence, `cmd.exe`, and `config.local.yaml` from the index.
 - `config.local.yaml` regenerated with a fresh 32-byte JWT secret.
 
+### 10. Camera ONVIF authentication
+Camera credentials (`onvif_user` / `onvif_pass`) are stored as
+AES-GCM ciphertext via `utils.SecretBox` (key = `SHA-256(JWT_SECRET)`).
+At runtime, ONVIF SOAP requests use **WS-Security UsernameToken with
+PasswordDigest** (`SHA1(nonce + created + password)`) per the ONVIF
+spec — not HTTP Basic Auth. This avoids sending the password in
+cleartext over the LAN and is required by most Hikvision / Dahua
+firmware (HTTP Basic Auth returns 401). Each request includes a
+random 16-byte nonce and UTC timestamp to prevent replay attacks.
+See `internal/camera/onvif.go` `wsseHeader`.
+
+### 11. Automation Engine security (Phase 5)
+The Automation Engine (`internal/automation/`) lets admin users create
+rules that fire actions on EventBus events. Three attack surfaces:
+
+1. **MQTT action — topic injection.** A compromised admin could publish
+   to `$SYS/broker/...` or third-party plugin topics. Mitigation: the
+   engine rejects any MQTT topic outside the `home-datacenter/`
+   namespace, identical to the `/api/v1/mqtt/publish` endpoint. The
+   check runs at BOTH CRUD time (immediate feedback) and fire time
+   (defence-in-depth). See `isAllowedMQTTTopic`.
+2. **Webhook action — SSRF.** A compromised admin could point a webhook
+   at `http://169.254.169.254/latest/meta-data/` (cloud metadata) or
+   `http://localhost:8080/admin` (internal API). Mitigation: the engine
+   resolves the webhook host and rejects private, loopback, link-local,
+   and unspecified addresses. The check runs at fire time (not CRUD
+   time) because DNS can change between create and fire. HTTPS is
+   recommended but not enforced. See `assertPublicHost` / `isPublicIP`.
+3. **Rule CRUD — privilege escalation.** All `/api/v1/automation/rules`
+   endpoints require JWT + `middleware.RequireAdmin`. Non-admin users
+   cannot create, list, or fire rules.
+
+Residual risk: DNS rebinding could race the SSRF check. Accepted
+because the rule surface is admin-only and the home OS is single-user.
+
 ---
 
 ## Residual Risks (accepted, not yet fixed)
@@ -114,6 +150,9 @@ failures (bad user_id, wrong key, revoked) instead of distinct messages.
 - [ ] `server.allowed_origins` populated with the dashboard hostname in
       `config.yaml` (or via env)
 - [ ] Cloudflare Tunnel ingress set to the `dashboard` + `api` hostnames
+- [ ] `camera.webrtc_public_base` set to the tunnel hostname (e.g.
+      `https://cam.feiyemomo.top`) or `http://localhost:1984` for
+      local-only access
 - [ ] `docker compose up -d` and verify `home-api` logs show
       `mqtt connected` and `server started on :8080`
 - [ ] Bind a device, hit `/user/me`, confirm 200
@@ -121,4 +160,4 @@ failures (bad user_id, wrong key, revoked) instead of distinct messages.
 
 ---
 
-**Last Updated:** 2026-07-04
+**Last Updated:** 2026-07-05 (Phase 5: Automation Engine security — MQTT namespace + SSRF guard)

@@ -30,8 +30,10 @@ services:
       - ./data/sqlite:/data/sqlite
       - ./services/api/configs:/configs:ro
     depends_on:
-      - mosquitto
-      - go2rtc
+      mosquitto:
+        condition: service_started
+      go2rtc:
+        condition: service_healthy
     environment:
       - APP_CONFIG=${APP_CONFIG:-/configs/config.yaml}
       # Secret material via env (preferred). See .env.example.
@@ -95,9 +97,25 @@ services:
     container_name: home-go2rtc
     restart: unless-stopped
     ports:
+      # HTTP API + WebRTC SDP signalling (proxied via dashboard nginx)
       - "127.0.0.1:1984:1984"
+      # WebRTC media: TCP ICE + UDP ICE on a single port. Browser
+      # needs direct access for ICE connectivity checks. For LAN
+      # access from other devices, change 127.0.0.1 to 0.0.0.0.
+      - "127.0.0.1:8555:8555"
+      - "127.0.0.1:8555:8555/udp"
     volumes:
       - ./data/go2rtc:/var/lib/go2rtc
+    # Healthcheck so dependent services (api) wait for the HTTP API
+    # to actually be ready, not just for the container to start.
+    # Without this, the API's BootReplay runs before go2rtc accepts
+    # connections and silently fails to register any stream.
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:1984/api/streams" ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
     networks:
       - home-net
   # coturn — optional STUN/TURN for WebRTC across the public

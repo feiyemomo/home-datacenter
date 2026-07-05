@@ -22,6 +22,7 @@ func InitDB(dbPath string) {
 		&model.Device{},
 		&model.Camera{},
 		&model.Recording{},
+		&model.Rule{},
 	)
 	if err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
