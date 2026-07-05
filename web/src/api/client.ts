@@ -89,4 +89,46 @@ export class ApiError extends Error {
     }
 }
 
+/**
+ * authedFetch — a thin wrapper over `fetch` that attaches the
+ * dashboard's JWT to the Authorization header. Use this for any
+ * request that goes through nginx's `/go2rtc/` location, which is
+ * gated by `auth_request` against /api/v1/auth/verify (see
+ * web/nginx.conf). Without the header, the request returns 401
+ * from nginx and never reaches go2rtc.
+ *
+ * Plain `axios` calls do NOT need this — they already attach
+ * Authorization via the request interceptor above. This helper
+ * exists for the two paths that bypass axios:
+ *
+ *   - useWebRTCStream.ts: fetch(...) for the SDP POST (binary-ish
+ *     SDP body, no JSON envelope, so axios is overkill).
+ *   - useHLSStream.ts:    hls.js can be configured to use
+ *     `xhrSetup` to add a header on its internal XHRs, but the
+ *     simpler/more reliable path is to override the loader via
+ *     `Hls.DefaultConfig.loader`. We use xhrSetup (per-stream
+ *     instance) because hooking the loader globally also affects
+ *     segments in ways that complicate cleanup.
+ */
+export function authedFetch(input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> {
+    const token = getToken();
+    const headers = new Headers(init.headers);
+    if (token) {
+        headers.set("Authorization", `Bearer ${token}`);
+    }
+    return fetch(input, { ...init, headers });
+}
+
+/**
+ * authHeaderFor — return the literal "Authorization: Bearer …"
+ * header value for the current session, or null if no token is
+ * stored. Useful when the caller needs to attach the header to a
+ * non-fetch transport (e.g. hls.js's `xhrSetup`).
+ */
+export function authHeaderFor(): { name: string; value: string } | null {
+    const token = getToken();
+    if (!token) return null;
+    return { name: "Authorization", value: `Bearer ${token}` };
+}
+
 export default client;

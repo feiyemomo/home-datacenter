@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Hls, { type ErrorData } from "hls.js";
+import { authHeaderFor } from "@/api/client";
 
 /**
  * useHLSStream — single-camera HLS viewer.
@@ -68,6 +69,15 @@ export function useHLSStream(
     }, []);
 
     useEffect(() => {
+        // Null/undefined src means the parent has suspended us
+        // (e.g. waiting on a primary playback path). Skip every
+        // side effect; the hook stays in "idle" until the parent
+        // hands us a real URL.
+        if (!opts.src) {
+            setState("idle");
+            setError(null);
+            return;
+        }
         let cancelled = false;
         setError(null);
         setState("loading");
@@ -126,13 +136,14 @@ export function useHLSStream(
         //
         // We size the watchdog to comfortably exceed the patched
         // go2rtc keepalive (30s, see deploy/go2rtc/Dockerfile) plus
-        // one full segment download (~2-3s for a 1MB HEVC chunk
-        // over a slow link) plus HLS startup latency (~2s for the
-        // initial playlist + first segment round-trip). 45s is
-        // generous enough that a healthy stream always wins, but
-        // short enough that a user-facing error appears within a
-        // reasonable wait if the session really is dead.
-        const stallTimeoutMs = 45_000;
+        // a couple of segment downloads. With the 2s segment +
+        // partial-segment config in go2rtc.yaml, a healthy stream
+        // reaches the `playing` event in ~1-2s. 20s is therefore
+        // generous enough for any realistic slow start (cold RTSP
+        // producer, first-segment network latency spike) but short
+        // enough that a genuinely broken stream surfaces an error
+        // to the user before they give up and refresh the page.
+        const stallTimeoutMs = 20_000;
         const stallTimer = window.setTimeout(() => {
             if (cancelled) return;
             setState((cur) => {
@@ -194,26 +205,45 @@ export function useHLSStream(
             return;
         }
 
-        // Native HLS — Safari (and iOS WebView). Hand it the URL
-        // directly; no JS player required. The video element
-        // listeners installed above (onPlaying / onError /
-        // onWaiting) already cover the state transitions, so we
-        // only kick off playback here.
-        if (v.canPlayType("application/vnd.apple.mpegurl")) {
-            v.src = opts.src;
-            v.play().catch(() => { /* handled by onError / stall watchdog */ });
-            return () => {
-                cancelled = true;
-                window.clearTimeout(stallTimer);
-                v.removeEventListener("playing", onPlaying);
-                v.removeEventListener("error", onError);
-                v.removeEventListener("waiting", onWaiting);
-                teardown();
-            };
-        }
-
-        // MSE / hls.js — Chrome, Firefox, Edge.
+        // Native HLS — legacy Safari / iOS WebView without MSE.
+        // The modern Safari 11+, Edge, Chrome, Firefox all support
+        // MSE and hls.js works on every one of them. We only hit
+        // this branch on the rare WebKit build that lacks MSE
+        // entirely, in which case the browser's own HLS pipeline
+        // is the only path available. The video element listeners
+        // installed above (onPlaying / onError / onWaiting) cover
+        // the state transitions, so we just kick off playback.
+        //
+        // **Order matters**: this branch is now strictly a
+        // FALLBACK. The hls.js path below is tried first so that
+        // browsers which support MSE go through hls.js (where the
+        // Authorization header can be attached via xhrSetup).
+        // Previously this was the *first* check, and Edge on
+        // Windows 11+ — which ships a built-in HLS player on top
+        // of Media Foundation and answers
+        // `canPlayType("application/vnd.apple.mpegurl")` with
+        // "probably" — took the URL via `video.src = url`, the
+        // hls.js xhrSetup was never invoked, no Authorization
+        // header was attached, nginx's auth_request rejected the
+        // m3u8 request with 401, and the HLS pipeline stalled
+        // with an empty 401 body. hls.js works on every modern
+        // browser that supports MSE (Chrome, Edge, Firefox,
+        // Safari 11+), so preferring it everywhere is safe.
         if (!Hls.isSupported()) {
+            if (v.canPlayType("application/vnd.apple.mpegurl")) {
+                v.src = opts.src;
+                v.play().catch(() => { /* handled by onError / stall watchdog */ });
+                return () => {
+                    cancelled = true;
+                    window.clearTimeout(stallTimer);
+                    v.removeEventListener("playing", onPlaying);
+                    v.removeEventListener("error", onError);
+                    v.removeEventListener("waiting", onWaiting);
+                    teardown();
+                };
+            }
+
+            // No HLS path at all — neither hls.js nor native.
             window.clearTimeout(stallTimer);
             v.removeEventListener("playing", onPlaying);
             v.removeEventListener("error", onError);
@@ -232,17 +262,53 @@ export function useHLSStream(
             lowLatencyMode: false,
             // Cameras are stable bandwidth; no aggressive ABR.
             capLevelToPlayerSize: true,
-            // Buffer settings. The go2rtc HLS server has a patched
-            // consumer keepalive of 30s (see deploy/go2rtc/Dockerfile
-            // — upstream hardcodes 5s, which is too short for HEVC
-            // segments). With a 30s keepalive we can safely use
-            // hls.js's default-ish buffer: ~12s in-flight, up to 30s
-            // headroom. The old value of 6s was a workaround for the
-            // 5s keepalive — it starved the decoder and made hls.js
-            // park in "waiting" forever, which our stall watchdog
-            // then misread as a dead session.
+            // Buffer: 12s in-flight, 30s headroom. The go2rtc
+            // HLS server uses a patched consumer keepalive of 30s
+            // (deploy/go2rtc/Dockerfile patches the upstream 5s,
+            // which is too short for ~1MB HEVC segments). With
+            // 30s keepalive the hls.js defaults are safe.
             maxBufferLength: 12,
             maxMaxBufferLength: 30,
+            // Attach the dashboard's JWT to every XHR hls.js makes
+            // (master playlist, media playlist, every segment, every
+            // key). nginx's `/go2rtc/` location is gated by
+            // `auth_request /api/v1/auth/verify`, so without the
+            // header the master-playlist request returns 401 and
+            // hls.js sees an empty body — looks like a "stalled"
+            // stream in the UI. `xhrSetup` runs once per XHR
+            // instance, so the header is added on playlist polls,
+            // segment downloads, and the eventual key fetch.
+            //
+            // **Order matters.** hls.js calls xhrSetup BEFORE
+            // open() in openAndSendXhr — and XMLHttpRequest
+            // spec mandates setRequestHeader() to be called AFTER
+            // open() (in OPENED state), otherwise the call throws
+            // InvalidStateError on spec-compliant browsers
+            // (Chromium-family honours this strictly). If we
+            // call setRequestHeader first, the header is silently
+            // dropped, the auth_request sub-call has no
+            // Authorization, nginx returns 401, and the HLS
+            // pipeline appears to "stall" with an empty body.
+            //
+            // We use xhrSetup (per-stream instance) rather than
+            // Hls.DefaultConfig.xhrSetup or overriding the loader
+            // globally: the global config is shared across all
+            // consumers on the page, which would let a stale JWT
+            // (e.g. after the user re-binds) keep being attached
+            // by detached players. The per-instance closure calls
+            // authHeaderFor() lazily, so a token refreshed mid-
+            // playback picks up correctly.
+            //
+            // After our open() call, the hls.js openAndSendXhr
+            // path's `e.readyState||e.open(...)` check sees
+            // readyState === 1 (OPENED) and skips its own
+            // open(), so we don't trigger an
+            // "open() already called" exception.
+            xhrSetup: (xhr, url) => {
+                xhr.open("GET", url, true);
+                const h = authHeaderFor();
+                if (h) xhr.setRequestHeader(h.name, h.value);
+            },
         });
         hlsRef.current = hls;
 

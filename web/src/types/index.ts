@@ -110,6 +110,14 @@ export interface Camera {
     meta: CameraMeta;
     presets: Record<string, string>;
     stream: CameraStream;
+    /**
+     * Server-side ffmpeg H.264 transcoding is on. Reflects the
+     * backend `cameras.transcode` column; the dashboard uses it
+     * to surface a small "x264" badge next to the camera name so
+     * the operator can spot which cameras are paying the
+     * transcode cost at a glance.
+     */
+    transcode?: boolean;
     created_at: string;
     updated_at: string;
 }

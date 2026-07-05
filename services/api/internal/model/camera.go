@@ -82,6 +82,26 @@ type Camera struct {
 	Capabilities JSON `gorm:"type:text" json:"capabilities"`
 	Credentials  JSON `gorm:"type:text" json:"-"` // never serialize
 	Meta         JSON `gorm:"type:text" json:"meta"`
+
+	// Transcode forces the RTSP source to be transcoded to H.264
+	// (via the #video=h264 URL fragment that go2rtc interprets as
+	// "run the source through ffmpeg, output H.264"). Off by
+	// default — HLS passthrough works fine for cameras whose codecs
+	// the browser can decode natively (H.264 everywhere, HEVC on
+	// Safari / Apple Silicon / Chrome-with-HEVC-extension). Turn
+	// it on for HEVC cameras that the operator wants to use over
+	// WebRTC on Chrome / Edge / Android, where the WebRTC RTP
+	// codec registry does not include H.265 (see
+	// docs/platformization.md).
+	//
+	// The flag is per-camera and only affects the RTSP URL handed
+	// to go2rtc. The platform's go2rtc image MUST include ffmpeg
+	// for this flag to do anything; the Docker build is
+	// unconditional (ffmpeg is ~30 MB and the alternative is a
+	// second image profile operators have to remember to switch
+	// into). Cost is paid once at build time, benefit only
+	// accrues when an admin opts a specific camera in.
+	Transcode bool `gorm:"default:false" json:"transcode"`
 	// OnvifProfileToken is the profile token we use for PTZ and
 	// presets. Stored as a dedicated column (not inside Meta) so
 	// the read path is a plain `string` — GORM's JSON scanning is

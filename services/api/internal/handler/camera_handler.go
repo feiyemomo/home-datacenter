@@ -125,6 +125,11 @@ type registerReq struct {
 	Audio        bool   `json:"audio"`
 	Motion       bool   `json:"motion"`
 	ProfileToken string `json:"profile_token"`
+	// Transcode opts the camera into ffmpeg-based H.264
+	// transcoding (see model.Camera.Transcode comment). Default
+	// false to match the platform's "HEVC passthrough works on
+	// HEVC-capable browsers, transcode is opt-in" contract.
+	Transcode bool `json:"transcode"`
 }
 
 // Register — POST /api/v1/cameras
@@ -152,6 +157,7 @@ func (h *CameraHandler) Register(c *gin.Context) {
 		Audio:        req.Audio,
 		Motion:       req.Motion,
 		ProfileToken: req.ProfileToken,
+		Transcode:    req.Transcode,
 		OwnerID:      uid,
 	})
 	if err != nil {
@@ -536,6 +542,7 @@ func cameraView(cam *model.Camera, stream camera.StreamConfig) gin.H {
 		"capabilities": cam.Capabilities,
 		"meta":         cam.Meta,
 		"stream":       stream,
+		"transcode":    cam.Transcode,
 		"created_at":   cam.CreatedAt,
 		"updated_at":   cam.UpdatedAt,
 	}

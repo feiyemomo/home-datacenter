@@ -45,7 +45,16 @@ type RegisterInput struct {
 	Audio        bool
 	Motion       bool
 	ProfileToken string // optional; blank → controller picks the first profile
-	OwnerID      uint   // 0 = assign to caller from handler context
+	// Transcode opts this camera into server-side H.264
+	// transcoding. The registry translates the boolean to a
+	// `#video=h264` URL fragment on the RTSP source; go2rtc
+	// interprets that fragment as "use ffmpeg, output H.264".
+	// Requires ffmpeg in the go2rtc image (always present in
+	// this build). Per-camera so the operator can leave
+	// H.264-friendly cameras untouched and only pay the
+	// CPU/memory cost on HEVC cameras they want over WebRTC.
+	Transcode bool
+	OwnerID   uint // 0 = assign to caller from handler context
 }
 
 // Register inserts a Camera row, then asks go2rtc to start pulling
@@ -113,6 +122,7 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		},
 		Credentials: creds,
 		Meta:        model.JSON{},
+		Transcode:   in.Transcode,
 		// Bug1 fix: the go2rtc stream key is the friendly name,
 		// not `cam_<id>`. Setting it BEFORE Create() lets the
 		// UNIQUE constraint on stream_name reject duplicates at
@@ -312,16 +322,35 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 // requiring any transcoder. If the operator wants browser audio
 // they can append "#audio=opus" later, but the default is silent.
 //
-// The legacy "#video=H264" hint (force-transcode to H.264) is
-// gone: the image no longer ships a transcoder, and HLS
-// passthrough keeps the camera's native HEVC for browsers that
-// can decode it. If a future browser cannot decode HEVC, the
-// user will see a clear "manifestIncompatibleCodecsError" in the
-// hook, not a silent failure. See docs/platformization.md for
-// the codec matrix and platformization decisions.
+// Video handling: by default the source's native video codec is
+// passed through (HEVC stays HEVC, H.264 stays H.264). When
+// `cam.Transcode` is true, the registry adds `#video=h264`, which
+// go2rtc interprets as "run the source through ffmpeg, output
+// H.264". This is the only escape for HEVC cameras on browsers
+// whose WebRTC RTP codec registry does not include H.265
+// (Chrome / Edge / Android WebView — see
+// docs/platformization.md for the matrix).
+//
+// rtspURL is the canonical RTSP source go2rtc pulls from.
+//
+// We always strip audio at the source (`#audio=0`) because the
+// home dashboard doesn't play sound and the only consumer that
+// would benefit is the mobile app — the savings in bandwidth and
+// decode cost are not worth the extra wiring.
+//
+// `cam.Transcode` adds a `#video=h264` fragment. go2rtc 1.9.x
+// recognises the fragment as a per-source instruction to run the
+// stream through ffmpeg, output H.264. The flag is per-camera so
+// H.264 sources don't pay the transcode cost. The combined
+// fragment is `#audio=0&video=h264` (ampersand, not a second #).
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
-	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d#audio=0",
+	url := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	fragments := []string{"audio=0"}
+	if cam.Transcode {
+		fragments = append(fragments, "video=h264")
+	}
+	return url + "#" + strings.Join(fragments, "&")
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into

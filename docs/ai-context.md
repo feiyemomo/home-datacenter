@@ -117,7 +117,11 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `POST /api/v1/automation/rules` | JWT+admin | Create automation rule |
 | `PUT /api/v1/automation/rules/:id` | JWT+admin | Update rule |
 | `DELETE /api/v1/automation/rules/:id` | JWT+admin | Delete rule |
-| `POST /api/v1/automation/rules/:id/test` | JWT+admin | Manually fire a rule |
+| `POST /api/v1/automation/rules/:id/test` | JWT+admin | Manually fire a rule (no fire_count bump) |
+| `GET /api/v1/automation/metrics` | JWT+admin | Global engine metrics (events/fires/errors/dropped) |
+| `GET /api/v1/automation/metrics?reset=1` | JWT+admin | Reset all metrics counters |
+| `GET /api/v1/automation/rules/:id/metrics` | JWT+admin | Per-rule metrics |
+| `POST /api/v1/automation/rules/:id/cooldown` | JWT+admin | Pin `lastFire` to silence a misbehaving rule (body `{seconds}`) |
 | `GET /api/v1/ws` | JWT | WebSocket upgrade (header or `?token=`) |
 
 **Response Envelope:**
@@ -194,11 +198,21 @@ services/api/
 
 web/                             // React + Vite + Tailwind dashboard SPA
 ├── src/
-│   ├── pages/{Dashboard,Devices,Login,MqttDebug,Profile}.tsx
-│   ├── api/{auth,client,device,system}.ts
+│   ├── pages/{Dashboard,Cameras,Devices,DeviceCreate,Login,MqttDebug,Profile}.tsx
+│   │                       // Cameras: list + live view + delete (read-mostly)
+│   │                       // DeviceCreate: /cameras/new — dedicated full-page
+│   │                       //   form for registering a camera (Phase 7)
+│   ├── api/{auth,camera,client,device,system}.ts
+│   │                  // client.ts: axios + authedFetch() + authHeaderFor()
+│   │                  //   (authedFetch attaches the JWT to plain fetch
+│   │                  //   requests going through nginx's /go2rtc/ location,
+│   │                  //   which is gated by auth_request /api/v1/auth/verify)
 │   ├── context/AuthContext.tsx  // /user/me probe, isAdmin
-│   ├── hooks/useWebSocket.ts    // WS + auto-reconnect + heartbeat
-│   └── components/              // Layout, ProtectedRoute, ui/*
+│   ├── hooks/{useAuth,useWebSocket,useHLSStream,useWebRTCStream}.ts
+│   │            // useHLSStream: HLS primary path (HEVC over fMP4)
+│   │            // useWebRTCStream: low-latency path; auto-fallback to HLS
+│   │            //   for HEVC cameras on Chromium (Chrome/Edge/WebView)
+│   └── components/              // Layout, Sidebar, ProtectedRoute, ui/*
 ├── nginx.conf                   // SPA + /api proxy + /api/v1/ws upgrade
 └── Dockerfile
 
@@ -342,6 +356,40 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
   - `POST   /api/v1/automation/rules/:id/test`  Manually fire (no fire_count bump)
 - Security: MQTT topic namespace + webhook SSRF guard (private / loopback /
   link-local / unspecified IPs rejected at fire time); rule CRUD admin-only.
+
+**Phase 6 (Automation Runtime):** Complete (2026-07-05)
+
+- **Enriched Condition**: `source` (exact match), `threshold` (numeric op +
+  value), `regex` (RE2), `any` (OR combine). `time_gte`/`time_lte` already
+  wrapped midnight.
+- **Enriched Action**: `timeout_ms` (per-attempt, default 5000) +
+  `retry_max` (webhook only; 4xx permanent, 5xx/network → exponential
+  backoff 500ms×2^n capped 30s; `notify`/`mqtt` not retried).
+- **Throttle**: `cooldown_s` / `rate_per_min` (60s sliding window) /
+  `dedup` (SHA-256 prefix of topic+source+payload). In-memory runtime
+  state per rule; pruned on `Reload()`.
+- **Metrics** (admin-only, in-memory, no Prometheus dep):
+  - `GET /api/v1/automation/metrics` — global counters + per-rule map
+  - `GET /api/v1/automation/metrics?reset=1` — zero all counters
+  - `GET /api/v1/automation/rules/:id/metrics` — per-rule slice
+  - Atomic counters via `sync/atomic`; per-rule map mutex-guarded.
+- **Admin escape hatches**:
+  - `POST /api/v1/automation/rules/:id/cooldown` body `{seconds:N}`
+    pins `lastFire` to silence a misbehaving rule.
+  - `POST /api/v1/automation/rules/:id/test` runs action synchronously
+    but does NOT increment `fire_count` (operator review metric).
+- **Audit event**: every fire publishes `automation.fired` to EventBus
+  with rule id/name, trigger, event id, ok/err, duration_ms. WS Hub
+  forwards it so the dashboard can render a live activity feed.
+- **Verified** end-to-end: `payload_eq` filter, throttle (5 events/1s →
+  2 fires + 9 dropped), SSRF (127.0.0.1 / 10.0.0.1 / 169.254.169.254
+  rejected at fire time), MQTT namespace (`$SYS/...` and `other-ns/...`
+  rejected at CRUD time), `?reset=1`, cooldown endpoint.
+- Unit tests in `internal/automation/engine_test.go` cover trigger
+  prefix match (segment boundary), `timeInRange` (incl. midnight
+  wrap), `conditionMatches` (payload_eq + malformed payload),
+  `isAllowedMQTTTopic`, `isPublicIP` (v4 + v6 loopback/private/
+  link-local/unspecified).
 
 **Security hardening pass (2026-07-04):** see `docs/Security` section below.
 

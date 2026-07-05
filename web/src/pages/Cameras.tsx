@@ -1,49 +1,28 @@
 import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Camera as CameraIcon, Plus, Trash2, RefreshCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
-import { listCameras, registerCamera, deleteCamera } from "@/api/camera";
+import { listCameras, deleteCamera } from "@/api/camera";
 import type { Camera, WsMessage } from "@/types";
 import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { LiveVideo } from "@/components/LiveVideo";
 
-interface DraftCam {
-    name: string;
-    host: string;
-    vendor: string;
-    onvif_port: number;
-    rtsp_port: number;
-    channel_id: number;
-    username: string;
-    password: string;
-    ptz: boolean;
-    audio: boolean;
-    motion: boolean;
-}
-
-const EMPTY_DRAFT: DraftCam = {
-    name: "",
-    host: "",
-    vendor: "hikvision",
-    onvif_port: 80,
-    rtsp_port: 554,
-    channel_id: 101,
-    username: "admin",
-    password: "",
-    ptz: true,
-    audio: true,
-    motion: true,
-};
-
+/**
+ * Cameras — list + live view + delete.
+ *
+ * Registration has moved to a dedicated page (/cameras/new,
+ * DeviceCreate.tsx). The list page is now strictly for *browsing*
+ * — the operator can refresh, watch live, and remove a camera, but
+ * not stand up a new one inline. This keeps the cards above the
+ * fold and gives the create flow its own URL to bookmark / share.
+ */
 export default function Cameras() {
     const { isAdmin } = useAuth();
+    const nav = useNavigate();
     const [cams, setCams] = useState<Camera[]>([]);
     const [loading, setLoading] = useState(false);
-    const [showForm, setShowForm] = useState(false);
-    const [draft, setDraft] = useState<DraftCam>(EMPTY_DRAFT);
     const [error, setError] = useState<string | null>(null);
 
     const refresh = useCallback(async () => {
@@ -62,18 +41,6 @@ export default function Cameras() {
     useEffect(() => {
         void refresh();
     }, [refresh]);
-
-    async function submit() {
-        setError(null);
-        try {
-            await registerCamera(draft);
-            setDraft(EMPTY_DRAFT);
-            setShowForm(false);
-            await refresh();
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        }
-    }
 
     async function remove(id: number) {
         if (!isAdmin) return;
@@ -100,7 +67,7 @@ export default function Cameras() {
                         Refresh
                     </Button>
                     {isAdmin && (
-                        <Button size="sm" onClick={() => setShowForm((s) => !s)}>
+                        <Button size="sm" onClick={() => nav("/cameras/new")}>
                             <Plus size={14} className="mr-1" />
                             Register
                         </Button>
@@ -112,54 +79,6 @@ export default function Cameras() {
                 <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
                     {error}
                 </div>
-            )}
-
-            {showForm && isAdmin && (
-                <Card>
-                    <CardHeader>
-                        <CardTitle className="text-sm">Register camera</CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                        <form
-                            className="grid grid-cols-2 gap-3 text-sm"
-                            onSubmit={(e) => { e.preventDefault(); void submit(); }}
-                        >
-                            <Field label="Name">
-                                <Input value={draft.name} onChange={(e) => setDraft({ ...draft, name: e.target.value })} required />
-                            </Field>
-                            <Field label="Vendor">
-                                <Input value={draft.vendor} onChange={(e) => setDraft({ ...draft, vendor: e.target.value })} />
-                            </Field>
-                            <Field label="Host">
-                                <Input placeholder="192.168.31.100" value={draft.host} onChange={(e) => setDraft({ ...draft, host: e.target.value })} required />
-                            </Field>
-                            <Field label="ONVIF port">
-                                <Input type="number" value={draft.onvif_port} onChange={(e) => setDraft({ ...draft, onvif_port: +e.target.value })} />
-                            </Field>
-                            <Field label="RTSP port">
-                                <Input type="number" value={draft.rtsp_port} onChange={(e) => setDraft({ ...draft, rtsp_port: +e.target.value })} />
-                            </Field>
-                            <Field label="Channel (Hik: 101/201)">
-                                <Input type="number" value={draft.channel_id} onChange={(e) => setDraft({ ...draft, channel_id: +e.target.value })} />
-                            </Field>
-                            <Field label="Username">
-                                <Input value={draft.username} onChange={(e) => setDraft({ ...draft, username: e.target.value })} />
-                            </Field>
-                            <Field label="Password">
-                                <Input type="password" value={draft.password} onChange={(e) => setDraft({ ...draft, password: e.target.value })} required />
-                            </Field>
-                            <div className="col-span-2 flex flex-wrap gap-3 text-xs text-slate-300">
-                                <Toggle label="PTZ" v={draft.ptz} on={(v) => setDraft({ ...draft, ptz: v })} />
-                                <Toggle label="Audio" v={draft.audio} on={(v) => setDraft({ ...draft, audio: v })} />
-                                <Toggle label="Motion" v={draft.motion} on={(v) => setDraft({ ...draft, motion: v })} />
-                            </div>
-                            <div className="col-span-2 flex gap-2">
-                                <Button type="submit">Register</Button>
-                                <Button type="button" variant="ghost" onClick={() => setShowForm(false)}>Cancel</Button>
-                            </div>
-                        </form>
-                    </CardContent>
-                </Card>
             )}
 
             <WsBridge>
@@ -176,7 +95,7 @@ export default function Cameras() {
                         ))}
                         {cams.length === 0 && !loading && (
                             <div className="col-span-full rounded-md border border-dashed border-slate-700 p-8 text-center text-sm text-slate-500">
-                                No cameras registered. {isAdmin ? "Click Register." : "Ask an admin to register one."}
+                                No cameras registered. {isAdmin ? "Click Register to add one." : "Ask an admin to register one."}
                             </div>
                         )}
                     </div>
@@ -210,24 +129,6 @@ function CamCard({
                 </button>
             )}
         </div>
-    );
-}
-
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
-    return (
-        <label className="flex flex-col gap-1">
-            <span className="text-xs text-slate-400">{label}</span>
-            {children}
-        </label>
-    );
-}
-
-function Toggle({ label, v, on }: { label: string; v: boolean; on: (v: boolean) => void }) {
-    return (
-        <label className="inline-flex items-center gap-2">
-            <input type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} />
-            {label}
-        </label>
     );
 }
 

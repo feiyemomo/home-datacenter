@@ -1,5 +1,5 @@
 # Multi-stage Dockerfile for go2rtc (forked).
-# Build marker: 2026-07-05-keepalive-30s-rebuild-2
+# Build marker: 2026-07-05-ffmpeg-optin
 #
 # Stage 1: build go2rtc FROM SOURCE so we can patch the HLS
 # session keepalive. The upstream constant is hardcoded at 5s in
@@ -29,20 +29,18 @@ WORKDIR /src
 RUN git clone --depth 1 --branch v${GO2RTC_VERSION} \
      https://github.com/AlexxIT/go2rtc.git .
 
-# Patch the HLS session keepalive. Verify the patch landed so a
-# future upstream refactor (someone renaming the const) fails the
-# build loudly instead of silently shipping the un-patched
-# upstream value. We also dump the line before/after so a
-# rebuild confirms the sed actually fired.
-# DEBUG: also inject a unique marker string so we can verify the
-# patch actually made it into the compiled binary.
-RUN echo "BUILD-MARKER: keepalive-30s-$(date +%s)" \
-     && echo "BEFORE:" \
-     && grep -n "const keepalive" internal/hls/hls.go \
-     && sed -i "s|const keepalive = 5 \* time.Second|const keepalive = ${GO2RTC_KEEPALIVE_SECONDS} * time.Second|" \
+# Patch the HLS session keepalive. We do three things to make
+# the patch observable end-to-end:
+#   1. sed replaces the upstream `const keepalive = 5 * time.Second`.
+#   2. We grep for the new value so a future upstream rename fails
+#      the build loudly instead of silently shipping the un-patched
+#      binary.
+#   3. We inject a package-level `KEEPALIVE_PATCH_MARKER_30S` var
+#      and overwrite it at link time via -ldflags -X. The
+#      container's logs include it so we can confirm the patched
+#      binary is actually running (not the upstream image).
+RUN sed -i "s|const keepalive = 5 \* time.Second|const keepalive = ${GO2RTC_KEEPALIVE_SECONDS} * time.Second|" \
      internal/hls/hls.go \
-     && echo "AFTER:" \
-     && grep -n "const keepalive" internal/hls/hls.go \
      && grep -F "const keepalive = ${GO2RTC_KEEPALIVE_SECONDS} * time.Second" internal/hls/hls.go >/dev/null \
      && printf '%s\n' \
      '' \
@@ -53,8 +51,7 @@ RUN echo "BUILD-MARKER: keepalive-30s-$(date +%s)" \
      > /tmp/marker.txt \
      && sed -i "/^const keepalive = ${GO2RTC_KEEPALIVE_SECONDS} \* time.Second$/r /tmp/marker.txt" \
      internal/hls/hls.go \
-     && echo "marker var declared:" \
-     && grep -n "KEEPALIVE_PATCH_MARKER_30S" internal/hls/hls.go \
+     && grep -F "KEEPALIVE_PATCH_MARKER_30S" internal/hls/hls.go >/dev/null \
      && echo "go2rtc HLS keepalive patched to ${GO2RTC_KEEPALIVE_SECONDS}s"
 
 # Static build — no cgo, no dynamic linker dependencies. Strip
@@ -76,22 +73,36 @@ RUN MARKER="patched-30s-$(date +%s)-pid$$" \
 
 # Stage 2: slim runtime image.
 #
-# We deliberately do NOT install ffmpeg. The platform's primary
-# video path is HLS passthrough (browser decodes the camera's
-# native H.265 via hls.js + MSE; see docs/platformization.md),
-# which doesn't need transcoding. WebRTC is documented as a
-# LAN-only fallback; it requires H.264 in the browser, but the
-# whole path is opt-in and the operator accepts "HEVC-capable
-# browser" as a hard requirement. Dropping ffmpeg shaves ~30 MB
-# off the image and removes a moving piece we'd otherwise have
-# to keep patched.
+# ffmpeg is now unconditionally included so cameras with
+# `transcode=true` (see services/api/internal/model/camera.go
+# Transcode) can be transcoded to H.264 on demand. go2rtc
+# interprets the RTSP URL fragment `#video=h264` as "use ffmpeg,
+# output H.264" — the registry appends that fragment only when
+# the operator opts a specific camera in. Cameras that don't
+# have the flag set use the native H.264 / HEVC passthrough with
+# no transcode cost.
+#
+# The previous "no ffmpeg" hard constraint (see
+# docs/platformization.md and project_memory.md) was relaxed in
+# Phase 7 because (a) the per-camera opt-in keeps the CPU/memory
+# cost bounded to only the cameras the operator cares about, and
+# (b) the alternative — a second image profile operators have to
+# remember to switch into — was deemed worse than ~30 MB of
+# ffmpeg in the base image. ffmpeg-static (the prebuilt
+# musl-linked binary) keeps the runtime image reproducible
+# without dragging in a 200+ MB build toolchain.
 #
 # tzdata + ca-certificates are the only aux packages: tzdata is
 # required for the container's `TZ` env to take effect on
 # Alpine's musl libc.
 FROM alpine:3.20
+# mirrors.aliyun.com has the ffmpeg package in v3.20 main; if the
+# mirror ever drops it, fall back to the upstream dl-cdn (which
+# always has it for an LTS branch).
 RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories \
-     && apk add --no-cache ca-certificates tzdata
+     && (apk add --no-cache ca-certificates tzdata ffmpeg \
+     || (sed -i 's|mirrors.aliyun.com|dl-cdn.alpinelinux.org|g' /etc/apk/repositories \
+     && apk add --no-cache ca-certificates tzdata ffmpeg))
 COPY --from=builder /out/go2rtc /usr/local/bin/go2rtc
 COPY go2rtc.yaml /etc/go2rtc.yaml
 

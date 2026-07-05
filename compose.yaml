@@ -100,10 +100,12 @@ services:
       # HTTP API + WebRTC SDP signalling (proxied via dashboard nginx)
       - "127.0.0.1:1984:1984"
       # WebRTC media: TCP ICE + UDP ICE on a single port. Browser
-      # needs direct access for ICE connectivity checks. For LAN
-      # access from other devices, change 127.0.0.1 to 0.0.0.0.
-      - "127.0.0.1:8555:8555"
-      - "127.0.0.1:8555:8555/udp"
+      # needs direct access for ICE connectivity checks. Binding to
+      # 0.0.0.0 (not 127.0.0.1) so the same go2rtc instance is also
+      # reachable from phones/tablets on the LAN. The /go2rtc/
+      # SDP path stays loopback-only because that's just signalling.
+      - "8555:8555"
+      - "8555:8555/udp"
     volumes:
       - ./data/go2rtc:/var/lib/go2rtc
     # Healthcheck so dependent services (api) wait for the HTTP API
