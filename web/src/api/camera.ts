@@ -22,7 +22,7 @@ export async function getCamera(id: number): Promise<Camera> {
     return data;
 }
 
-export async function registerCamera(req: {
+export interface RegisterCameraPayload {
     name: string;
     vendor?: string;
     host: string;
@@ -35,7 +35,11 @@ export async function registerCamera(req: {
     audio?: boolean;
     motion?: boolean;
     profile_token?: string;
-}): Promise<Camera> {
+    /** Opt into ffmpeg-based H.264 transcoding (HEVC → H.264). */
+    transcode?: boolean;
+}
+
+export async function registerCamera(req: RegisterCameraPayload): Promise<Camera> {
     const { data } = await client.post<Camera>("/cameras", req);
     return data;
 }

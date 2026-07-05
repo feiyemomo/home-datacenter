@@ -40,6 +40,13 @@ Event 进入 EventBus，再驱动 WebSocket 推送与 Automation Engine
 详见 [`docs/platformization.md`](docs/platformization.md) 的 Phase 5 一节与
 [`docs/security.md`](docs/security.md) §11。
 
+Phase 6（自动化运行时）将规则引擎升级为可执行的 Runtime：扩展 Condition
+（`source` / `threshold` / `regex` / `any`）、Action（`timeout_ms` / `retry_max`）、
+新增 Throttle（`cooldown_s` / `rate_per_min` / `dedup`）与 Metrics
+（`/metrics`、`/rules/:id/metrics`、`?reset=1`、`/cooldown`），
+每次 fire 还会发布 `automation.fired` 审计事件。详见
+[`docs/platformization.md`](docs/platformization.md) §7。
+
 所有服务都在 `home-net` 内部 Docker 网络中互相通信。默认只把 `80` 和 `8080` 绑定到 `127.0.0.1`，避免直接对外暴露。
 
 ---
@@ -255,7 +262,9 @@ curl -sS -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/cameras
 # {"code":0,"data":[]}
 ```
 
-注册一台海康摄像头：
+注册一台海康摄像头（推荐使用 Dashboard `/cameras/new` 页面，含厂商
+预设、RTSP URL 实时预览、密码可见性切换；底层接口仍是下面的
+`POST /api/v1/cameras`）：
 
 ```bash
 curl -sS -X POST http://localhost:8080/api/v1/cameras \
@@ -360,6 +369,54 @@ curl -sS -X POST http://localhost:8080/api/v1/automation/rules/1/test \
 | `webhook` | HTTP POST 到外部 URL | host 必须是公网 IP；私网 / loopback / link-local 在 fire 时被拒（SSRF 守卫） |
 
 > 安全细节见 [`docs/security.md`](docs/security.md) §11。
+
+### Automation Runtime（Phase 6，管理员 only）
+
+在 Phase 5 的基础上，规则多了 **节流（throttle）**、**超时 / 重试**、**可观测（metrics）** 与 **应急静音** 能力：
+
+- **Condition 扩展**：`source`（精确匹配 Event 来源）、`threshold`（数值比较，如 `{"confidence":{"op":">=","val":0.8}}`）、`regex`（RE2）、`any`（OR 组合）。
+- **Action 扩展**：`timeout_ms`（单次超时，默认 5000ms）、`retry_max`（webhook 专用；4xx 永久失败不重试，5xx / 网络错误指数退避 500ms×2^n，封顶 30s）。
+- **Throttle**：`cooldown_s`（静默窗口）、`rate_per_min`（60s 滑窗）、`dedup`（合并相同事件）。
+- **Metrics**：
+  ```bash
+  curl -sS "http://localhost:8080/api/v1/automation/metrics" -H "Authorization: Bearer $ADMIN_TOKEN"
+  curl -sS "http://localhost:8080/api/v1/automation/metrics?reset=1" -H "Authorization: Bearer $ADMIN_TOKEN"
+  curl -sS "http://localhost:8080/api/v1/automation/rules/1/metrics" -H "Authorization: Bearer $ADMIN_TOKEN"
+  ```
+- **应急静音**（不删除规则，仅临时压制触发）：
+  ```bash
+  curl -sS -X POST "http://localhost:8080/api/v1/automation/rules/1/cooldown" \
+    -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+    -d '{"seconds":3600}'
+  ```
+- **审计事件**：每次 fire 都会在 EventBus 上发 `automation.fired`（rule id、trigger、event id、ok/err、duration_ms），前端 WS 自动收到，可用于活动流。
+
+示例：摄像头在夜间且置信度 ≥ 0.8 时通过 webhook 推送：
+
+```bash
+curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{
+    "name":"夜间高置信度推送",
+    "trigger":"camera",
+    "condition":{
+      "time_gte":"22:00","time_lte":"06:00",
+      "source":"camera",
+      "payload_eq":{"event":"motion"},
+      "threshold":{"confidence":{"op":">=","val":0.8}}
+    },
+    "action":{
+      "type":"webhook",
+      "url":"https://example.com/hook",
+      "method":"POST",
+      "payload":"{\"event\":\"motion\"}",
+      "timeout_ms":3000,
+      "retry_max":2
+    },
+    "throttle":{"cooldown_s":30,"rate_per_min":5,"dedup":true},
+    "enabled": true
+  }'
+```
 
 ---
 

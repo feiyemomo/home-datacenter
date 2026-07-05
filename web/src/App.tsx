@@ -5,6 +5,7 @@ import { Layout } from "@/components/Layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Cameras from "@/pages/Cameras";
+import DeviceCreate from "@/pages/DeviceCreate";
 import Devices from "@/pages/Devices";
 import MqttDebug from "@/pages/MqttDebug";
 import Profile from "@/pages/Profile";
@@ -12,12 +13,13 @@ import Profile from "@/pages/Profile";
 /**
  * Application routes.
  *
- * - /login           public
- * - /dashboard       auth
- * - /cameras         auth (admin for mutating)
- * - /devices         auth
- * - /mqtt            auth + admin
- * - /profile         auth
+ * - /login            public
+ * - /dashboard        auth
+ * - /cameras          auth (admin for mutating)
+ * - /cameras/new      auth + admin (dedicated device-create page)
+ * - /devices          auth
+ * - /mqtt             auth + admin
+ * - /profile          auth
  *
  * A tiny full-screen splash is shown while AuthProvider resolves the
  * initial /user/me probe so route guards see an accurate `isAdmin`.
@@ -44,6 +46,16 @@ export default function App() {
                         <ProtectedRoute>
                             <Layout>
                                 <Cameras />
+                            </Layout>
+                        </ProtectedRoute>
+                    }
+                />
+                <Route
+                    path="/cameras/new"
+                    element={
+                        <ProtectedRoute adminOnly>
+                            <Layout>
+                                <DeviceCreate />
                             </Layout>
                         </ProtectedRoute>
                     }

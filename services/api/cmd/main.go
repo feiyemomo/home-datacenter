@@ -188,6 +188,14 @@ func main() {
 		auth := api.Group("/auth")
 		{
 			auth.POST("/bind", authHandler.Bind)
+			// GET /auth/verify does NOT go through JWTAuth middleware
+			// — it IS the JWT validator. It exists to back nginx's
+			// auth_request on /go2rtc/, gating the previously
+			// unauthenticated go2rtc API + media path with a JWT
+			// (see web/nginx.conf for the auth_request directive).
+			// No auth is required to *call* /auth/verify — you just
+			// need a valid bearer token in the Authorization header.
+			auth.GET("/verify", authHandler.Verify)
 		}
 
 		user := api.Group("/user")
@@ -257,6 +265,14 @@ func main() {
 			automationGroup.PUT("/rules/:id", automationHandler.Update)
 			automationGroup.DELETE("/rules/:id", automationHandler.Delete)
 			automationGroup.POST("/rules/:id/test", automationHandler.Test)
+			// Phase 6: runtime introspection. Global metrics show
+			// total event throughput + drop/error rates; per-rule
+			// metrics are the operator's "is this rule healthy?"
+			// pane. Cooldown is the admin escape hatch for
+			// silencing a misbehaving rule without deleting it.
+			automationGroup.GET("/metrics", automationHandler.Metrics)
+			automationGroup.GET("/rules/:id/metrics", automationHandler.RuleMetrics)
+			automationGroup.POST("/rules/:id/cooldown", automationHandler.Cooldown)
 		}
 	}
 

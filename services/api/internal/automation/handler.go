@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -35,14 +36,15 @@ func NewHandler(db *gorm.DB, eng *Engine, bus *eventbus.Bus) *Handler {
 }
 
 // ruleResponse is the JSON shape returned by all rule endpoints. It
-// mirrors model.Rule but guarantees Condition/Action are always
-// well-formed objects (never null).
+// mirrors model.Rule but guarantees Condition/Action/Throttle are
+// always well-formed objects (never null).
 type ruleResponse struct {
 	ID         uint   `json:"id"`
 	Name       string `json:"name"`
 	Trigger    string `json:"trigger"`
 	Condition  model.Condition `json:"condition"`
 	Action     model.Action    `json:"action"`
+	Throttle   model.Throttle  `json:"throttle"`
 	Enabled    bool   `json:"enabled"`
 	FireCount  uint64 `json:"fire_count"`
 	LastFireAt *int64 `json:"last_fire_at,omitempty"`
@@ -62,6 +64,7 @@ func toResponse(r model.Rule) ruleResponse {
 		Trigger:    r.Trigger,
 		Condition:  r.Condition,
 		Action:     r.Action,
+		Throttle:   r.Throttle,
 		Enabled:    r.Enabled,
 		FireCount:  r.FireCount,
 		LastFireAt: lastFire,
@@ -78,6 +81,7 @@ type createRuleRequest struct {
 	Trigger   string          `json:"trigger"`
 	Condition model.Condition `json:"condition"`
 	Action    model.Action    `json:"action"`
+	Throttle  model.Throttle  `json:"throttle"`
 	Enabled   *bool           `json:"enabled"`
 }
 
@@ -128,6 +132,7 @@ func (h *Handler) Create(c *gin.Context) {
 		Trigger:   req.Trigger,
 		Condition: req.Condition,
 		Action:    req.Action,
+		Throttle:  req.Throttle,
 		Enabled:   true,
 	}
 	if req.Enabled != nil {
@@ -190,14 +195,16 @@ func (h *Handler) Update(c *gin.Context) {
 	if req.Trigger != "" {
 		r.Trigger = req.Trigger
 	}
-	// Condition/Action are structs; zero values mean "not provided",
-	// but since we unmarshal JSON, empty fields stay as their zero
-	// values. We always overwrite with the request body so the user
-	// can clear a condition by sending {}.
+	// Condition/Action/Throttle are structs; zero values mean
+	// "not provided", but since we unmarshal JSON, empty fields
+	// stay as their zero values. We always overwrite with the
+	// request body so the user can clear a condition by sending
+	// {}.
 	r.Condition = req.Condition
 	if req.Action.Type != "" {
 		r.Action = req.Action
 	}
+	r.Throttle = req.Throttle
 	if req.Enabled != nil {
 		r.Enabled = *req.Enabled
 	}
@@ -303,3 +310,87 @@ func validateAction(a model.Action) error {
 type errAction string
 
 func (e errAction) Error() string { return string(e) }
+
+// Metrics returns the global engine counters + per-rule stats.
+//
+//	GET /api/v1/automation/metrics        Snapshot of the engine
+//	GET /api/v1/automation/metrics?reset=1  Reset all counters (admin-only)
+//
+// Per-rule stats are keyed by rule ID; pair them with the rule
+// name from /api/v1/automation/rules for human-friendly output.
+func (h *Handler) Metrics(c *gin.Context) {
+	if c.Query("reset") == "1" {
+		h.Engine.Metrics().Reset()
+		utils.Success(c, gin.H{"reset": true})
+		return
+	}
+	utils.Success(c, h.Engine.Metrics().Snapshot())
+}
+
+// RuleMetrics returns the per-rule slice of metrics, augmented with
+// the rule's name and last_fire timestamp from the DB.
+//
+//	GET /api/v1/automation/rules/:id/metrics
+func (h *Handler) RuleMetrics(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var r model.Rule
+	if err := h.DB.First(&r, id).Error; err != nil {
+		utils.Fail(c, http.StatusNotFound, "rule not found")
+		return
+	}
+	snap := h.Engine.Metrics().Snapshot()
+	rm := snap.PerRule[r.ID]
+	if rm == nil {
+		// Rule exists in DB but has never fired. Surface an
+		// empty stats object so the UI doesn't have to handle
+		// the missing case.
+		rm = &RuleMetrics{}
+	}
+	out := gin.H{
+		"id":         r.ID,
+		"name":       r.Name,
+		"trigger":    r.Trigger,
+		"enabled":    r.Enabled,
+		"fire_count": r.FireCount, // persistent total
+		"runtime":    rm,          // in-memory slice
+	}
+	if r.LastFireAt != nil {
+		out["last_fire_at"] = r.LastFireAt.Unix()
+	}
+	utils.Success(c, out)
+}
+
+// Cooldown temporarily pins a rule's last-fire timestamp to "now",
+// effectively silencing it for the requested number of seconds.
+// This is an admin escape hatch for silencing a misbehaving rule
+// without deleting it.
+//
+//	POST /api/v1/automation/rules/:id/cooldown
+//	body: {"seconds": 3600}
+func (h *Handler) Cooldown(c *gin.Context) {
+	id, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var body struct {
+		Seconds int `json:"seconds"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if body.Seconds <= 0 || body.Seconds > 86400 {
+		utils.Fail(c, http.StatusBadRequest, "seconds must be between 1 and 86400")
+		return
+	}
+	if err := h.Engine.PinCooldown(uint(id), time.Duration(body.Seconds)*time.Second); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"id": id, "cooldown_s": body.Seconds})
+}

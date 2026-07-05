@@ -1,6 +1,6 @@
 # Camera Platformization (Phase 4) + Event-Driven System (Phase 5)
 
-> Status: ✅ Implemented — 2026-07-04 (Phase 4), 2026-07-05 (Phase 5)
+> Status: ✅ Implemented — 2026-07-04 (Phase 4), 2026-07-05 (Phase 5), 2026-07-05 (Phase 7: ffmpeg opt-in, HLS tuning, nginx auth_request fix)
 
 This document describes the camera module: how a network camera becomes
 a first-class **Device** in the Home Datacenter platform, how live
@@ -182,9 +182,93 @@ The handler returns three URLs in the `stream` field:
 
 | URL | Use |
 |-----|-----|
-| `hls_url`    | Primary: hls.js plays HEVC/H.264 in any modern browser, works through HTTP-only tunnels |
-| `webrtc_url` | Fallback: SDP exchange, sub-200ms latency, LAN-only (needs UDP) |
+| `webrtc_url` | **Primary (Phase 6+).** Sub-200ms latency, p2p UDP/TCP ICE. go2rtc returns 3 UDP + 1 TCP candidates from its `webrtc.candidates` list (defaults to 127.0.0.1:8555 + LAN + STUN-reflected). ICE/DTLS completes in <1s on a healthy link. |
+| `hls_url`    | **Fallback.** Works through HTTP-only tunnels and **decodes H.265/HEVC in every modern browser via fMP4/MSE** (Chrome on Windows requires the "HEVC Video Extensions" Microsoft Store plugin; Firefox/Linux Chrome never decode HEVC). 1-3s latency (segment length). |
 | `stream_name`| Lookup key in go2rtc — **the user-entered friendly name** (e.g. `"前门"`); non-ASCII is URL-escaped on the wire |
+
+#### Why HLS is the fallback despite being slower
+
+WebRTC is technically the lower-latency transport, but it has a
+**hard browser limitation for HEVC cameras on Windows/Chrome**: Chrome
+*can* decode H.265 via the MSE/fMP4 path (HLS), but it does **not**
+recognise the H.265 RTP payload format (`video/H265`, RFC 7798) that
+go2rtc offers in the WebRTC SDP answer. The browser completes ICE
+and DTLS, RTP packets flow, but `framesDecoded = 0` because the
+decoder rejects the codec.
+
+**Workarounds**, in order of operator preference:
+
+1. **Live with the fallback.** The dashboard's `LiveVideo` always
+   tries WebRTC first; on codec failure (no frames within ~1s after
+   the track arrives), it tears down the peer connection and remounts
+   the same tile with HLS. The user sees an H.265 stream at HLS
+   latency. This is the current default and what the rest of this
+   section assumes.
+2. **Use a browser with native H.265 WebRTC decode.** Safari on
+   Apple Silicon decodes H.265 in hardware and accepts the same SDP.
+   If the operator can constrain which browser is used to view the
+   dashboard (e.g. an iPad kiosk), WebRTC works at sub-200ms latency
+   with zero transcoding cost.
+3. **Re-introduce ffmpeg in go2rtc** and force the source to
+   `rtsp://...#video=h264`. go2rtc transcodes H.265 → H.264 on the
+   fly and Chrome happily decodes it via WebRTC. Cost: ~30 MB image
+   bloat, ~50% of one CPU core per 1080p H.265 stream.
+
+The dashboard does **not** try option 3 because the project
+deliberately excludes ffmpeg from the go2rtc image (see
+`deploy/go2rtc/Dockerfile` — "We deliberately do NOT install
+ffmpeg"). Operators who need WebRTC on H.265 cameras on Windows
+should switch to option 1 (current behaviour) or option 2
+(Safari/Apple Silicon).
+
+#### Why HLS works for H.265 but WebRTC doesn't
+
+`MediaSource.isTypeSupported('video/mp4; codecs="hvc1.1.6.L153.B0"')`
+returns `true` in Chrome when the "HEVC Video Extensions" plugin is
+installed (and on Safari / Edge-with-HEVC out of the box). HLS uses
+this MSE path.
+
+WebRTC's RTP stack uses a separate codec registry that only
+recognises the H.264/VP8/VP9/AV1 RTP payload formats. The H.265 RTP
+payload format (RFC 7798) is registered with `video/H265` in the
+SDP, but Chrome's WebRTC implementation does not include an H.265
+decoder on the WebRTC side. (The same is true for Firefox.)
+
+The **fMP4 container** (`segment.m4s`) is required for H.265 in HLS
+because `hls.js`'s TS demuxer has weak HEVC support and silently
+drops frames even when MSE would accept them. The API's HLS URL
+builder appends `&mp4=` to force the fMP4 mode (see
+`internal/camera/registry.go` `StreamConfig`).
+
+#### WebRTC infrastructure (always wired up)
+
+Even when the camera is HEVC and the operator uses Chrome, the
+WebRTC path is fully implemented and tested end-to-end:
+
+- **go2rtc** listens on TCP and UDP `:8555` (verified via
+  `netstat -tunlp` inside the container). The 1.9.5 release binds
+  both transports only with `webrtc.listen: ":8555"` — the
+  split-into-`/tcp` + `udp: ":8555"` form silently drops UDP.
+- **SDP candidates** are configured via `webrtc.candidates: [127.0.0.1:8555]`
+  in `go2rtc.yaml`. Without this, go2rtc advertises the Docker
+  bridge IP (e.g. `172.19.0.3:8555`) and the STUN-reflected public
+  IP; the former is unreachable from a host browser, the latter
+  needs UDP port forwarding that home routers almost never do.
+- **Compose port mapping** is `0.0.0.0:8555:8555` (TCP+UDP), not
+  `127.0.0.1`, so the same go2rtc instance is also reachable from
+  phones/tablets on the LAN.
+- **`useWebRTCStream.ts` waits for ICE gathering to complete**
+  (up to 3s) before POSTing the SDP offer, so all host + STUN
+  candidates are in the offer. Without this, the offer ships with
+  only the first host candidate — usually the Docker bridge IP —
+  and the connection dies even though a 127.0.0.1:8555 candidate
+  would have arrived 200ms later.
+- **Fallback only triggers on `connectionState: failed/closed`**.
+  The browser briefly reports `iceConnectionState: failed` as it
+  cycles through candidate pairs, and treating that transient as
+  fatal would tear down a connection that's about to stabilise.
+  The hook logs the transient state to `console.debug` but does
+  not surface it as an error.
 
 These URLs are derived from the `camera.webrtc_public_base` config
 key. When blank, the API returns the in-network Docker hostname
@@ -196,12 +280,14 @@ path, same-origin, no CORS). For Cloudflare Tunnel access use
 
 The HLS URL responds with a master playlist. The browser follows
 the relative media-playback URL inside it. HLS sessions on go2rtc
-live ~5 seconds past the last segment request, so the media
-playlist must be fetched promptly.
+live ~30 seconds past the last segment request (we patched the
+upstream 5s to 30s in `deploy/go2rtc/Dockerfile` — HEVC segments
+are ~1.4 MB at 22 Mbps and take >5s to deliver on a <2.5 Mbps
+link), so the media playlist must be fetched promptly.
 
-For WebRTC fallback, hit `webrtc_url` with a `POST` whose body is
-your SDP offer and `Content-Type: application/sdp`; the response is
-the SDP answer.
+For WebRTC, hit `webrtc_url` with a `POST` whose body is your SDP
+offer and `Content-Type: application/sdp`; the response is the
+SDP answer.
 
 > **Stream key = friendly name.** `Registry.Register` uses the
 > dashboard's `name` field (e.g. "前门", "backyard") as the go2rtc
@@ -271,6 +357,27 @@ a native `<video>` element (Safari) or an hls.js-backed MSE source
 (typically "your browser can't decode H.265") so the UI can render
 a clear message instead of stalling silently.
 
+### HLS startup tuning (Phase 7)
+
+go2rtc's upstream HLS default is `segment: 6, window: 3` (six-
+second segments, three-segment window). On the home network with
+~22 Mbps HEVC cameras, that means the operator sees a spinner for
+~6s before the first frame — most of that wait is "go2rtc hasn't
+finished writing a single segment yet." We tune the HLS server
+in `deploy/go2rtc/go2rtc.yaml` to:
+
+| Key | Value | Why |
+|---|---|---|
+| `hls.segment` | 2s | First frame lands in ~1-2s instead of ~6s. Cameras are bandwidth-stable on the LAN, so a smaller segment doesn't hurt recovery. |
+| `hls.partial` | true | Splits each 2s segment into ~200ms parts; hls.js can start decoding the first part before the segment is fully written. Sub-second time-to-first-frame on healthy streams. |
+| `hls.window` | 4 | 4 × 2s = 8s of forward-buffered segments; absorbs a 2-3s home-api GC pause without forcing a playlist refetch. |
+
+The front-end stall watchdog in `useHLSStream.ts` was tightened
+from 45s to 20s to match: a healthy stream now reaches `playing`
+in ~1-2s, so a 20s watchdog is plenty of headroom for cold-RTSP-
+producer scenarios, while a genuinely broken session surfaces an
+error to the user in 20s instead of 45s.
+
 ```tsx
 import Hls from "hls.js";
 import { useEffect, useRef } from "react";
@@ -304,14 +411,72 @@ go2rtc's HLS endpoint defaults to **passthrough**: an HEVC
 source stays HEVC in the m3u8 (`CODECS="hvc1.1.6.L153.B0"`).
 What a typical user actually sees with each browser:
 
-| Browser | HEVC decode | Required action |
-|---|---|---|
-| Safari (macOS / iOS) | Yes (hardware) | None — works out of the box |
-| Edge (current, Windows 11) | Yes | None — built in |
-| Chrome on macOS Apple Silicon | Yes (hardware) | None — works out of the box |
-| Chrome on Windows 11 | Yes **only with extension** | Install "HEVC Video Extensions" from the Microsoft Store (free tier works for decode) |
-| Chrome on Linux | No | **Will not work** — no HEVC path |
-| Firefox (any OS) | No | **Will not work** — Mozilla has not licensed HEVC |
+#### Per-transport browser matrix
+
+The HEVC story is **transport-specific**: a browser may decode
+HEVC fine for `<video src="…mp4">` and for hls.js/MSE while
+*still* failing to decode the same HEVC stream over WebRTC. The
+two paths use different decoder registries (MSE via the system
+codec, WebRTC via the browser's RTP stack), so the table below
+splits them.
+
+| Browser | MSE/HLS HEVC | WebRTC HEVC | Result for an HEVC camera |
+|---|---|---|---|
+| Safari (macOS / iOS) | Yes (hardware) | Yes (hardware) | WebRTC primary, sub-200ms latency |
+| Edge (Windows 11) | Yes (OS extension) | **No** — Chromium WebRTC codec registry does not include H.265 | WebRTC connects, `framesDecoded=0`, dashboard auto-fallback to HLS |
+| Edge (macOS / Linux) | No | No | HLS fails too; "cannot decode H.265" error |
+| Chrome on macOS Apple Silicon | Yes (hardware) | **No** — same as Edge | WebRTC fallback to HLS |
+| Chrome on Windows 11 | Yes with "HEVC Video Extensions" | No | WebRTC fallback to HLS; HLS works after extension install |
+| Chrome on Linux | No | No | HLS fails too; "cannot decode H.265" error |
+| Firefox (any OS) | No | No | HLS fails too; "cannot decode H.265" error |
+| Chrome / WebView on Android | Yes (Android 9+ MediaCodec, vendor-dependent) | **No** — Chromium WebRTC codec registry does not include H.265 | WebRTC fallback to HLS; HLS works on most modern devices |
+| iOS native WebView (WKWebView) | Yes (hardware) | Yes (hardware, same as Safari) | WebRTC primary |
+
+Why the asymmetry: WebRTC's RTP stack uses a separate codec
+registry (the WebRTC "stack codec" set) that only includes
+H.264 / VP8 / VP9 / AV1. RFC 7798's `video/H265` is registered
+in the SDP, but **Chromium-derivatives (Chrome, Edge, WebView) do
+not route that to the system HEVC decoder on the WebRTC side**.
+The MSE path *does* route to the system decoder, which is why
+the same browser happily plays the HLS variant. The same is true
+for Firefox (no HEVC at all on either path). Safari is the only
+desktop-or-mobile browser that wires system HEVC into both
+pipelines.
+
+Operator-facing consequences:
+
+- **The dashboard always shows *something*.** The Phase 6
+  fallback in `LiveVideo.tsx` switches to HLS on the first
+  HEVC-decoder failure, so an HEVC camera on Chrome/Edge/Android
+  ends up on HLS within ~1s of the first frame arriving
+  (connection state never goes to "failed" — the connection
+  succeeds, but `framesDecoded` stays 0 and the `<video>` element
+  never fires `playing`; the hook's stall watchdog flips the path
+  to HLS). Users do not see a black tile.
+- **The fallback badge in the corner flips from "WebRTC" to "HLS"**
+  as the tile remounts. If you need WebRTC for an HEVC camera on
+  a non-Apple platform, you have two options:
+  (a) **Per-camera ffmpeg transcode** — turn on the
+  `transcode` toggle in the camera register form (or
+  `POST /api/v1/cameras` with `"transcode": true`). The
+  registry appends `#video=h264` to the RTSP URL, go2rtc routes
+  the source through ffmpeg, and WebRTC receives a clean H.264
+  stream that Chrome / Edge / Android can decode natively.
+  ffmpeg is now part of the go2rtc image (~30 MB on top of
+  the existing footprint, only consumes CPU for cameras with
+  the flag on). The Dashboard shows a small "x264" badge next
+  to the camera name so the operator can see at a glance which
+  cameras are paying the transcode cost.
+  (b) Swap the camera for an H.264 model.
+- **Android app, when shipped, will hit the same behaviour as
+  Chrome-on-Android.** If the app uses the platform `WebView`
+  (default for most cross-platform stacks), WebRTC will fall
+  back to HLS for HEVC cameras. If the app embeds a real
+  Chromium (e.g. `flutter_inappwebview` with hardware
+  acceleration), the same applies. The only path that gives
+  WebRTC sub-200ms on Android for HEVC is a fully native WebRTC
+  client with Android's `MediaCodec` HEVC decoder wired into
+  the WebRTC stack — out of scope for the current web dashboard.
 
 The hook probes `video.canPlayType('video/mp4; codecs="hvc1.1.6.L153.B0"')`
 up front and short-circuits with a clear "Browser cannot
@@ -645,14 +810,219 @@ curl -X POST http://localhost:8080/api/v1/automation/rules \
   between create and fire.
 - **All rule CRUD endpoints are admin-only** via `middleware.RequireAdmin`.
 
+---
+
+## 7. Automation Runtime (Phase 6)
+
+Phase 5 wired the basic rule engine. Phase 6 turns it into a
+**runtime**: rules now have richer conditions, configurable actions
+with retries and timeouts, per-rule throttle, in-memory metrics, and
+admin escape hatches for silencing a misbehaving rule. The goal is a
+system you can deploy unattended — flapping sensors, slow webhooks,
+and event floods must not bring the engine down or hammer external
+services.
+
+### 7.1 Architecture (unchanged shape, deeper internals)
+
+```
+EventBus (subscribe "*")
+    │
+    ▼
+Engine.handleEvent
+    │  ─ per-rule fan-out, O(rules) per event
+    │  ─ Throttle:  cooldown / rate limit / dedup
+    ▼
+Condition.eval              ── time / source / payload_eq / threshold / regex / Any(OR)
+    │
+    ▼
+Action.execute              ── notify | mqtt | webhook
+    │  ─ per-action timeout (default 5s)
+    │  ─ webhook: retry with exponential backoff (4xx is permanent)
+    ▼
+Metrics.RecordFire          ── atomic counters + per-rule runtime
+    │
+    ▼
+Publish "automation.fired"  ── audit event for UI / external log
+```
+
+The engine keeps an in-memory copy of all enabled rules plus a
+per-rule runtime (last-fire, recent-fires sliding window, last-seen
+event hash for dedup) so the hot path is allocation-free. CRUD
+endpoints call `engine.Reload()` after every mutation.
+
+### 7.2 Enriched `Condition`
+
+```json
+{
+  "time_gte":   "22:00",                        // 24h "HH:MM"
+  "time_lte":   "06:00",                        // wraps midnight if gte > lte
+  "source":     "camera",                       // exact match on Event.Source
+  "payload_eq": { "status": "offline" },        // JSON-normalised equality
+  "threshold":  { "confidence": { "op": ">", "val": 0.8 } },
+  "regex":      { "device_id": "^cam_[0-9]+$" },
+  "any":        false                           // true = OR, default = AND
+}
+```
+
+| Field        | Semantics |
+|--------------|-----------|
+| `time_gte/lte` | "HH:MM" bounds; `gte > lte` wraps midnight |
+| `source`       | exact match — `mqtt` / `ws` / `system` / `camera` / `automation` / `test` |
+| `payload_eq`   | each top-level payload field is JSON-normalised and compared; missing keys fail |
+| `threshold`    | numeric comparison; payload field must coerce to a number |
+| `regex`        | RE2 pattern; non-string fields fail |
+| `any`          | combines the rest with OR (default AND); no fields = match all |
+
+**Example: high-confidence camera motion at night**
+
+```json
+{
+  "time_gte":  "22:00",
+  "time_lte":  "06:00",
+  "source":    "camera",
+  "payload_eq":{ "event": "motion" },
+  "threshold": { "confidence": { "op": ">=", "val": 0.8 } }
+}
+```
+
+### 7.3 Enriched `Action`
+
+```json
+{
+  "type":        "webhook",
+  "url":         "https://example.com/hook",
+  "method":      "POST",                  // default POST
+  "headers":     { "Authorization": "Bearer xxx" },
+  "payload":     "{\"event\":\"motion\"}", // body (defaults to event payload)
+  "timeout_ms":  3000,                    // per-attempt; default 5000
+  "retry_max":   3                        // total attempts = 1 + retry_max
+}
+```
+
+Retry policy for `webhook` only:
+
+- 4xx response → **permanent** error, no retry.
+- 5xx, network error, timeout → **retry** with backoff
+  `500ms × 2^n` capped at 30s.
+- `notify` and `mqtt` are not retried: `notify` is an in-process
+  EventBus publish (best-effort, the Hub already dedups downstream),
+  and `mqtt` is delegated to the broker which has its own QoS
+  guarantees.
+
+### 7.4 `Throttle` (event-flood protection)
+
+```json
+{
+  "cooldown_s":   30,        // silent for N seconds after a fire
+  "rate_per_min": 5,         // max fires in a 60s sliding window
+  "dedup":        true       // collapse identical events (same topic+source+payload)
+}
+```
+
+All three checks run before the action. The hot path keeps:
+
+- `lastFire`        — for cooldown
+- `fireHistory`     — circular buffer for rate limit (cap 256)
+- `lastEventKey`    — SHA-256 prefix of topic+source+payload for dedup
+
+`RecordFire` mutates all three. `throttleAllows` returns `(false,
+reason)`; dropped events are logged + counted in metrics.
+
+### 7.5 Metrics (admin-only)
+
+The engine maintains a `Metrics` struct with `sync/atomic` counters
+and a mutex-guarded per-rule map. No external dependency (no
+Prometheus client) — this is a home OS, the operator reads it via
+the admin UI or the audit event stream.
+
+| Endpoint                                          | Purpose |
+|---------------------------------------------------|---------|
+| `GET  /api/v1/automation/metrics`                 | Global counters + per-rule map |
+| `GET  /api/v1/automation/metrics?reset=1`         | Reset all counters (admin only) |
+| `GET  /api/v1/automation/rules/:id/metrics`       | Per-rule slice (Fires, Errors, Dropped, AvgMs, MaxMs) |
+
+**Global metrics shape:**
+
+```json
+{
+  "events_seen":     1234,
+  "fires":           57,
+  "errors":          2,
+  "dropped":         8,
+  "avg_duration_ms": 12.3,
+  "max_duration_ms": 4300,
+  "started_at":      "2026-07-05T07:00:00Z",
+  "uptime_seconds":  9000,
+  "per_rule": {
+    "5": { "Fires": 50, "Errors": 0, "Dropped": 5, "AvgMs": 10, "MaxMs": 200 }
+  }
+}
+```
+
+### 7.6 Admin escape hatches
+
+- **`POST /api/v1/automation/rules/:id/cooldown`** — set
+  `lastFire = now - seconds`, silencing the rule for the requested
+  window without deleting it. Handy when a downstream webhook is
+  down and a rule is firing on every event.
+- **`POST /api/v1/automation/rules/:id/test`** — fire the action
+  synchronously with a synthetic event. Does **not** increment
+  `fire_count` (it would distort the persistent counter for
+  operator review).
+
+### 7.7 Audit event
+
+Every fire publishes `automation.fired` to the EventBus with the
+full context: rule id/name, trigger, event id, ok/err, duration_ms.
+The WebSocket Hub already forwards it to subscribed clients, so the
+dashboard can render a live "rule activity" feed without polling.
+
+### 7.8 Verified behaviour (E2E)
+
+The following were verified against the live stack on 2026-07-05:
+
+| Scenario                         | Result | Evidence                                  |
+|----------------------------------|--------|-------------------------------------------|
+| Rule with empty condition        | fires  | every EventBus event matches               |
+| `payload_eq` filter              | fires  | MQTT `status=online` → `device-online-notify` rule fires |
+| `cooldown_s` + `rate_per_min`    | throttled | 5 events / 1s → 2 fires, 9 dropped         |
+| Webhook to `127.0.0.1`           | blocked | `action failed: webhook host 127.0.0.1 is private/loopback/link-local` |
+| Webhook to `169.254.169.254`     | blocked | `webhook host ... is private/loopback/link-local` |
+| Webhook to public IP             | passes | SSRF check passes; HTTP error is reported as a fire error |
+| MQTT topic `home-datacenter/...` | allowed | CRUD + fire both pass                      |
+| MQTT topic `$SYS/...`            | rejected | CRUD returns 400                           |
+| MQTT topic `other-ns/...`        | rejected | CRUD returns 400                           |
+| `?reset=1`                       | zeros counters | snapshot shows `events_seen=0, fires=0`     |
+| `cooldown` endpoint              | pins `lastFire` | rule 5 silenced for 3600s                |
+
+Unit tests in `internal/automation/engine_test.go` cover
+`triggerMatches`, `timeInRange` (including midnight wrap),
+`conditionMatches` (payload_eq + malformed payload),
+`isAllowedMQTTTopic`, and `isPublicIP` (loopback, private,
+link-local, unspecified, v6).
+
+### 7.9 Operational notes
+
+- **Reload is eager**: any CRUD operation calls `engine.Reload()`
+  synchronously. A spike of 100 creates will trigger 100 reloads —
+  acceptable for a home dashboard where rule count is in the
+  dozens, but a batch-import endpoint should consider deferring.
+- **Per-rule runtime is in-memory**: a container restart resets
+  cooldowns. The `fire_count` and `last_fire_at` in SQLite are
+  durable but are only updated on actual fires, not on
+  engine-state changes.
+- **Metrics are process-local**: the `Reset` button resets the
+  container's view only. There is no cluster-wide aggregation —
+  this is a single-node home OS, not a SaaS.
+
 ## Next Steps (Future Extensions)
 
-- **Persistence**: rules are already SQLite-backed; consider a rule
-  import/export endpoint for backup.
-- **Templating**: action bodies could support Go templates
+- **Rule templating**: action bodies with Go templates
   (`{{.event.topic}}`, `{{.event.payload.status}}`) for dynamic
   payloads. Currently static.
-- **Rate limiting**: per-rule cooldown to prevent runaway firing on
-  flapping cameras.
-- **AI Layer**: a future subscriber on `*` could feed events into an
-  LLM for anomaly detection or natural-language summaries.
+- **Per-rule audit log**: persist `automation.fired` events to
+  SQLite for a durable history (currently EventBus-only, in-process).
+- **AI Layer**: a future subscriber on `*` could feed events into
+  an LLM for anomaly detection or natural-language summaries.
+- **Rule import/export**: backup and version-control rules as
+  YAML/JSON.

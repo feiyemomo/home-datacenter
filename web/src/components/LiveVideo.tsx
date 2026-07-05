@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
+import { useWebRTCStream } from "@/hooks/useWebRTCStream";
 import { useHLSStream } from "@/hooks/useHLSStream";
 import { ptzMove, gotoPreset } from "@/api/camera";
 import type { Camera, CameraEventMessage, CameraStatusEvent, WsMessage } from "@/types";
@@ -18,18 +19,50 @@ interface LiveVideoProps {
 /**
  * LiveVideo — one camera: video pane + PTZ pad + preset bar.
  *
+ * Streaming strategy (Phase 6)
+ * ---------------------------
+ *
+ *   1. WebRTC (primary). Lowest latency. We always try this first.
+ *   2. HLS (fallback). If WebRTC fails (SDP 5xx, ICE, codec, or any
+ *      other error), we tear down the WebRTC peer connection and
+ *      remount with hls.js bound to the HLS URL. HLS requires an
+ *      HEVC-capable browser (see docs/platformization.md
+ *      "Browser / Codec requirement"); if HLS also fails we surface
+ *      the error and offer Retry.
+ *
+ * The two paths live in independent <WebRTCVideo> / <HLSVideo>
+ * sub-components so React unmounts one when the other takes over —
+ * a fresh hook tree is the only way to guarantee a clean state
+ * transition between two independent playback engines (each owns
+ * its own videoRef and pc/hls instance). Unmounting causes a
+ * brief black flash, which is acceptable because fallback is a
+ * recovery path, not a routine mode.
+ *
  * Online status is updated either from the camera row's `status`
- * field (initial render) or from the WebSocket
- * "device.<id>.status" event the parent routes in via onWsMessage.
+ * field (initial render) or from the WebSocket "device.<id>.status"
+ * event the parent routes in via onWsMessage.
+ *
+ * Recording playback (NOT in this component) uses useHLSStream
+ * directly with the recording's per-segment m3u8 URL.
  */
 export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
-    // The hook owns the videoRef; attaching the <video> to a
-    // different ref here (e.g. our own useRef) would leave the
-    // hook's internal ref null and the hook would fail with
-    // "video element not mounted". Use the one the hook returns.
-    const { videoRef, state, error, retry } = useHLSStream({
-        src: camera.stream.hls_url,
-    });
+    // Path drives which sub-component is mounted. We start on
+    // WebRTC and flip to HLS on the primary's onError.
+    const [path, setPath] = useState<"webrtc" | "hls">("webrtc");
+    // Generation counter increments on every retry; changing it
+    // forces a remount of the active sub-component.
+    const [generation, setGeneration] = useState(0);
+
+    function retry() {
+        setGeneration((g) => g + 1);
+    }
+
+    // Reset to WebRTC on camera change (e.g. operator switched
+    // tiles). The next render of LiveVideo remounts both hooks.
+    useEffect(() => {
+        setPath("webrtc");
+        setGeneration(0);
+    }, [camera.id]);
 
     const [status, setStatus] = useState<"online" | "offline" | "unknown">(camera.status);
     const [lastSeen, setLastSeen] = useState(camera.last_seen_at);
@@ -99,10 +132,22 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
     return (
         <Card className="overflow-hidden">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-base font-semibold text-slate-100">
+                <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-100">
                     {camera.name}
+                    {camera.transcode && (
+                        <Badge
+                            variant="info"
+                            className="text-[9px]"
+                            title="Server-side H.264 transcoding via ffmpeg (HEVC → H.264). Costs CPU on the home-api host."
+                        >
+                            x264
+                        </Badge>
+                    )}
                 </CardTitle>
                 <div className="flex items-center gap-2">
+                    <Badge variant="outline" className="text-[10px]">
+                        {path === "webrtc" ? "WebRTC" : "HLS"}
+                    </Badge>
                     <Badge variant="outline" className={cn("ring-1 ring-inset", statusColor)}>
                         <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-current" />
                         {status}
@@ -114,41 +159,24 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
             </CardHeader>
             <CardContent className="space-y-3 p-0">
                 <div className="relative aspect-video w-full bg-black">
-                    <video
-                        ref={videoRef}
-                        autoPlay
-                        playsInline
-                        muted
-                        controls
-                        className="h-full w-full object-contain"
-                    />
+                    {path === "webrtc" ? (
+                        <WebRTCVideo
+                            key={`webrtc-${generation}`}
+                            streamName={camera.stream.stream_name}
+                            webrtcUrl={camera.stream.webrtc_url}
+                            onFallback={() => setPath("hls")}
+                        />
+                    ) : (
+                        <HLSVideo
+                            key={`hls-${generation}`}
+                            src={camera.stream.hls_url}
+                            onRetry={retry}
+                        />
+                    )}
                     {eventToast && (
                         <div className="absolute right-2 top-2 rounded-md bg-rose-500/80 px-2 py-1 text-xs font-semibold text-white shadow-lg">
                             {eventToast}
                         </div>
-                    )}
-                    {state === "loading" && (
-                        <Overlay>
-                            <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                            loading HLS stream
-                        </Overlay>
-                    )}
-                    {state === "error" && (
-                        <Overlay>
-                            <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
-                            <p className="px-4 text-center text-sm text-slate-200">
-                                {error ?? "playback failed"}
-                            </p>
-                            <Button
-                                size="sm"
-                                variant="outline"
-                                className="mt-2"
-                                onClick={retry}
-                            >
-                                <RefreshCw className="mr-1 h-3 w-3" />
-                                Retry
-                            </Button>
-                        </Overlay>
                     )}
                 </div>
 
@@ -261,6 +289,124 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                 </div>
             </CardContent>
         </Card>
+    );
+}
+
+/**
+ * WebRTCVideo — wraps useWebRTCStream in a sub-component so its
+ * lifecycle is fully decoupled from HLSVideo's. When the parent
+ * switches to HLS, React unmounts this component, the
+ * RTCPeerConnection closes, and the next mount is a clean slate.
+ */
+function WebRTCVideo({
+    streamName,
+    webrtcUrl,
+    onFallback,
+}: {
+    streamName: string;
+    webrtcUrl: string;
+    onFallback: () => void;
+}) {
+    const { videoRef, state, error } = useWebRTCStream({
+        streamName,
+        webrtcUrl,
+    });
+    useEffect(() => {
+        if (state === "error") onFallback();
+    }, [state, onFallback]);
+    return (
+        <VideoSurface videoRef={videoRef} state={state} error={error} label="WebRTC" />
+    );
+}
+
+/**
+ * HLSVideo — same pattern as WebRTCVideo, but for the hls.js
+ * fallback. Retry is exposed because the parent owns the
+ * generation counter (it decides when to remount).
+ */
+function HLSVideo({
+    src,
+    onRetry,
+}: {
+    src: string;
+    onRetry: () => void;
+}) {
+    const { videoRef, state, error, retry } = useHLSStream({ src });
+    return (
+        <VideoSurface
+            videoRef={videoRef}
+            state={state === "idle" ? "loading" : state}
+            error={error}
+            label="HLS"
+            onRetry={state === "error" ? () => { retry(); onRetry(); } : undefined}
+        />
+    );
+}
+
+/**
+ * VideoSurface — the shared <video> + state overlay layout. Both
+ * sub-components render this so the surrounding chrome is
+ * identical regardless of which transport is active.
+ */
+function VideoSurface({
+    videoRef,
+    state,
+    error,
+    label: _label,
+    onRetry,
+}: {
+    videoRef: React.RefObject<HTMLVideoElement>;
+    state: "idle" | "loading" | "fetching-ice" | "connecting" | "playing" | "fallback" | "error";
+    error: string | null;
+    label: string;
+    onRetry?: () => void;
+}) {
+    // Map underlying hook states to the three states VideoSurface
+    // knows about (loading / playing / error). "idle",
+    // "fetching-ice", "connecting" all mean "we're not playing
+    // yet and haven't errored".
+    const viewState: "loading" | "playing" | "error" =
+        state === "playing" || state === "fallback"
+            ? "playing"
+            : state === "error"
+                ? "error"
+                : "loading";
+    return (
+        <>
+            <video
+                ref={videoRef}
+                autoPlay
+                playsInline
+                muted
+                controls
+                className="h-full w-full object-contain"
+            />
+            {viewState === "loading" && (
+                <Overlay>
+                    <Loader2 className="mr-2 h-5 w-5 animate-spin" />
+                    loading live stream
+                </Overlay>
+            )}
+            {viewState === "error" && (
+                <Overlay>
+                    <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
+                    <p className="px-4 text-center text-sm text-slate-200">
+                        {error ?? "playback failed"}
+                    </p>
+                    {onRetry && (
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            className="mt-2"
+                            onClick={onRetry}
+                        >
+                            <RefreshCw className="mr-1 h-3 w-3" />
+                            Retry
+                        </Button>
+                    )}
+                </Overlay>
+            )}
+        </>
     );
 }
 

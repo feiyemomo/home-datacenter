@@ -1,6 +1,45 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getIceConfig } from "@/api/camera";
+import { authedFetch } from "@/api/client";
 import type { IceConfig } from "@/types";
+
+/**
+ * waitForIceGathering — resolve once the browser has finished
+ * gathering ICE candidates for `pc`, or `timeoutMs` elapses.
+ *
+ * The browser enumerates host candidates immediately, but STUN-
+ * reflected and relay candidates require a round trip to the STUN
+ * server. If we POST the SDP offer before that round trip completes,
+ * the SDP lacks the late-arriving candidates and the offer only
+ * contains the host candidates — which are useless when the host
+ * is on a private subnet (e.g. Docker bridge 172.x.x.x).
+ *
+ * Most browsers finish gathering in 100-500ms on a healthy network;
+ * the default 3000ms timeout is generous enough to cover slow STUN
+ * servers but short enough to keep the fallback path responsive.
+ */
+function waitForIceGathering(
+    pc: RTCPeerConnection,
+    timeoutMs: number,
+): Promise<void> {
+    if (pc.iceGatheringState === "complete") {
+        return Promise.resolve();
+    }
+    return new Promise((resolve) => {
+        const onChange = () => {
+            if (pc.iceGatheringState === "complete") {
+                pc.removeEventListener("icegatheringstatechange", onChange);
+                window.clearTimeout(timer);
+                resolve();
+            }
+        };
+        const timer = window.setTimeout(() => {
+            pc.removeEventListener("icegatheringstatechange", onChange);
+            resolve();
+        }, timeoutMs);
+        pc.addEventListener("icegatheringstatechange", onChange);
+    });
+}
 
 /**
  * useWebRTCStream — single-camera WebRTC viewer.
@@ -109,8 +148,38 @@ export function useWebRTCStream(
                         setState("playing");
                     }
                 };
+                pc.oniceconnectionstatechange = () => {
+                    // We intentionally DO NOT treat iceConnectionState
+                    // 'failed' as a terminal error here. The browser
+                    // briefly reports 'failed' as it cycles through
+                    // candidate pairs (especially over ICE-TCP on slow
+                    // links) before settling on 'connected' or
+                    // 'completed'. Surfacing that transient as an
+                    // error triggers LiveVideo's onFallback → HLS
+                    // remount, which closes the peer connection just
+                    // as it was about to stabilise.
+                    //
+                    // We log the state for visibility but let
+                    // pc.onconnectionstatechange (below) decide
+                    // whether the whole connection is dead. That
+                    // callback only fires on a stable terminal state
+                    // (failed/closed), not on transient ICE churn.
+                    if (cancelled) return;
+                    if (pc.iceConnectionState === "failed" ||
+                        pc.iceConnectionState === "disconnected") {
+                        // eslint-disable-next-line no-console
+                        console.debug(
+                            `[webrtc] iceConnectionState=${pc.iceConnectionState} ` +
+                            `(transient; not failing over yet)`,
+                        );
+                    }
+                };
                 pc.onconnectionstatechange = () => {
                     if (cancelled) return;
+                    // connectionState is the most stable aggregate
+                    // signal. 'failed' / 'closed' are terminal — at
+                    // this point the peer connection is genuinely
+                    // dead and the UI should fall back to HLS.
                     if (pc.connectionState === "failed" ||
                         pc.connectionState === "closed") {
                         setState("error");
@@ -121,6 +190,20 @@ export function useWebRTCStream(
                 const offer = await pc.createOffer();
                 await pc.setLocalDescription(offer);
 
+                // Wait for ICE gathering to complete BEFORE POSTing the
+                // SDP offer. If we send the offer while candidates are
+                // still being gathered, the SDP we hand to go2rtc
+                // contains only the first host candidate — and if that
+                // one is wrong (e.g. Docker bridge IP 172.x.x.x that
+                // the browser can't reach), the connection dies even
+                // though a perfectly fine 127.0.0.1:8555 candidate
+                // would have arrived 200ms later. iceGatheringState
+                // transitions to 'complete' once the browser has
+                // finished enumerating host + STUN-reflected
+                // candidates, or our hard timeout fires.
+                await waitForIceGathering(pc, 3000);
+                if (cancelled) return;
+
                 // Prefer the browser-accessible base from ICE config.
                 // The per-camera webrtcUrl may contain an internal Docker
                 // hostname (e.g. http://home-go2rtc:1984) that the browser
@@ -129,13 +212,27 @@ export function useWebRTCStream(
                     ?? (ice?.webrtc_base
                         ? `${ice.webrtc_base}/api/webrtc?src=${encodeURIComponent(opts.streamName)}`
                         : opts.webrtcUrl);
-                const resp = await fetch(sdpUrl, {
+                const resp = await authedFetch(sdpUrl, {
                     method: "POST",
                     headers: { "Content-Type": "application/sdp" },
                     body: offer.sdp ?? "",
                 });
                 if (!resp.ok) {
-                    throw new Error(`SDP ${resp.status}`);
+                    // The body of the error response is the most
+                    // useful diagnostic. go2rtc returns plain text
+                    // (not JSON) on its 5xx; nginx returns JSON via
+                    // the @go2rtc_unauthorized handler on 401. We
+                    // try to read a small slice of the body for
+                    // both, falling back to the status line if the
+                    // body is empty or unreadable.
+                    let detail = "";
+                    try {
+                        detail = (await resp.text()).slice(0, 200);
+                    } catch { /* */ }
+                    throw new Error(
+                        `SDP ${resp.status} ${resp.statusText}` +
+                        (detail ? `: ${detail}` : ""),
+                    );
                 }
                 const answer = await resp.text();
                 if (cancelled) return;
@@ -143,6 +240,16 @@ export function useWebRTCStream(
                     type: "answer",
                     sdp: answer,
                 });
+
+                // After setRemoteDescription, ICE connectivity checks
+                // begin. We don't have an explicit 'connected' event
+                // on RTCPeerConnection, but pc.oniceconnectionstatechange
+                // will report 'connected' or 'completed' on success,
+                // and 'failed' if all candidates are unreachable. The
+                // parent's WebRTCVideo surface will see state "playing"
+                // when ontrack fires, or "error" when oniceconnection
+                // statechange reports 'failed' — both paths are
+                // covered above.
             } catch (e) {
                 if (cancelled) return;
                 setState("error");
@@ -159,6 +266,54 @@ export function useWebRTCStream(
 
     const retry = useCallback(() => setNonce((n) => n + 1), []);
     const stop = useCallback(() => teardown(), [teardown]);
+
+    // Video element error listener.
+    //
+    // The hook sets `state = "playing"` on `ontrack` (an RTP frame
+    // is arriving), but the <video> element independently reports
+    // codec decode failures via the `error` event. The most common
+    // shape for an HEVC camera on a Chromium-derivative browser
+    // (Chrome / Edge / WebView) is:
+    //
+    //   1. SDP exchange succeeds, ICE+DTLS connect, ontrack fires.
+    //   2. RTP packets arrive carrying H.265 NAL units.
+    //   3. Chromium's WebRTC codec registry does NOT include H.265
+    //      (RFC 7798 is registered in the SDP but never wired to
+    //      the system HEVC decoder on the WebRTC side — see
+    //      docs/platformization.md for the per-browser matrix).
+    //   4. The video element's MediaError reports
+    //      MEDIA_ERR_SRC_NOT_SUPPORTED (code 4). `connectionState`
+    //      stays "connected" because the network path is fine —
+    //      it's the *decoder* that can't render the frames.
+    //
+    // Without this listener, the hook parks at "playing" forever
+    // and the UI shows a black tile. The MediaError codes that
+    // matter for the fallback decision are 3 (MEDIA_ERR_DECODE,
+    // the stream itself is unsupported) and 4
+    // (MEDIA_ERR_SRC_NOT_SUPPORTED, the browser can't play this
+    // MIME/codec at all). Code 1 (aborted) and 2 (network) are
+    // transient and not actionable here.
+    useEffect(() => {
+        const v = videoRef.current;
+        if (!v) return;
+        const onError = () => {
+            const code = v.error?.code;
+            // Only convert terminal codec / source failures into
+            // the hook's "error" state. Codes 1/2 are transient
+            // and we let the underlying recovery path (SDP retry,
+            // ICE reconnect) handle them — flipping to HLS on a
+            // momentary network blip would cause a needless
+            // remount storm.
+            if (code === 3 || code === 4) {
+                const label = code === 4 ? "SRC_NOT_SUPPORTED" : "DECODE";
+                setState("error");
+                setError(`video element error: ${code} (${label})`);
+                teardown();
+            }
+        };
+        v.addEventListener("error", onError);
+        return () => v.removeEventListener("error", onError);
+    }, [teardown]);
 
     return { videoRef, state, error, retry, stop };
 }
