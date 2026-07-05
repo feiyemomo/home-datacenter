@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/automation"
 	"home-datacenter-api/internal/camera"
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/database"
@@ -159,6 +160,17 @@ func main() {
 	go camHealth.Run(context.Background())
 	go camRecorder.Run(context.Background())
 
+	// ---- Phase 5: Automation Engine ----
+	//
+	// The engine subscribes to "*" on the EventBus and evaluates every
+	// enabled Rule against each event. Actions are fire-and-forget
+	// (notify / mqtt / webhook). The mqtt handler is the publish
+	// interface for "mqtt" actions; nil-safe if MQTT is down.
+	automationEngine := automation.NewEngine(database.DB, bus, mqttHandler)
+	automationEngine.Start()
+	defer automationEngine.Stop()
+	automationHandler := automation.NewHandler(database.DB, automationEngine, bus)
+
 	// ---- HTTP server ----
 	r := gin.Default()
 
@@ -232,6 +244,20 @@ func main() {
 		// Phase 3: WebSocket endpoint
 		// Auth is handled inside the handler (query param or header).
 		api.GET("/ws", wsHandler.Handle)
+
+		// Phase 5: Automation Engine endpoints (admin-only).
+		// Rules are CRUD-managed here; the engine itself runs in the
+		// background and reacts to EventBus events.
+		automationGroup := api.Group("/automation")
+		automationGroup.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		{
+			automationGroup.GET("/rules", automationHandler.List)
+			automationGroup.POST("/rules", automationHandler.Create)
+			automationGroup.GET("/rules/:id", automationHandler.Get)
+			automationGroup.PUT("/rules/:id", automationHandler.Update)
+			automationGroup.DELETE("/rules/:id", automationHandler.Delete)
+			automationGroup.POST("/rules/:id/test", automationHandler.Test)
+		}
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)

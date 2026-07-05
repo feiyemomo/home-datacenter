@@ -62,44 +62,50 @@ func (j *JSON) Scan(src any) error {
 // Dashboard/App consumes them through the same event channel as
 // every other device type.
 type Camera struct {
-	ID         uint           `gorm:"primaryKey" json:"id"`
-	Type       string         `gorm:"size:32;index" json:"type"` // fixed "camera"
-	Name       string         `gorm:"size:64" json:"name"`
-	Vendor     string         `gorm:"size:32" json:"vendor"`
-	Host       string         `gorm:"size:128;index" json:"host"`
-	ONVIFPort  int            `gorm:"default:80" json:"onvif_port"`
-	RTSPPort   int            `gorm:"default:554" json:"rtsp_port"`
-	ChannelID  int            `gorm:"default:1" json:"channel_id"`
+	ID        uint   `gorm:"primaryKey" json:"id"`
+	Type      string `gorm:"size:32;index" json:"type"` // fixed "camera"
+	Name      string `gorm:"size:64" json:"name"`
+	Vendor    string `gorm:"size:32" json:"vendor"`
+	Host      string `gorm:"size:128;index" json:"host"`
+	ONVIFPort int    `gorm:"default:80" json:"onvif_port"`
+	RTSPPort  int    `gorm:"default:554" json:"rtsp_port"`
+	ChannelID int    `gorm:"default:1" json:"channel_id"`
 
-	Status     string         `gorm:"size:16;index" json:"status"` // online/offline/unknown
-	LastSeenAt *time.Time     `json:"last_seen_at,omitempty"`
+	Status     string     `gorm:"size:16;index" json:"status"` // online/offline/unknown
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
 
 	// OwnerID is the user who registered the camera. Non-admin
 	// List/Get calls are scoped to cameras whose OwnerID matches
 	// the caller's user id; admin sees all.
 	OwnerID uint `gorm:"index" json:"owner_id"`
 
-	Capabilities JSON         `gorm:"type:text" json:"capabilities"`
-	Credentials  JSON         `gorm:"type:text" json:"-"`     // never serialize
-	Meta         JSON         `gorm:"type:text" json:"meta"`
+	Capabilities JSON `gorm:"type:text" json:"capabilities"`
+	Credentials  JSON `gorm:"type:text" json:"-"` // never serialize
+	Meta         JSON `gorm:"type:text" json:"meta"`
 	// OnvifProfileToken is the profile token we use for PTZ and
 	// presets. Stored as a dedicated column (not inside Meta) so
 	// the read path is a plain `string` — GORM's JSON scanning is
 	// lossy across drivers and used to fail type-assertion in
 	// `cam.Meta["onvif_profile"].(string)`, surfacing as a
 	// spurious "missing onvif profile_token" error after register.
-	OnvifProfileToken string     `gorm:"size:64" json:"onvif_profile"`
+	OnvifProfileToken string `gorm:"size:64" json:"onvif_profile"`
 	// Presets maps a friendly name to an ONVIF preset token that the
 	// user has pre-set up in the camera's own UI. The API never
 	// *creates* presets (most firmware forbids it) — only stores
 	// the alias and triggers GotoPreset on demand.
-	Presets JSON             `gorm:"type:text" json:"presets"` // {"home":"Preset_1","away":"Preset_2"}
+	Presets JSON `gorm:"type:text" json:"presets"` // {"home":"Preset_1","away":"Preset_2"}
 
-	StreamName string         `gorm:"size:64;uniqueIndex" json:"stream_name"` // cam_<id>
+	// StreamName is the go2rtc stream key. It is set to the
+	// operator-entered friendly name (e.g. "前门", "backyard")
+	// rather than the synthetic "cam_<id>" so the dashboard name
+	// matches `GET /api/streams` 1:1. The column is UNIQUE — two
+	// cameras with the same name will fail to register the second
+	// one. URL-encoded on the wire (see camera.Registry.StreamConfig).
+	StreamName string `gorm:"size:64;uniqueIndex" json:"stream_name"` // friendly name; same as go2rtc stream key
 
-	CreatedAt  time.Time      `json:"created_at"`
-	UpdatedAt  time.Time      `json:"updated_at"`
-	DeletedAt  gorm.DeletedAt `gorm:"index" json:"-"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
 }
 
 func (Camera) TableName() string { return "cameras" }

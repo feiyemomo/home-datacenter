@@ -22,9 +22,9 @@ type Hub struct {
 	clients map[uint64]*Client // keyed by internal client ID
 	nextID  uint64
 
-	bus     *eventbus.Bus
-	unsub   func() // EventBus unsubscribe handle
-	closed  atomic.Bool
+	bus    *eventbus.Bus
+	unsub  func() // EventBus unsubscribe handle
+	closed atomic.Bool
 }
 
 // NewHub creates a Hub and subscribes it to all device.* and
@@ -36,11 +36,14 @@ func NewHub(bus *eventbus.Bus) *Hub {
 	}
 
 	// Subscribe to all relevant event topics. Prefix matching means
-	// "device" catches device.status, device.telemetry, device.command.
+	// "device" catches device.status, device.telemetry, device.command;
+	// "camera" catches camera.online, camera.offline, camera.motion, etc.
 	topics := []string{
 		"device",
+		"camera",
 		eventbus.TopicUserNotification,
 		eventbus.TopicSystemBroadcast,
+		eventbus.TopicAutomationFired,
 	}
 	for _, t := range topics {
 		bus.Subscribe(t, h.onEvent)

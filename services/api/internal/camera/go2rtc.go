@@ -40,6 +40,23 @@ func NewGo2RTCClient(base string) *Go2RTCClient {
 	}
 }
 
+// Alive reports whether go2rtc's HTTP API is reachable. Used by
+// BootReplay to decide whether to attempt stream registration or
+// wait. A simple GET /api/streams with a short timeout is enough —
+// go2rtc responds with 200 once its API server is up.
+func (c *Go2RTCClient) Alive(ctx context.Context) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Base+"/api/streams", nil)
+	if err != nil {
+		return false
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return false
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode < 500
+}
+
 // AddStream registers a stream. It is idempotent: re-adding the same
 // name with a different URL updates the source.
 //
@@ -138,6 +155,20 @@ func (c *Go2RTCClient) WebRTCURL(streamName string) string {
 }
 
 // HLSURL is the iOS-Safari fallback (HLS, not WebRTC).
+//
+// The `mp4=` query parameter switches go2rtc from the default
+// MPEG-TS container (segment.ts) to fragmented MP4 (segment.m4s).
+// hls.js's TS demuxer has weak HEVC support and will silently drop
+// frames on the path back to MSE, which manifests as a "playback
+// starts, gets a frame or two, then stalls" symptom (the browser
+// has fresh data in the buffer but no decoded frame reaches the
+// compositor, so `<video>` never fires `playing`). fMP4 sidesteps
+// the demuxer problem entirely and is the recommended container
+// for HEVC over HLS in 2024+.
+//
+// See: build-host/go2rtc/internal/hls/hls.go (uses
+// mp4.ParseQuery to choose between `mp4.NewConsumer` and
+// `mpegts.NewConsumer`).
 func (c *Go2RTCClient) HLSURL(streamName string) string {
-	return fmt.Sprintf("%s/api/stream.m3u8?src=%s", c.Base, url.QueryEscape(streamName))
+	return fmt.Sprintf("%s/api/stream.m3u8?src=%s&mp4=", c.Base, url.QueryEscape(streamName))
 }

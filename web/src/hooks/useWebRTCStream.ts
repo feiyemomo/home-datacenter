@@ -97,8 +97,11 @@ export function useWebRTCStream(
                 const pc = new RTCPeerConnection({ iceServers });
                 pcRef.current = pc;
 
-                pc.addTransceiver("video", { direction: "sendrecv" });
-                pc.addTransceiver("audio", { direction: "sendrecv" });
+                // Video only — camera audio codecs (G726/PCMU/MPEG4-
+                // GENERIC) are not browser-decodable via WebRTC. The
+                // API also appends #audio=0 to the go2rtc source URL
+                // so go2rtc won't even try to negotiate audio.
+                pc.addTransceiver("video", { direction: "recvonly" });
 
                 pc.ontrack = (ev) => {
                     if (videoRef.current && ev.streams[0]) {
