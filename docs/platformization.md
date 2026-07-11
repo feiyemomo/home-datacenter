@@ -1,6 +1,6 @@
 # Camera Platformization (Phase 4) + Event-Driven System (Phase 5)
 
-> Status: ✅ Implemented — 2026-07-04 (Phase 4), 2026-07-05 (Phase 5), 2026-07-05 (Phase 7: ffmpeg opt-in, HLS tuning, nginx auth_request fix)
+> Status: ✅ Implemented — 2026-07-04 (Phase 4), 2026-07-05 (Phase 5), 2026-07-05 (Phase 7a: ffmpeg opt-in, HLS tuning, nginx auth_request fix), 2026-07-11 (Phase 7b: transport toggle + light/dark theme), 2026-07-11 (Phase 8: user management API + last-admin/self-delete/self-demote state guards)
 
 This document describes the camera module: how a network camera becomes
 a first-class **Device** in the Home Datacenter platform, how live
@@ -1029,6 +1029,173 @@ link-local, unspecified, v6).
 - **Metrics are process-local**: the `Reset` button resets the
   container's view only. There is no cluster-wide aggregation —
   this is a single-node home OS, not a SaaS.
+
+---
+
+## 8. Transport Toggle (Phase 7)
+
+`LiveVideo.tsx` ships a three-position segmented control adjacent to
+the live path badge, giving the operator direct control over which
+transport the playback hook mounts:
+
+| Mode | Behavior |
+|---|---|
+| `auto` | Default. Try WebRTC first; on `state === "error"` (SDP 5xx, ICE failure, codec mismatch) remount with the HLS sub-component. The path badge in the header flips from "WebRTC" to "HLS" so the operator can see what landed. |
+| `webrtc` | Sticky. Mount the WebRTC sub-component and never auto-fallback. A failure surfaces as an error overlay with a `Retry` button. Useful when a transcode fix has just landed and the operator wants to confirm WebRTC plays without HLS masking the regression. |
+| `hls` | Sticky. Force the fragmented-MP4 HLS path. Useful for comparing HLS playback against WebRTC during codec-bug triage. |
+
+The selection is stored in `localStorage` under `home.transport` and
+read synchronously during component init, so reloads preserve the
+choice. It is a **global** preference (one toggle for every camera);
+per-camera preference was considered but adds UI surface for a value
+that almost-always wants the same setting across cameras.
+
+**Reset on camera change.** When the operator switches between
+cameras (or the dashboard re-fetches the camera list), the
+`useEffect([camera.id, transport])` resets `path` to the requested
+transport's default and zeroes the `generation` counter, so a
+mid-session WebRTC failure on camera A does not leak into camera B.
+
+**Why expose this at all?** The auto-fallback is the right default
+for the user-facing flow, but it makes codec-bug triage noisy — the
+operator triggers a known-broken WebRTC scenario and the dashboard
+"fixes itself" by switching to HLS, hiding the bug. The explicit
+modes pin the transport so a regression is visible in the error
+overlay. The same control also lets an operator on a browser that
+*does* support WebRTC HEVC (Safari) opt out of the fallback path
+entirely.
+
+---
+
+## 9. Light / Dark Theme (Phase 7)
+
+The dashboard ships with a two-theme palette, switchable from the
+header Sun/Moon button. Implementation is intentionally minimal:
+
+- **CSS variables in `index.css`** define a `--bg` / `--bg-raised` /
+  `--fg` / `--slate-50…950` palette. Two blocks:
+  ```css
+  :root, [data-theme="light"] { --bg: 248 250 252; ... }
+  [data-theme="dark"]        { --bg: 11 17 32; ... }
+  ```
+  `:root` resolves to the light palette so users without a
+  preference (or with `prefers-reduced-motion`) see the bright
+  version on first visit; `data-theme="dark"` overrides it.
+- **Tailwind is bound to the variables**, not to baked-in colors.
+  `tailwind.config.js` overrides the default slate palette to
+  `rgb(var(--slate-50) / <alpha-value>)` etc., so every
+  `bg-slate-*` / `text-slate-*` / `border-slate-*` utility class
+  flips automatically. The four `surface` / `fg` design tokens
+  (`bg-surface`, `text-fg-muted`, etc.) point at the same variables
+  for components that want a deliberate semantic name.
+- **`useTheme()` is the single source of truth.** Reads
+  `localStorage["home.theme"]` synchronously on hook init; writes
+  the `data-theme` attribute on `<html>` in a `useEffect`. The
+  `storage` event listener propagates a toggle from one tab to
+  every other tab of the same origin without a refresh.
+- **`applyThemeEarly()` runs in `main.tsx` BEFORE React mounts** to
+  set the `data-theme` attribute on `<html>` from the same
+  `localStorage` read, so the first paint already has the right
+  palette. Without it, the page renders with the default dark
+  theme for ~16ms before `useTheme`'s first effect runs — a
+  visible dark→light flash on slow devices.
+
+The choice is persisted in `localStorage` only; there is no
+server-side theme preference. Adding a "system" mode that follows
+`prefers-color-scheme` is a one-line change in `useTheme.ts`
+(`readInitial` checks `matchMedia` when no stored value) and was
+deferred to keep the surface small.
+
+---
+
+## 10. User Management (Phase 8)
+
+The user-management API is **admin-only CRUD over the `users` table**,
+with three state guards that protect the system from accidentally
+locking itself out:
+
+| Guard | Service error | HTTP code | What the UI does |
+|---|---|---|---|
+| Last-admin | `ErrLastAdmin` | 400 | Disables the role checkbox + delete button on the only admin row |
+| Self-delete | `ErrSelfDelete` | 400 | Disables the delete button on the caller's own row |
+| Self-demote | `ErrSelfDemote` | 400 | Disables the role checkbox on the caller's own row |
+
+The service layer (`internal/service/user_service.go`) is the single
+source of these errors. The handler layer
+(`internal/handler/user_handler.go`) centralises the
+`writeUserServiceError` mapping so the HTTP code is consistent
+across every endpoint. The dashboard's `Users.tsx` page **mirrors the
+same guards client-side** by disabling the offending buttons; this
+keeps the operator from round-tripping a request that the server is
+guaranteed to reject with 400.
+
+**Routes** (mounted under `/api/v1/user` with `JWTAuth + RequireAdmin`,
+except `/me` which is any-authenticated user):
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET    | `/user`        | List all users with each user's `device_count` |
+| POST   | `/user`        | Create user `{name, is_admin}` |
+| GET    | `/user/:id`    | Fetch one user |
+| PUT    | `/user/:id`    | Partial update `{name?, is_admin?}` |
+| DELETE | `/user/:id`    | Delete user + cascade-delete their devices |
+
+**Name validation** (`isValidUserName` in
+`services/api/internal/service/user_service.go`):
+
+- Trimmed length 1..32 runes
+- Each rune: unicode letter / digit / `_` / `-`
+- Leading/trailing whitespace is silently trimmed (forgiving
+  paste-from-clipboard behaviour)
+- Internal whitespace (space / tab / newline) is rejected outright
+  because it would corrupt the friendly-name path used by cameras,
+  mqtt topics, etc.
+- Unicode is fully supported (e.g. `小明`, `自己`)
+
+**Cascade semantics on `DELETE /user/:id`:**
+
+- The user row is removed AND every device they own is removed
+  (`DELETE FROM devices WHERE user_id = :id`). Devices-first:
+  if the device delete fails, the user row is still around and
+  the admin can retry; the inverse order would orphan devices
+  pointing at a now-missing user.
+- Cameras are **not** cascaded. The `cameras.owner_id` column
+  already drives list/get scoping, so a deleted user's cameras
+  stay in the DB but become invisible to non-admin callers. An
+  admin who wants the camera gone calls
+  `DELETE /api/v1/cameras/:id` separately.
+- `AccessKeyHash` is never exposed by the API. A deleted user's
+  devices are removed from the table, which is enough to reject
+  their JWTs via the existing revocation check.
+
+**TOCTOU note on `Create` / `Update` rename:** the service does a
+pre-check on `users.name` uniqueness, then issues the `INSERT` /
+`UPDATE`. The DB `UNIQUE` index is the load-bearing defense — if
+two admins race to register the same name, the loser sees a
+unique-constraint violation, which `isUniqueViolation(err)` maps
+back to `ErrNameTaken` and the handler turns into 409. Both SQLite
+("UNIQUE constraint failed") and Postgres ("duplicate key value")
+error strings are matched so the future PG migration is drop-in.
+
+**Frontend surface:**
+
+- `web/src/pages/Users.tsx` — the admin-only CRUD page (linked
+  from `Layout.tsx` with an `adminOnly` flag and a "you" badge on
+  the caller's own row).
+- `web/src/api/user.ts` — `listUsers` / `createUser` / `updateUser` /
+  `deleteUser` (typed against `web/src/types.ts`).
+- The `me` endpoint (`GET /api/v1/user/me`) is unchanged; the
+  dashboard's AuthContext already polls it for the "you" indicator
+  and the admin guard.
+
+**Tests:** `services/api/internal/service/user_service_test.go`
+covers the validation paths (`isValidUserName` ascii + unicode +
+whitespace + length boundaries; `normalizeUserName` trim + reject
+internal whitespace) and the unique-violation detection
+(`isUniqueViolation` against both SQLite and Postgres error
+strings).
+
+---
 
 ## Next Steps (Future Extensions)
 

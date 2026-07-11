@@ -130,20 +130,27 @@ export function useHLSStream(
         // within stallTimeoutMs, treat the stream as broken. The
         // most common cause is the go2rtc HLS consumer being
         // reaped — the segments download fine but the media-
-        // playlist 404s after `keepalive` of inactivity, so
+        // playlist 404s after the keepalive of inactivity, so
         // hls.js never gets a new segment and `<video>` parks
         // itself in "waiting for data" forever.
         //
-        // We size the watchdog to comfortably exceed the patched
-        // go2rtc keepalive (30s, see deploy/go2rtc/Dockerfile) plus
-        // a couple of segment downloads. With the 2s segment +
-        // partial-segment config in go2rtc.yaml, a healthy stream
-        // reaches the `playing` event in ~1-2s. 20s is therefore
-        // generous enough for any realistic slow start (cold RTSP
-        // producer, first-segment network latency spike) but short
-        // enough that a genuinely broken stream surfaces an error
-        // to the user before they give up and refresh the page.
-        const stallTimeoutMs = 20_000;
+        // We size the watchdog to comfortably exceed the go2rtc
+        // keepalive plus a couple of segment downloads. Frigate's
+        // bundled go2rtc uses the upstream 5s keepalive which
+        // cannot be patched; instead we drive segment size down
+        // (hls.segment=1) so each .m4s fits inside the 5s window
+        // on Tunnel links, and we let the watchdog absorb the
+        // hls.js frag-load retry stack.
+        //
+        // On slow Cloudflare Tunnel links, the first segment
+        // download alone can take 9.97s (a 1.8 MB HEVC .m4s at
+        // ~2.5 Mbps), and hls.js's frag-loading retry backoff
+        // can stack up to 32s before the segment is declared
+        // failed. We give the stall watchdog 60s to absorb the
+        // first 1-2 segment loads before declaring the stream
+        // dead — otherwise a clean cold start falsely surfaces
+        // "HLS stream stalled" on every page load.
+        const stallTimeoutMs = 60_000;
         const stallTimer = window.setTimeout(() => {
             if (cancelled) return;
             setState((cur) => {
@@ -263,12 +270,31 @@ export function useHLSStream(
             // Cameras are stable bandwidth; no aggressive ABR.
             capLevelToPlayerSize: true,
             // Buffer: 12s in-flight, 30s headroom. The go2rtc
-            // HLS server uses a patched consumer keepalive of 30s
-            // (deploy/go2rtc/Dockerfile patches the upstream 5s,
-            // which is too short for ~1MB HEVC segments). With
-            // 30s keepalive the hls.js defaults are safe.
+            // HLS server uses an upstream consumer keepalive of 5s
+            // (Frigate's bundled go2rtc — we can't patch it like we
+            // did for the standalone container). On slow Cloudflare
+            // Tunnel links (~2.5 Mbps) a 1.8 MB HEVC segment can
+            // take 9.97s to download, which is well past 5s. We
+            // compensate with a long maxBufferLength so the player
+            // can re-buffer after a stall without reloading the
+            // master playlist, plus aggressive frag-load retries.
             maxBufferLength: 12,
-            maxMaxBufferLength: 30,
+            maxMaxBufferLength: 60,
+            // Frag-level loading: a slow segment is the dominant
+            // failure mode on Tunnel links. hls.js defaults to 1
+            // retry with a 4s base backoff — we bump to 6 retries
+            // with a 2s base so a single 9.97s segment doesn't
+            // fail the whole pipeline. Max wait becomes ~64s.
+            fragLoadingMaxRetry: 6,
+            fragLoadingMaxRetryTimeout: 32000,
+            manifestLoadingMaxRetry: 6,
+            manifestLoadingMaxRetryTimeout: 16000,
+            // Each segment/playlist request must complete in 20s
+            // (was 60s default — a stalled playlist poll was
+            // keeping the connection alive long past the go2rtc
+            // session timeout, causing the next poll to 404).
+            fragLoadingTimeOut: 20000,
+            manifestLoadingTimeOut: 20000,
             // Attach the dashboard's JWT to every XHR hls.js makes
             // (master playlist, media playlist, every segment, every
             // key). nginx's `/go2rtc/` location is gated by

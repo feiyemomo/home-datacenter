@@ -17,13 +17,13 @@ export interface ButtonProps
 
 const variantClasses: Record<ButtonVariant, string> = {
     primary:
-        "bg-sky-500 text-white hover:bg-sky-400 focus-visible:ring-sky-500 shadow-sm shadow-sky-500/20",
+        "bg-sky-500 text-fg-inverted hover:bg-sky-400 focus-visible:ring-sky-500 shadow-sm shadow-sky-500/20",
     secondary:
-        "bg-slate-700 text-slate-100 hover:bg-slate-600 focus-visible:ring-slate-500",
+        "bg-surface-subtle text-fg hover:bg-slate-300 dark:hover:bg-slate-700 focus-visible:ring-sky-500",
     outline:
-        "border border-slate-600 bg-transparent text-slate-100 hover:bg-slate-800 focus-visible:ring-slate-500",
+        "border border-surface-border bg-white text-fg hover:bg-surface-subtle focus-visible:ring-sky-500 dark:bg-transparent",
     ghost:
-        "bg-transparent text-slate-200 hover:bg-slate-800 focus-visible:ring-slate-500",
+        "bg-transparent text-fg-muted hover:bg-surface-subtle hover:text-fg focus-visible:ring-sky-500",
     danger:
         "bg-rose-600 text-white hover:bg-rose-500 focus-visible:ring-rose-500 shadow-sm shadow-rose-500/20",
 };
@@ -45,8 +45,8 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
             <button
                 ref={ref}
                 className={cn(
-                    "inline-flex items-center justify-center gap-2 rounded-md font-medium transition-colors",
-                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-slate-950",
+                    "inline-flex items-center justify-center gap-2 rounded-lg font-medium transition-all active:scale-95",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-offset-surface",
                     "disabled:pointer-events-none disabled:opacity-50",
                     variantClasses[variant],
                     sizeClasses[size],

@@ -248,11 +248,15 @@ Content-Type: application/json
 |--------|-----------|----------|
 | 400 | `invalid request body` | Missing/invalid JSON body |
 | 401 | `invalid credentials` | No device matches (user_id, hash), user not found, or device revoked |
+| 429 | `invalid credentials` | Per-IP rate limit exceeded (5 burst, then 1 per 10s — see [security §13](security.md#13-authbind-rate-limiting)) |
 
 > **Security note:** all bind failures return the same generic
 > `invalid credentials` to prevent user/key enumeration. The detailed
-> causes (invalid access key / device revoked / user lookup) are still
-> distinguished internally but not exposed to the client.
+> causes (invalid access key / device revoked / user lookup / rate
+> limit) are still distinguished internally but not exposed to the
+> client. The 429 body is byte-for-byte identical to the 401 body so a
+> probing attacker cannot tell throttling apart from credential
+> failure.
 
 **JWT Claims:**
 
@@ -308,6 +312,200 @@ Authorization: Bearer <jwt_token>
 | 401 | `device revoked` | `RevokedAt` is non-NULL |
 | 401 | `device lookup failed` | Internal DB error |
 | 404 | `user not found` | User row deleted from DB |
+
+---
+
+### User Management (Admin)
+
+All routes in this section are mounted under `/api/v1/user` and require
+both `JWTAuth` *and* `RequireAdmin`. The bootstrap admin (`自己`, id=1)
+is the only account that exists on a fresh install — every other
+operator is created through `POST /api/v1/user` by an existing admin.
+Devices are still created offline (no API endpoint for that — see
+[Offline Device Creation](#offline-device-creation)).
+
+#### List Users
+
+**Endpoint:**
+
+```
+GET /api/v1/user
+```
+
+**Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "users": [
+      {
+        "id": 1,
+        "name": "自己",
+        "is_admin": true,
+        "created_at": "2026-07-04 12:00:00",
+        "updated_at": "2026-07-11 22:00:00",
+        "device_count": 3
+      },
+      {
+        "id": 2,
+        "name": "alice",
+        "is_admin": false,
+        "created_at": "2026-07-10 09:00:00",
+        "updated_at": "2026-07-10 09:00:00",
+        "device_count": 1
+      }
+    ]
+  }
+}
+```
+
+`device_count` is computed per-row by a `COUNT(*)` on the `devices`
+table keyed by `user_id` (small N in a home OS — N+1 acceptable).
+
+#### Create User
+
+**Endpoint:**
+
+```
+POST /api/v1/user
+```
+
+**Request Body:**
+
+```json
+{ "name": "alice", "is_admin": false }
+```
+
+**Success Response (200):**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": 2,
+    "name": "alice",
+    "is_admin": false,
+    "created_at": "2026-07-11 22:00:00",
+    "updated_at": "2026-07-11 22:00:00"
+  }
+}
+```
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid request body` | Missing/invalid JSON |
+| 400 | `name must be 1-32 chars of letters, digits, _ or - (no whitespace)` | Name fails `isValidUserName` |
+| 409 | `name already in use` | Another user already has this name |
+
+**Name validation** (`isValidUserName`):
+
+- Trimmed length 1..32 runes
+- Each rune must be a unicode letter/digit, `_`, or `-`
+- Internal whitespace (e.g. `"ali ce"`, tab, newline) is rejected
+- Leading/trailing whitespace is silently trimmed (forgiving for
+  paste-from-clipboard)
+- Unicode is fully supported (e.g. `小明`, `自己`)
+
+#### Get User
+
+**Endpoint:**
+
+```
+GET /api/v1/user/:id
+```
+
+**Success Response:** same single-user shape as the create response
+above.
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid user id` | `:id` not a valid uint |
+| 404 | `user not found` | No row with that id |
+
+#### Update User (Partial)
+
+**Endpoint:**
+
+```
+PUT /api/v1/user/:id
+```
+
+**Request Body (both fields optional, pointer-typed so `null` means
+"leave unchanged" and `"name": ""` would still hit the validator):**
+
+```json
+{ "name": "alice2", "is_admin": true }
+```
+
+**Success Response:** same as the create response.
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid request body` | Bad JSON |
+| 400 | `no fields to update` | Both fields absent |
+| 400 | `name must be 1-32 chars of letters, digits, _ or - (no whitespace)` | Name fails validator |
+| 400 | `cannot demote the currently authenticated user` | Caller is demoting themselves |
+| 400 | `cannot remove/demote the last admin` | Demotion would leave zero admins |
+| 404 | `user not found` | No row with that id |
+| 409 | `name already in use` | Rename target collides with another user |
+
+**Last-admin + self-demote guards are enforced server-side AND in the
+dashboard UI** (the `Users.tsx` page disables the role checkbox on
+both the "self" row and the only-admin row, so the operator never
+sees a 400 for these).
+
+#### Delete User (Cascade)
+
+**Endpoint:**
+
+```
+DELETE /api/v1/user/:id
+```
+
+**Behavior:** deletes the user row AND every device they own
+(`DELETE FROM devices WHERE user_id = :id`). JWTs issued to those
+devices are immediately rejected by middleware (revoked row +
+deleted row — both paths return 401). Cameras are NOT cascaded —
+they have an `owner_id` column that the camera list / get handlers
+already scope by, so a deleted user's cameras remain in the DB
+but become invisible to non-admin callers. An admin who wants the
+camera gone calls `DELETE /api/v1/cameras/:id` separately.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": { "deleted_devices": 2 }
+}
+```
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid user id` | `:id` not a valid uint |
+| 400 | `cannot delete the currently authenticated user` | Caller is deleting themselves |
+| 400 | `cannot remove/demote the last admin` | Target is the only admin |
+| 404 | `user not found` | No row with that id |
+| 500 | `operation failed` | DB error during cascade |
+
+**Cascade order:** devices first, then the user row. If the
+device delete fails, the user row is still around and the admin
+can retry; if the user delete fails after the device delete
+succeeds, the orphan devices are detected at next request (the
+JWT middleware reads `device.user_id` and 401s on `user not
+found` if the row is gone).
 
 ---
 
@@ -978,7 +1176,6 @@ Publish `{"status":"offline",...}` to flip it back.
 | PostgreSQL migration | Optional, SQLite sufficient for home use |
 | User management API | Create/delete users, assign admin |
 | Unit tests | Handler/service/repository layers |
-| Rate limiting | Protect `/auth/bind` from brute force |
 | Audit log | Record who revoked which device when |
 | Web UI | Dashboard for device management |
 
@@ -992,7 +1189,12 @@ Publish `{"status":"offline",...}` to flip it back.
 | `/api/v1/auth/bind` | POST | No | Bind device, obtain JWT |
 | `/api/v1/auth/verify` | GET | JWT | Used by nginx `auth_request` for `/go2rtc/*` gating; returns 200/401 |
 | `/api/v1/user/me` | GET | JWT | Get current user profile |
-| `/api/v1/device/list` | GET | JWT | List visible devices |
+| `/api/v1/user` | GET | JWT+admin | List all users with each user's `device_count` |
+| `/api/v1/user` | POST | JWT+admin | Create a user `{name, is_admin}` (cascades to nothing yet) |
+| `/api/v1/user/:id` | GET | JWT+admin | Fetch a single user |
+| `/api/v1/user/:id` | PUT | JWT+admin | Partial update `{name?, is_admin?}` (last-admin + self-demote guards) |
+| `/api/v1/user/:id` | DELETE | JWT+admin | Delete a user + cascade-delete their devices; returns `{deleted_devices:N}` |
+| `/api/v1/device/list` | GET | JWT | List visible devices (admin → all; non-admin → own) |
 | `/api/v1/device/:id` | DELETE | JWT | Revoke a device |
 | `/api/v1/system/status` | GET | JWT | Dashboard metrics |
 | `/api/v1/mqtt/publish` | POST | JWT | Publish within `home-datacenter/` (dashboard admin) |

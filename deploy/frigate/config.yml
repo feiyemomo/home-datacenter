@@ -1,0 +1,150 @@
+# Frigate base config — home-api pushes camera definitions via
+# PUT /api/config/save (requires SET_CONFIG_BY_API=true in the
+# container environment). This file provides the global settings
+# that home-api does NOT manage: MQTT, detectors, environment, and
+# the go2rtc subsystem defaults (WebRTC candidates, HLS segment
+# length, etc.).
+#
+# Camera entries are added/removed dynamically by home-api's
+# FrigateClient.pushFrigateConfig(). Do NOT add cameras here —
+# they will be overwritten on the next config push.
+
+mqtt:
+  host: mosquitto
+  topic_prefix: frigate
+  # client_id: frigate
+
+# Frigate's own authentication is enabled in PROXY MODE — the
+# dashboard's nginx layer (home-web) already gates /frigate/ behind
+# our JWT auth_request subrequest, so by the time a request reaches
+# Frigate it has Remote-User / Remote-Role headers attached.
+#
+# We can't disable Frigate's nginx auth_request directive (it's
+# hard-coded in /usr/local/nginx/conf/auth_request.conf and
+# unconditional across every location). When auth.enabled is false,
+# the auth subrequest goes to http://127.0.0.1:5001/auth which is
+# NOT running → connection refused → 502 → 500 on every Frigate
+# request (including Frigate's own healthcheck in
+# docker-compose.yaml). The fix is to enable the auth service AND
+# configure proxy auth, so the subrequest succeeds when
+# Remote-User is present.
+#
+# Without `auth.enabled: true`:
+#   * 127.0.0.1:5001 is not bound (the auth service never starts)
+#   * every /frigate/ request 500s because the subrequest to /auth
+#     hits a dead upstream
+#   * Frigate's own /api/config healthcheck in compose.yaml 500s,
+#     so the container is reported as unhealthy even though the
+#     go2rtc subsystem is fine
+#
+# With `auth.enabled: true` and proxy mode:
+#   * auth service starts on 127.0.0.1:5001
+#   * /auth subrequest succeeds when Remote-User is present
+#     (the proxy_auth path returns 200 with the user from headers)
+#   * /auth subrequest 401s for unauthenticated requests (the
+#     normal login flow), which is fine because nginx handles
+#     the 401/500 cases separately
+auth:
+  enabled: true
+proxy:
+  # Map the headers nginx sends. The default_role is the role
+  # Frigate assigns when no role header is present; we always
+  # send role=admin from nginx so this is the fallback.
+  header_map:
+    user: Remote-User
+    role: Remote-Role
+  default_role: admin
+
+# Detectors: CPU-based object detection. No Coral USB accelerator
+# required — works out of the box with ~10-15% CPU per camera at
+# 5 fps. For production with 3+ cameras, add a Google Coral TPU
+# (USB or PCIe) and uncomment the detector block below.
+detectors:
+  cpu:
+    type: cpu
+    num_threads: 3
+
+# model:
+#   path: /cpu_model.tflite
+#   width: 320
+#   height: 320
+
+# go2rtc subsystem — bundled inside Frigate. These settings are
+# the same as the old standalone go2rtc.yaml.
+go2rtc:
+  # webrtc.candidates: the ICE host candidates go2rtc advertises in
+  # its SDP answer. 127.0.0.1:8555 is the loopback candidate that
+  # works when the browser is on the same machine. For LAN access
+  # from phones/tablets, add the host's LAN IP (or use STUN).
+  webrtc:
+    listen: :8555
+    candidates:
+      - 127.0.0.1:8555
+  hls:
+    # 1s segment: keeps each .m4s under ~1 MB on a 8 Mbps HEVC
+    # stream, so it can finish downloading inside the 5s upstream
+    # keepalive window on slow Cloudflare Tunnel links. The old
+    # 2s setting produced 1.8 MB segments that took 9.97s to
+    # download, which is well past the session timeout and
+    # triggered the "no new segments arrived in time" stall loop.
+    segment: 1
+    partial: true
+    # 8 segments in the rolling window: hls.js can re-buffer two
+    # or three without falling off the end of the playlist.
+    window: 8
+
+# Cameras section is managed by home-api. The empty dict here is
+# a placeholder so Frigate boots without complaining about a
+# missing cameras key; home-api replaces it on the first config push.
+#
+# IMPORTANT: the stream URL contains a `#video=h264#width=1280`
+# directive. YAML treats an unquoted `#` as the start of a comment,
+# so the value MUST be quoted — otherwise the transcode flags
+# silently disappear and go2rtc falls back to the camera's native
+# codec (H.265/HEVC + PCMA on Hikvision), which Chrome cannot
+# decode for WebRTC and produces the SDP 502 "codecs not matched:
+# video:H265, audio:PCMA" error. This is only relevant during the
+# boot window before home-api's first pushFrigateConfig() (the
+# JSON-encoded push is not subject to YAML's comment rules), but
+# quoting here is the durable fix.
+  streams:
+    前门: 
+      ffmpeg:rtsp://admin:Haikangcam@192.168.31.100:554/Streaming/Channels/101#video=h264#width=1280
+cameras:
+  front_door:
+    name: front_door
+    enabled: true
+    ffmpeg:
+      inputs:
+        # Same `#` comment pitfall — quote the path so Frigate's
+        # own ffmpeg child receives the transcode directives.
+        - path: 
+            rtsp://admin:Haikangcam@192.168.31.100:554/Streaming/Channels/101#video=h264#width=1280
+          roles:
+            - detect
+            - record
+    detect:
+      enabled: true
+    record:
+      enabled: false
+
+# Recording and snapshots are off by default. home-api sets
+# per-camera record.enabled=false; the operator can toggle recording
+# per camera from the dashboard later.
+record:
+  enabled: false
+  continuous:
+    days: 0
+  motion:
+    days: 7
+snapshots:
+  enabled: false
+  retain:
+    default: 14
+    mode: motion
+
+# Bird's-eye / multi-camera view (optional, disabled by default).
+birdseye:
+  enabled: false
+  mode: continuous
+version: 0.17-0

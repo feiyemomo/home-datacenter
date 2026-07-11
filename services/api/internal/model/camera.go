@@ -102,6 +102,18 @@ type Camera struct {
 	// into). Cost is paid once at build time, benefit only
 	// accrues when an admin opts a specific camera in.
 	Transcode bool `gorm:"default:false" json:"transcode"`
+	// TranscodeUseSubstream, when true (the default), switches the
+	// RTSP source to the camera's substream channel
+	// (Hikvision: ChannelID + 100, e.g. 101 → 201) before applying
+	// the ffmpeg transcode pipeline. The substream is typically
+	// 720x576 / 1 Mbps H.264 — designed for low-bandwidth remote
+	// viewing, and a perfect match for Cloudflare Tunnel links
+	// where the main 1080p HEVC stream produces 1+ MB HLS
+	// segments that hit the 5s go2rtc keepalive. Set false to
+	// force transcoding the main stream (e.g. when the operator
+	// wants the dashboard to show the same view as the on-site
+	// NVR). Ignored when Transcode=false.
+	TranscodeUseSubstream bool `gorm:"default:true" json:"transcode_use_substream"`
 	// OnvifProfileToken is the profile token we use for PTZ and
 	// presets. Stored as a dedicated column (not inside Meta) so
 	// the read path is a plain `string` — GORM's JSON scanning is

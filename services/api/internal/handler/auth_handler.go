@@ -35,6 +35,27 @@ type BindRequest struct {
 // all bind failures (bad user_id, wrong key, revoked device). A
 // distinct message per failure would let an attacker enumerate which
 // user IDs exist and which keys are valid.
+//
+// On success the response is twofold:
+//
+//  1. JSON body with the token (dashboard stores it in localStorage
+//     for `Authorization: Bearer <jwt>` on /api/ calls).
+//  2. Set-Cookie: home_token=<jwt> (the browser auto-sends it on
+//     same-origin navigations to /frigate/, /go2rtc/, etc., which
+//     are gated by nginx's `auth_request /api/v1/auth/verify`
+//     subrequest. The subrequest only sees the original request's
+//     headers — Authorization is added by the SPA's axios/fetch
+//     interceptors, but a raw browser navigation to /frigate/
+//     carries no Authorization. The cookie bridges that gap so the
+//     operator can click a sidebar link to open Frigate's UI
+//     without re-logging in.)
+//
+// The cookie is NOT HttpOnly because the dashboard already stores
+// the same JWT in localStorage (XSS-readable) — the cookie is just
+// a transport for the same secret, not a fresh attack surface.
+// SameSite=Lax is enough: it blocks cross-site XHR/fetch but
+// allows top-level navigations (which is how the dashboard opens
+// /frigate/).
 func (h *AuthHandler) Bind(c *gin.Context) {
 
 	var req BindRequest
@@ -49,6 +70,15 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 		utils.Fail(c, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
+
+	// 365 days, matching the JWT's exp claim. SameSite=Lax is
+	// the right choice: top-level navigations (which is the only
+	// way the dashboard reaches /frigate/) carry the cookie,
+	// while cross-site XHR/fetch (the only path an attacker would
+	// use to ride the cookie) is blocked by the browser.
+	const maxAge = 365 * 24 * 60 * 60
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("home_token", token, maxAge, "/", "", false, false)
 
 	utils.Success(c, gin.H{
 		"token": token,
@@ -104,12 +134,36 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 	// the read AND the keepalive wait.
 	c.Request.Body = http.NoBody
 
-	authHeader := c.GetHeader("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+	// Token resolution order:
+	//  1. `Authorization: Bearer <jwt>` (the SPA's axios/fetch
+	//     interceptors add this on /api/ calls).
+	//  2. `Cookie: home_token=<jwt>` (the browser auto-sends
+	//     this on top-level navigations like clicking a link to
+	//     /frigate/ or /go2rtc/. Without this fallback a raw
+	//     navigation to /frigate/ would 401 because the
+	//     Authorization header is only added by the SPA's JS,
+	//     and the auth_request subrequest is plain nginx —
+	//     no JS hooks. See Bind's comment for the full
+	//     rationale.)
+	//
+	// The two paths are kept separate so we can later add
+	// per-source revocation (e.g. "force re-auth on cookie
+	// but keep Authorization valid for service-to-service
+	// calls"). For now both yield the same token and the
+	// downstream checks are identical.
+	tokenString := ""
+	if authHeader := c.GetHeader("Authorization"); authHeader != "" && strings.HasPrefix(authHeader, "Bearer ") {
+		tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+	if tokenString == "" {
+		if cookie, err := c.Cookie("home_token"); err == nil {
+			tokenString = cookie
+		}
+	}
+	if tokenString == "" {
 		utils.Fail(c, http.StatusUnauthorized, "missing or invalid Authorization header")
 		return
 	}
-	tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
 	claims, err := utils.ParseToken(tokenString)
 	if err != nil {

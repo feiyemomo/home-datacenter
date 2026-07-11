@@ -17,6 +17,38 @@ interface LiveVideoProps {
 }
 
 /**
+ * Transport preference for the live stream.
+ *
+ *   auto    — try WebRTC first, fall back to HLS on failure
+ *             (default; works on every browser + every codec)
+ *   webrtc  — WebRTC only. If the SDP exchange fails (codec /
+ *             ICE / network), surface the error and offer Retry.
+ *             Useful when the operator wants to confirm a
+ *             transcoding fix landed without HLS masking the
+ *             regression.
+ *   hls     — HLS only. Force the fragmented-MP4 path so the
+ *             operator can compare against WebRTC during
+ *             codec-bug triage.
+ *
+ * The preference is global (one toggle for all cameras) and
+ * persisted in localStorage. Per-camera preference was
+ * considered but adds UI surface for a feature that
+ * almost-always wants the same value across cameras.
+ */
+export type TransportMode = "auto" | "webrtc" | "hls";
+
+const TRANSPORT_KEY = "home.transport";
+
+function readTransport(): TransportMode {
+    if (typeof window === "undefined") return "auto";
+    try {
+        const v = window.localStorage.getItem(TRANSPORT_KEY);
+        if (v === "auto" || v === "webrtc" || v === "hls") return v;
+    } catch { /* private browsing etc. */ }
+    return "auto";
+}
+
+/**
  * LiveVideo — one camera: video pane + PTZ pad + preset bar.
  *
  * Streaming strategy (Phase 6)
@@ -38,6 +70,10 @@ interface LiveVideoProps {
  * brief black flash, which is acceptable because fallback is a
  * recovery path, not a routine mode.
  *
+ * The `transport` prop overrides this default policy: forcing
+ * WebRTC or HLS suppresses the auto-fallback so the operator can
+ * pin a single transport for debugging.
+ *
  * Online status is updated either from the camera row's `status`
  * field (initial render) or from the WebSocket "device.<id>.status"
  * event the parent routes in via onWsMessage.
@@ -47,7 +83,11 @@ interface LiveVideoProps {
  */
 export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
     // Path drives which sub-component is mounted. We start on
-    // WebRTC and flip to HLS on the primary's onError.
+    // WebRTC and flip to HLS on the primary's onError (in auto
+    // mode only; explicit WebRTC/HLS selections are sticky).
+    const [transport, setTransport] = useState<TransportMode>(readTransport);
+    // Internal effective path. Differs from `transport` only
+    // in "auto" mode where a WebRTC failure flipped us to HLS.
     const [path, setPath] = useState<"webrtc" | "hls">("webrtc");
     // Generation counter increments on every retry; changing it
     // forces a remount of the active sub-component.
@@ -57,12 +97,22 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
         setGeneration((g) => g + 1);
     }
 
-    // Reset to WebRTC on camera change (e.g. operator switched
-    // tiles). The next render of LiveVideo remounts both hooks.
+    // Reset to the requested transport on camera change. For
+    // "auto" we start on WebRTC; for explicit selections we
+    // honor the choice immediately.
     useEffect(() => {
-        setPath("webrtc");
+        setPath(transport === "hls" ? "hls" : "webrtc");
         setGeneration(0);
-    }, [camera.id]);
+    }, [camera.id, transport]);
+
+    // Persist transport changes to localStorage. Survives reloads
+    // and propagates to other tabs via the `storage` event (the
+    // hook is re-read in those tabs the next time they remount).
+    useEffect(() => {
+        try {
+            window.localStorage.setItem(TRANSPORT_KEY, transport);
+        } catch { /* private browsing — accept loss of persistence */ }
+    }, [transport]);
 
     const [status, setStatus] = useState<"online" | "offline" | "unknown">(camera.status);
     const [lastSeen, setLastSeen] = useState(camera.last_seen_at);
@@ -129,6 +179,23 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                 ? "bg-rose-500/20 text-rose-300 ring-rose-500/30"
                 : "bg-slate-500/20 text-slate-300 ring-slate-500/30";
 
+    // Compute the "effective" transport for the badge label
+    // and the fallback handler. In auto mode the effective
+    // path is whatever `path` resolved to (WebRTC succeeded or
+    // HLS took over); in explicit modes the effective path is
+    // always the requested one.
+    const effectivePath: "webrtc" | "hls" =
+        transport === "hls"
+            ? "hls"
+            : transport === "webrtc"
+                ? "webrtc"
+                : path;
+
+    // In explicit WebRTC mode we suppress the auto-fallback so
+    // a failure surfaces as an error overlay the operator can
+    // act on, instead of silently switching to HLS.
+    const onWebRTCFallback = transport === "auto" ? () => setPath("hls") : undefined;
+
     return (
         <Card className="overflow-hidden">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
@@ -145,8 +212,44 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                     )}
                 </CardTitle>
                 <div className="flex items-center gap-2">
+                    {/* Transport segmented control. Compact
+                     * three-button toggle, visually adjacent to
+                     * the live path badge so the relationship
+                     * (selection → resolved path) is obvious. */}
+                    <div
+                        className="inline-flex h-6 items-center rounded-md border border-slate-700 bg-slate-900/40 p-0.5 text-[10px]"
+                        role="radiogroup"
+                        aria-label="Live stream transport"
+                    >
+                        {(["auto", "webrtc", "hls"] as TransportMode[]).map((t) => {
+                            const active = transport === t;
+                            return (
+                                <button
+                                    key={t}
+                                    role="radio"
+                                    aria-checked={active}
+                                    onClick={() => setTransport(t)}
+                                    className={cn(
+                                        "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-colors",
+                                        active
+                                            ? "bg-sky-500/20 text-sky-300 shadow-sm"
+                                            : "text-slate-500 hover:text-slate-300",
+                                    )}
+                                    title={
+                                        t === "auto"
+                                            ? "Try WebRTC; fall back to HLS on failure"
+                                            : t === "webrtc"
+                                                ? "Force WebRTC; show error on failure (no auto-fallback)"
+                                                : "Force HLS; never try WebRTC"
+                                    }
+                                >
+                                    {t}
+                                </button>
+                            );
+                        })}
+                    </div>
                     <Badge variant="outline" className="text-[10px]">
-                        {path === "webrtc" ? "WebRTC" : "HLS"}
+                        {effectivePath === "webrtc" ? "WebRTC" : "HLS"}
                     </Badge>
                     <Badge variant="outline" className={cn("ring-1 ring-inset", statusColor)}>
                         <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-current" />
@@ -159,13 +262,13 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
             </CardHeader>
             <CardContent className="space-y-3 p-0">
                 <div className="relative aspect-video w-full bg-black">
-                    {path === "webrtc" ? (
+                    {effectivePath === "webrtc" ? (
                         <WebRTCVideo
                             key={`webrtc-${generation}`}
                             cameraId={camera.id}
                             streamName={camera.stream.stream_name}
                             webrtcUrl={camera.stream.webrtc_url}
-                            onFallback={() => setPath("hls")}
+                            onFallback={onWebRTCFallback}
                         />
                     ) : (
                         <HLSVideo
@@ -308,7 +411,7 @@ function WebRTCVideo({
     cameraId: number;
     streamName: string;
     webrtcUrl: string;
-    onFallback: () => void;
+    onFallback?: () => void;
 }) {
     const { videoRef, state, error } = useWebRTCStream({
         cameraId,
@@ -316,7 +419,7 @@ function WebRTCVideo({
         webrtcUrl,
     });
     useEffect(() => {
-        if (state === "error") onFallback();
+        if (state === "error") onFallback?.();
     }, [state, onFallback]);
     return (
         <VideoSurface videoRef={videoRef} state={state} error={error} label="WebRTC" />

@@ -99,7 +99,7 @@ func main() {
 
 	// ---- Services & Handlers ----
 	authService := service.NewAuthService(userRepo, deviceRepo)
-	userService := service.NewUserService(userRepo)
+	userService := service.NewUserService(userRepo, deviceRepo)
 	deviceService := service.NewDeviceService(deviceRepo)
 
 	authHandler := handler.NewAuthHandler(authService)
@@ -127,15 +127,17 @@ func main() {
 	//
 	// SecretBox derives its AES-256-GCM key from the same JWT secret
 	// we already trust (one root secret to rotate, not two). The
-	// go2rtc client talks HTTP to home-go2rtc:1984 on the internal
-	// home-net network.
+	// go2rtc client talks HTTP to Frigate's bundled go2rtc on port
+	// 1984; the Frigate client talks to Frigate's REST API on port
+	// 5000 for config push (AI detection / recording pipeline).
 	box, err := utils.NewSecretBox(cfg.JWT.Secret)
 	if err != nil {
 		log.Fatalf("camera: secret box init: %v", err)
 	}
 	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
+	frigate := camera.NewFrigateClient(cfg.Frigate.BaseURL, cfg.Go2RTC.BaseURL)
 	camONVIF := camera.NewONVIFController()
-	camReg := camera.NewRegistry(database.DB, go2, box, camONVIF, cfg.Camera.WebRTCPublicBase)
+	camReg := camera.NewRegistry(database.DB, go2, frigate, box, camONVIF, cfg.Camera.WebRTCPublicBase)
 	camRecorder := &camera.Recorder{
 		DB:        database.DB,
 		Go2:       go2,
@@ -185,9 +187,30 @@ func main() {
 
 	api := r.Group("/api/v1")
 	{
+		// /auth/bind is gated by an IP-based rate limiter to
+		// slow down online brute-force attacks against the
+		// AccessKey. The 256-bit keyspace makes offline attacks
+		// infeasible, but a determined attacker can still grind
+		// the live endpoint — 5 attempts, then 1 per 10s. The
+		// limiter is in-process and best-effort; see
+		// internal/middleware/ratelimit.go for the storage /
+		// eviction semantics. The same generic "invalid
+		// credentials" error is returned whether the limiter or
+		// the auth check rejected the request, so a probing
+		// attacker cannot distinguish throttling from failure.
+		bindLimiter := middleware.NewIPLimiter(
+			cfg.Auth.RateLimit.RPS,
+			cfg.Auth.RateLimit.Burst,
+		)
+		defer bindLimiter.Stop()
+		bindLimit := gin.HandlerFunc(func(c *gin.Context) { c.Next() })
+		if cfg.Auth.RateLimit.Enabled != nil && *cfg.Auth.RateLimit.Enabled {
+			bindLimit = middleware.RateLimitByIP(bindLimiter)
+		}
+
 		auth := api.Group("/auth")
 		{
-			auth.POST("/bind", authHandler.Bind)
+			auth.POST("/bind", bindLimit, authHandler.Bind)
 			// GET /auth/verify does NOT go through JWTAuth middleware
 			// — it IS the JWT validator. It exists to back nginx's
 			// auth_request on /go2rtc/, gating the previously
@@ -201,7 +224,21 @@ func main() {
 		user := api.Group("/user")
 		user.Use(middleware.JWTAuth(deviceRepo))
 		{
+			// /me is available to any authenticated user.
 			user.GET("/me", userHandler.Me)
+			// /user (list/create) and /user/:id (get/update/delete)
+			// are admin-only. Mounted under a sub-group that
+			// stacks the RequireAdmin guard on top of the JWT
+			// guard installed above.
+			adminUser := user.Group("")
+			adminUser.Use(middleware.RequireAdmin(database.DB))
+			{
+				adminUser.GET("", userHandler.List)
+				adminUser.POST("", userHandler.Create)
+				adminUser.GET(":id", userHandler.Get)
+				adminUser.PUT(":id", userHandler.Update)
+				adminUser.DELETE(":id", userHandler.Delete)
+			}
 		}
 
 		device := api.Group("/device")

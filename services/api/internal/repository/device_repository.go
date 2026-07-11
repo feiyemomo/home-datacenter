@@ -138,6 +138,19 @@ func (r *DeviceRepository) Delete(id uint) error {
 	return r.db.Delete(&model.Device{}, id).Error
 }
 
+// DeleteByUser removes every device owned by the given user.
+// Used by the user-management API as a hard-delete cascade: when
+// an admin deletes a user, the auth identities they owned are
+// also wiped (revocation is meaningless once the user row is gone,
+// so we delete rather than soft-revoke).
+//
+// Returns the number of rows removed so the caller can log it
+// (and so the API response can surface "deleted 3 devices").
+func (r *DeviceRepository) DeleteByUser(userID uint) (int64, error) {
+	res := r.db.Where("user_id = ?", userID).Delete(&model.Device{})
+	return res.RowsAffected, res.Error
+}
+
 // UpdateLastSeen persists last_seen_at and last_ip for a device.
 // Called asynchronously by the device Manager on every heartbeat.
 func (r *DeviceRepository) UpdateLastSeen(

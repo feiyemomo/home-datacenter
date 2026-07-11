@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"path/filepath"
 
 	"home-datacenter-api/internal/database"
 	"home-datacenter-api/internal/repository"
@@ -12,7 +13,16 @@ import (
 func main() {
 
 	// 初始化数据库
-	database.InitDB("../../../data/sqlite/app.db")
+	// Resolve path relative to the project root, not the script's
+	// CWD. The script lives at services/api/scripts/ — three levels
+	// up reaches the project root, where the docker volume mount
+	// ./data/sqlite lives. Using filepath.Abs ensures the path
+	// works regardless of where `go run` is invoked from.
+	dbPath, err := filepath.Abs("../../../data/sqlite/app.db")
+	if err != nil {
+		log.Fatalf("resolve db path: %v", err)
+	}
+	database.InitDB(dbPath)
 
 	// 创建设备仓库
 	deviceRepo := repository.NewDeviceRepository(

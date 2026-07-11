@@ -104,6 +104,11 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `GET /health` | None | Docker/Cloudflare health probe |
 | `POST /api/v1/auth/bind` | None | Exchange AccessKey for JWT |
 | `GET /api/v1/user/me` | JWT | Current user profile |
+| `GET /api/v1/user` | JWT+admin | List all users with each user's `device_count` |
+| `POST /api/v1/user` | JWT+admin | Create user `{name, is_admin}` |
+| `GET /api/v1/user/:id` | JWT+admin | Fetch one user |
+| `PUT /api/v1/user/:id` | JWT+admin | Partial update `{name?, is_admin?}` (last-admin + self-demote guards) |
+| `DELETE /api/v1/user/:id` | JWT+admin | Delete user + cascade-delete their devices; returns `{deleted_devices:N}` |
 | `GET /api/v1/device/list` | JWT | List devices (admin=all, non-admin=own) |
 | `DELETE /api/v1/device/:id` | JWT | Revoke device (soft delete) |
 | `GET /api/v1/system/status` | JWT | Dashboard metrics (MQTT/WS/online devices) |
@@ -391,15 +396,103 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
   `isAllowedMQTTTopic`, `isPublicIP` (v4 + v6 loopback/private/
   link-local/unspecified).
 
+**Phase 7 (Player UX + Security Hardening):** Complete (2026-07-11)
+
+- **Light/dark theme**: `useTheme` hook persists `home.theme` in
+  `localStorage`, applies `data-theme` on `<html>`. `applyThemeEarly()`
+  runs in `main.tsx` BEFORE React mounts to avoid a dark→light flash
+  on first paint. CSS variables (`--bg`, `--fg`, `--slate-50…950`)
+  drive Tailwind colors via `bg-slate-*` / `text-fg-*` / `bg-surface-*`
+  utility classes, so the entire palette auto-flips. Header Sun/Moon
+  button toggles; cross-tab sync via `storage` event.
+- **WebRTC/HLS transport toggle**: `LiveVideo.tsx` segmented control
+  with `auto` (default: WebRTC→HLS fallback) / `webrtc` (sticky,
+  error overlay) / `hls` (sticky, forced fragmented-MP4). Stored in
+  `home.transport` localStorage key. The auto→HLS fallback fires
+  only in `auto` mode; explicit selections suppress it so the operator
+  can pin a single transport during codec-bug triage.
+- **HLS fragmented-MP4 fix**: both `go2rtc.go` `HLSURL` helper and
+  the inline public-base branch in `registry.go` `StreamConfig` now
+  append `&mp4=` so hls.js requests `segment.m4s` (fMP4) instead of
+  `segment.ts` (MPEG-TS). hls.js's TS demuxer silently drops HEVC
+  frames even when the segments arrive — `<video>` never fires
+  `playing` and the dashboard looks stalled. `useHLSStream` now
+  probes both `video.canPlayType` and `MediaSource.isTypeSupported`
+  for `hvc1` so the "browser cannot decode H.265" error message
+  fires earlier.
+- **ffmpeg opt-in**: `Camera.Transcode=true` rewrites the go2rtc
+  source URL to `ffmpeg:rtsp://…#video=h264`. The `ffmpeg:` scheme
+  prefix is required — go2rtc's rtsp producer silently ignores
+  `#video=h264` and forwards whatever codecs the SDP advertises.
+  We do NOT add `#audio=…` to the ffmpeg URL (any non-empty audio
+  value is fed raw to ffmpeg, e.g. `audio=0` produces `-0`, a
+  malformed command line). Omitting `audio=` causes `parseArgs` to
+  inject `-an` so ffmpeg drops the camera's PCMA track cleanly.
+  Dashboard shows a small "x264" badge on transcoding cameras.
+- **`/auth/bind` rate limit**: `internal/middleware/ratelimit.go`
+  exposes a per-IP token-bucket limiter using `golang.org/x/time/rate`.
+  Defaults `rps=0.1, burst=5` (5 quick attempts, then 1 per 10s),
+  configurable via `auth.rate_limit.*` in `configs/config.yaml`. 429
+  response body is identical to the 401 body to prevent enumeration.
+  See `docs/security.md` §13 for the limitations discussion
+  (in-process state, `c.ClientIP()` trust, per-IP-not-per-account).
+
+**Phase 8 (User Management API):** Complete (2026-07-11)
+
+- **Backend** (`services/api/internal/service/user_service.go`,
+  `services/api/internal/handler/user_handler.go`):
+  - Domain errors: `ErrUserNotFound` / `ErrInvalidName` / `ErrNameTaken` /
+    `ErrLastAdmin` / `ErrSelfDelete` / `ErrSelfDemote`. Centralised
+    `writeUserServiceError` maps each to a stable HTTP code
+    (400 / 400 / 409 / 400 / 400 / 400).
+  - `isValidUserName`: 1..32 runes, unicode letter/digit/`_`/`-`,
+    leading/trailing whitespace silently trimmed, internal whitespace
+    rejected. Unicode is fully supported (e.g. `小明`, `自己`).
+  - `Create` / `Update` / `Delete` enforce: pre-check + DB unique
+    constraint (TOCTOU-safe), last-admin guard on demote/delete,
+    self-delete + self-demote rejected. Cameras are NOT cascaded.
+  - `Delete` cascades to `devices` (devices-first order so a partial
+    failure leaves the user row recoverable).
+  - `isUniqueViolation` matches both SQLite ("UNIQUE constraint
+    failed") and Postgres ("duplicate key value") error strings.
+- **Routes** (all admin-only, mounted under `/api/v1/user`):
+  - `GET    /api/v1/user`       List + `device_count` per row
+  - `POST   /api/v1/user`       Create `{name, is_admin}`
+  - `GET    /api/v1/user/:id`   Fetch one
+  - `PUT    /api/v1/user/:id`   Partial update `{name?, is_admin?}`
+  - `DELETE /api/v1/user/:id`   Delete + cascade devices
+  - `GET    /api/v1/user/me`    Self (any authenticated user, existed
+                                before Phase 8 — now reused as the
+                                dashboard's "you" indicator)
+- **Frontend** (`web/src/api/user.ts`, `web/src/pages/Users.tsx`,
+  `web/src/types.ts`):
+  - Admin-only `/users` route in `Layout.tsx` nav.
+  - CRUD table with per-row rename / role toggle / delete confirm.
+  - Client-side guards mirror the server's last-admin + self-
+    delete/self-demote rules (disabled buttons, inline error
+    banner) so the operator never round-trips a guaranteed-reject.
+  - The `you` badge on the caller's own row disables the
+    delete + role-toggle controls even before the request leaves
+    the browser.
+- **Tests**: `services/api/internal/service/user_service_test.go`
+  covers `isValidUserName` (ascii / unicode / whitespace / length
+  boundaries), `normalizeUserName` (trim + reject internal ws),
+  and `isUniqueViolation` (sqlite + postgres error shapes).
+- **Documentation**: full per-endpoint section in
+  `docs/api-documentation.md` (request/response/error matrices);
+  `docs/security.md` and `docs/ai-context.md` reference the new
+  state guards.
+
 **Security hardening pass (2026-07-04):** see `docs/Security` section below.
 
 **Next Items (Optional):**
 
 - PostgreSQL migration
-- User management API (create/delete users)
-- Unit tests
-- Rate limiting on `/auth/bind`
-- Audit log
+- Unit tests (automation rule cases, WS hub fan-out, gorm repositories)
+- Audit log (record who created/deleted users, bound devices, fired rules)
+- Recordings (continuous HLS archive per camera → searchable playback)
+- Per-camera user ownership transfer (currently `cameras.owner_id` is
+  set at register time and never reassigned)
 
 ---
 
@@ -492,14 +585,15 @@ rate limit on `/auth/bind`. Defence-in-depth layers applied:
   previously tracked have been `git rm --cached`.
 
 **Residual risks (accepted, not yet fixed)**
-- No rate limiting on `/auth/bind` — a determined attacker could brute
-  AccessKeys offline-rate. Mitigated by 256-bit keys; add a limiter
-  when feasible (see `golang.org/x/time/rate`).
-- No audit log of bind/revoke events.
+- `/auth/bind` rate limiter is in-process and per-IP (not per-account),
+  so a botnet can still grind at 1 attempt per 10s × N IPs. The
+  256-bit keyspace is the load-bearing defense; the limiter only
+  blunts volume. See `docs/security.md` §13.
+- No audit log of bind/revoke/user-lifecycle events.
 - 365-day JWTs are long; revocation is immediate (per-request DB check),
   but there is no short-lived-token + refresh-token rotation yet.
 - `CheckOrigin` is permissive when `allowed_origins` is empty (local dev).
 
 ---
 
-**Last Updated:** 2026-07-04 (security hardening pass + dashboard docs + lenient status parser + disconnect → mark-all-offline)
+**Last Updated:** 2026-07-11 (Phase 8: User Management API + last-admin/self-delete/self-demote state guards)

@@ -2,10 +2,96 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ---------------------------------------------------------------------------
+ * Theme variables.
+ *
+ * Two themes (light / dark) selected by `data-theme` on <html>. Tailwind's
+ * slate palette is wired up to these variables in tailwind.config.js, so
+ * every `slate-XXX` utility class auto-flips when the attribute changes.
+ *
+ * The light mode is intentionally a cool slate-leaning grayscale (not pure
+ * white) so cards / borders / scrollbar tracks still read as distinct
+ * surfaces against the background. The dark mode preserves the original
+ * navy / slate palette the dashboard was designed around.
+ *
+ * When adding a new color elsewhere, prefer the semantic `surface` / `fg`
+ * tokens over `slate-XXX` — they alias to the variables below and the
+ * theme change is automatic.
+ * --------------------------------------------------------------------------- */
+:root,
+[data-theme="light"] {
+    color-scheme: light;
+    /* Light mode uses slightly darker backgrounds so white cards
+     * read as elevated surfaces and text doesn't fight with the
+     * background. Foreground tokens stay at least slate-600 for
+     * WCAG AA against the raised white surface. */
+    --bg: 226 232 240;
+    /* slate-200 */
+    --bg-raised: 255 255 255;
+    /* white */
+    --bg-subtle: 241 245 249;
+    /* slate-100 */
+    --border: 203 213 225;
+    /* slate-300 */
+    /* Foreground. */
+    --fg: 15 23 42;
+    /* slate-900 */
+    --fg-muted: 51 65 85;
+    /* slate-700 */
+    --fg-subtle: 100 116 139;
+    /* slate-500 */
+    --fg-inverted: 248 250 252;
+    /* slate-50 (on dark buttons) */
+    /* Slate scale. Mirrors Tailwind's default `slate` palette
+     * values (50 -> 950) so the existing `slate-XXX` utility
+     * classes resolve identically to the default in light mode. */
+    --slate-50: 248 250 252;
+    --slate-100: 241 245 249;
+    --slate-200: 226 232 240;
+    --slate-300: 203 213 225;
+    --slate-400: 148 163 184;
+    --slate-500: 100 116 139;
+    --slate-600: 71 85 105;
+    --slate-700: 51 65 85;
+    --slate-800: 30 41 59;
+    --slate-900: 15 23 42;
+    --slate-950: 2 6 23;
+}
+
+[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: 11 17 32;
+    /* #0b1120 - navy */
+    --bg-raised: 17 24 39;
+    /* #111827 */
+    --bg-subtle: 30 41 59;
+    /* #1e293b - slate-800 */
+    --border: 51 65 85;
+    /* #334155 - slate-700 */
+    --fg: 241 245 249;
+    /* slate-100 */
+    --fg-muted: 100 116 139;
+    /* slate-500 */
+    --fg-subtle: 71 85 105;
+    /* slate-600 */
+    --fg-inverted: 15 23 42;
+    /* slate-900 */
+    /* Dark-mode slate scale. Tighter contrast (700, 800 are
+     * close to the bg) gives the chrome its "hud" look. */
+    --slate-50: 248 250 252;
+    --slate-100: 241 245 249;
+    --slate-200: 226 232 240;
+    --slate-300: 203 213 225;
+    --slate-400: 148 163 184;
+    --slate-500: 100 116 139;
+    --slate-600: 71 85 105;
+    --slate-700: 51 65 85;
+    --slate-800: 30 41 59;
+    --slate-900: 15 23 42;
+    --slate-950: 2 6 23;
+}
+
 @layer base {
-    :root {
-        color-scheme: dark;
-    }
 
     html,
     body,
@@ -14,11 +100,14 @@
     }
 
     body {
-        @apply bg-surface text-slate-100;
+        @apply bg-surface text-fg;
         font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+        /* Smooth transition between themes to avoid the page
+         * "flashing" white on toggle. */
+        transition: background-color 150ms ease, color 150ms ease;
     }
 
-    /* Subtle scrollbars that match the dark theme. */
+    /* Subtle scrollbars that match the active theme. */
     ::-webkit-scrollbar {
         width: 10px;
         height: 10px;
