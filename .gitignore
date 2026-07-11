@@ -30,20 +30,15 @@ web/tsconfig.tsbuildinfo
 web/tsconfig.node.tsbuildinfo
 
 # ---- Build artifacts & iteration leftovers ----
-# Go2rtc HLS keepalive patch iteration: OCI image extracts, tarballs,
-# and intermediate binaries. The canonical build product is the
-# `home-datacenter-go2rtc` Docker image (see deploy/go2rtc/Dockerfile).
-# These directories are kept locally as scratch during a build, but
-# must never be committed.
+# Old go2rtc build artifacts (no longer used — Frigate is a prebuilt
+# image). Kept in .gitignore so stale local dirs don't get tracked.
 go2rtc-extract/
 go2rtc-new/
 go2rtc-v2/
 go2rtc-*.tar
 go2rtc-newly-built
 
-# Ad-hoc build logs from the go2rtc patch iteration. Useful for
-# bisecting a regression, but the canonical log is scripts/
-# (added on demand). Generated as `build_*.log`.
+# Ad-hoc build logs. Generated as `build_*.log`.
 build_*.log
 
 # Live JWT for ad-hoc curl tests. NEVER commit — rotate immediately

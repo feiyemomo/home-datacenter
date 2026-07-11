@@ -21,9 +21,11 @@ type Config struct {
 	Server    ServerConfig    `mapstructure:"server"`
 	Database  DatabaseConfig  `mapstructure:"database"`
 	JWT       JWTConfig       `mapstructure:"jwt"`
+	Auth      AuthConfig      `mapstructure:"auth"`
 	MQTT      MQTTConfig      `mapstructure:"mqtt"`
 	WebSocket WebSocketConfig `mapstructure:"websocket"`
 	Go2RTC    Go2RTCConfig    `mapstructure:"go2rtc"`
+	Frigate   FrigateConfig   `mapstructure:"frigate"`
 	Camera    CameraConfig    `mapstructure:"camera"`
 }
 
@@ -49,6 +51,31 @@ type JWTConfig struct {
 	ExpireDays int    `mapstructure:"expire_days"`
 }
 
+// AuthConfig holds authentication-related tunables.
+type AuthConfig struct {
+	// RateLimit throttles /auth/bind per source IP. The 256-bit
+	// AccessKey makes offline brute-force infeasible, but a
+	// determined attacker can still mount an online attack against
+	// /auth/bind. The default rps=0.1 / burst=5 (i.e. 5 quick
+	// attempts, then 1 per 10s) keeps a single client honest
+	// without inconveniencing a user who mistypes their key.
+	RateLimit RateLimitConfig `mapstructure:"rate_limit"`
+}
+
+// RateLimitConfig holds the IP token-bucket parameters.
+type RateLimitConfig struct {
+	// RPS is the steady-state refill rate in events per second.
+	// 0.1 = 1 attempt per 10 seconds.
+	RPS float64 `mapstructure:"rps"`
+	// Burst is the initial bucket size — the number of attempts
+	// allowed back-to-back before throttling kicks in.
+	Burst int `mapstructure:"burst"`
+	// Enabled toggles the limiter. Set to false to disable
+	// (e.g. when running automated integration tests that need
+	// thousands of binds per second).
+	Enabled *bool `mapstructure:"enabled"`
+}
+
 // MQTTConfig holds MQTT broker connection settings (Phase 3).
 type MQTTConfig struct {
 	Broker   string `mapstructure:"broker"`    // e.g. "tcp://mosquitto:1883"
@@ -68,12 +95,24 @@ type WebSocketConfig struct {
 	HeartbeatSeconds int `mapstructure:"heartbeat_seconds"` // default 30
 }
 
-// Go2RTCConfig holds the go2rtc HTTP API endpoint. The camera module
-// pushes RTSP sources to it and uses it as a WebRTC/HLS origin.
+// Go2RTCConfig holds the go2rtc HTTP API endpoint. In the Frigate
+// era this points to Frigate's bundled go2rtc on port 1984. The
+// camera module pushes RTSP sources to it and uses it as a
+// WebRTC/HLS origin.
 type Go2RTCConfig struct {
 	// BaseURL is the in-network address of the go2rtc server, e.g.
-	// "http://home-go2rtc:1984". Set GO2RTC_BASE_URL env var to
+	// "http://home-frigate:1984". Set GO2RTC_BASE_URL env var to
 	// override without editing the YAML.
+	BaseURL string `mapstructure:"base_url"`
+}
+
+// FrigateConfig holds the Frigate REST API endpoint (port 5000).
+// home-api pushes the full camera config to Frigate so its AI
+// detection, recording, and snapshot features know about each camera.
+type FrigateConfig struct {
+	// BaseURL is the in-network address of the Frigate REST API,
+	// e.g. "http://home-frigate:5000". Set FRIGATE_BASE_URL env
+	// var to override without editing the YAML.
 	BaseURL string `mapstructure:"base_url"`
 }
 
@@ -143,6 +182,13 @@ func Load(path string) error {
 	v.SetDefault("jwt.secret", "")
 	v.SetDefault("jwt.expire_days", 365)
 
+	// Auth rate-limit defaults: 5 burst, 1 attempt per 10s.
+	// These are the in-process IPLimiter parameters. See
+	// internal/middleware/ratelimit.go for the implementation.
+	v.SetDefault("auth.rate_limit.rps", 0.1)
+	v.SetDefault("auth.rate_limit.burst", 5)
+	v.SetDefault("auth.rate_limit.enabled", true)
+
 	// Phase 3 defaults — MQTT disabled by default (empty broker).
 	v.SetDefault("mqtt.broker", "tcp://mosquitto:1883")
 	v.SetDefault("mqtt.client_id", "home-datacenter")
@@ -154,7 +200,8 @@ func Load(path string) error {
 	v.SetDefault("websocket.heartbeat_seconds", 30)
 
 	// Phase 4 defaults — camera platformization
-	v.SetDefault("go2rtc.base_url", "http://home-go2rtc:1984")
+	v.SetDefault("go2rtc.base_url", "http://home-frigate:1984")
+	v.SetDefault("frigate.base_url", "http://home-frigate:5000")
 	v.SetDefault("camera.health_interval_seconds", 15)
 	v.SetDefault("camera.health_timeout_seconds", 3)
 	v.SetDefault("camera.recording_dir", "/data/recordings")
@@ -170,6 +217,9 @@ func Load(path string) error {
 	}
 	if envURL := os.Getenv("GO2RTC_BASE_URL"); envURL != "" {
 		v.Set("go2rtc.base_url", envURL)
+	}
+	if envURL := os.Getenv("FRIGATE_BASE_URL"); envURL != "" {
+		v.Set("frigate.base_url", envURL)
 	}
 
 	v.SetConfigFile(path)
@@ -198,9 +248,9 @@ func Load(path string) error {
 // accepted as a real JWT signing key. They match the defaults baked into
 // configs/config.yaml and internal/utils/jwt.go.
 var insecureSecrets = map[string]struct{}{
-	"":                                 {},
-	"your-secret-key":                  {},
-	"change-me":                        {},
+	"":                                      {},
+	"your-secret-key":                       {},
+	"change-me":                             {},
 	"PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET": {},
 }
 
@@ -211,9 +261,9 @@ const minSecretLen = 32
 func validateJWTSecret(secret string) error {
 	if _, bad := insecureSecrets[secret]; bad {
 		return fmt.Errorf(
-			"jwt.secret is not set (or is a placeholder). "+
-				"Generate one with `openssl rand -hex 32`, "+
-				"put it in configs/config.yaml (or config.local.yaml), "+
+			"jwt.secret is not set (or is a placeholder). " +
+				"Generate one with `openssl rand -hex 32`, " +
+				"put it in configs/config.yaml (or config.local.yaml), " +
 				"or set the JWT_SECRET env var.",
 		)
 	}

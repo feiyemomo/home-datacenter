@@ -57,8 +57,8 @@ export default function Cameras() {
         <div className="space-y-4">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                    <CameraIcon className="h-5 w-5 text-sky-300" />
-                    <h2 className="text-lg font-semibold text-slate-100">Cameras</h2>
+                    <CameraIcon className="h-5 w-5 text-sky-600 dark:text-sky-300" />
+                    <h2 className="text-lg font-semibold text-fg">Cameras</h2>
                     <Badge variant="outline">{cams.length}</Badge>
                 </div>
                 <div className="flex gap-2">
@@ -76,7 +76,7 @@ export default function Cameras() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-200">
+                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
                     {error}
                 </div>
             )}
@@ -94,7 +94,7 @@ export default function Cameras() {
                             />
                         ))}
                         {cams.length === 0 && !loading && (
-                            <div className="col-span-full rounded-md border border-dashed border-slate-700 p-8 text-center text-sm text-slate-500">
+                            <div className="col-span-full rounded-md border border-dashed border-surface-border p-8 text-center text-sm text-fg-muted">
                                 No cameras registered. {isAdmin ? "Click Register to add one." : "Ask an admin to register one."}
                             </div>
                         )}
@@ -116,18 +116,51 @@ function CamCard({
     onDelete: () => void;
     onWsMessage: (handler: (m: WsMessage) => void) => () => void;
 }) {
+    const statusVariant =
+        cam.status === "online"
+            ? "success"
+            : cam.status === "offline"
+                ? "danger"
+                : "warning";
+
     return (
-        <div className="relative">
-            <LiveVideo camera={cam} isAdmin={isAdmin} onWsMessage={onWsMessage} />
-            {isAdmin && (
-                <button
-                    className="absolute right-2 top-2 rounded-md bg-rose-500/20 p-1.5 text-rose-300 ring-1 ring-rose-500/30 hover:bg-rose-500/30"
-                    onClick={onDelete}
-                    aria-label="Delete camera"
-                >
-                    <Trash2 size={14} />
-                </button>
-            )}
+        <div className="flex flex-col overflow-hidden rounded-xl border border-surface-border bg-surface-raised shadow-sm shadow-black/5 transition-shadow hover:shadow-md hover:shadow-black/10 dark:bg-surface-raised/90 dark:shadow-black/20 dark:hover:shadow-black/30">
+            {/* Header */}
+            <div className="flex items-center justify-between gap-3 border-b border-surface-border bg-surface-subtle/40 px-4 py-3">
+                <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-2">
+                        <h3 className="truncate text-sm font-semibold text-fg">
+                            {cam.name}
+                        </h3>
+                        {cam.transcode && (
+                            <Badge variant="info" className="shrink-0 text-[9px]">x264</Badge>
+                        )}
+                    </div>
+                    <p className="truncate text-[11px] text-fg-muted">
+                        {cam.vendor} · {cam.host}
+                    </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                    <Badge variant={statusVariant} className="text-[10px] capitalize">
+                        {cam.status}
+                    </Badge>
+                    {isAdmin && (
+                        <button
+                            className="rounded-md p-1.5 text-fg-subtle transition-colors hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-300"
+                            onClick={onDelete}
+                            aria-label="Delete camera"
+                            title="Delete camera"
+                        >
+                            <Trash2 size={14} />
+                        </button>
+                    )}
+                </div>
+            </div>
+
+            {/* Video */}
+            <div className="relative aspect-video bg-black">
+                <LiveVideo camera={cam} isAdmin={isAdmin} onWsMessage={onWsMessage} />
+            </div>
         </div>
     );
 }

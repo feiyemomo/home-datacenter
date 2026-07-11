@@ -47,6 +47,38 @@ export interface User {
     is_admin: boolean;
 }
 
+/** A user row from GET /api/v1/user (admin list). */
+export interface UserListEntry {
+    id: number;
+    name: string;
+    is_admin: boolean;
+    created_at: string;
+    updated_at: string;
+    device_count: number;
+}
+
+/** Response of GET /api/v1/user. */
+export interface UserListResponse {
+    users: UserListEntry[];
+}
+
+/** Response of DELETE /api/v1/user/:id. */
+export interface UserDeleteResponse {
+    deleted_devices: number;
+}
+
+/** Request body for POST /api/v1/user (create). */
+export interface CreateUserRequest {
+    name: string;
+    is_admin: boolean;
+}
+
+/** Request body for PUT /api/v1/user/:id (partial update). */
+export interface UpdateUserRequest {
+    name?: string;
+    is_admin?: boolean;
+}
+
 /** Response of POST /api/v1/auth/bind. */
 export interface BindResponse {
     token: string;

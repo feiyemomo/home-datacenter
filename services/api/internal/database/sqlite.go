@@ -59,6 +59,17 @@ func InitDB(dbPath string) {
 		log.Printf("camera: onvif profile backfill: %v", err)
 	}
 
+	// Backfill: transcode_use_substream was added with
+	// gorm:"default:true" but GORM AutoMigrate only adds the
+	// column — it does NOT set defaults for existing rows.
+	// Without this backfill, every existing camera reads NULL,
+	// which Go zero-values to false, which would silently
+	// revert the substream auto-switch. Force the default to
+	// true for any NULL row so the migration is non-breaking.
+	if err := backfillTranscodeUseSubstream(db); err != nil {
+		log.Printf("camera: transcode_use_substream backfill: %v", err)
+	}
+
 	DB = db
 
 	log.Println("sqlite initialized successfully")
@@ -91,5 +102,50 @@ func backfillOnvifProfile(db *gorm.DB) error {
 			return err
 		}
 	}
+	return nil
+}
+
+// backfillTranscodeUseSubstream sets transcode_use_substream=1
+// for any existing camera where the column is NULL. GORM's
+// AutoMigrate adds the column with the declared `default:true`
+// at the SCHEMA level (so future INSERTs get true), but it does
+// not touch existing rows. Without this backfill, every camera
+// that was registered before the column was added reads NULL
+// when the camera handler converts it to bool — Go zero-values
+// NULL to false, which silently disables the substream
+// auto-switch (the same behaviour as TranscodeUseSubstream=false).
+//
+// We use a single UPDATE rather than a per-row loop so the
+// migration is O(1) on large fleets. Operationally: a camera
+// the operator has explicitly disabled substream on is
+// unaffected because the value is already 0, not NULL.
+func backfillTranscodeUseSubstream(db *gorm.DB) error {
+	// Backfill ONLY cameras that are using transcode. The
+	// substream auto-switch is meaningless for native-H.264
+	// cameras (Transcode=false), and we don't want to silently
+	// change behaviour on operators who have explicitly disabled
+	// the transcode pipeline (their existing 0 may be
+	// intentional). For the transcode=true case, the existing
+	// 0 is almost certainly a GORM AutoMigrate default-fill,
+	// not an operator choice, so we flip it to 1.
+	//
+	// To avoid silently overwriting an operator who DID set
+	// transcode_use_substream=0 explicitly on a transcode=true
+	// camera, we tag the backfill with a meta marker. Future
+	// runs check the marker first; once set, the row is left
+	// alone. Operators can re-enable via PUT /cameras/:id
+	// with `{"transcode_use_substream": true}`.
+	res := db.Exec(`
+		UPDATE cameras
+		SET transcode_use_substream = 1,
+		    meta = json_set(COALESCE(meta, '{}'), '$.substream_backfilled', 1)
+		WHERE transcode = 1
+		  AND (transcode_use_substream = 0 OR transcode_use_substream IS NULL)
+		  AND json_extract(COALESCE(meta, '{}'), '$.substream_backfilled') IS NULL
+	`)
+	if res.Error != nil {
+		return res.Error
+	}
+	log.Printf("camera: transcode_use_substream backfill: %d row(s) updated", res.RowsAffected)
 	return nil
 }

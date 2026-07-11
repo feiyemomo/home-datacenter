@@ -15,18 +15,25 @@ import (
 	"home-datacenter-api/internal/utils"
 )
 
-// Registry is the camera CRUD + go2rtc sync boundary. It does NOT
+// Registry is the camera CRUD + Frigate/go2rtc sync boundary. It does NOT
 // expose HTTP — the handler layer calls it.
+//
+// Frigate bundles go2rtc internally. We use two clients:
+//   - Go2: talks to the bundled go2rtc API (stream add/remove, SDP
+//     exchange, recorder). Same API as the old standalone container.
+//   - Frigate: talks to the Frigate REST API (config save) so Frigate's
+//     AI detection and recording pipelines know about each camera.
 type Registry struct {
 	DB        *gorm.DB
 	Go2       *Go2RTCClient
+	Frigate   *FrigateClient
 	Box       *utils.SecretBox
 	ONVIF     *ONVIFController
 	WebRTCURL string // optional public base, e.g. https://cam.feiyemomo.top
 }
 
-func NewRegistry(db *gorm.DB, g *Go2RTCClient, box *utils.SecretBox, onvif *ONVIFController, webRTCURL string) *Registry {
-	return &Registry{DB: db, Go2: g, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL}
+func NewRegistry(db *gorm.DB, g *Go2RTCClient, fr *FrigateClient, box *utils.SecretBox, onvif *ONVIFController, webRTCURL string) *Registry {
+	return &Registry{DB: db, Go2: g, Frigate: fr, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL}
 }
 
 // RegisterInput is the wire format for POST /api/v1/cameras.
@@ -142,6 +149,17 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		return nil, fmt.Errorf("go2rtc add stream: %w", err)
 	}
 
+	// Push the full config to Frigate so its AI detection and
+	// recording pipelines pick up the new camera. Best-effort:
+	// if Frigate is down, the go2rtc stream is still live and
+	// the operator can view video. The config will be pushed on
+	// the next BootReplay.
+	if r.Frigate != nil {
+		if err := r.pushFrigateConfig(ctx); err != nil {
+			log.Printf("camera: register: frigate config push (non-fatal): %v", err)
+		}
+	}
+
 	if err := r.DB.Model(cam).Updates(map[string]any{
 		"updated_at": time.Now(),
 	}).Error; err != nil {
@@ -152,7 +170,9 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 
 // Unregister removes the row and asks go2rtc to drop the stream.
 // go2rtc errors are logged but not returned — the DB is the source
-// of truth and we don't want a half-deleted camera.
+// of truth and we don't want a half-deleted camera. The Frigate config
+// is also re-pushed so Frigate drops the camera from its detection
+// pipeline.
 func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	var cam model.Camera
 	if err := r.DB.First(&cam, id).Error; err != nil {
@@ -161,7 +181,15 @@ func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	if cam.StreamName != "" {
 		_ = r.Go2.RemoveStream(ctx, cam.StreamName)
 	}
-	return r.DB.Delete(&cam).Error
+	if err := r.DB.Delete(&cam).Error; err != nil {
+		return err
+	}
+	if r.Frigate != nil {
+		if err := r.pushFrigateConfig(ctx); err != nil {
+			log.Printf("camera: unregister: frigate config push (non-fatal): %v", err)
+		}
+	}
+	return nil
 }
 
 func (r *Registry) Get(id uint) (*model.Camera, error) {
@@ -218,17 +246,15 @@ func (r *Registry) UpdateStatus(id uint, status string, seen *time.Time) {
 	r.DB.Model(&model.Camera{}).Where("id = ?", id).Updates(updates)
 }
 
-// BootReplay re-registers every existing camera with go2rtc. Call
-// this from main.go after the go2rtc container has had a moment to
-// come up. A failure on one camera must not stop the others.
+// BootReplay re-registers every existing camera with the Frigate
+// bundled go2rtc and pushes the full config to Frigate. Call this
+// from main.go after the Frigate container has had a moment to come
+// up. A failure on one camera must not stop the others.
 //
-// Robustness: go2rtc's HTTP API may not be ready the instant its
-// container starts (Docker Compose depends_on without a health
-// condition only waits for the container to start, not for the
-// service inside). We retry the whole replay pass with backoff so
-// a slow-starting go2rtc doesn't leave all cameras unregistered —
-// which was the root cause of the "SDP 500" / "cam_X not in go2rtc"
-// issue. Errors are logged, not swallowed silently.
+// Robustness: the go2rtc API may not be ready the instant its
+// container starts. We retry the whole replay pass with backoff so
+// a slow-starting Frigate doesn't leave all cameras unregistered.
+// Errors are logged, not swallowed silently.
 func (r *Registry) BootReplay(ctx context.Context) error {
 	cams := r.List()
 	if len(cams) == 0 {
@@ -273,6 +299,16 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 			log.Printf("camera: boot replay: cam %d (%s): stream added", c.ID, c.StreamName)
 		}
 
+		// Push the full config to Frigate so its AI detection and
+		// recording pipelines pick up every camera. Best-effort:
+		// if Frigate's REST API is down, the go2rtc streams are
+		// still live and video works.
+		if r.Frigate != nil {
+			if err := r.pushFrigateConfig(ctx); err != nil {
+				log.Printf("camera: boot replay: frigate config push (non-fatal): %v", err)
+			}
+		}
+
 		if failed == 0 {
 			log.Printf("camera: boot replay: %d camera(s) registered with go2rtc", len(cams))
 			return nil
@@ -289,6 +325,189 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("boot replay: go2rtc not ready after %d attempts", maxAttempts)
+}
+
+// pushFrigateConfig generates the full Frigate camera config from the
+// DB and pushes it via the Frigate REST API. Called after each
+// register/unregister and during BootReplay.
+//
+// The Frigate camera name uses a normalized ASCII slug (because
+// Frigate's Pydantic model validates names against a strict regex),
+// but the go2rtc stream key is the original friendly name from the
+// dashboard. The two are linked by go2rtc.streams[name] — Frigate
+// picks up the RTSP URL for each camera by looking up its slug in
+// go2rtc.streams.
+//
+// IMPORTANT: Frigate's ffmpeg.inputs[].path is the path Frigate
+// passes to its OWN ffmpeg child process for AI detection — it
+// does NOT go through go2rtc. The `ffmpeg:` scheme prefix is
+// go2rtc-specific; Frigate treats it as a literal filename and
+// fails with "Protocol not found". We therefore send a plain
+// rtsp:// URL (with the same `#video=h264#width=1280` ffmpeg
+// directives) to Frigate's camera config, and the full
+// `ffmpeg:rtsp://...` URL to go2rtc.streams for the streaming
+// pipeline. The two URLs share the same credentials and transcode
+// options but differ only in scheme.
+func (r *Registry) pushFrigateConfig(ctx context.Context) error {
+	cams := r.List()
+	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
+	go2rtcStreams := make(map[string]string)
+	for _, c := range cams {
+		if c.StreamName == "" {
+			continue
+		}
+		u, p, err := r.DecryptCredentials(&c)
+		if err != nil {
+			log.Printf("camera: frigate config: cam %d: decrypt: %v", c.ID, err)
+			continue
+		}
+		go2rtcURL := r.rtspURL(&c, u, p)             // ffmpeg:rtsp://...
+		frigatePath := r.frigateCameraPath(&c, u, p) // rtsp://...
+
+		// Frigate's name validator: ^[a-zA-Z0-9_-]+$
+		slug := slugifyName(c.StreamName)
+		frigateCams = append(frigateCams, FrigateCameraConfig{
+			Name:    slug,
+			Enabled: true,
+			Ffmpeg: FrigateFfmpeg{
+				Inputs: []FrigateInput{
+					{
+						Path:  frigatePath,
+						Roles: []string{"detect", "record"},
+					},
+				},
+			},
+			Detect: FrigateDetect{Enabled: true},
+			Record: FrigateRecord{Enabled: false},
+		})
+		// go2rtc stream key keeps the original friendly name so
+		// the existing stream URLs (e.g. /api/stream.m3u8?src=前门)
+		// continue to work.
+		go2rtcStreams[c.StreamName] = go2rtcURL
+	}
+	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams)
+}
+
+// frigateCameraPath is the URL form Frigate's OWN ffmpeg child
+// process (for AI detection) expects. Unlike go2rtc, Frigate does
+// not honour the `ffmpeg:` scheme prefix — it passes the path
+// directly to `ffmpeg -i <path>`, so the scheme must be one ffmpeg
+// knows natively (`rtsp://` is fine, with the same `#video=h264`
+// and `#width=...` directives that go2rtc understands).
+//
+// Channel selection: when `transcode=true` AND
+// `transcode_use_substream=true` (the default), we use the
+// substream channel (ChannelID + 100, Hikvision convention:
+// 101 → 201). The substream is typically 720x576 / 1 Mbps —
+// designed for low-bandwidth remote viewing, and a perfect match
+// for Cloudflare Tunnel links where the main 1080p HEVC stream
+// produces 1+ MB HLS segments that hit the 5s go2rtc keepalive.
+//
+// IMPORTANT codec caveat: many newer Hikvision / Dahua
+// cameras deliver the substream as H.265/HEVC too, which
+// Chrome does NOT support for WebRTC (SDP 502 "codecs not
+// matched: video:H265" — only Safari and Firefox nightly
+// have HEVC WebRTC). If your substream is H.265 you must
+// EITHER change the camera's substream video encoding to
+// H.264 in its web admin UI, OR set
+// `transcode_use_substream: false` in the camera config
+// (which sources the main 101 stream and re-encodes it
+// via the ffmpeg `#video=h264#width=1280` pipeline).
+//
+// (Previous `subStreamChannel` helper removed: the substream
+// auto-switching heuristic was unreliable because newer
+// Hikvision / Dahua cameras deliver the substream as H.265
+// too, which Chrome cannot decode for WebRTC. We now source
+// the configured ChannelID as-is and let the transcode
+// pipeline re-encode to H.264 720p — universally compatible
+// and the only stable path on slow Cloudflare Tunnel links.)
+
+// frigateCameraPath builds the URL Frigate's OWN ffmpeg child
+// process (for AI detection) expects. Unlike go2rtc, Frigate does
+// not honour the `ffmpeg:` scheme prefix — it passes the path
+// directly to `ffmpeg -i <path>`, so the scheme must be one ffmpeg
+// knows natively (`rtsp://` is fine, with the same `#video=h264`
+// and `#width=...` directives that go2rtc understands).
+//
+// Transcode decision:
+//   - transcode=true → ffmpeg H.264 720p pipeline
+//     (`#video=h264#width=1280`). Universally compatible
+//     with Chrome WebRTC, fits the 1Mbps Cloudflare Tunnel
+//     link with room to spare (~250-400 kbps output).
+//     Frigate's ffmpeg and the streaming layer use the
+//     same directive syntax.
+//   - transcode=false → raw RTSP, Frigate handles the
+//     codec (HEVC, H.264, etc.) directly.
+func (r *Registry) frigateCameraPath(cam *model.Camera, user, pass string) string {
+	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	if !cam.Transcode {
+		// Native path (operator-disabled transcode on a
+		// codec-compatible camera). Skip audio. Frigate's
+		// ffmpeg reads H.264 / H.265 directly.
+		return raw + "#audio=0"
+	}
+	// Frigate ffmpeg reads the same `#video=h264` and
+	// `#width=1280` query directives (Frigate reuses go2rtc's
+	// ffmpeg arg parser). Transcoded streams hit Frigate's
+	// detection pipeline as H.264 720p instead of raw HEVC 1080p,
+	// which is the same path the streaming layer takes.
+	return raw + "#video=h264#width=1280"
+}
+
+// slugifyName converts a human-friendly camera name (which may
+// contain Chinese, spaces, or other non-ASCII characters) to an
+// ASCII slug that passes Frigate's Pydantic name validator
+// (^[a-zA-Z0-9_-]+$).
+//
+//	"前门"      → "front_door" (well-known map)
+//	"Back Yard" → "back_yard"
+//	"Camera-1"  → "camera-1" (already valid)
+//	"摄像头 02" → "cam_02"
+//
+// The well-known Chinese map is intentionally small — operators
+// can rename cameras in the dashboard to whatever they like; the
+// slug only needs to be unique and ASCII-clean. If the result
+// collides with an existing slug we append a numeric suffix.
+func slugifyName(name string) string {
+	// Well-known Chinese → English map. Operators can edit the
+	// camera name in the dashboard if they want a different slug.
+	cn := map[string]string{
+		"前门": "front_door",
+		"后门": "back_door",
+		"客厅": "living_room",
+		"卧室": "bedroom",
+		"厨房": "kitchen",
+		"院子": "yard",
+		"车库": "garage",
+	}
+	if en, ok := cn[name]; ok {
+		return en
+	}
+	// Generic: keep alnum + _ + -, replace everything else with _,
+	// collapse runs of underscores, trim leading/trailing _.
+	var b strings.Builder
+	prevUnderscore := false
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+			b.WriteRune(r)
+			prevUnderscore = false
+		case r == '_' || r == '-':
+			b.WriteRune('_')
+			prevUnderscore = false
+		default:
+			if !prevUnderscore && b.Len() > 0 {
+				b.WriteByte('_')
+				prevUnderscore = true
+			}
+		}
+	}
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		out = "camera"
+	}
+	return out
 }
 
 // --- credential helpers (also used by the ONVIF controller) ---
@@ -376,10 +595,16 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 	if !cam.Transcode {
-		// Native H.264 (or HEVC-on-HEVC-browser) path. The
-		// rtsp scheme honours `#audio=0` to skip audio at
-		// the source (Hikvision's PCMA/PCMU would otherwise
-		// show up in the SDP but not be negotiated).
+		// Native path: no ffmpeg, no transcode. Camera
+		// delivers whatever codec it has (H.264 / H.265)
+		// and we hope the consumer supports it. HLS
+		// always works (hls.js transcodes on the fly
+		// via Media Source Extensions for H.265 on
+		// supporting browsers), WebRTC only works for
+		// H.264 in Chrome. The `audio=0` directive
+		// tells go2rtc to drop the camera's PCMA track
+		// from the SDP — go2rtc exposes a PCMU/PCMA
+		// audio track that the browser cannot decode.
 		return raw + "#audio=0"
 	}
 	// Transcode path: route through go2rtc's ffmpeg
@@ -388,7 +613,17 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// high@4.1, superfast/zerolatency, yuv420p). Omitting
 	// `audio=` causes parseArgs to inject `-an` so ffmpeg
 	// drops the camera's PCMA track entirely.
-	return "ffmpeg:" + raw + "#video=h264"
+	//
+	// `width=1280` downscales the source to 1280px wide
+	// (preserving aspect ratio). The HEVC front-door camera
+	// is 1920x1080 at ~8 Mbps after transcode, which on a
+	// 1 Mbps Cloudflare Tunnel link produces ~1 MB per
+	// 1-second HLS segment and reliably hits the upstream
+	// 5s go2rtc HLS keepalive. Downscaling to 720p (1280px
+	// wide) cuts that to ~250-400 kbps, fitting 4-5
+	// segments inside the 5s window. The aspect ratio
+	// produces ~720p height.
+	return "ffmpeg:" + raw + "#video=h264#width=1280"
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into

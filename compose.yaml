@@ -32,7 +32,7 @@ services:
     depends_on:
       mosquitto:
         condition: service_started
-      go2rtc:
+      frigate:
         condition: service_healthy
     environment:
       - APP_CONFIG=${APP_CONFIG:-/configs/config.yaml}
@@ -40,7 +40,8 @@ services:
       - JWT_SECRET=${JWT_SECRET:-}
       - MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
       - MQTT_PASSWORD=${MQTT_PASSWORD:-}
-      - GO2RTC_BASE_URL=${GO2RTC_BASE_URL:-http://home-go2rtc:1984}
+      - GO2RTC_BASE_URL=${GO2RTC_BASE_URL:-http://home-frigate:1984}
+      - FRIGATE_BASE_URL=${FRIGATE_BASE_URL:-http://home-frigate:5000}
     networks:
       - home-net
 
@@ -74,50 +75,48 @@ services:
     networks:
       - home-net
 
-  # go2rtc — RTSP → WebRTC/HLS bridge.
-  # The API pushes stream definitions to it at runtime; this
-  # container just serves what it's told. Port 1984 is bound to
-  # the loopback only — the only path in is via Cloudflare Tunnel
-  # (or your LAN via a manually mapped port).
+  # frigate — NVR with built-in go2rtc, AI object detection,
+  # and recording. Replaces the standalone go2rtc container.
   #
-  # IMPORTANT: go2rtc.yaml is NOT bind-mounted. The Dockerfile
-  # COPYs it into the image at /etc/go2rtc.yaml, and go2rtc rewrites
-  # that file on every PUT /api/streams call (it persists in-memory
-  # streams to disk for next-boot replay). A bind-mounted file —
-  # especially on Windows / Docker Desktop — can be read-only at
-  # the filesystem level even without the :ro flag, causing the
-  # write to fail silently: the API returns 200 but the stream is
-  # never added. By relying on the Dockerfile COPY the file lives
-  # in the container's writable layer and go2rtc can save freely.
-  # The DB remains the source of truth on container restart;
-  # home-api's BootReplay re-injects all persisted streams.
-  go2rtc:
-    build:
-      context: ./deploy/go2rtc
-    container_name: home-go2rtc
+  # Frigate bundles go2rtc internally on port 1984 (same API as the
+  # standalone container). The Frigate REST API is on port 5000.
+  # home-api pushes camera config to Frigate via PUT /api/config/save
+  # so the AI detection pipeline knows about each camera.
+  #
+  # Ports:
+  #   1984 — bundled go2rtc HTTP API (stream management, SDP, HLS)
+  #   5000 — Frigate REST API (config, events, snapshots)
+  #   8555 — WebRTC media (TCP ICE + UDP ICE, same as standalone go2rtc)
+  #
+  # SET_CONFIG_BY_API=true enables the PUT /api/config/save endpoint
+  # so home-api can push camera definitions dynamically.
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:stable
+    container_name: home-frigate
     restart: unless-stopped
+    environment:
+      - SET_CONFIG_BY_API=true
+      - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-}
     ports:
-      # HTTP API + WebRTC SDP signalling (proxied via dashboard nginx)
+      # Frigate REST API (config, events, snapshots)
+      - "127.0.0.1:5000:5000"
+      # Bundled go2rtc HTTP API (HLS, WebRTC SDP signalling)
       - "127.0.0.1:1984:1984"
-      # WebRTC media: TCP ICE + UDP ICE on a single port. Browser
-      # needs direct access for ICE connectivity checks. Binding to
-      # 0.0.0.0 (not 127.0.0.1) so the same go2rtc instance is also
-      # reachable from phones/tablets on the LAN. The /go2rtc/
-      # SDP path stays loopback-only because that's just signalling.
+      # WebRTC media: TCP ICE + UDP ICE. Browser needs direct
+      # access for ICE connectivity checks.
       - "8555:8555"
       - "8555:8555/udp"
     volumes:
-      - ./data/go2rtc:/var/lib/go2rtc
-    # Healthcheck so dependent services (api) wait for the HTTP API
-    # to actually be ready, not just for the container to start.
-    # Without this, the API's BootReplay runs before go2rtc accepts
-    # connections and silently fails to register any stream.
+      - ./deploy/frigate/config.yml:/config/config.yml
+      - ./data/frigate:/media/frigate
+      - ./data/recordings:/recordings
+    # Healthcheck: check the Frigate REST API is responding.
     healthcheck:
-      test: [ "CMD", "wget", "-qO-", "http://localhost:1984/api/streams" ]
+      test: [ "CMD", "wget", "-qO-", "http://localhost:5000/api/config" ]
       interval: 5s
       timeout: 3s
       retries: 10
-      start_period: 3s
+      start_period: 10s
     networks:
       - home-net
   # coturn — optional STUN/TURN for WebRTC across the public

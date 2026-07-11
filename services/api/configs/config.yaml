@@ -29,6 +29,17 @@ jwt:
   secret: your-secret-key
   expire_days: 365
 
+# /auth/bind online-bruteforce throttling. The 256-bit AccessKey
+# already rules out offline attacks, but a determined attacker can
+# still pound the live endpoint. The IP token-bucket in
+# internal/middleware/ratelimit.go is bounded by these values.
+# Set enabled: false to disable (e.g. for local soak tests).
+auth:
+  rate_limit:
+    rps: 0.1        # steady-state: 1 attempt per 10 seconds per IP
+    burst: 5        # bucket size: 5 attempts allowed back-to-back
+    enabled: true
+
 # Phase 3: MQTT broker (Mosquitto)
 mqtt:
   broker: tcp://mosquitto:1883
@@ -43,11 +54,14 @@ websocket:
   heartbeat_seconds: 30
 
 # Phase 4: Camera platformization
-# go2rtc is reached by its Docker service name on the home-net
-# network. Override with GO2RTC_BASE_URL env var if the address
-# differs (e.g. local dev with a host-installed go2rtc on :1984).
+# Frigate bundles go2rtc internally. The go2rtc API is on port 1984
+# and the Frigate REST API (config save, AI detection) is on port 5000.
+# Override with GO2RTC_BASE_URL / FRIGATE_BASE_URL env vars if needed.
 go2rtc:
-  base_url: http://home-go2rtc:1984
+  base_url: http://home-frigate:1984
+
+frigate:
+  base_url: http://home-frigate:5000
 
 camera:
   # How often to TCP-probe each camera's RTSP port.

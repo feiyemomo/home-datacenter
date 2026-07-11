@@ -191,23 +191,72 @@ because the rule surface is admin-only and the home OS is single-user.
 
 ---
 
+## §13. `/auth/bind` rate limiting
+
+### Why
+- AccessKeys are 256 bits — offline brute force is infeasible. But
+  the live `/auth/bind` endpoint is still online-attackable: a
+  determined attacker can grind it.
+- The limiter is the second line of defense after the keyspace.
+  It blunts attack volume and keeps the auth-failure log from
+  drowning out real signal.
+
+### Mechanism
+- `internal/middleware/ratelimit.go` exposes `IPLimiter`:
+  in-process token-bucket per source IP, with a 5-minute background
+  GC that evicts entries idle for >10 minutes.
+- Defaults: `rps=0.1`, `burst=5` → 5 quick attempts, then
+  1 every 10s. Configurable via `auth.rate_limit.*` in
+  `configs/config.yaml`.
+- Rejected requests get `429 Too Many Requests` with the **same
+  body as the 401 path** (`{"code":429,"message":"invalid
+  credentials","data":null}`), so a probing attacker cannot
+  distinguish throttling from credential failure.
+
+### Limitations (acknowledged)
+- **In-process state.** The limiter is per home-api instance. If
+  the deployment is horizontally scaled, swap the storage for
+  Redis (TODO). For the home use case (single instance) this is
+  sufficient.
+- **c.ClientIP() trust.** Behind Cloudflare Tunnel, `c.ClientIP()`
+  reads `CF-Connecting-IP` only when the request actually came
+  from the tunnel; nginx must forward the original IP. Verify
+  with `docker logs home-api | grep "401"` that the X-Forwarded-For
+  chain terminates at a trusted proxy, otherwise an attacker can
+  spoof their IP via `X-Forwarded-For` and reset the bucket
+  arbitrarily.
+- **Per-IP, not per-account.** A botnet with 1000 IPs gets
+  1000 × burst tokens. The 256-bit keyspace still makes the
+  attack cost-prohibitive (10^77 attempts), but the limiter alone
+  is not a brute-force defense — it just slows the attack down
+  to a trickle. The keyspace is the real defense.
+
+### Verification
+```
+for ($i=1; $i -le 12; $i++) {
+  Invoke-WebRequest -Uri "http://localhost:8080/api/v1/auth/bind" `
+    -Method POST -ContentType "application/json" `
+    -Body '{"user_id":1,"access_key":"wrong"}' -UseBasicParsing
+}
+# Expect: 1-5 → 401, 6-12 → 429
+```
+
+---
+
 ## Residual Risks (accepted, not yet fixed)
 
-1. **No rate limiting on `/auth/bind`.** A 256-bit key makes online brute
-   force infeasible, but a limiter (`golang.org/x/time/rate`) is still
-   worth adding to blunt traffic and log noise.
-2. **No audit log.** Bind and revoke events are not persisted beyond the
+1. **No audit log.** Bind and revoke events are not persisted beyond the
    device row's `LastLoginAt` / `RevokedAt` timestamps.
-3. **365-day JWTs.** Long-lived; revocation is immediate (per-request DB
+2. **365-day JWTs.** Long-lived; revocation is immediate (per-request DB
    check on `RevokedAt`), but there is no short-lived + refresh rotation.
-4. **Permissive WebSocket origin in dev.** `allowed_origins: []` accepts
+3. **Permissive WebSocket origin in dev.** `allowed_origins: []` accepts
    any origin — fine on localhost, must be populated for production.
-5. **MQTT publish is admin-by-convention, not enforced server-side.** The
+4. **MQTT publish is admin-by-convention, not enforced server-side.** The
    `/mqtt/publish` route is JWT-gated but does not itself check `IsAdmin`;
    admin enforcement lives in the dashboard route guard. If a non-admin
    JWT calls the endpoint directly it will succeed. Consider adding an
    `AdminOnly` middleware.
-6. **`core.autocrlf=true`** on Windows means gofmt may locally flag CRLF
+5. **`core.autocrlf=true`** on Windows means gofmt may locally flag CRLF
    in committed-then-rechecked files; the canonical line ending is LF.
 
 ---

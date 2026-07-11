@@ -30,12 +30,12 @@ interface StatCardProps {
 }
 
 const accentClasses: Record<StatCardProps["accent"], string> = {
-    sky: "from-sky-500/20 to-sky-500/0 text-sky-300 ring-sky-500/30",
+    sky: "from-sky-500/20 to-sky-500/0 text-sky-700 dark:text-sky-300 ring-sky-500/30",
     emerald:
-        "from-emerald-500/20 to-emerald-500/0 text-emerald-300 ring-emerald-500/30",
-    amber: "from-amber-500/20 to-amber-500/0 text-amber-300 ring-amber-500/30",
+        "from-emerald-500/20 to-emerald-500/0 text-emerald-700 dark:text-emerald-300 ring-emerald-500/30",
+    amber: "from-amber-500/20 to-amber-500/0 text-amber-700 dark:text-amber-300 ring-amber-500/30",
     violet:
-        "from-violet-500/20 to-violet-500/0 text-violet-300 ring-violet-500/30",
+        "from-violet-500/20 to-violet-500/0 text-violet-700 dark:text-violet-300 ring-violet-500/30",
 };
 
 function StatCard({ label, value, icon, accent, hint }: StatCardProps) {
@@ -45,20 +45,20 @@ function StatCard({ label, value, icon, accent, hint }: StatCardProps) {
                 className={`pointer-events-none absolute inset-0 bg-gradient-to-br ${accentClasses[accent].split(" ")[0]} ${accentClasses[accent].split(" ")[1]}`}
             />
             <CardHeader className="relative flex-row items-center justify-between pb-2">
-                <CardTitle className="text-xs uppercase tracking-wider text-slate-400">
+                <CardTitle className="text-xs uppercase tracking-wider text-fg-muted">
                     {label}
                 </CardTitle>
                 <div
-                    className={`flex h-9 w-9 items-center justify-center rounded-lg bg-slate-900/60 ring-1 ring-inset ${accentClasses[accent].split(" ").slice(2).join(" ")}`}
+                    className={`flex h-9 w-9 items-center justify-center rounded-lg bg-surface-subtle ring-1 ring-inset ${accentClasses[accent].split(" ").slice(2).join(" ")}`}
                 >
                     {icon}
                 </div>
             </CardHeader>
             <CardContent className="relative">
-                <div className="text-3xl font-semibold tracking-tight text-slate-50">
+                <div className="text-3xl font-semibold tracking-tight text-fg">
                     {value}
                 </div>
-                {hint && <div className="mt-2 text-xs text-slate-400">{hint}</div>}
+                {hint && <div className="mt-2 text-xs text-fg-muted">{hint}</div>}
             </CardContent>
         </Card>
     );
@@ -115,17 +115,17 @@ export default function Dashboard() {
         <div className="space-y-6">
             <div className="flex items-center justify-between">
                 <div>
-                    <h2 className="text-lg font-semibold text-slate-100">Dashboard</h2>
-                    <p className="text-xs text-slate-500">
+                    <h2 className="text-lg font-semibold text-fg">Dashboard</h2>
+                    <p className="text-xs text-fg-muted">
                         Live system metrics, refreshed every 5 seconds.
                     </p>
                 </div>
                 {loading ? (
-                    <RefreshCw size={16} className="animate-spin text-slate-500" />
+                    <RefreshCw size={16} className="animate-spin text-fg-subtle" />
                 ) : (
                     <Badge variant={error ? "danger" : "success"}>
                         <span
-                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-rose-400" : "bg-emerald-400"}`}
+                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-rose-500 dark:bg-rose-400" : "bg-emerald-500 dark:bg-emerald-400"}`}
                         />
                         {error ? "error" : "live"}
                     </Badge>
@@ -133,7 +133,7 @@ export default function Dashboard() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
                     {error}
                 </div>
             )}
@@ -203,7 +203,7 @@ export default function Dashboard() {
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
-                    <pre className="overflow-x-auto rounded-md bg-slate-950/80 p-4 text-xs leading-relaxed text-slate-300">
+                    <pre className="overflow-x-auto rounded-lg border border-surface-border bg-surface-subtle/50 p-4 text-xs leading-relaxed text-fg">
                         {status ? JSON.stringify(status, null, 2) : "// no data yet"}
                     </pre>
                 </CardContent>
