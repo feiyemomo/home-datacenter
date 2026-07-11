@@ -27,6 +27,7 @@ type Config struct {
 	Go2RTC    Go2RTCConfig    `mapstructure:"go2rtc"`
 	Frigate   FrigateConfig   `mapstructure:"frigate"`
 	Camera    CameraConfig    `mapstructure:"camera"`
+	Network   NetworkConfig   `mapstructure:"network"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -152,6 +153,27 @@ type CameraConfig struct {
 	ICEServers string `mapstructure:"ice_servers"`
 }
 
+// NetworkConfig holds the network capability detection settings
+// (Phase 10: Network Layer).
+type NetworkConfig struct {
+	// STUNServers is the list of public STUN servers used for NAT
+	// detection and P2P signaling. If empty, a built-in default list
+	// (Google, Cloudflare, MiWiFi) is used.
+	STUNServers []STUNServerConfig `mapstructure:"stun_servers"`
+
+	// CheckIntervalSeconds is how often the background detection loop
+	// re-runs all checks. Default 60. The cache TTL matches this
+	// interval, so the API always serves fresh-enough data without
+	// blocking on STUN round-trips.
+	CheckIntervalSeconds int `mapstructure:"check_interval_seconds"`
+}
+
+// STUNServerConfig is a single STUN server entry in the config file.
+type STUNServerConfig struct {
+	Host string `mapstructure:"host"`
+	Port int    `mapstructure:"port"`
+}
+
 // AppConfig is the globally accessible configuration instance,
 // populated by Load(). It is safe to read after Load returns nil.
 var AppConfig *Config
@@ -207,6 +229,9 @@ func Load(path string) error {
 	v.SetDefault("camera.recording_dir", "/data/recordings")
 	v.SetDefault("camera.webrtc_public_base", "")
 	v.SetDefault("camera.ice_servers", "")
+
+	// Phase 10 defaults — network capability detection
+	v.SetDefault("network.check_interval_seconds", 60)
 
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /

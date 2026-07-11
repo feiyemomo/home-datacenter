@@ -7,11 +7,16 @@ import {
     Wifi,
     WifiOff,
     RefreshCw,
+    Globe,
+    Star,
+    Smartphone,
+    ArrowUp,
 } from "lucide-react";
 import { getSystemStatus } from "@/api/system";
+import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
 import { ApiError } from "@/api/client";
 import { formatUptime } from "@/lib/utils";
-import type { SystemStatus } from "@/types";
+import type { SystemStatus, NetworkStatus } from "@/types";
 import {
     Card,
     CardContent,
@@ -69,6 +74,8 @@ function StatCard({ label, value, icon, accent, hint }: StatCardProps) {
  */
 export default function Dashboard() {
     const [status, setStatus] = useState<SystemStatus | null>(null);
+    const [netStatus, setNetStatus] = useState<NetworkStatus | null>(null);
+    const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [loading, setLoading] = useState(true);
 
@@ -78,9 +85,13 @@ export default function Dashboard() {
 
         async function tick() {
             try {
-                const s = await getSystemStatus();
+                const [s, n] = await Promise.all([
+                    getSystemStatus(),
+                    getNetworkStatus(),
+                ]);
                 if (!cancelled) {
                     setStatus(s);
+                    setNetStatus(n);
                     setError(null);
                 }
             } catch (err) {
@@ -106,6 +117,13 @@ export default function Dashboard() {
             cancelled = true;
             if (timer !== null) window.clearTimeout(timer);
         };
+    }, []);
+
+    // Client-side IPv6 check — runs once on mount (client IPv6 doesn't
+    // change frequently; re-checking every 5s would be wasteful and
+    // could cause CORS noise in the console).
+    useEffect(() => {
+        checkClientIPv6().then((v) => setClientIPv6(v));
     }, []);
 
     const onlineCount = status?.online_device_count ?? 0;
@@ -192,6 +210,89 @@ export default function Dashboard() {
                     }
                 />
             </div>
+
+            {/* Network quality summary */}
+            <Card>
+                <CardHeader className="flex-row items-center justify-between pb-2">
+                    <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
+                        <Globe size={16} /> Network Quality
+                    </CardTitle>
+                    {netStatus && (
+                        <div className="flex items-center gap-0.5">
+                            {[1, 2, 3, 4, 5].map((n) => (
+                                <Star
+                                    key={n}
+                                    size={14}
+                                    className={
+                                        n <= netStatus.quality
+                                            ? "fill-amber-400 text-amber-400"
+                                            : "fill-none text-fg-subtle"
+                                    }
+                                />
+                            ))}
+                        </div>
+                    )}
+                </CardHeader>
+                <CardContent>
+                    <div className="flex items-center gap-4">
+                        <div className="min-w-0 flex-1">
+                            {/* Connection model: Relay → Upgrade */}
+                            <div className="flex items-center gap-2">
+                                <span className="text-lg font-semibold text-fg">
+                                    Relay
+                                </span>
+                                {netStatus && netStatus.strategy !== netStatus.initial && (
+                                    <>
+                                        <ArrowUp size={14} className="text-sky-500" />
+                                        <span className="text-sm text-sky-600 dark:text-sky-400">
+                                            upgradable to{" "}
+                                            {netStatus.strategy === "ipv6_direct"
+                                                ? "IPv6 Direct"
+                                                : netStatus.strategy === "p2p"
+                                                    ? "P2P"
+                                                    : ""}
+                                        </span>
+                                    </>
+                                )}
+                            </div>
+                            {/* Capability indicators: Server vs Client */}
+                            <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-fg-muted">
+                                <span className="inline-flex items-center gap-1" title="Server IPv6">
+                                    <Server size={11} />
+                                    <span
+                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.ipv6?.reachable ? "bg-emerald-400" : "bg-rose-400"}`}
+                                    />
+                                    IPv6
+                                </span>
+                                <span className="inline-flex items-center gap-1" title="Your device IPv6">
+                                    <Smartphone size={11} />
+                                    <span
+                                        className={`inline-block h-2 w-2 rounded-full ${clientIPv6 === null
+                                                ? "bg-slate-400"
+                                                : clientIPv6
+                                                    ? "bg-emerald-400"
+                                                    : "bg-rose-400"
+                                            }`}
+                                    />
+                                    You
+                                </span>
+                                <span className="inline-flex items-center gap-1" title="Server P2P">
+                                    <span
+                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.p2p?.supported ? "bg-emerald-400" : "bg-rose-400"}`}
+                                    />
+                                    P2P
+                                </span>
+                                <span className="inline-flex items-center gap-1" title="Relay">
+                                    <span
+                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.relay?.available ? "bg-emerald-400" : "bg-rose-400"}`}
+                                    />
+                                    Relay
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </CardContent>
+            </Card>
 
             <Card>
                 <CardHeader>

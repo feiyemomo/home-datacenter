@@ -18,6 +18,7 @@ import (
 	"home-datacenter-api/internal/handler"
 	"home-datacenter-api/internal/middleware"
 	"home-datacenter-api/internal/mqtt"
+	"home-datacenter-api/internal/network"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
@@ -185,6 +186,23 @@ func main() {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
 
+	// ---- Phase 10: Network capability detection ----
+	//
+	// The network service runs IPv6/STUN/NAT detection in the
+	// background and caches results for the configured TTL. The P2P
+	// peer registry is an in-memory signaling store for UDP hole
+	// punching — the mobile app registers its STUN-discovered public
+	// endpoint, then looks up the server's endpoint to start punching.
+	var stunServers []network.STUNServer
+	for _, s := range cfg.Network.STUNServers {
+		stunServers = append(stunServers, network.STUNServer{Host: s.Host, Port: s.Port})
+	}
+	netService := network.NewService(stunServers,
+		time.Duration(cfg.Network.CheckIntervalSeconds)*time.Second)
+	netService.StartBackground(context.Background())
+	peerRegistry := network.NewPeerRegistry()
+	netHandler := handler.NewNetworkHandler(netService, peerRegistry)
+
 	api := r.Group("/api/v1")
 	{
 		// /auth/bind is gated by an IP-based rate limiter to
@@ -318,6 +336,27 @@ func main() {
 			automationGroup.GET("/metrics", automationHandler.Metrics)
 			automationGroup.GET("/rules/:id/metrics", automationHandler.RuleMetrics)
 			automationGroup.POST("/rules/:id/cooldown", automationHandler.Cooldown)
+		}
+
+		// Phase 10: Network capability detection + P2P signaling.
+		// Status is available to any authenticated user (the mobile
+		// app needs it to decide the connection strategy). P2P peer
+		// registration is also per-user. The peer list is admin-only.
+		netGroup := api.Group("/network")
+		netGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			netGroup.GET("/status", netHandler.Status)
+			// P2P signaling endpoints.
+			netGroup.POST("/p2p/register", netHandler.RegisterP2P)
+			netGroup.DELETE("/p2p/register", netHandler.UnregisterP2P)
+			netGroup.GET("/p2p/server-endpoint", netHandler.LookupServer)
+			netGroup.GET("/p2p/peers/:id", netHandler.LookupPeer)
+			// Admin-only: list all registered peers.
+			adminNet := netGroup.Group("")
+			adminNet.Use(middleware.RequireAdmin(database.DB))
+			{
+				adminNet.GET("/p2p/peers", netHandler.ListPeers)
+			}
 		}
 	}
 

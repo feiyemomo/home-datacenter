@@ -87,3 +87,19 @@ camera:
   #                   {"urls":"turn:turn.example.com:3478",
   #                    "username":"x","credential":"y"}]'
   ice_servers: ""
+
+# Phase 10: Network capability detection
+# The server detects IPv6 availability, NAT type, and P2P feasibility
+# by querying public STUN servers. Results are cached for
+# check_interval_seconds and exposed via GET /api/v1/network/status.
+# The mobile app uses this to decide: IPv6 direct → P2P → relay.
+network:
+  check_interval_seconds: 60
+  # STUN servers used for NAT detection. If omitted, built-in defaults
+  # (Google, Cloudflare, MiWiFi) are used. Add custom servers here only
+  # if the defaults are blocked in your region.
+  # stun_servers:
+  #   - host: stun.l.google.com
+  #     port: 19302
+  #   - host: stun.cloudflare.com
+  #     port: 3478
