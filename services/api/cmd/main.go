@@ -234,6 +234,14 @@ func main() {
 			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
 			camGroup.GET(":id/recordings", camHandler.ListRecordings)
 			camGroup.GET(":id/recordings/:recId/file", camHandler.PlayRecording)
+			// WebRTC SDP exchange. Lives in the cameras group so it
+			// shares the JWT middleware (any authenticated user with
+			// read access to the camera can call it). The SDP body
+			// is read once in camHandler.WebRTC and forwarded once
+			// to go2rtc — going through home-api avoids the
+			// nginx auth_request + body-discard interaction that
+			// used to make /go2rtc/api/webrtc hang for 60s.
+			camGroup.POST(":id/webrtc", camHandler.WebRTC)
 			// Mutating endpoints are admin-only.
 			adminCam := camGroup.Group("")
 			adminCam.Use(middleware.RequireAdmin(database.DB))

@@ -30,7 +30,7 @@
 | go2rtc | AlexxIT/go2rtc | `home-go2rtc` | `1984`（仅本地） |
 
 Phase 4（摄像头平台化）新增 `home-go2rtc`：所有摄像头的 RTSP 由
-`home-api` 注册并加密入 SQLite，再以 `cam_<id>` 为名推送给
+`home-api` 注册并加密入 SQLite，再以**友好名称（如"前门"）**为名推送给
 go2rtc；前端通过 **HLS（主）** 或 **WebRTC（备）** 拉流。详见
 [`docs/platformization.md`](docs/platformization.md)。
 
@@ -290,7 +290,7 @@ WebRTC 拉流（浏览器侧）：
   rtc.addTransceiver("video", {direction:"sendrecv"});
   rtc.createOffer()
     .then(o => rtc.setLocalDescription(o))
-    .then(() => fetch("http://localhost:1984/api/webrtc?src=cam_1", {
+    .then(() => fetch("http://localhost:1984/api/webrtc?src=前门", {
       method:"POST", headers:{"Content-Type":"application/sdp"},
       body: rtc.localDescription.sdp
     }))

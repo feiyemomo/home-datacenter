@@ -324,12 +324,23 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 //
 // Video handling: by default the source's native video codec is
 // passed through (HEVC stays HEVC, H.264 stays H.264). When
-// `cam.Transcode` is true, the registry adds `#video=h264`, which
-// go2rtc interprets as "run the source through ffmpeg, output
-// H.264". This is the only escape for HEVC cameras on browsers
-// whose WebRTC RTP codec registry does not include H.265
-// (Chrome / Edge / Android WebView — see
-// docs/platformization.md for the matrix).
+// `cam.Transcode` is true, the registry routes the source through
+// go2rtc's `ffmpeg:` exec pipeline (`ffmpeg:rtsp://...#video=h264`),
+// which spawns an ffmpeg process that transcodes the camera's
+// native codec (typically H.265 on Hikvision) to H.264. This is
+// the only escape for HEVC cameras on browsers whose WebRTC RTP
+// codec registry does not include H.265 (Chrome / Edge / Android
+// WebView — see docs/platformization.md for the matrix).
+//
+// The `ffmpeg:` scheme prefix is REQUIRED — the bare rtsp:// scheme
+// has no transcode path, and a `#video=h264` fragment on a plain
+// rtsp:// URL is silently ignored (the rtsp producer just connects
+// to the camera and reports whatever codecs the camera advertises
+// in its SDP). go2rtc's `ffmpeg:` scheme redirects through its
+// internal parseArgs → exec: pipeline (see
+// build-host/go2rtc/internal/ffmpeg/ffmpeg.go streams.RedirectFunc),
+// so the URL must look like `ffmpeg:rtsp://...#video=h264` for
+// transcoding to actually happen.
 //
 // rtspURL is the canonical RTSP source go2rtc pulls from.
 //
@@ -338,19 +349,46 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 // would benefit is the mobile app — the savings in bandwidth and
 // decode cost are not worth the extra wiring.
 //
-// `cam.Transcode` adds a `#video=h264` fragment. go2rtc 1.9.x
-// recognises the fragment as a per-source instruction to run the
-// stream through ffmpeg, output H.264. The flag is per-camera so
-// H.264 sources don't pay the transcode cost. The combined
-// fragment is `#audio=0&video=h264` (ampersand, not a second #).
+// `cam.Transcode` opts the camera into ffmpeg-backed H.264
+// transcoding, which is required for HEVC sources on browsers
+// whose WebRTC RTP registry does not include H.265
+// (Chrome / Edge / Android WebView — see
+// docs/platformization.md for the matrix).
+//
+// IMPORTANT: go2rtc's RTSP scheme does NOT honour the
+// `#video=h264` fragment on its own — that fragment is a
+// directive for the `ffmpeg:` scheme handler (see
+// build-host/go2rtc/internal/ffmpeg/ffmpeg.go
+// streams.RedirectFunc + parseArgs). We therefore prefix the
+// URL with `ffmpeg:` when transcode=true, which routes it
+// through go2rtc's exec pipeline. The native H.264 path
+// stays on the rtsp:// scheme with just `#audio=0`.
+//
+// Fragment form: `ffmpeg:rtsp://...#video=h264`
+// — we deliberately do NOT add `#audio=...` to the ffmpeg
+// URL. go2rtc's parseArgs adds `-an` automatically when
+// `query["audio"]` is empty, and any non-empty value (e.g.
+// "0", "anull") is fed straight to ffmpeg as a raw codec
+// arg, which produces a malformed command line. The Hikvision
+// audio (PCMA) is not browser-decodable anyway, so dropping
+// it is the right default.
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
-	url := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
-	fragments := []string{"audio=0"}
-	if cam.Transcode {
-		fragments = append(fragments, "video=h264")
+	if !cam.Transcode {
+		// Native H.264 (or HEVC-on-HEVC-browser) path. The
+		// rtsp scheme honours `#audio=0` to skip audio at
+		// the source (Hikvision's PCMA/PCMU would otherwise
+		// show up in the SDP but not be negotiated).
+		return raw + "#audio=0"
 	}
-	return url + "#" + strings.Join(fragments, "&")
+	// Transcode path: route through go2rtc's ffmpeg
+	// pipeline. `video=h264` is a hard-coded ffmpeg preset
+	// in go2rtc (see defaults["h264"] in ffmpeg.go: H.264
+	// high@4.1, superfast/zerolatency, yuv420p). Omitting
+	// `audio=` causes parseArgs to inject `-an` so ffmpeg
+	// drops the camera's PCMA track entirely.
+	return "ffmpeg:" + raw + "#video=h264"
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into

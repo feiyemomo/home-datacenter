@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 )
 
@@ -152,6 +153,64 @@ func (c *Go2RTCClient) RemoveStream(ctx context.Context, name string) error {
 // the HTTP body.
 func (c *Go2RTCClient) WebRTCURL(streamName string) string {
 	return fmt.Sprintf("%s/api/webrtc?src=%s", c.Base, url.QueryEscape(streamName))
+}
+
+// ExchangeSDP forwards the browser's SDP offer to go2rtc and
+// returns the SDP answer verbatim.
+//
+// Why this exists: the dashboard was originally proxying the
+// browser's POST /api/webrtc through nginx, gating it with
+// auth_request /api/v1/auth/verify. nginx's auth_request
+// sub-request machinery reads (and discards) the request body
+// while it's being formed for the sub-call, so when the upstream
+// proxy_pass tried to forward the same body to go2rtc the body
+// was already gone — the upstream connection sat idle waiting
+// for bytes that would never come, hit the 60s
+// proxy_send_timeout, and the browser saw 504/500.
+//
+// Bypassing nginx for the SDP exchange fixes that: the front-end
+// POSTs the SDP directly to home-api (which already speaks
+// JWT-auth), and home-api acts as the thin reverse-proxy to
+// go2rtc. The SDP body is read once, in a Go handler, and
+// forwarded once. The JWT is validated by the existing
+// camGroup.Use(middleware.JWTAuth) middleware, so we don't need
+// any new auth surface.
+//
+// Returns the SDP answer bytes (no parsing — go2rtc hands us the
+// answer SDP as the response body, and we hand it back to the
+// browser as our response body). go2rtc 5xx is bubbled up as
+// an error; the handler turns that into a 502 BadGateway so the
+// front-end can keep its existing SDP-error fallback path.
+func (c *Go2RTCClient) ExchangeSDP(ctx context.Context, streamName string, sdpOffer []byte) ([]byte, error) {
+	if len(sdpOffer) == 0 {
+		return nil, fmt.Errorf("empty SDP offer")
+	}
+	u := c.WebRTCURL(streamName)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(string(sdpOffer)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/sdp")
+
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	// Read the full body so the connection can be returned to the
+	// pool (go2rtc speaks HTTP/1.1 keep-alive). Cap at 64 KiB
+	// — a normal SDP answer is well under 4 KiB; this is just a
+	// guard against a misbehaving upstream that streams forever.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+	if err != nil {
+		return nil, fmt.Errorf("read sdp answer: %w", err)
+	}
+
+	if resp.StatusCode >= 300 {
+		return body, fmt.Errorf("go2rtc webrtc: %s: %s", resp.Status, strings.TrimSpace(string(body)))
+	}
+	return body, nil
 }
 
 // HLSURL is the iOS-Safari fallback (HLS, not WebRTC).

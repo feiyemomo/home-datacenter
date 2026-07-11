@@ -2,6 +2,7 @@ package handler
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"path/filepath"
@@ -398,6 +399,75 @@ func (h *CameraHandler) ICE(c *gin.Context) {
 	lanBase := h.Reg.Go2.Base
 	cfg := camera.BuildIceConfig(h.RawIce, h.PublicBase, lanBase)
 	utils.Success(c, cfg)
+}
+
+// WebRTC — POST /api/v1/cameras/:id/webrtc
+//
+// Body: the browser's SDP offer (`Content-Type: application/sdp`).
+// Response: the SDP answer verbatim (`Content-Type: application/sdp`).
+//
+// This endpoint exists because proxying the SDP POST through nginx +
+// auth_request hits a hard nginx quirk: the auth_request sub-call
+// reads (and discards) the request body while preparing the
+// sub-request, and the original proxy_pass upstream is left
+// without bytes to send to go2rtc. The upstream connection then
+// hangs on proxy_send_timeout (60s) and the browser sees a 504/500.
+//
+// Going front-end → home-api → go2rtc instead means the SDP body
+// is read exactly once (in this handler) and forwarded exactly
+// once (via Go2RTCClient.ExchangeSDP). Auth is the existing
+// camGroup JWT middleware; no new auth surface. The WebRTC media
+// path (RTP / RTCP over UDP 8555) is unchanged — that's a
+// direct browser-to-go2rtc link that doesn't touch nginx.
+//
+// Errors:
+//   - 400 if the SDP body is empty or unreadable
+//   - 404 if the camera doesn't exist (handled by requireCanRead)
+//   - 403 if the caller doesn't own the camera (handled by requireCanRead)
+//   - 502 if go2rtc is down or returns 5xx (the answer body is
+//     included in the error message so the front-end can surface it)
+func (h *CameraHandler) WebRTC(c *gin.Context) {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
+		return
+	}
+
+	// Reject obviously bad bodies. SDP offers from a healthy browser
+	// are 1–4 KiB; 64 KiB is a generous cap that still leaves room
+	// for a future trickle-ICE variant while not letting a
+	// misbehaving client push us into reading a multi-GB body into
+	// memory.
+	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<16))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "read sdp body: "+err.Error())
+		return
+	}
+	if len(body) == 0 {
+		utils.Fail(c, http.StatusBadRequest, "empty SDP body")
+		return
+	}
+
+	answer, err := h.Reg.Go2.ExchangeSDP(c.Request.Context(), cam.StreamName, body)
+	if err != nil {
+		// 502 because the upstream (go2rtc) is the failing party
+		// — the request itself was well-formed. The go2rtc error
+		// message is included so the front-end can render it.
+		utils.Fail(c, http.StatusBadGateway, err.Error())
+		return
+	}
+
+	// go2rtc returns the SDP answer as the response body. We
+	// mirror that contract so the browser can do
+	// `await resp.text()` and feed it straight into
+	// pc.setRemoteDescription({type:"answer", sdp}). Use the
+	// successful SDP-200 status code (utils.Success wraps in our
+	// standard {code,message,data} envelope, which is NOT what
+	// the browser expects for the SDP answer), so write the raw
+	// body instead.
+	c.Header("Content-Type", "application/sdp")
+	c.Header("Cache-Control", "no-store")
+	c.Status(http.StatusOK)
+	_, _ = c.Writer.Write(answer)
 }
 
 // List — GET /api/v1/cameras

@@ -3,7 +3,7 @@ api:
   origin: "*"
 
 log:
-  level: info
+  level: debug
   output: stderr
 
 webrtc:

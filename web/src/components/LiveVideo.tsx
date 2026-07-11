@@ -162,6 +162,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                     {path === "webrtc" ? (
                         <WebRTCVideo
                             key={`webrtc-${generation}`}
+                            cameraId={camera.id}
                             streamName={camera.stream.stream_name}
                             webrtcUrl={camera.stream.webrtc_url}
                             onFallback={() => setPath("hls")}
@@ -299,15 +300,18 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
  * RTCPeerConnection closes, and the next mount is a clean slate.
  */
 function WebRTCVideo({
+    cameraId,
     streamName,
     webrtcUrl,
     onFallback,
 }: {
+    cameraId: number;
     streamName: string;
     webrtcUrl: string;
     onFallback: () => void;
 }) {
     const { videoRef, state, error } = useWebRTCStream({
+        cameraId,
         streamName,
         webrtcUrl,
     });
