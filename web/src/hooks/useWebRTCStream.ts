@@ -73,10 +73,12 @@ export type WebRTCState =
     | "error";
 
 export interface UseWebRTCStreamOptions {
+    cameraId: number;
     streamName: string;
     webrtcUrl: string;
     /** When the WebRTC server is behind a different origin, override
-     *  the SDP endpoint entirely. Default: `webrtcUrl`. */
+     *  the SDP endpoint entirely. Default: relative path on the
+     *  same origin as the dashboard. */
     sdpUrlOverride?: string;
     /** Disable the auto-reconnect on connection-state changes. */
     autoReconnect?: boolean;
@@ -204,14 +206,35 @@ export function useWebRTCStream(
                 await waitForIceGathering(pc, 3000);
                 if (cancelled) return;
 
-                // Prefer the browser-accessible base from ICE config.
-                // The per-camera webrtcUrl may contain an internal Docker
-                // hostname (e.g. http://home-go2rtc:1984) that the browser
-                // cannot resolve, causing "Failed to fetch".
+                // Same-origin POST to home-api. The SDP body is read
+                // exactly once in the Go handler and forwarded
+                // exactly once via Go2RTCClient.ExchangeSDP, so
+                // nginx's auth_request machinery is bypassed (and
+                // the body-discard bug that used to hang the
+                // request for 60s on proxy_send_timeout is
+                // avoided).
+                //
+                // We deliberately do NOT prepend `ice.webrtc_base`
+                // here. The old /go2rtc/ reverse-proxy path used
+                // to be reached through that base, but the new
+                // home-api proxy is a same-origin REST endpoint
+                // that home-api's own JWT middleware already
+                // protects — the public base isn't a hop on this
+                // path. If we naively concatenated (e.g.
+                // "/go2rtc" + "/api/v1/cameras/17/webrtc"), the
+                // URL would hit nginx's /go2rtc/ location, get
+                // proxied to go2rtc, which has no such endpoint
+                // — go2rtc would hang waiting for ICE on a path
+                // it never recognised, and the browser would see
+                // a 60s 500. The fix is to always go through the
+                // same-origin REST route.
+                //
+                // The browser still talks directly to go2rtc:8555
+                // for the RTP media (via the ICE candidates in
+                // the SDP answer), but the SDP path is just a
+                // regular JWT-authenticated POST.
                 const sdpUrl = opts.sdpUrlOverride
-                    ?? (ice?.webrtc_base
-                        ? `${ice.webrtc_base}/api/webrtc?src=${encodeURIComponent(opts.streamName)}`
-                        : opts.webrtcUrl);
+                    ?? `/api/v1/cameras/${opts.cameraId}/webrtc`;
                 const resp = await authedFetch(sdpUrl, {
                     method: "POST",
                     headers: { "Content-Type": "application/sdp" },
@@ -262,7 +285,7 @@ export function useWebRTCStream(
             cancelled = true;
             teardown();
         };
-    }, [opts.streamName, opts.webrtcUrl, opts.sdpUrlOverride, nonce, teardown]);
+    }, [opts.cameraId, opts.streamName, opts.webrtcUrl, opts.sdpUrlOverride, nonce, teardown]);
 
     const retry = useCallback(() => setNonce((n) => n + 1), []);
     const stop = useCallback(() => teardown(), [teardown]);

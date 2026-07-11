@@ -990,13 +990,32 @@ Publish `{"status":"offline",...}` to flip it back.
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check |
 | `/api/v1/auth/bind` | POST | No | Bind device, obtain JWT |
+| `/api/v1/auth/verify` | GET | JWT | Used by nginx `auth_request` for `/go2rtc/*` gating; returns 200/401 |
 | `/api/v1/user/me` | GET | JWT | Get current user profile |
 | `/api/v1/device/list` | GET | JWT | List visible devices |
 | `/api/v1/device/:id` | DELETE | JWT | Revoke a device |
 | `/api/v1/system/status` | GET | JWT | Dashboard metrics |
 | `/api/v1/mqtt/publish` | POST | JWT | Publish within `home-datacenter/` (dashboard admin) |
 | `/api/v1/ws` | GET (upgrade) | JWT | WebSocket real-time channel |
+| `/api/v1/cameras` | GET | JWT | List cameras |
+| `/api/v1/cameras` | POST | JWT+admin | Register a camera (encrypts creds, pushes RTSP to go2rtc) |
+| `/api/v1/cameras/:id` | GET | JWT | Fetch one camera + live stream URLs |
+| `/api/v1/cameras/:id` | DELETE | JWT+admin | Unregister a camera (DB + go2rtc) |
+| `/api/v1/cameras/:id/ptz` | POST | JWT+admin | Send ONVIF PTZ command (auto-discovers profile_token) |
+| `/api/v1/cameras/:id/webrtc` | POST | JWT | SDP exchange proxy → go2rtc (`Content-Type: application/sdp`) |
+| `/api/v1/cameras/ice` | GET | JWT | Browser ICE servers config (STUN/TURN) + `webrtc_base` |
+| `/api/v1/automation/rules` | GET/POST | JWT+admin | List / create automation rules |
+| `/api/v1/automation/rules/:id` | PUT/DELETE | JWT+admin | Update / delete rule |
+| `/api/v1/automation/rules/:id/test` | POST | JWT+admin | Manually fire a rule (no `fire_count` bump) |
+| `/api/v1/automation/metrics` | GET | JWT+admin | Global engine metrics; `?reset=1` resets counters |
+| `/api/v1/automation/rules/:id/metrics` | GET | JWT+admin | Per-rule metrics |
+| `/api/v1/automation/rules/:id/cooldown` | POST | JWT+admin | Pin `lastFire` to silence a misbehaving rule |
+
+> Camera + Automation endpoints are described in detail in
+> [`docs/platformization.md`](platformization.md) and
+> [`docs/security.md`](security.md) §11–12. The rows above are the
+> authoritative route surface as of Phase 7.
 
 ---
 
-**Document Version:** 2026-07-04 (security hardening + Phase 3 endpoints + dashboard)
+**Document Version:** 2026-07-11 (Phase 7: go2rtc public auth + SDP proxy + camera/automation routes)

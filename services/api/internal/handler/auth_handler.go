@@ -83,6 +83,27 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 // laptop" and "the thief keeps watching". Leaving cache headers off
 // is the safe default.
 func (h *AuthHandler) Verify(c *gin.Context) {
+	// nginx's `auth_request` directive sub-calls this endpoint
+	// with the ORIGINAL request's method, headers, AND
+	// Content-Length — but the body itself is dropped before
+	// the sub-request goes out. The result is a malformed
+	// HTTP request: a GET with `Content-Length: 367` and an
+	// immediately-EOF body. Go's net/http strictly honors
+	// Content-Length and blocks the read for the full 60s
+	// keepalive window before returning `unexpected EOF`,
+	// which surfaces to the client as a 60s `auth_request`
+	// 500. (Verified by adding timing logs in this handler:
+	// `enter method=GET cl=367` followed by
+	// `drain done in 1m0s (n=0 err=unexpected EOF)`.)
+	//
+	// The fix: discard the body entirely. The /auth/verify
+	// handler only needs the Authorization header and a
+	// single device row, so any forwarded body is by
+	// definition garbage from a misbehaving sub-request
+	// machinery. Setting `Body = http.NoBody` skips both
+	// the read AND the keepalive wait.
+	c.Request.Body = http.NoBody
+
 	authHeader := c.GetHeader("Authorization")
 	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
 		utils.Fail(c, http.StatusUnauthorized, "missing or invalid Authorization header")

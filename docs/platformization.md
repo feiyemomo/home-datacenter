@@ -47,8 +47,9 @@ so every state change becomes a queryable, automatable event.
 ```
 
 * **`home-go2rtc`** is a stateless RTSP-to-WebRTC/HLS bridge. It owns
-  no credentials — it only knows stream names (`cam_1`, `cam_2` …)
-  and the source URLs the API feeds it.
+  no credentials — it only knows stream names (the friendly name
+  entered in dashboard, e.g. `前门`, `客厅`) and the source URLs the
+  API feeds it.
 * **`home-api`** owns the camera registry (`cameras` table), encrypts
   credentials with AES-GCM, pushes stream definitions to go2rtc at
   register/unregister time, and probes each camera's RTSP port on a
@@ -459,10 +460,24 @@ Operator-facing consequences:
   (a) **Per-camera ffmpeg transcode** — turn on the
   `transcode` toggle in the camera register form (or
   `POST /api/v1/cameras` with `"transcode": true`). The
-  registry appends `#video=h264` to the RTSP URL, go2rtc routes
-  the source through ffmpeg, and WebRTC receives a clean H.264
-  stream that Chrome / Edge / Android can decode natively.
-  ffmpeg is now part of the go2rtc image (~30 MB on top of
+  registry rewrites the source URL to
+  `ffmpeg:rtsp://...#video=h264` (see
+  `services/api/internal/camera/registry.go` rtspURL). The
+  `ffmpeg:` scheme prefix is required — a bare
+  `rtsp://...#video=h264` is silently ignored by go2rtc's
+  rtsp producer, which just connects to the camera and
+  forwards whatever codecs the SDP advertises. With the
+  `ffmpeg:` prefix, go2rtc routes the source through its
+  internal `streams.RedirectFunc` → `parseArgs` → `exec:`
+  pipeline (see `build-host/go2rtc/internal/ffmpeg/ffmpeg.go`),
+  spawns an ffmpeg child process with the `h264` preset
+  (libx264, high@4.1, superfast/zerolatency, yuv420p), and
+  feeds the H.264 output to the WebRTC peer. The Hikvision
+  audio (PCMA / G726) is dropped automatically by ffmpeg's
+  `-an` (we deliberately do NOT add `#audio=...` to the
+  ffmpeg URL — any non-empty audio value would be fed
+  raw to ffmpeg, producing a malformed command line).
+  ffmpeg is part of the go2rtc image (~30 MB on top of
   the existing footprint, only consumes CPU for cameras with
   the flag on). The Dashboard shows a small "x264" badge next
   to the camera name so the operator can see at a glance which

@@ -12,7 +12,28 @@ import (
 var DB *gorm.DB
 
 func InitDB(dbPath string) {
-	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
+	// The bare `glebarez/sqlite` driver defaults to a 60s busy
+	// timeout (the upstream _modernc.org/sqlite default) and a
+	// `journal=DELETE` mode. On a busy home-api where the
+	// automation engine, camera health checker, and EventBus-
+	// bridged MQTT handler all touch the same DB, a single long
+	// write (e.g. an automation `webhook` action retry, or a
+	// camera health tick that updates `last_seen`) can hold the
+	// write lock for milliseconds — but a concurrent /api/v1/auth/verify
+	// (called by nginx `auth_request` for every /go2rtc/ SDP
+	// POST) will then stall for the full 60s on its primary-key
+	// lookup, cascade into nginx's default 60s
+	// `proxy_read_timeout`, and surface as a WebRTC SDP 500.
+	//
+	// We override:
+	//   * busy_timeout=1000ms: read requests fail fast (and
+	//     can be retried by nginx) instead of waiting the full
+	//     SQLite default of 60s.
+	//   * journal_mode=WAL: concurrent readers no longer block
+	//     on a writer, and vice versa, so a slow automation
+	//     webhook can no longer freeze the auth path.
+	dsn := dbPath + "?_pragma=busy_timeout(1000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)"
+	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{})
 	if err != nil {
 		log.Fatalf("failed to connect sqlite: %v", err)
 	}
