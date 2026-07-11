@@ -4,6 +4,7 @@ WORKDIR /app
 
 # Configure Go proxy for faster downloads in China
 ENV GOPROXY=https://goproxy.cn,https://goproxy.io,direct
+ENV GOSUMDB=off
 
 COPY go.mod .
 COPY go.sum .

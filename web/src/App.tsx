@@ -5,6 +5,7 @@ import { Layout } from "@/components/Layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Cameras from "@/pages/Cameras";
+import Network from "@/pages/Network";
 import DeviceCreate from "@/pages/DeviceCreate";
 import Devices from "@/pages/Devices";
 import MqttDebug from "@/pages/MqttDebug";
@@ -48,6 +49,16 @@ export default function App() {
                         <ProtectedRoute>
                             <Layout>
                                 <Cameras />
+                            </Layout>
+                        </ProtectedRoute>
+                    }
+                />
+                <Route
+                    path="/network"
+                    element={
+                        <ProtectedRoute>
+                            <Layout>
+                                <Network />
                             </Layout>
                         </ProtectedRoute>
                     }

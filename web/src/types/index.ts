@@ -241,3 +241,69 @@ export interface IceConfig {
 export interface SetPresetRequest {
     token: string;
 }
+
+// -------------------- Network capability (Phase 10) --------------------
+
+/** IPv6 availability and public reachability. */
+export interface IPv6Status {
+    enabled: boolean;
+    reachable: boolean;
+    address?: string;
+    checked_at: string;
+}
+
+/** NAT type detected via STUN. */
+export interface NATStatus {
+    type: "cone" | "symmetric" | "unknown";
+    public_ip?: string;
+    public_port?: number;
+    checked_at: string;
+}
+
+/** P2P feasibility assessment. */
+export interface P2PStatus {
+    supported: boolean;
+    reason: string;
+}
+
+/** Relay fallback status. */
+export interface RelayStatus {
+    available: boolean;
+    type: string;
+}
+
+/** Recommended connection strategy for the mobile app. */
+export type ConnectionStrategy = "ipv6_direct" | "p2p" | "relay";
+
+/** Full network capability report from GET /api/v1/network/status. */
+export interface NetworkStatus {
+    ipv6: IPv6Status;
+    nat: NATStatus;
+    p2p: P2PStatus;
+    relay: RelayStatus;
+    /** Recommended INITIAL connection — always "relay". Connect immediately, then probe `strategy` for upgrade. */
+    initial: ConnectionStrategy;
+    /** BEST achievable path after probing. Client upgrades from `initial` to this if probe succeeds. */
+    strategy: ConnectionStrategy;
+    quality: number; // 1-5
+    checked_at: string;
+}
+
+/** Server's P2P endpoint for UDP hole punching. */
+export interface ServerEndpoint {
+    public_ip: string;
+    public_port: number;
+    ipv6?: string;
+    nat_type: string;
+    strategy: string;
+}
+
+/** A registered P2P peer. */
+export interface PeerEndpoint {
+    peer_id: string;
+    public_ip: string;
+    public_port: number;
+    ipv6?: string;
+    registered_at: string;
+    expires_at: string;
+}
