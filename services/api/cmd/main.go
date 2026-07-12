@@ -197,11 +197,25 @@ func main() {
 	for _, s := range cfg.Network.STUNServers {
 		stunServers = append(stunServers, network.STUNServer{Host: s.Host, Port: s.Port})
 	}
+
+	// P2P hole puncher — binds a persistent UDP socket, discovers the
+	// server's public endpoint via STUN, and listens for hole-punching
+	// packets from peers. Disabled when p2p_port = 0 (dev default).
+	var holePuncher *network.HolePuncher
+	if cfg.Network.P2PPort > 0 {
+		holePuncher = network.NewHolePuncher(cfg.Network.P2PPort, stunServers)
+		if err := holePuncher.Listen(); err != nil {
+			log.Printf("warning: holepunch listen failed: %v — P2P disabled", err)
+			holePuncher = nil
+		}
+	}
+
 	netService := network.NewService(stunServers,
-		time.Duration(cfg.Network.CheckIntervalSeconds)*time.Second)
+		time.Duration(cfg.Network.CheckIntervalSeconds)*time.Second,
+		cfg.Network.DirectPort, cfg.Network.PublicIPv6, holePuncher)
 	netService.StartBackground(context.Background())
 	peerRegistry := network.NewPeerRegistry()
-	netHandler := handler.NewNetworkHandler(netService, peerRegistry)
+	netHandler := handler.NewNetworkHandler(netService, peerRegistry, holePuncher)
 
 	api := r.Group("/api/v1")
 	{
@@ -342,6 +356,10 @@ func main() {
 		// Status is available to any authenticated user (the mobile
 		// app needs it to decide the connection strategy). P2P peer
 		// registration is also per-user. The peer list is admin-only.
+		// Probe endpoint — no auth required (clients use it to test
+		// IPv6 direct connectivity without a JWT).
+		api.GET("/network/probe", netHandler.Probe)
+
 		netGroup := api.Group("/network")
 		netGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
@@ -351,11 +369,12 @@ func main() {
 			netGroup.DELETE("/p2p/register", netHandler.UnregisterP2P)
 			netGroup.GET("/p2p/server-endpoint", netHandler.LookupServer)
 			netGroup.GET("/p2p/peers/:id", netHandler.LookupPeer)
-			// Admin-only: list all registered peers.
+			// Admin-only: list all registered peers + P2P sessions.
 			adminNet := netGroup.Group("")
 			adminNet.Use(middleware.RequireAdmin(database.DB))
 			{
 				adminNet.GET("/p2p/peers", netHandler.ListPeers)
+				adminNet.GET("/p2p/sessions", netHandler.ListSessions)
 			}
 		}
 	}

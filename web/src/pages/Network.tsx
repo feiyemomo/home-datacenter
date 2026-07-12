@@ -12,10 +12,12 @@ import {
     XCircle,
     Smartphone,
     Server,
+    Zap,
+    Activity,
 } from "lucide-react";
-import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
+import { getNetworkStatus, checkClientIPv6, probeIPv6Direct } from "@/api/network";
 import { ApiError } from "@/api/client";
-import type { NetworkStatus, ConnectionStrategy } from "@/types";
+import type { NetworkStatus, ConnectionStrategy, P2PSession } from "@/types";
 import {
     Card,
     CardContent,
@@ -42,10 +44,14 @@ export default function Network() {
     const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
     const [error, setError] = useState<string | null>(null);
     const [refreshing, setRefreshing] = useState(false);
+    // IPv6 direct probe result: null = not probed, >=0 = RTT ms, -1 = failed, -2 = mixed content.
+    const [probeRTT, setProbeRTT] = useState<number | null>(null);
+    const [probing, setProbing] = useState(false);
 
     const fetchAll = useCallback(async (force = false) => {
         try {
             if (force) setRefreshing(true);
+            setProbeRTT(null); // clear stale probe result
             const [s, c] = await Promise.all([
                 getNetworkStatus(force),
                 checkClientIPv6(),
@@ -53,6 +59,22 @@ export default function Network() {
             setStatus(s);
             setClientIPv6(c);
             setError(null);
+
+            // Auto-probe IPv6 direct in the background. checkClientIPv6()
+            // test endpoints may be blocked by GFW; the probe is the
+            // definitive test. If it succeeds, override clientIPv6=true.
+            // On HTTPS pages this returns -2 (mixed content) instantly.
+            if (s.direct_url) {
+                setProbing(true);
+                probeIPv6Direct(s.direct_url).then((rtt) => {
+                    setProbeRTT(rtt);
+                    if (rtt >= 0) {
+                        setClientIPv6(true);
+                    }
+                }).finally(() => {
+                    setProbing(false);
+                });
+            }
         } catch (err) {
             setError(
                 err instanceof ApiError
@@ -82,6 +104,36 @@ export default function Network() {
     // IPv6 direct is possible only if BOTH server and client have IPv6.
     const ipv6DirectPossible =
         status?.ipv6?.reachable === true && clientIPv6 === true;
+
+    // Probe the server's IPv6 direct URL. Tests whether this client can
+    // actually reach the server over IPv6 (firewall, routing, etc.).
+    // If the probe succeeds, the client definitively has IPv6 — override
+    // the checkClientIPv6() result which may fail due to GFW blocking
+    // the test endpoints even though the client's network has IPv6.
+    const handleProbe = useCallback(async () => {
+        if (!status?.direct_url) return;
+        setProbing(true);
+        try {
+            const rtt = await probeIPv6Direct(status.direct_url);
+            setProbeRTT(rtt);
+            if (rtt >= 0) {
+                setClientIPv6(true);
+            }
+        } finally {
+            setProbing(false);
+        }
+    }, [status?.direct_url]);
+
+    const sessionStatusBadge = (s: P2PSession["status"]) => {
+        switch (s) {
+            case "established":
+                return <Badge variant="success">Established</Badge>;
+            case "punching":
+                return <Badge variant="info">Punching</Badge>;
+            default:
+                return <Badge variant="danger">Failed</Badge>;
+        }
+    };
 
     return (
         <div className="space-y-6">
@@ -163,18 +215,16 @@ export default function Network() {
 
                             {/* Step 2: Probe & Upgrade */}
                             <div
-                                className={`flex items-center gap-3 rounded-lg border px-4 py-3 ${
-                                    hasUpgrade
-                                        ? "border-sky-500/30 bg-sky-500/5"
-                                        : "border-surface-border bg-surface-subtle/30"
-                                }`}
+                                className={`flex items-center gap-3 rounded-lg border px-4 py-3 ${hasUpgrade
+                                    ? "border-sky-500/30 bg-sky-500/5"
+                                    : "border-surface-border bg-surface-subtle/30"
+                                    }`}
                             >
                                 <div
-                                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold ${
-                                        hasUpgrade
-                                            ? "bg-sky-500 text-white"
-                                            : "bg-surface-subtle text-fg-muted"
-                                    }`}
+                                    className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold ${hasUpgrade
+                                        ? "bg-sky-500 text-white"
+                                        : "bg-surface-subtle text-fg-muted"
+                                        }`}
                                 >
                                     2
                                 </div>
@@ -288,7 +338,9 @@ export default function Network() {
                                 </div>
                                 <p className="text-xs text-fg-muted">
                                     {clientIPv6 === false
-                                        ? "Your network lacks IPv6 — relay is the only option"
+                                        ? probeRTT !== null && probeRTT >= 0
+                                            ? "IPv6 confirmed via direct probe (test endpoints may be blocked by GFW)"
+                                            : "No IPv6 detected — try the direct probe below to confirm"
                                         : clientIPv6 === true && !status?.ipv6?.reachable
                                             ? "You have IPv6, but the server doesn't — IPv6 direct blocked by server"
                                             : ipv6DirectPossible
@@ -298,6 +350,86 @@ export default function Network() {
                             </div>
                         </div>
                     </div>
+                </CardContent>
+            </Card>
+
+            {/* IPv6 Direct Probe — test actual reachability to server's IPv6 */}
+            <Card>
+                <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                        <Zap size={16} /> IPv6 Direct Probe
+                    </CardTitle>
+                    <CardDescription>
+                        Test whether this device can reach the server over public IPv6.
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    {status?.direct_url ? (
+                        <div className="space-y-3">
+                            <div className="flex items-center gap-2">
+                                <span className="text-xs text-fg-muted">Target:</span>
+                                <code className="font-mono text-xs text-fg">
+                                    {status.direct_url}
+                                </code>
+                            </div>
+                            <div className="flex items-center gap-3">
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={handleProbe}
+                                    disabled={probing}
+                                >
+                                    {probing ? (
+                                        <RefreshCw size={14} className="animate-spin" />
+                                    ) : (
+                                        <Zap size={14} />
+                                    )}
+                                    {probing ? "Probing..." : "Probe"}
+                                </Button>
+                                {probeRTT !== null && (
+                                    <div className="flex items-center gap-2">
+                                        {probeRTT >= 0 ? (
+                                            <>
+                                                <CheckCircle2 size={16} className="text-emerald-500" />
+                                                <span className="text-sm text-fg">
+                                                    Reachable — <span className="font-mono">{probeRTT} ms</span> RTT
+                                                </span>
+                                            </>
+                                        ) : probeRTT === -2 ? (
+                                            <>
+                                                <XCircle size={16} className="text-amber-500" />
+                                                <span className="text-sm text-fg">
+                                                    Mixed content blocked
+                                                </span>
+                                            </>
+                                        ) : (
+                                            <>
+                                                <XCircle size={16} className="text-rose-500" />
+                                                <span className="text-sm text-fg">
+                                                    Unreachable from this device
+                                                </span>
+                                            </>
+                                        )}
+                                    </div>
+                                )}
+                            </div>
+                            <p className="text-xs text-fg-muted">
+                                {probeRTT === -2
+                                    ? status?.ipv6?.address
+                                        ? <>Dashboard is HTTPS but probe target is HTTP — browser blocks mixed content. Open <code className="font-mono">{`http://[${status.ipv6.address}]/`}</code> on this device to probe via HTTP over IPv6 direct.</>
+                                        : "Dashboard is HTTPS but probe target is HTTP — browser blocks mixed content. Access the dashboard via HTTP or use the mobile app for probing."
+                                    : ipv6DirectPossible
+                                        ? "Both sides have IPv6 — probe tests the actual end-to-end path."
+                                        : "Direct URL configured, but IPv6 may not be available on one side."}
+                            </p>
+                        </div>
+                    ) : (
+                        <div className="text-sm text-fg-muted">
+                            IPv6 direct is not configured. Set{" "}
+                            <code className="font-mono text-xs">network.direct_port</code>{" "}
+                            on the server to enable.
+                        </div>
+                    )}
                 </CardContent>
             </Card>
 
@@ -375,6 +507,80 @@ export default function Network() {
                     </CardContent>
                 </Card>
             </div>
+
+            {/* P2P Sessions — active hole-punching sessions */}
+            <Card>
+                <CardHeader className="flex-row items-center justify-between">
+                    <div>
+                        <CardTitle className="flex items-center gap-2">
+                            <Activity size={16} /> P2P Sessions
+                        </CardTitle>
+                        <CardDescription>
+                            Active UDP hole-punching sessions on this server.
+                        </CardDescription>
+                    </div>
+                    {status?.p2p_endpoint && (
+                        <Badge variant="info">
+                            <code className="font-mono text-xs">{status.p2p_endpoint}</code>
+                        </Badge>
+                    )}
+                </CardHeader>
+                <CardContent>
+                    {!status?.p2p_endpoint ? (
+                        <div className="text-sm text-fg-muted">
+                            P2P hole punching is not enabled. Set{" "}
+                            <code className="font-mono text-xs">network.p2p_port</code>{" "}
+                            on the server to enable.
+                        </div>
+                    ) : status.p2p_sessions && status.p2p_sessions.length > 0 ? (
+                        <div className="space-y-2">
+                            {status.p2p_sessions.map((s) => (
+                                <div
+                                    key={s.peer_id}
+                                    className="flex flex-wrap items-center gap-3 rounded-lg border border-surface-border bg-surface-subtle/30 px-4 py-3"
+                                >
+                                    <div className="min-w-0 flex-1">
+                                        <div className="flex items-center gap-2">
+                                            <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
+                                                Peer
+                                            </span>
+                                            <code className="font-mono text-xs text-fg">
+                                                {s.peer_id}
+                                            </code>
+                                        </div>
+                                        <div className="mt-1 flex items-center gap-2">
+                                            <span className="text-xs text-fg-muted">Remote:</span>
+                                            <code className="font-mono text-xs text-fg-muted">
+                                                {s.remote_addr}
+                                            </code>
+                                        </div>
+                                        <div className="mt-1 flex flex-wrap gap-x-4 gap-y-0.5 text-xs text-fg-subtle">
+                                            <span>Punches: {s.punch_count}</span>
+                                            {s.established_at && (
+                                                <span>
+                                                    Established:{" "}
+                                                    {new Date(s.established_at).toLocaleTimeString()}
+                                                </span>
+                                            )}
+                                            {s.last_packet_at && (
+                                                <span>
+                                                    Last pkt:{" "}
+                                                    {new Date(s.last_packet_at).toLocaleTimeString()}
+                                                </span>
+                                            )}
+                                        </div>
+                                    </div>
+                                    {sessionStatusBadge(s.status)}
+                                </div>
+                            ))}
+                        </div>
+                    ) : (
+                        <div className="text-sm text-fg-muted">
+                            No active sessions. Peers will appear here once they start hole punching.
+                        </div>
+                    )}
+                </CardContent>
+            </Card>
 
             {/* Raw payload */}
             <Card>
