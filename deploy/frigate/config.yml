@@ -9,6 +9,22 @@
 # FrigateClient.pushFrigateConfig(). Do NOT add cameras here —
 # they will be overwritten on the next config push.
 
+# ---- Hardware acceleration ----
+#
+# Intel J4125 (UHD Graphics 600) via VAAPI. The container must have
+# the /dev/dri device mounted (see compose.yaml). VAAPI accelerates
+# ffmpeg video decoding — critical for reducing CPU load when
+# processing multiple 1080p streams. The AI detector (CPU-based
+# TensorFlow Lite) runs separately and is not accelerated by VAAPI.
+#
+# On fnOS / Linux production: uncomment the ffmpeg section below and
+# add `devices: ["/dev/dri:/dev/dri"]` to compose.yaml's frigate
+# service. On Docker Desktop / Windows, GPU passthrough is not
+# supported — keep it commented.
+#
+# ffmpeg:
+#   hwaccel_args: preset-vaapi
+
 mqtt:
   host: mosquitto
   topic_prefix: frigate
