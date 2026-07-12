@@ -61,7 +61,10 @@ type RegisterInput struct {
 	// H.264-friendly cameras untouched and only pay the
 	// CPU/memory cost on HEVC cameras they want over WebRTC.
 	Transcode bool
-	OwnerID   uint // 0 = assign to caller from handler context
+	// FrigateCamera overrides the auto-derived slug from StreamName.
+	// Leave empty to use the default (e.g. "前门" → "front_door").
+	FrigateCamera string
+	OwnerID       uint // 0 = assign to caller from handler context
 }
 
 // Register inserts a Camera row, then asks go2rtc to start pulling
@@ -135,6 +138,8 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		// UNIQUE constraint on stream_name reject duplicates at
 		// the DB layer instead of crashing inside go2rtc.AddStream.
 		StreamName: name,
+		// Frigate camera name: explicit override wins, else slug.
+		FrigateCamera: orDefault(in.FrigateCamera, slugifyName(name)),
 	}
 
 	if err := r.DB.Create(cam).Error; err != nil {
@@ -195,6 +200,17 @@ func (r *Registry) Unregister(ctx context.Context, id uint) error {
 func (r *Registry) Get(id uint) (*model.Camera, error) {
 	var c model.Camera
 	if err := r.DB.First(&c, id).Error; err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+// FindByFrigateCamera looks up a camera by its Frigate camera name
+// (the identifier used in Frigate MQTT events like after.camera).
+// Returns nil if no camera maps to the given Frigate name.
+func (r *Registry) FindByFrigateCamera(frigateName string) (*model.Camera, error) {
+	var c model.Camera
+	if err := r.DB.Where("frigate_camera = ?", frigateName).First(&c).Error; err != nil {
 		return nil, err
 	}
 	return &c, nil
@@ -365,7 +381,12 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		frigatePath := r.frigateCameraPath(&c, u, p) // rtsp://...
 
 		// Frigate's name validator: ^[a-zA-Z0-9_-]+$
-		slug := slugifyName(c.StreamName)
+		// Prefer the explicit frigate_camera mapping; fall back to
+		// the auto-derived slug from StreamName.
+		slug := c.FrigateCamera
+		if slug == "" {
+			slug = slugifyName(c.StreamName)
+		}
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: true,
@@ -508,6 +529,14 @@ func slugifyName(name string) string {
 		out = "camera"
 	}
 	return out
+}
+
+// orDefault returns a if non-empty, else b.
+func orDefault(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // --- credential helpers (also used by the ONVIF controller) ---

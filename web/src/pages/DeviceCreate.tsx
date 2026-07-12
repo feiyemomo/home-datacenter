@@ -88,6 +88,7 @@ interface DraftCam {
     audio: boolean;
     motion: boolean;
     transcode: boolean;
+    frigate_camera: string;
 }
 
 const EMPTY_DRAFT: DraftCam = {
@@ -103,6 +104,7 @@ const EMPTY_DRAFT: DraftCam = {
     audio: true,
     motion: true,
     transcode: false,
+    frigate_camera: "",
 };
 
 type SubmitState =
@@ -202,6 +204,7 @@ export default function DeviceCreate() {
                 audio: draft.audio,
                 motion: draft.motion,
                 transcode: draft.transcode,
+                frigate_camera: draft.frigate_camera || undefined,
             });
             setSubmit({ kind: "ok", id: cam.id, name: cam.name });
         } catch (err) {
@@ -294,6 +297,20 @@ export default function DeviceCreate() {
                                     {VENDOR_PRESETS[draft.vendor]?.notes ??
                                         "Pick a vendor to autofill ports and channel id."}
                                 </p>
+                            </div>
+                            <div className="space-y-2">
+                                <label className="text-xs font-medium text-fg-muted">
+                                    Frigate camera name (optional)
+                                </label>
+                                <p className="text-[10px] text-fg-muted/60">
+                                    ASCII identifier used by Frigate. Leave empty to auto-derive from camera name (e.g. "前门" → "front_door").
+                                </p>
+                                <input
+                                    className="w-full rounded-md border border-surface-border bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-muted/40"
+                                    placeholder="e.g. front_door"
+                                    value={draft.frigate_camera}
+                                    onChange={(e) => setDraft({ ...draft, frigate_camera: e.target.value })}
+                                />
                             </div>
                         </CardContent>
                     </Card>

@@ -15,6 +15,7 @@ import {
     Sun,
     Moon,
     Network as NetworkIcon,
+    Bell,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
@@ -33,6 +34,7 @@ const NAV_ITEMS: NavItem[] = [
     { to: "/dashboard", label: "Dashboard", icon: <LayoutDashboard size={18} /> },
     { to: "/cameras", label: "Cameras", icon: <CameraIcon size={18} /> },
     { to: "/network", label: "Network", icon: <NetworkIcon size={18} /> },
+    { to: "/events", label: "Events", icon: <Bell size={18} /> },
     { to: "/devices", label: "Devices", icon: <HardDrive size={18} /> },
     {
         to: "/users",

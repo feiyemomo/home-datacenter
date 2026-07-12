@@ -44,9 +44,21 @@ func InitDB(dbPath string) {
 		&model.Camera{},
 		&model.Recording{},
 		&model.Rule{},
+		&model.StoredEvent{},
 	)
 	if err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
+	}
+
+	// The events table is managed via a raw CREATE TABLE IF NOT
+	// EXISTS rather than AutoMigrate because glebarez/sqlite creates
+	// the table as "stored_events" (Go struct name) ignoring the
+	// model.StoredEvent.TableName() override. Dropping and recreating
+	// under the correct name is safe because the table is append-only
+	// (no foreign keys point to it, and a fresh DB has either the
+	// wrong table or none at all).
+	if err := ensureEventsTable(db); err != nil {
+		log.Printf("warning: failed to create events table: %v", err)
 	}
 
 	// One-shot backfill: cameras that were registered before the
@@ -148,4 +160,27 @@ func backfillTranscodeUseSubstream(db *gorm.DB) error {
 	}
 	log.Printf("camera: transcode_use_substream backfill: %d row(s) updated", res.RowsAffected)
 	return nil
+}
+
+// ensureEventsTable creates the events table with the correct
+// name ("events", not "stored_events") and schema.
+func ensureEventsTable(db *gorm.DB) error {
+	// Clean up any wrongly-named table from a previous run.
+	db.Exec("DROP TABLE IF EXISTS stored_events")
+
+	return db.Exec(`
+		CREATE TABLE IF NOT EXISTS events (
+			id         INTEGER PRIMARY KEY AUTOINCREMENT,
+			topic      TEXT    NOT NULL,
+			source     TEXT    NOT NULL,
+			severity   TEXT    NOT NULL DEFAULT 'info',
+			payload    TEXT    NOT NULL DEFAULT '{}',
+			status     TEXT    NOT NULL DEFAULT 'created',
+			timestamp  TEXT    NOT NULL,
+			created_at TEXT    NOT NULL DEFAULT (datetime('now'))
+		);
+		CREATE INDEX IF NOT EXISTS idx_events_topic   ON events(topic);
+		CREATE INDEX IF NOT EXISTS idx_events_source  ON events(source);
+		CREATE INDEX IF NOT EXISTS idx_events_ts       ON events(timestamp);
+	`).Error
 }

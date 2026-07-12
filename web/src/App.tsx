@@ -6,6 +6,7 @@ import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Cameras from "@/pages/Cameras";
 import Network from "@/pages/Network";
+import EventsPage from "@/pages/Events";
 import DeviceCreate from "@/pages/DeviceCreate";
 import Devices from "@/pages/Devices";
 import MqttDebug from "@/pages/MqttDebug";
@@ -59,6 +60,16 @@ export default function App() {
                         <ProtectedRoute>
                             <Layout>
                                 <Network />
+                            </Layout>
+                        </ProtectedRoute>
+                    }
+                />
+                <Route
+                    path="/events"
+                    element={
+                        <ProtectedRoute>
+                            <Layout>
+                                <EventsPage />
                             </Layout>
                         </ProtectedRoute>
                     }
