@@ -127,6 +127,9 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `GET /api/v1/automation/metrics?reset=1` | JWT+admin | Reset all metrics counters |
 | `GET /api/v1/automation/rules/:id/metrics` | JWT+admin | Per-rule metrics |
 | `POST /api/v1/automation/rules/:id/cooldown` | JWT+admin | Pin `lastFire` to silence a misbehaving rule (body `{seconds}`) |
+| `GET /api/v1/events` | JWT | List persisted events (page/limit/type/source/since/before) |
+| `GET /api/v1/events/:id` | JWT | Get single event detail |
+| `DELETE /api/v1/events/:id` | JWT+admin | Delete an event record |
 | `GET /api/v1/ws` | JWT | WebSocket upgrade (header or `?token=`) |
 
 **Response Envelope:**
@@ -158,20 +161,25 @@ services/api/
 │   │   ├── registry.go          // CRUD + go2rtc sync + BootReplay + UpdateStatus + SaveProfileToken
 │   │   ├── onvif.go             // ONVIF PTZ dispatcher (raw SOAP, WS-Security PasswordDigest, lazy-cached)
 │   │   ├── health.go            // Background TCP probe → device.status / camera.online / camera.offline on EventBus
+│   │   ├── frigate_event.go     // Phase 10 — Frigate MQTT → camera.object.detected translator
 │   │   └── json.go
 │   ├── automation/              // Phase 5 — Automation Engine (rule CRUD + fire)
 │   │   ├── engine.go            // Subscribe "*" → trigger match → condition → action (notify/mqtt/webhook)
 │   │   ├── handler.go           // /api/v1/automation/rules CRUD + /test
 │   │   └── engine_test.go       // trigger / time / payload / SSRF / MQTT-topic unit tests
+│   ├── event/                     // Phase 9 — EventBus → SQLite persistence
+│   │   └── persister.go
 │   ├── eventbus/                // In-memory pub/sub (Device/Camera/MQTT → WS + Automation)
 │   ├── model/
 │   │   ├── user.go
 │   │   ├── device.go
-│   │   ├── camera.go            // Camera + stream URLs (Phase 4)
+│   │   ├── camera.go            // Camera + stream URLs (Phase 4) + frigate_camera (Phase 10)
+│   │   ├── event.go             // StoredEvent (Phase 9)
 │   │   └── automation.go        // Rule + Condition + Action (GORM, JSON TEXT columns)
 │   ├── repository/
 │   │   ├── user_repository.go
-│   │   └── device_repository.go
+│   │   ├── device_repository.go
+│   │   └── event_repository.go  // Phase 9 — StoredEvent CRUD + pagination
 │   ├── service/
 │   │   ├── bootstrap_service.go // Auto-create admin on first run
 │   │   ├── auth_service.go      // Bind logic
@@ -183,7 +191,9 @@ services/api/
 │   │   ├── device_handler.go
 │   │   ├── system_handler.go    // /system/status + /mqtt/publish
 │   │   ├── ws_handler.go        // WebSocket upgrade + origin check
-│   │   └── camera_handler.go    // /cameras* — register/list/get/delete/ptz
+│   │   ├── camera_handler.go    // /cameras* — register/list/get/delete/ptz
+│   │   ├── event_handler.go     // Phase 9 — /events* — event history CRUD
+│   │   └── network_handler.go   // Phase 6.1 — /network* — P2P/relay endpoints
 │   ├── middleware/
 │   │   ├── jwt.go               // JWT auth + revocation check
 │   │   └── admin.go             // RequireAdmin(db) — must be installed after JWTAuth
@@ -203,10 +213,11 @@ services/api/
 
 web/                             // React + Vite + Tailwind dashboard SPA
 ├── src/
-│   ├── pages/{Dashboard,Cameras,Devices,DeviceCreate,Login,MqttDebug,Profile}.tsx
+│   ├── pages/{Dashboard,Cameras,Devices,DeviceCreate,Login,MqttDebug,Profile,Users,Network,Events}.tsx
 │   │                       // Cameras: list + live view + delete (read-mostly)
 │   │                       // DeviceCreate: /cameras/new — dedicated full-page
 │   │                       //   form for registering a camera (Phase 7)
+│   │                       // Events: timeline + filters + real-time (Phase 9)
 │   ├── api/{auth,camera,client,device,system}.ts
 │   │                  // client.ts: axios + authedFetch() + authHeaderFor()
 │   │                  //   (authedFetch attaches the JWT to plain fetch
@@ -439,49 +450,60 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 
 **Phase 8 (User Management API):** Complete (2026-07-11)
 
-- **Backend** (`services/api/internal/service/user_service.go`,
-  `services/api/internal/handler/user_handler.go`):
-  - Domain errors: `ErrUserNotFound` / `ErrInvalidName` / `ErrNameTaken` /
-    `ErrLastAdmin` / `ErrSelfDelete` / `ErrSelfDemote`. Centralised
-    `writeUserServiceError` maps each to a stable HTTP code
-    (400 / 400 / 409 / 400 / 400 / 400).
-  - `isValidUserName`: 1..32 runes, unicode letter/digit/`_`/`-`,
-    leading/trailing whitespace silently trimmed, internal whitespace
-    rejected. Unicode is fully supported (e.g. `小明`, `自己`).
-  - `Create` / `Update` / `Delete` enforce: pre-check + DB unique
-    constraint (TOCTOU-safe), last-admin guard on demote/delete,
-    self-delete + self-demote rejected. Cameras are NOT cascaded.
-  - `Delete` cascades to `devices` (devices-first order so a partial
-    failure leaves the user row recoverable).
-  - `isUniqueViolation` matches both SQLite ("UNIQUE constraint
-    failed") and Postgres ("duplicate key value") error strings.
-- **Routes** (all admin-only, mounted under `/api/v1/user`):
-  - `GET    /api/v1/user`       List + `device_count` per row
-  - `POST   /api/v1/user`       Create `{name, is_admin}`
-  - `GET    /api/v1/user/:id`   Fetch one
-  - `PUT    /api/v1/user/:id`   Partial update `{name?, is_admin?}`
-  - `DELETE /api/v1/user/:id`   Delete + cascade devices
-  - `GET    /api/v1/user/me`    Self (any authenticated user, existed
-                                before Phase 8 — now reused as the
-                                dashboard's "you" indicator)
-- **Frontend** (`web/src/api/user.ts`, `web/src/pages/Users.tsx`,
-  `web/src/types.ts`):
-  - Admin-only `/users` route in `Layout.tsx` nav.
-  - CRUD table with per-row rename / role toggle / delete confirm.
-  - Client-side guards mirror the server's last-admin + self-
-    delete/self-demote rules (disabled buttons, inline error
-    banner) so the operator never round-trips a guaranteed-reject.
-  - The `you` badge on the caller's own row disables the
-    delete + role-toggle controls even before the request leaves
-    the browser.
-- **Tests**: `services/api/internal/service/user_service_test.go`
-  covers `isValidUserName` (ascii / unicode / whitespace / length
-  boundaries), `normalizeUserName` (trim + reject internal ws),
-  and `isUniqueViolation` (sqlite + postgres error shapes).
-- **Documentation**: full per-endpoint section in
-  `docs/api-documentation.md` (request/response/error matrices);
-  `docs/security.md` and `docs/ai-context.md` reference the new
-  state guards.
+- ...
+
+**Phase 9 (Event Center):** Complete (2026-07-12)
+
+- **Event persistence**: new `events` SQLite table via raw migration (glebarez
+  driver ignores GORM `TableName()` so we use `CREATE TABLE IF NOT EXISTS events`).
+- **EventPersister** (`internal/event/persister.go`): subscribes `*` on EventBus,
+  filters out `device.status` (heartbeat spam), `ws.*`, and `mqtt.*` control-plane
+  chatter. Remaining events are INSERTed into the events table for permanent
+  audit trail.
+- **EventRepository** (`internal/repository/event_repository.go`): GORM-backed
+  CRUD with List (type/source/since/before filter, limit/offset pagination),
+  GetByID, Insert, Delete, UpdateStatus, PurgeOlderThan.
+- **Event API**: `GET /api/v1/events` (JWT, list with filters), 
+  `GET /api/v1/events/:id` (JWT, detail), `DELETE /api/v1/events/:id` (JWT+admin).
+- **Frontend Events page** (`web/src/pages/Events.tsx`): timeline view grouped
+  by date (Today/Yesterday/date), type/source/time filters, detail panel with
+  full JSON payload, WebSocket real-time updates via existing hub ("+N new"
+  badge), severity colors with dark/light mode variants.
+- New model: `model.StoredEvent` — id, topic, source, severity, payload (JSON TEXT),
+  status (created/processed/archived), timestamp, created_at.
+- New files: `internal/event/persister.go`, `internal/repository/event_repository.go`,
+  `internal/handler/event_handler.go`, `web/src/api/events.ts`, `web/src/pages/Events.tsx`.
+- Sidebar nav: "Events" entry added in `Layout.tsx`, route at `/events` in `App.tsx`.
+- `StoredEvent` type added to `web/src/types/index.ts`.
+
+**Phase 10 (Frigate Event Pipeline):** Complete (2026-07-12)
+
+- **MQTT subscription**: `OnConnect` now also subscribes to `frigate/events` (QoS 1).
+  Frigate publishes on its own prefix (`frigate/`), not `home-datacenter/`, so
+  `OnMessage` has a `strings.HasPrefix("frigate/")` early-return that bypasses
+  `ParseTopic` and delegates to `handleFrigateMessage`.
+- **`handleFrigateMessage`** in `mqtt/handler.go`: skips `"type":"end"` events
+  (cheap prefix check, no JSON parsing), publishes raw payload as `frigate.event`
+  on EventBus.
+- **`FrigateEventTranslator`** (`internal/camera/frigate_event.go`): subscribes
+  `frigate.event` on EventBus, unmarshals into `frigateRawEvent`, looks up
+  Camera by `frigate_camera` name via `Registry.FindByFrigateCamera()`, skips
+  stationary "update" events, publishes platform-native `camera.object.detected`
+  with payload: `{camera_id, camera_name, frigate_camera, object, confidence,
+  frigate_event_id, has_clip, has_snapshot, zones, stationary}`.
+- **Camera model**: new `FrigateCamera` string column (size:64, indexed).
+  `Register()` auto-derives it from `slugifyName(StreamName)` with explicit
+  `RegisterInput.FrigateCamera` override. `pushFrigateConfig()` prefers the
+  explicit field over `slugifyName()`.
+- **`FindByFrigateCamera()`** on `Registry`: GORM `WHERE frigate_camera = ?`
+  for reverse lookup during translation.
+- **Frontend**: Events page recognizes `camera.object.detected` events, renders
+  human-readable labels ("Camera 前门 detected person (95%)"), hover thumbnail
+  (48×32px, lazy-loaded, opacity transition), snapshot in detail panel
+  (`/frigate/api/events/{event_id}/snapshot.jpg`).
+- Camera registration form (`DeviceCreate.tsx`): optional "Frigate camera name"
+  input field with auto-derive explanation.
+- Topics: `TopicDeviceStatus` now filtered from EventPersister (heartbeat not persisted).
 
 **Security hardening pass (2026-07-04):** see `docs/Security` section below.
 

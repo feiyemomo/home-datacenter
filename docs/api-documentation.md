@@ -1212,12 +1212,136 @@ Publish `{"status":"offline",...}` to flip it back.
 | `/api/v1/automation/metrics` | GET | JWT+admin | Global engine metrics; `?reset=1` resets counters |
 | `/api/v1/automation/rules/:id/metrics` | GET | JWT+admin | Per-rule metrics |
 | `/api/v1/automation/rules/:id/cooldown` | POST | JWT+admin | Pin `lastFire` to silence a misbehaving rule |
+| `/api/v1/events` | GET | JWT | List persisted events (page/limit/type/source/since/before) |
+| `/api/v1/events/:id` | GET | JWT | Get single event detail |
+| `/api/v1/events/:id` | DELETE | JWT+admin | Delete an event record |
+
+### Automation Rules
+
+Phase 5 engine: rule CRUD model (GORM JSON columns). See [ai-context.md](ai-context.md) for the full struct.
+
+### StoredEvent (Event Center)
+
+```go
+type StoredEvent struct {
+    ID        uint
+    Topic     string    // e.g. "camera.object.detected"
+    Source    string    // e.g. "camera", "system"
+    Severity  string    // "info" | "warn" | "error" | "critical"
+    Payload   string    // JSON TEXT column (opaque)
+    Status    string    // "created" | "processed" | "archived"
+    Timestamp time.Time // when the event occurred
+    CreatedAt time.Time // when the row was inserted
+}
+```
+
+Events are persisted by `EventPersister` (subscribes `*` on EventBus, skips
+`device.status` / `ws.*` / `mqtt.*`). Queried via `GET /api/v1/events` with
+type/source/since/before filters and pagination.
+
+### Event History (Phase 9 — Event Center)
+
+#### List Events
+
+**Endpoint:**
+
+```
+GET /api/v1/events
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Query Parameters:**
+
+| Param | Type | Required | Description |
+|-------|------|----------|-------------|
+| `page` | int | No | Page number (default 1) |
+| `limit` | int | No | Items per page (default 20, max 100) |
+| `type` | string | No | Exact topic match (e.g. `camera.object.detected`) |
+| `source` | string | No | Source filter (e.g. `camera`, `system`) |
+| `since` | string | No | RFC3339 — events after this time |
+| `before` | string | No | RFC3339 — events before this time |
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "items": [
+      {
+        "id": 42,
+        "type": "camera.object.detected",
+        "source": "camera",
+        "severity": "info",
+        "payload": {
+          "camera_id": 1,
+          "camera_name": "前门",
+          "frigate_camera": "front_door",
+          "object": "person",
+          "confidence": 0.95,
+          "frigate_event_id": "1720345678.123456",
+          "has_snapshot": true,
+          "has_clip": false
+        },
+        "status": "created",
+        "timestamp": "2026-07-12 10:32:15"
+      }
+    ],
+    "total": 42
+  }
+}
+```
+
+#### Get Event
+
+**Endpoint:**
+
+```
+GET /api/v1/events/:id
+```
+
+**Success Response:** single event item (same shape as list).
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid event id` | `:id` not a valid uint |
+| 404 | `event not found` | No row with that id |
+
+#### Delete Event (Admin)
+
+**Endpoint:**
+
+```
+DELETE /api/v1/events/:id
+```
+
+**Authorization:** admin only.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": null
+}
+```
+
+### WebSocket Real-Time Events
 
 > Camera + Automation endpoints are described in detail in
 > [`docs/platformization.md`](platformization.md) and
 > [`docs/security.md`](security.md) §11–12. The rows above are the
-> authoritative route surface as of Phase 7.
+> authoritative route surface as of Phase 10.
 
 ---
 
-**Document Version:** 2026-07-11 (Phase 7: go2rtc public auth + SDP proxy + camera/automation routes)
+**Document Version:** 2026-07-12 (Phase 10: Frigate event pipeline + Event Center)

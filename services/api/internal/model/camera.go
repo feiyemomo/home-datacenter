@@ -135,6 +135,12 @@ type Camera struct {
 	// one. URL-encoded on the wire (see camera.Registry.StreamConfig).
 	StreamName string `gorm:"size:64;uniqueIndex" json:"stream_name"` // friendly name; same as go2rtc stream key
 
+	// FrigateCamera is the name of this camera in Frigate's config
+	// (e.g. "front_door"). Frigate uses this identifier in its
+	// MQTT events ({after.camera: "front_door"}) and REST API.
+	// Defaults to an ASCII slug of StreamName when empty.
+	FrigateCamera string `gorm:"size:64;index" json:"frigate_camera"`
+
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`

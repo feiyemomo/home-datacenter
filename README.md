@@ -65,6 +65,25 @@ list / get 的 scope 过滤）。详见
 [`docs/api-documentation.md`](docs/api-documentation.md) 的
 "User Management (Admin)" 章节。
 
+Phase 9（Event Center — 事件持久化与 Web 查看）将 EventBus 从纯内存
+广播升级为持久化事件审计系统：新增 `events` SQLite 表 + `EventPersister`
+（订阅 `*` 自动写入） + `GET /api/v1/events`（分页 + 按 type/source/time
+过滤） + `DELETE /api/v1/events/:id`（admin-only）。Web 端 `/events`
+页面提供时间线视图（Today / Yesterday / 日期分组）、类型/来源/时间筛选器、
+WebSocket 实时推送（新事件带 "+N new" 徽章）、详情面板（完整 JSON payload）。
+`device.status` 心跳（15s 一次）不写入 events 表避免淹没有意义的事件。
+详见 [`docs/platformization.md`](docs/platformization.md) §11。
+
+Phase 10（Frigate 事件接入 — 真实摄像头检测闭环）完成从摄像头
+→ Frigate AI 检测 → MQTT `frigate/events` → API EventBus
+→ `FrigateEventTranslator` → `camera.object.detected` → Event Center 的
+完整链路。Camera 模型新增 `frigate_camera` 字段（注册时从友好名自动推导
+或手动指定）；FrigateEventTranslator 根据 Frigate 事件中的 `after.camera`
+查表映射为 home-datacenter camera，发布统一格式事件（含 `object`、
+`confidence`、`frigate_event_id`、snapshot URL）。前端 Events 页面
+显示检测目标 + 置信度，hover 可见缩略图，detail 面板展示 Frigate snapshot。
+详见 [`docs/platformization.md`](docs/platformization.md) §12。
+
 所有服务都在 `home-net` 内部 Docker 网络中互相通信。默认只把 `80` 和 `8080` 绑定到 `127.0.0.1`，避免直接对外暴露。
 
 ---
@@ -75,11 +94,17 @@ list / get 的 scope 过滤）。详见
    ┌──────────────┐    HTTP/WS   ┌──────────────┐   MQTT  ┌──────────────┐
    │   home-web   │ ◄──────────► │   home-api   │ ◄─────► │ home-mosquitto│
    │  (nginx SPA) │              │ (Go + Gin)   │         │   (broker)   │
-   └──────────────┘              └──────┬───────┘         └──────────────┘
-          │                              │ RTSP push             │
+   └──────────────┘              └──────┬───────┘         └──────┬───────┘
+          │                              │ RTSP push             │ MQTT
        127.0.0.1:80                 127.0.0.1:8080              │
           │                              │                ┌──────▼──────┐
-          └────── 外部经 Cloudflare Tunnel 暴露 ────────► │ home-go2rtc │
+          └────── 外部经 Cloudflare Tunnel 暴露 ────────► │ home-frigate │
+                                                           │ :5000, :8554
+                                                           │ AI detection│
+                                                           └──────┬──────┘
+                                                                  │ RTSP
+                                                           ┌──────▼──────┐
+                                                           │ home-go2rtc │
                                                            │ :1984      │
                                                            │ WebRTC/HLS │
                                                            └────────────┘

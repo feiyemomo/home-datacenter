@@ -325,3 +325,14 @@ export interface PeerEndpoint {
     registered_at: string;
     expires_at: string;
 }
+
+/** Persisted event from the Event Center (GET /api/v1/events). */
+export interface StoredEvent {
+    id: number;
+    type: string;
+    source: string;
+    severity: "info" | "warn" | "error" | "critical";
+    payload: Record<string, unknown>;
+    status: "created" | "processed" | "archived";
+    timestamp: string;
+}

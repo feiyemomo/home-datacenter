@@ -15,6 +15,7 @@ import (
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/database"
 	"home-datacenter-api/internal/device"
+	"home-datacenter-api/internal/event"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/handler"
 	"home-datacenter-api/internal/middleware"
@@ -90,6 +91,18 @@ func main() {
 
 	// EventBus is the central pub/sub bridge between MQTT and WebSocket.
 	bus := eventbus.New()
+
+	// ---- Event persistence bridge (Event Center) ----
+	//
+	// Every event published to the EventBus is automatically persisted
+	// to the `events` SQLite table by the Persister. This turns the
+	// in-memory fire-and-forget bus into a permanent audit trail
+	// queryable via GET /api/v1/events.
+	eventRepo := repository.NewEventRepository(database.DB)
+	eventPersister := event.NewPersister(eventRepo, bus)
+	eventPersister.Start()
+	defer eventPersister.Stop()
+	eventHandler := handler.NewEventHandler(eventRepo)
 
 	// DeviceManager tracks online/offline state in memory and
 	// persists LastSeen to the database.
@@ -185,6 +198,14 @@ func main() {
 	camRecorder.HC = camHealth
 	go camHealth.Run(context.Background())
 	go camRecorder.Run(context.Background())
+
+	// ---- Frigate event translation ----
+	//
+	// Translates raw frigate.event (from MQTT via frigate/events) into
+	// platform-native camera.object.detected events with camera name
+	// lookup via the Camera Registry.
+	frigateEvents := camera.NewFrigateEventTranslator(bus, camReg)
+	frigateEvents.Start()
 
 	// ---- Phase 5: Automation Engine ----
 	//
@@ -438,6 +459,20 @@ func main() {
 				adminNet.GET("/p2p/peers", netHandler.ListPeers)
 				adminNet.GET("/p2p/sessions", netHandler.ListSessions)
 			}
+		}
+
+		// Event Center: persisted event history (Phase 6.5 — Event Center).
+		eventsGroup := api.Group("/events")
+		eventsGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			eventsGroup.GET("", eventHandler.List)
+			eventsGroup.GET("/:id", eventHandler.Get)
+		}
+		// Admin-only: event deletion (keeps the history cleanable).
+		adminEvents := eventsGroup.Group("")
+		adminEvents.Use(middleware.RequireAdmin(database.DB))
+		{
+			adminEvents.DELETE("/:id", eventHandler.Delete)
 		}
 	}
 
