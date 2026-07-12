@@ -278,6 +278,7 @@ func main() {
 		{
 			device.GET("/list", deviceHandler.List)
 			device.DELETE("/:id", deviceHandler.Delete)
+			device.DELETE("/:id/purge", deviceHandler.Purge)
 		}
 
 		system := api.Group("/system")
