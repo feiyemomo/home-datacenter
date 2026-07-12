@@ -18,16 +18,28 @@ const (
 
 	// --- Camera events (Phase 5) ---
 	// Emitted by the camera HealthChecker on status transitions.
-	TopicCameraOnline       = "camera.online"
-	TopicCameraOffline      = "camera.offline"
-	TopicCameraRTSPLost     = "camera.rtsp_lost"
+	TopicCameraOnline        = "camera.online"
+	TopicCameraOffline       = "camera.offline"
+	TopicCameraRTSPLost      = "camera.rtsp_lost"
 	TopicCameraStatusChanged = "camera.status_changed"
-	TopicCameraMotion       = "camera.motion"
+	TopicCameraMotion        = "camera.motion"
 
 	// --- System events ---
 	TopicSystemAlert      = "system.alert"
 	TopicUserNotification = "user.notification"
 	TopicSystemBroadcast  = "system.broadcast"
+
+	// --- Server lifecycle events (Phase 1) ---
+	// Emitted once at boot and at graceful shutdown so clients can
+	// react to the server coming up or going down.
+	TopicServerOnline  = "server.online"
+	TopicServerOffline = "server.offline"
+
+	// --- Disk events (Phase 1) ---
+	// Emitted when disk space falls below a threshold. Subscribers
+	// (e.g. Automation Engine, future App push) can react before
+	// writes fail.
+	TopicDiskWarning = "disk.warning"
 
 	// --- Automation events (Phase 5) ---
 	TopicAutomationFired = "automation.fired"
@@ -35,10 +47,10 @@ const (
 
 // Source identifiers — recorded on every Event for debugging.
 const (
-	SourceMQTT      = "mqtt"
-	SourceWS        = "ws"
-	SourceSystem    = "system"
-	SourceCamera    = "camera"
+	SourceMQTT       = "mqtt"
+	SourceWS         = "ws"
+	SourceSystem     = "system"
+	SourceCamera     = "camera"
 	SourceAutomation = "automation"
 )
 
@@ -94,4 +106,31 @@ type CameraStatusPayload struct {
 	Status   string `json:"status"`
 	Host     string `json:"host"`
 	TS       int64  `json:"ts"`
+}
+
+// ServerOnlinePayload is published once at boot on server.online.
+type ServerOnlinePayload struct {
+	ServerID     string   `json:"server_id"`
+	Version      string   `json:"version"`
+	Capabilities []string `json:"capabilities"`
+	TS           int64    `json:"ts"`
+}
+
+// ServerOfflinePayload is published at graceful shutdown on
+// server.offline. Uptime is the total seconds the server ran.
+type ServerOfflinePayload struct {
+	ServerID string `json:"server_id"`
+	Uptime   int64  `json:"uptime_seconds"`
+	TS       int64  `json:"ts"`
+}
+
+// DiskWarningPayload is published on disk.warning when free space
+// drops below the threshold. Path is the mount point or directory
+// being monitored.
+type DiskWarningPayload struct {
+	Path         string `json:"path"`
+	FreeBytes    int64  `json:"free_bytes"`
+	TotalBytes   int64  `json:"total_bytes"`
+	ThresholdPct int    `json:"threshold_pct"`
+	TS           int64  `json:"ts"`
 }

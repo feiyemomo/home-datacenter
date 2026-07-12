@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -20,6 +21,7 @@ import (
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
 	"home-datacenter-api/internal/repository"
+	"home-datacenter-api/internal/server"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
 	"home-datacenter-api/internal/ws"
@@ -60,6 +62,27 @@ func main() {
 
 	log.Println("sqlite initialized successfully")
 	log.Println("system bootstrap completed")
+
+	// ---- Phase 1: Server Identity ----
+	//
+	// Each home server has a stable, unique identity generated on
+	// first boot and persisted across restarts: a UUIDv4 server_id,
+	// an Ed25519 keypair (public key advertised, private key never
+	// leaves the process), the build version, and a capabilities
+	// list. Clients use GET /api/v1/server/info to discover the
+	// server before authenticating.
+	sqlDB, err := database.DB.DB()
+	if err != nil {
+		log.Fatalf("failed to get sql.DB: %v", err)
+	}
+	if err := server.MigrateSchema(sqlDB); err != nil {
+		log.Fatalf("failed to migrate server_identity: %v", err)
+	}
+	identity, err := server.LoadOrCreateIdentity(sqlDB, "", server.Version)
+	if err != nil {
+		log.Fatalf("failed to initialize server identity: %v", err)
+	}
+	log.Printf("server identity: id=%s name=%q version=%s", identity.ServerID, identity.Name, identity.Version)
 
 	deviceRepo := repository.NewDeviceRepository(database.DB)
 
@@ -217,8 +240,45 @@ func main() {
 	peerRegistry := network.NewPeerRegistry()
 	netHandler := handler.NewNetworkHandler(netService, peerRegistry, holePuncher)
 
+	// ---- Phase 1: Server capabilities advertisement ----
+	//
+	// Compute the capability list from the actually-wired subsystems
+	// so a dev build without P2P (p2p_port=0) correctly omits "p2p"
+	// from GET /api/v1/server/info. The list is captured once at boot;
+	// a subsystem going down later (e.g. MQTT drops) does NOT remove
+	// its capability — the flag means "the server supports this
+	// feature", not "the feature is healthy right now". Live health
+	// is surfaced via /system/status and the EventBus.
+	status := netService.Status()
+	serverCaps := server.AllCapabilities(
+		status.IPv6.Reachable,     // ipv6
+		holePuncher != nil,        // p2p
+		true,                      // relay (Cloudflare Tunnel always configured)
+		camReg != nil,             // camera
+		cfg.Frigate.BaseURL != "", // frigate
+		mqttClient.IsConnected(),  // mqtt
+		true,                      // ws (always available)
+	)
+	serverHandler := handler.NewServerHandler(identity, serverCaps)
+
+	// ---- Phase 2: Connection Manager ----
+	//
+	// Wraps the network detection service, hole puncher, and peer
+	// registry behind a single Connect() API. Clients call
+	// POST /api/v1/network/connect to discover the best transport
+	// for their peer, and the ConnectionManager picks IPv6 Direct,
+	// P2P UDP, or Relay (Cloudflare Tunnel) automatically.
+	connMgr := network.NewConnectionManager(netService, holePuncher, peerRegistry, cfg.Server.RelayURL)
+	netHandler.SetConnectionManager(connMgr)
+
 	api := r.Group("/api/v1")
 	{
+		// Phase 1: Server identity & capability advertisement.
+		// No auth — clients need to discover the server before they
+		// can authenticate. The public_key is not a secret; the
+		// private_key never leaves the process.
+		api.GET("/server/info", serverHandler.Info)
+
 		// /auth/bind is gated by an IP-based rate limiter to
 		// slow down online brute-force attacks against the
 		// AccessKey. The 256-bit keyspace makes offline attacks
@@ -365,6 +425,7 @@ func main() {
 		netGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
 			netGroup.GET("/status", netHandler.Status)
+			netGroup.POST("/connect", netHandler.Connect)
 			// P2P signaling endpoints.
 			netGroup.POST("/p2p/register", netHandler.RegisterP2P)
 			netGroup.DELETE("/p2p/register", netHandler.UnregisterP2P)
@@ -383,7 +444,117 @@ func main() {
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("server started on %s", addr)
 
+	// ---- Phase 1: Publish server.online event ----
+	//
+	// Notify all WebSocket clients (and future consumers) that the
+	// server is fully booted. The event includes the server identity
+	// so clients can verify they're connected to the right server.
+	// We also record the boot time for the eventual server.offline
+	// uptime calculation.
+	bootTime := time.Now()
+	capsStr := make([]string, len(serverCaps))
+	for i, c := range serverCaps {
+		capsStr[i] = string(c)
+	}
+	bus.Publish(eventbus.Event{
+		Topic:    eventbus.TopicServerOnline,
+		Source:   eventbus.SourceSystem,
+		Severity: eventbus.SeverityInfo,
+		Payload: mustJSON(map[string]any{
+			"server_id":    identity.ServerID,
+			"name":         identity.Name,
+			"version":      identity.Version,
+			"capabilities": capsStr,
+			"ts":           bootTime.Unix(),
+		}),
+	})
+
+	// Publish server.offline at graceful shutdown.
+	defer func() {
+		bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicServerOffline,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityWarn,
+			Payload: mustJSON(map[string]any{
+				"server_id":      identity.ServerID,
+				"uptime_seconds": int64(time.Since(bootTime).Seconds()),
+				"ts":             time.Now().Unix(),
+			}),
+		})
+	}()
+
+	// ---- Phase 1: Disk space monitor ----
+	//
+	// Periodically checks the recording directory free space and
+	// publishes disk.warning events when it drops below 10%. Runs
+	// every 5 minutes in the background.
+	go func() {
+		runDiskCheck(bus, cfg.Camera.RecordingDir)
+	}()
+
 	if err := r.Run(addr); err != nil {
 		log.Fatalf("failed to start server: %v", err)
+	}
+}
+
+// mustJSON marshals v to []byte, panicking on error. Only used for
+// event payloads at startup/shutdown where a marshal error indicates
+// a programming bug (non-JSON-serializable type).
+func mustJSON(v any) []byte {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("event payload not JSON-serializable: %v", err))
+	}
+	return b
+}
+
+// runDiskCheck periodically checks free disk space on the given path
+// and publishes disk.warning events when free space drops below the
+// threshold (10%).
+func runDiskCheck(bus *eventbus.Bus, path string) {
+	if path == "" {
+		path = "/data/recordings"
+	}
+	const (
+		checkInterval = 5 * time.Minute
+		thresholdPct  = 10 // publish disk.warning when free < 10%
+	)
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	// Run one check immediately on startup.
+	doDiskCheck(bus, path, thresholdPct)
+
+	for range ticker.C {
+		doDiskCheck(bus, path, thresholdPct)
+	}
+}
+
+// doDiskCheck checks the filesystem at path and publishes a
+// disk.warning event if free space is below thresholdPct.
+func doDiskCheck(bus *eventbus.Bus, path string, thresholdPct int) {
+	total, free, err := getDiskUsage(path)
+	if err != nil {
+		log.Printf("disk check: %v", err)
+		return
+	}
+	if total == 0 {
+		return
+	}
+	pctFree := int(float64(free) / float64(total) * 100)
+	if pctFree < thresholdPct {
+		bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicDiskWarning,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityWarn,
+			Payload: mustJSON(map[string]any{
+				"path":          path,
+				"free_bytes":    free,
+				"total_bytes":   total,
+				"threshold_pct": thresholdPct,
+			}),
+		})
+		log.Printf("disk warning: %s %d%% free (%d/%d bytes)", path, pctFree, free, total)
 	}
 }

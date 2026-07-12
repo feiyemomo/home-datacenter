@@ -39,6 +39,11 @@ type ServerConfig struct {
 	// (local dev). In production list the dashboard hostname(s),
 	// e.g. ["dashboard.feiyemomo.top"].
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
+
+	// RelayURL is the public Cloudflare Tunnel endpoint used as the
+	// relay fallback in the ConnectionManager. e.g.
+	// "https://dashboard.feiyemomo.top". Empty = relay disabled.
+	RelayURL string `mapstructure:"relay_url"`
 }
 
 // DatabaseConfig holds database connection settings.
@@ -226,6 +231,7 @@ func Load(path string) error {
 	// Defaults — keep the app runnable even if a field is omitted.
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.allowed_origins", []string{})
+	v.SetDefault("server.relay_url", "")
 	v.SetDefault("database.path", "/data/sqlite/app.db")
 	v.SetDefault("jwt.secret", "")
 	v.SetDefault("jwt.expire_days", 365)

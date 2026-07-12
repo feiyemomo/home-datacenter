@@ -117,6 +117,16 @@ services:
       - ./deploy/frigate/config.yml:/config/config.yml
       - ./data/frigate:/media/frigate
       - ./data/recordings:/recordings
+    # Intel GPU (UHD Graphics 600) passthrough for VAAPI hardware
+    # decoding. /dev/dri/renderD128 is the compute-only render node
+    # — safer than /dev/dri/card0 which grants display privileges.
+    # On fnOS (Linux) this works out of the box. On Docker Desktop
+    # (Windows/WSL2), GPU passthrough is not supported — uncomment
+    # the line below and remove `ffmpeg.hwaccel_args` from the
+    # Frigate config to fall back to software decoding.
+    #
+    #   devices:
+    #     - /dev/dri:/dev/dri
     # Healthcheck: check the Frigate REST API is responding.
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:5000/api/config" ]

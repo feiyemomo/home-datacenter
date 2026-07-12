@@ -41,6 +41,8 @@ func NewHub(bus *eventbus.Bus) *Hub {
 	topics := []string{
 		"device",
 		"camera",
+		"server",
+		"disk",
 		eventbus.TopicUserNotification,
 		eventbus.TopicSystemBroadcast,
 		eventbus.TopicAutomationFired,
