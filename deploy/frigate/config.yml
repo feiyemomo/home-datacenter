@@ -22,8 +22,8 @@
 # service. On Docker Desktop / Windows, GPU passthrough is not
 # supported — keep it commented.
 #
-# ffmpeg:
-#   hwaccel_args: preset-vaapi
+ffmpeg:
+  hwaccel_args: preset-vaapi
 
 mqtt:
   host: mosquitto
