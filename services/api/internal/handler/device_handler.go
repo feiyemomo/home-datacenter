@@ -143,3 +143,50 @@ func (h *DeviceHandler) Delete(c *gin.Context) {
 
 	utils.Success(c, nil)
 }
+
+// Purge permanently deletes a device row from the database.
+// Only works on already-revoked devices — call DELETE /device/:id
+// first to revoke, then DELETE /device/:id/purge to remove.
+//
+// Non-admin -> may only purge their own devices.
+//
+// Route: DELETE /api/v1/device/:id/purge
+func (h *DeviceHandler) Purge(c *gin.Context) {
+	userID := c.GetUint("user_id")
+
+	idStr := c.Param("id")
+	idParsed, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid device id")
+		return
+	}
+	deviceID := uint(idParsed)
+
+	device, err := h.deviceService.GetDeviceByID(deviceID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "device not found")
+		return
+	}
+
+	user, err := h.userService.GetByID(userID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
+	if !user.IsAdmin && device.UserID != userID {
+		utils.Fail(c, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	if !device.RevokedAt.Valid {
+		utils.Fail(c, http.StatusConflict, "device must be revoked before purging")
+		return
+	}
+
+	if err := h.deviceService.HardDelete(deviceID); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to delete device")
+		return
+	}
+
+	utils.Success(c, nil)
+}

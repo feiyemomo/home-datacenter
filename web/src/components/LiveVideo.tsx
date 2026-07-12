@@ -177,7 +177,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
             ? "bg-emerald-500/20 text-emerald-300 ring-emerald-500/30"
             : status === "offline"
                 ? "bg-rose-500/20 text-rose-300 ring-rose-500/30"
-                : "bg-slate-500/20 text-slate-300 ring-slate-500/30";
+                : "bg-surface-subtle/40 text-fg-muted ring-surface-border";
 
     // Compute the "effective" transport for the badge label
     // and the fallback handler. In auto mode the effective
@@ -199,7 +199,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
     return (
         <Card className="overflow-hidden">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-100">
+                <CardTitle className="flex items-center gap-2 text-base font-semibold text-fg">
                     {camera.name}
                     {camera.transcode && (
                         <Badge
@@ -217,7 +217,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                      * the live path badge so the relationship
                      * (selection → resolved path) is obvious. */}
                     <div
-                        className="inline-flex h-6 items-center rounded-md border border-slate-700 bg-slate-900/40 p-0.5 text-[10px]"
+                        className="inline-flex h-6 items-center rounded-md border border-surface-border bg-surface-subtle/40 p-0.5 text-[10px]"
                         role="radiogroup"
                         aria-label="Live stream transport"
                     >
@@ -233,7 +233,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                                         "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-colors",
                                         active
                                             ? "bg-sky-500/20 text-sky-300 shadow-sm"
-                                            : "text-slate-500 hover:text-slate-300",
+                                            : "text-fg-muted hover:text-fg",
                                     )}
                                     title={
                                         t === "auto"
@@ -385,7 +385,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             <p className="text-xs text-rose-300">{ptzError}</p>
                         )}
                         {lastSeen && (
-                            <p className="text-[10px] text-slate-500">
+                            <p className="text-[10px] text-fg-muted">
                                 last seen {new Date(lastSeen).toLocaleString()}
                             </p>
                         )}

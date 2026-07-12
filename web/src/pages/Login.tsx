@@ -78,7 +78,7 @@ export default function Login() {
                         <Server size={24} />
                     </div>
                     <CardTitle className="text-base">Sign in to Home Datacenter</CardTitle>
-                    <p className="text-xs text-slate-500">
+                    <p className="text-xs text-fg-muted">
                         Bind this browser to an existing device credential.
                     </p>
                 </CardHeader>
@@ -90,7 +90,7 @@ export default function Login() {
                             <div className="relative">
                                 <UserIcon
                                     size={16}
-                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500"
+                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fg-muted"
                                 />
                                 <Input
                                     id="user_id"
@@ -113,7 +113,7 @@ export default function Login() {
                             <div className="relative">
                                 <KeyRound
                                     size={16}
-                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500"
+                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fg-muted"
                                 />
                                 <Input
                                     id="access_key"

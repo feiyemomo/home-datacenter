@@ -70,3 +70,12 @@ func (s *DeviceService) GetDeviceByID(
 ) (*model.Device, error) {
 	return s.deviceRepo.GetByID(deviceID)
 }
+
+// HardDelete permanently removes a device row from the database.
+// Only allowed for already-revoked devices — the caller (handler)
+// must verify device.RevokedAt.Valid before calling this.
+func (s *DeviceService) HardDelete(
+	deviceID uint,
+) error {
+	return s.deviceRepo.Delete(deviceID)
+}

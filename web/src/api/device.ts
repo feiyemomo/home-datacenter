@@ -20,3 +20,13 @@ export async function listDevices(): Promise<Device[]> {
 export async function revokeDevice(deviceId: number): Promise<void> {
     await client.delete(`/device/${deviceId}`);
 }
+
+/**
+ * Permanently delete a device row (hard delete).
+ * Only works on already-revoked devices.
+ *
+ * DELETE /api/v1/device/:id/purge
+ */
+export async function deleteDevice(deviceId: number): Promise<void> {
+    await client.delete(`/device/${deviceId}/purge`);
+}

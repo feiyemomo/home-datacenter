@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { HardDrive, RefreshCw, Trash2, Loader2 } from "lucide-react";
-import { listDevices, revokeDevice } from "@/api/device";
+import { HardDrive, RefreshCw, Trash2, Loader2, XCircle } from "lucide-react";
+import { listDevices, revokeDevice, deleteDevice } from "@/api/device";
 import { getSystemStatus } from "@/api/system";
 import { ApiError } from "@/api/client";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -32,6 +32,8 @@ export default function Devices() {
     const [error, setError] = useState<string | null>(null);
     const [revokingId, setRevokingId] = useState<number | null>(null);
     const [confirmId, setConfirmId] = useState<number | null>(null);
+    const [deletingId, setDeletingId] = useState<number | null>(null);
+    const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
 
     const { lastMessage, subscribe } = useWebSocket();
 
@@ -172,12 +174,32 @@ export default function Devices() {
         }
     }
 
+    async function handleDelete(device: Device) {
+        setError(null);
+        setDeletingId(device.id);
+        try {
+            await deleteDevice(device.id);
+            setDevices((prev) => prev.filter((d) => d.id !== device.id));
+            setConfirmDeleteId(null);
+        } catch (err) {
+            setError(
+                err instanceof ApiError
+                    ? err.message
+                    : err instanceof Error
+                        ? err.message
+                        : "failed to delete device",
+            );
+        } finally {
+            setDeletingId(null);
+        }
+    }
+
     return (
         <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                    <h2 className="text-lg font-semibold text-slate-100">Devices</h2>
-                    <p className="text-xs text-slate-500">
+                    <h2 className="text-lg font-semibold text-fg">Devices</h2>
+                    <p className="text-xs text-fg-muted">
                         Bound device credentials and live online state.
                     </p>
                 </div>
@@ -197,7 +219,7 @@ export default function Devices() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-600 dark:text-rose-300">
                     {error}
                 </div>
             )}
@@ -215,7 +237,7 @@ export default function Devices() {
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
-                            <thead className="border-b border-slate-800 bg-slate-950/40 text-xs uppercase tracking-wider text-slate-500">
+                            <thead className="border-b border-surface-border bg-surface-subtle/40 text-xs uppercase tracking-wider text-fg-muted">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">User</th>
@@ -225,12 +247,12 @@ export default function Devices() {
                                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-800/70">
+                            <tbody className="divide-y divide-surface-border">
                                 {devices.length === 0 && !loading && (
                                     <tr>
                                         <td
                                             colSpan={6}
-                                            className="px-4 py-10 text-center text-slate-500"
+                                            className="px-4 py-10 text-center text-fg-muted"
                                         >
                                             No devices found.
                                         </td>
@@ -243,7 +265,7 @@ export default function Devices() {
                                         <tr
                                             key={d.id}
                                             className={cn(
-                                                "transition-colors hover:bg-slate-800/30",
+                                                "transition-colors hover:bg-surface-subtle/30",
                                                 isRevoked && "opacity-60",
                                             )}
                                         >
@@ -253,24 +275,24 @@ export default function Devices() {
                                                         className={cn(
                                                             "flex h-8 w-8 items-center justify-center rounded-md",
                                                             isRevoked
-                                                                ? "bg-slate-800 text-slate-500"
+                                                                ? "bg-surface-subtle text-fg-muted"
                                                                 : "bg-sky-500/10 text-sky-300 ring-1 ring-inset ring-sky-500/30",
                                                         )}
                                                     >
                                                         <HardDrive size={15} />
                                                     </div>
                                                     <div>
-                                                        <div className="font-medium text-slate-200">
+                                                        <div className="font-medium text-fg">
                                                             {d.device_name}
                                                         </div>
-                                                        <div className="text-[11px] text-slate-500">
+                                                        <div className="text-[11px] text-fg-muted">
                                                             id #{d.id}
                                                             {d.last_ip ? ` · ${d.last_ip}` : ""}
                                                         </div>
                                                     </div>
                                                 </div>
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-fg-muted">
                                                 #{d.user_id}
                                             </td>
                                             <td className="px-4 py-3">
@@ -285,13 +307,14 @@ export default function Devices() {
                                                     <Badge variant="outline">offline</Badge>
                                                 )}
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-fg-muted">
                                                 {formatDateTime(d.last_login_at)}
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-fg-muted">
                                                 {formatDateTime(d.created_at)}
                                             </td>
                                             <td className="px-4 py-3 text-right">
+                                                {/* Revoke confirm dialog */}
                                                 {confirmId === d.id ? (
                                                     <div className="flex items-center justify-end gap-2">
                                                         <Button
@@ -316,13 +339,49 @@ export default function Devices() {
                                                             Confirm
                                                         </Button>
                                                     </div>
-                                                ) : (
+                                                ) : confirmDeleteId === d.id ? (
+                                                    /* Delete confirm dialog (revoked devices only) */
+                                                    <div className="flex items-center justify-end gap-2">
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            onClick={() => setConfirmDeleteId(null)}
+                                                            disabled={deletingId === d.id}
+                                                        >
+                                                            Cancel
+                                                        </Button>
+                                                        <Button
+                                                            variant="danger"
+                                                            size="sm"
+                                                            onClick={() => handleDelete(d)}
+                                                            disabled={deletingId === d.id}
+                                                        >
+                                                            {deletingId === d.id ? (
+                                                                <Loader2 size={14} className="animate-spin" />
+                                                            ) : (
+                                                                <XCircle size={14} />
+                                                            )}
+                                                            Delete
+                                                        </Button>
+                                                    </div>
+                                                ) : isRevoked ? (
+                                                    /* Delete button for revoked devices */
                                                     <Button
                                                         variant="ghost"
                                                         size="sm"
-                                                        className="text-slate-400 hover:text-rose-300"
+                                                        className="text-fg-muted hover:text-rose-500"
+                                                        onClick={() => setConfirmDeleteId(d.id)}
+                                                    >
+                                                        <XCircle size={14} />
+                                                        Delete
+                                                    </Button>
+                                                ) : (
+                                                    /* Revoke button for active devices */
+                                                    <Button
+                                                        variant="ghost"
+                                                        size="sm"
+                                                        className="text-fg-muted hover:text-rose-500"
                                                         onClick={() => setConfirmId(d.id)}
-                                                        disabled={isRevoked}
                                                     >
                                                         <Trash2 size={14} />
                                                         Revoke
@@ -364,7 +423,7 @@ function EventLog({ lastMessage }: { lastMessage: WsMessage | null }) {
 
     if (entries.length === 0) {
         return (
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-fg-muted">
                 Waiting for events… (subscribed to <code>device</code>)
             </p>
         );
@@ -375,18 +434,18 @@ function EventLog({ lastMessage }: { lastMessage: WsMessage | null }) {
             {entries.map((m, i) => (
                 <li
                     key={`${m.ts}-${i}`}
-                    className="flex items-start gap-2 rounded bg-slate-950/60 px-3 py-2"
+                    className="flex items-start gap-2 rounded bg-surface-subtle/60 px-3 py-2"
                 >
-                    <span className="text-slate-500">
+                    <span className="text-fg-muted">
                         {new Date(m.ts * 1000).toLocaleTimeString()}
                     </span>
                     <Badge variant="info" className="text-[10px]">
                         {m.type}
                     </Badge>
                     {m.topic && (
-                        <span className="text-slate-400">{m.topic}</span>
+                        <span className="text-fg-muted">{m.topic}</span>
                     )}
-                    <span className="ml-auto max-w-[60%] truncate text-slate-500">
+                    <span className="ml-auto max-w-[60%] truncate text-fg-muted">
                         {JSON.stringify(m.payload)}
                     </span>
                 </li>

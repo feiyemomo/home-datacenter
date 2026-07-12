@@ -17,6 +17,7 @@ import {
 } from "lucide-react";
 import { getNetworkStatus, checkClientIPv6, probeIPv6Direct } from "@/api/network";
 import { ApiError } from "@/api/client";
+import { cn } from "@/lib/utils";
 import type { NetworkStatus, ConnectionStrategy, P2PSession } from "@/types";
 import {
     Card,
@@ -47,6 +48,9 @@ export default function Network() {
     // IPv6 direct probe result: null = not probed, >=0 = RTT ms, -1 = failed, -2 = mixed content.
     const [probeRTT, setProbeRTT] = useState<number | null>(null);
     const [probing, setProbing] = useState(false);
+    // Manual strategy override: "auto" follows server recommendation,
+    // otherwise the user forces a specific path. Persisted in localStorage.
+    const [manualStrategy, setManualStrategy] = useState<ConnectionStrategy | "auto">("auto");
 
     const fetchAll = useCallback(async (force = false) => {
         try {
@@ -92,6 +96,35 @@ export default function Network() {
         fetchAll();
     }, [fetchAll]);
 
+    // Load manual strategy override from localStorage on mount.
+    useEffect(() => {
+        try {
+            const saved = localStorage.getItem("network.strategy.override");
+            if (
+                saved === "auto" ||
+                saved === "ipv6_direct" ||
+                saved === "p2p" ||
+                saved === "relay"
+            ) {
+                setManualStrategy(saved);
+            }
+        } catch {
+            // localStorage may be unavailable (private browsing) — ignore.
+        }
+    }, []);
+
+    const handleStrategyChange = useCallback(
+        (strategy: ConnectionStrategy | "auto") => {
+            setManualStrategy(strategy);
+            try {
+                localStorage.setItem("network.strategy.override", strategy);
+            } catch {
+                // Ignore write failure in private browsing.
+            }
+        },
+        [],
+    );
+
     const strategyLabel: Record<ConnectionStrategy, string> = {
         ipv6_direct: "IPv6 Direct",
         p2p: "P2P UDP",
@@ -104,6 +137,20 @@ export default function Network() {
     // IPv6 direct is possible only if BOTH server and client have IPv6.
     const ipv6DirectPossible =
         status?.ipv6?.reachable === true && clientIPv6 === true;
+
+    // Effective strategy: manual override takes precedence, otherwise
+    // fall back to the server's recommended upgrade target.
+    const effectiveStrategy: ConnectionStrategy =
+        manualStrategy === "auto"
+            ? status?.strategy ?? "relay"
+            : manualStrategy;
+
+    // Availability per strategy — unavailable options are disabled.
+    const strategyAvailable: Record<ConnectionStrategy, boolean> = {
+        ipv6_direct: ipv6DirectPossible,
+        p2p: status?.p2p?.supported ?? false,
+        relay: status?.relay?.available ?? true,
+    };
 
     // Probe the server's IPv6 direct URL. Tests whether this client can
     // actually reach the server over IPv6 (firewall, routing, etc.).
@@ -259,6 +306,78 @@ export default function Network() {
                     ) : (
                         <div className="text-sm text-fg-muted">Loading...</div>
                     )}
+                </CardContent>
+            </Card>
+
+            {/* Manual Strategy Override */}
+            <Card>
+                <CardHeader>
+                    <CardTitle className="flex items-center gap-2">
+                        <Shield size={16} /> Manual Strategy Override
+                    </CardTitle>
+                    <CardDescription>
+                        Force a specific connection path instead of the server's
+                        recommendation. Preference is stored locally in this browser.
+                    </CardDescription>
+                </CardHeader>
+                <CardContent>
+                    <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                        {(["auto", "ipv6_direct", "p2p", "relay"] as const).map((opt) => {
+                            const isActive = manualStrategy === opt;
+                            const isAvailable =
+                                opt === "auto" || strategyAvailable[opt];
+                            const label =
+                                opt === "auto" ? "Auto" : strategyLabel[opt];
+                            return (
+                                <button
+                                    key={opt}
+                                    type="button"
+                                    onClick={() => handleStrategyChange(opt)}
+                                    disabled={!isAvailable}
+                                    className={cn(
+                                        "flex flex-col items-start gap-1 rounded-lg border px-4 py-3 text-left transition-colors",
+                                        isActive
+                                            ? "border-sky-500 bg-sky-500/10"
+                                            : isAvailable
+                                                ? "border-surface-border bg-surface-subtle/30 hover:border-sky-500/50 hover:bg-sky-500/5"
+                                                : "cursor-not-allowed border-surface-border bg-surface-subtle/20 opacity-50",
+                                    )}
+                                >
+                                    <div className="flex w-full items-center justify-between">
+                                        <span className="text-sm font-medium text-fg">
+                                            {label}
+                                        </span>
+                                        {isActive && (
+                                            <CheckCircle2
+                                                size={14}
+                                                className="text-sky-500"
+                                            />
+                                        )}
+                                    </div>
+                                    <span className="text-xs text-fg-muted">
+                                        {opt === "auto"
+                                            ? `Server: ${status ? strategyLabel[status.strategy] : "..."}`
+                                            : isAvailable
+                                                ? "Available"
+                                                : "Unavailable"}
+                                    </span>
+                                </button>
+                            );
+                        })}
+                    </div>
+                    <div className="mt-4 flex items-center gap-2 rounded-lg border border-surface-border bg-surface-subtle/30 px-4 py-3">
+                        <span className="text-xs text-fg-muted">
+                            Effective strategy:
+                        </span>
+                        <Badge variant="info">
+                            {strategyLabel[effectiveStrategy]}
+                        </Badge>
+                        {manualStrategy !== "auto" && (
+                            <span className="text-xs text-amber-600 dark:text-amber-400">
+                                Manual override active
+                            </span>
+                        )}
+                    </div>
                 </CardContent>
             </Card>
 

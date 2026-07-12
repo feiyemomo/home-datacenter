@@ -126,6 +126,28 @@ services:
       start_period: 10s
     networks:
       - home-net
+  # cloudflared — Cloudflare Tunnel connector. Routes public
+  # hostnames (dashboard / api / cam .feiyemomo.top) to the
+  # internal Docker services via the home-net bridge network.
+  # The tunnel ID and credentials are mounted from the host's
+  # ~/.cloudflared directory; the ingress rules live in
+  # deploy/cloudflared/config.yaml.
+  cloudflared:
+    image: docker.m.daocloud.io/cloudflare/cloudflared:latest
+    container_name: home-cloudflared
+    restart: unless-stopped
+    command: tunnel --config /etc/cloudflared/config.yaml run
+    volumes:
+      - ./deploy/cloudflared/config.yaml:/etc/cloudflared/config.yaml:ro
+      # Mount the credentials JSON from the host. On Windows the
+      # path is C:\Users\<user>\.cloudflared\<tunnel-id>.json.
+      - ${USERPROFILE}/.cloudflared/663e45da-2140-4b42-8dbc-b65da7b5956a.json:/etc/cloudflared/credentials.json:ro
+    depends_on:
+      - web
+      - api
+      - frigate
+    networks:
+      - home-net
   # coturn — optional STUN/TURN for WebRTC across the public
   # internet. Without this, browsers can only reach go2rtc via
   # LAN or Cloudflare Tunnel (HTTP SDP only — no UDP media).
