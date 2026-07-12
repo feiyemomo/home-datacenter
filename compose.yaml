@@ -124,9 +124,8 @@ services:
     # (Windows/WSL2), GPU passthrough is not supported — uncomment
     # the line below and remove `ffmpeg.hwaccel_args` from the
     # Frigate config to fall back to software decoding.
-    #
-    #   devices:
-    #     - /dev/dri:/dev/dri
+    devices:
+      - /dev/dri:/dev/dri
     # Healthcheck: check the Frigate REST API is responding.
     healthcheck:
       test: [ "CMD", "wget", "-qO-", "http://localhost:5000/api/config" ]
