@@ -103,3 +103,16 @@ network:
   #     port: 19302
   #   - host: stun.cloudflare.com
   #     port: 3478
+  # IPv6 direct: TCP port published on the server's public IPv6 address.
+  # 0 = disabled (no direct_url in /network/status). Set to the port
+  # the api listens on when reachable over IPv6 (usually 8080).
+  direct_port: 8080
+  # Manual override for the server's public IPv6 address. Auto-detection
+  # (via echo services) fails on Docker Desktop/WSL2 because containers
+  # have no IPv6 NAT. Set this to the host's public IPv6 address; the
+  # client's probe verifies actual reachability. Empty = auto-detect.
+  public_ipv6: "2409:8a70:37af:7e30::81e"
+  # P2P UDP hole punching: port for the persistent UDP socket used by
+  # the HolePuncher. 0 = disabled. Must be published to the host
+  # (compose: "p2p_port:p2p_port/udp") for peers to reach it.
+  p2p_port: 0

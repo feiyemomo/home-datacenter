@@ -286,7 +286,25 @@ export interface NetworkStatus {
     /** BEST achievable path after probing. Client upgrades from `initial` to this if probe succeeds. */
     strategy: ConnectionStrategy;
     quality: number; // 1-5
+    /** IPv6 direct URL for client-side probing. Empty when IPv6 unavailable or direct_port not configured. */
+    direct_url?: string;
+    /** Server's UDP endpoint for hole punching. Empty when P2P disabled. */
+    p2p_endpoint?: string;
+    /** Active P2P hole-punching sessions. */
+    p2p_sessions?: P2PSession[];
     checked_at: string;
+}
+
+/** P2P hole-punching session status. */
+export interface P2PSession {
+    peer_id: string;
+    remote_addr: string;
+    status: "punching" | "established" | "failed";
+    established_at?: string;
+    last_packet_at?: string;
+    last_punch_at?: string;
+    punch_count: number;
+    created_at: string;
 }
 
 /** Server's P2P endpoint for UDP hole punching. */

@@ -26,6 +26,9 @@ services:
     # by service name.
     ports:
       - "127.0.0.1:8080:8080"
+      # Publish on IPv6 so clients can connect directly via
+      # http://[host-ipv6]:8080 — bypasses Cloudflare Tunnel relay.
+      - ":::8080:8080"
     volumes:
       - ./data/sqlite:/data/sqlite
       - ./services/api/configs:/configs:ro
@@ -70,6 +73,10 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:80:80"
+      # Publish on IPv6 so mobile devices can access the dashboard
+      # directly via http://[host-ipv6]/ — HTTP (no mixed content),
+      # so the IPv6 Direct Probe works in the browser.
+      - ":::80:80"
     depends_on:
       - api
     networks:
@@ -139,3 +146,14 @@ services:
 networks:
   home-net:
     driver: bridge
+    # Enable IPv6 on the Docker bridge network so containers have
+    # outbound IPv6 connectivity. Requires "Enable IPv6" in Docker
+    # Desktop settings (Settings → Resources → Network). The ULA subnet
+    # is Docker-internal; Docker NATs outbound IPv6 to the host's public
+    # address. The api's CheckIPv6() discovers the public address via
+    # an external echo service, so clients get the right endpoint.
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
+        - subnet: fd00:dead:beef::/64
