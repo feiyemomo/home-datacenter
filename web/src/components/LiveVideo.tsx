@@ -1,19 +1,31 @@
-import { useEffect, useState } from "react";
-import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power, Play, Trash2, RefreshCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { useWebRTCStream } from "@/hooks/useWebRTCStream";
 import { useHLSStream } from "@/hooks/useHLSStream";
-import { ptzMove, gotoPreset } from "@/api/camera";
-import type { Camera, CameraEventMessage, CameraStatusEvent, WsMessage } from "@/types";
+import {
+    ptzMove,
+    gotoPreset,
+    cameraFrameUrl,
+    listRecordings,
+    deleteRecording,
+    setRecordingPlan,
+} from "@/api/camera";
+import { authHeaderFor } from "@/api/client";
+import type { Camera, CameraEventMessage, CameraRecording, CameraStatusEvent, WsMessage } from "@/types";
 
 interface LiveVideoProps {
     camera: Camera;
     isAdmin: boolean;
     /** Subscribe to a single topic and dispatch parsed events. */
     onWsMessage?: (handler: (m: WsMessage) => void) => () => void;
+    /** Refresh camera data (used after recording plan changes). */
+    onRefresh?: () => void | Promise<void>;
+    /** When set, auto-switch to playback mode and play the matching recording. */
+    targetTime?: number;
 }
 
 /**
@@ -48,8 +60,24 @@ function readTransport(): TransportMode {
     return "auto";
 }
 
+/** Format a recording duration (seconds) as h:mm:ss or m:ss. */
+function formatDuration(sec: number): string {
+    if (!Number.isFinite(sec) || sec < 0) return "--";
+    const s = Math.floor(sec % 60);
+    const m = Math.floor(sec / 60) % 60;
+    const h = Math.floor(sec / 3600);
+    const pad = (n: number) => n.toString().padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 /**
- * LiveVideo — one camera: video pane + PTZ pad + preset bar.
+ * LiveVideo — one camera with three modes:
+ *
+ *   preview  — static JPEG snapshot + Play button (default). Avoids
+ *              spinning up a WebRTC/HLS connection for every camera
+ *              on the page until the operator actually wants video.
+ *   live     — WebRTC/HLS live stream with PTZ + transport picker.
+ *   playback — recording list + inline `<video>` player.
  *
  * Streaming strategy (Phase 6)
  * ---------------------------
@@ -78,10 +106,21 @@ function readTransport(): TransportMode {
  * field (initial render) or from the WebSocket "device.<id>.status"
  * event the parent routes in via onWsMessage.
  *
- * Recording playback (NOT in this component) uses useHLSStream
- * directly with the recording's per-segment m3u8 URL.
+ * Recording playback uses the same JWT-authenticated blob fetch
+ * path that the previous standalone RecordingPanel used: fetch
+ * the MP4 with the Authorization header attached (the file
+ * endpoint is behind JWTAuth, and <video src> cannot set
+ * headers), then hand the blob URL to a <video controls>
+ * element. The blob URL is revoked on stop / switch / unmount.
  */
-export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
+export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime }: LiveVideoProps) {
+    // Mode drives which surface is mounted. Preview is the
+    // cheap default; live/playback mount their respective
+    // engines. Switching back to preview unmounts both,
+    // tearing down the WebRTC peer connection / HLS session
+    // and revoking any in-flight recording blob URL.
+    const [mode, setMode] = useState<"preview" | "live" | "playback">("preview");
+
     // Path drives which sub-component is mounted. We start on
     // WebRTC and flip to HLS on the primary's onError (in auto
     // mode only; explicit WebRTC/HLS selections are sticky).
@@ -172,6 +211,162 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
         }
     }
 
+    // ----------------- Recording playback state -----------------
+    // Ported from the previous standalone RecordingPanel. The
+    // playback mode mounts this state; leaving playback mode
+    // revokes any in-flight blob URL so we don't leak the MP4.
+    const [recordings, setRecordings] = useState<CameraRecording[]>([]);
+    const [loadingRecs, setLoadingRecs] = useState(false);
+    const [toggling, setToggling] = useState(false);
+    const [recError, setRecError] = useState<string | null>(null);
+    const [playingId, setPlayingId] = useState<number | null>(null);
+    const [videoUrl, setVideoUrl] = useState<string | null>(null);
+    const [fetchingPlay, setFetchingPlay] = useState<number | null>(null);
+
+    // Track the current blob URL so we can revoke it before
+    // replacing it or on unmount. Keeping it in a ref lets the
+    // cleanup function read the latest value without re-running.
+    const urlRef = useRef<string | null>(null);
+    useEffect(() => {
+        return () => {
+            if (urlRef.current) {
+                URL.revokeObjectURL(urlRef.current);
+                urlRef.current = null;
+            }
+        };
+    }, []);
+
+    const recordingEnabled = camera.meta.recording?.enabled ?? false;
+
+    const loadRecordings = useCallback(async () => {
+        setLoadingRecs(true);
+        setRecError(null);
+        try {
+            const list = await listRecordings(camera.id, 20);
+            setRecordings(list);
+        } catch (e) {
+            setRecError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setLoadingRecs(false);
+        }
+    }, [camera.id]);
+
+    function revokeCurrentUrl() {
+        if (urlRef.current) {
+            URL.revokeObjectURL(urlRef.current);
+            urlRef.current = null;
+        }
+        setVideoUrl(null);
+    }
+
+    async function onPlay(rec: CameraRecording) {
+        if (fetchingPlay !== null) return;
+        // Stop any current playback first.
+        revokeCurrentUrl();
+        setPlayingId(null);
+        setFetchingPlay(rec.id);
+        setRecError(null);
+        try {
+            const h = authHeaderFor();
+            const resp = await fetch(
+                `/api/v1/cameras/${camera.id}/recordings/${rec.id}/file`,
+                { headers: h ? { [h.name]: h.value } : {} },
+            );
+            if (!resp.ok) {
+                throw new Error(`HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}`);
+            }
+            const blob = await resp.blob();
+            const url = URL.createObjectURL(blob);
+            urlRef.current = url;
+            setVideoUrl(url);
+            setPlayingId(rec.id);
+        } catch (e) {
+            setRecError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setFetchingPlay(null);
+        }
+    }
+
+    function onStopPlay() {
+        revokeCurrentUrl();
+        setPlayingId(null);
+    }
+
+    async function onDeleteRec(rec: CameraRecording) {
+        if (!isAdmin) return;
+        if (!confirm(`Delete recording ${rec.id}?`)) return;
+        try {
+            if (playingId === rec.id) onStopPlay();
+            await deleteRecording(camera.id, rec.id);
+            await loadRecordings();
+        } catch (e) {
+            setRecError(e instanceof Error ? e.message : String(e));
+        }
+    }
+
+    async function onToggleRecording() {
+        if (!isAdmin || toggling || !onRefresh) return;
+        setToggling(true);
+        setRecError(null);
+        try {
+            await setRecordingPlan(camera.id, {
+                enabled: !recordingEnabled,
+                segment_seconds: 600,
+                retention_days: 7,
+            });
+            await onRefresh();
+        } catch (e) {
+            setRecError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setToggling(false);
+        }
+    }
+
+    // targetTime auto-playback — when the URL carries ?time=… the
+    // parent routes it in here. We switch to playback mode, load
+    // the recordings (if not already loaded), and play the one
+    // whose start minute matches the requested minute. Logic
+    // preserved verbatim from the previous RecordingPanel.
+    useEffect(() => {
+        if (targetTime === undefined || targetTime === 0) return;
+        setMode("playback");
+        if (recordings.length === 0 && !loadingRecs) {
+            void loadRecordings();
+        }
+    }, [targetTime]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    useEffect(() => {
+        if (targetTime === undefined || targetTime === 0) return;
+        if (recordings.length === 0 || loadingRecs) return;
+
+        const targetMinuteStart = Math.floor(targetTime / 60) * 60;
+        const matchingRec = recordings.find((rec) => {
+            const recStartTime = new Date(rec.start_at).getTime() / 1000;
+            const recStartMinute = Math.floor(recStartTime / 60) * 60;
+            return recStartMinute === targetMinuteStart;
+        });
+
+        if (matchingRec && playingId !== matchingRec.id && fetchingPlay === null) {
+            void onPlay(matchingRec);
+        }
+    }, [recordings, targetTime, loadingRecs, playingId, fetchingPlay]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // When entering playback mode, lazy-load the recording list.
+    useEffect(() => {
+        if (mode === "playback" && recordings.length === 0 && !loadingRecs) {
+            void loadRecordings();
+        }
+    }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    // Leaving playback mode revokes the blob URL so the MP4
+    // doesn't keep a fetched-but-hidden reference. The next
+    // entry into playback will re-fetch on demand.
+    useEffect(() => {
+        if (mode !== "playback" && videoUrl) {
+            onStopPlay();
+        }
+    }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
+
     const statusColor =
         status === "online"
             ? "bg-emerald-500/20 text-emerald-300 ring-emerald-500/30"
@@ -212,45 +407,129 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                     )}
                 </CardTitle>
                 <div className="flex items-center gap-2">
-                    {/* Transport segmented control. Compact
-                     * three-button toggle, visually adjacent to
-                     * the live path badge so the relationship
+                    {/* Transport segmented control — live mode only.
+                     * Compact three-button toggle, visually adjacent
+                     * to the live path badge so the relationship
                      * (selection → resolved path) is obvious. */}
-                    <div
-                        className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
-                        role="radiogroup"
-                        aria-label="Live stream transport"
-                    >
-                        {(["auto", "webrtc", "hls"] as TransportMode[]).map((t) => {
-                            const active = transport === t;
-                            return (
-                                <button
-                                    key={t}
-                                    role="radio"
-                                    aria-checked={active}
-                                    onClick={() => setTransport(t)}
-                                    className={cn(
-                                        "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
-                                        active
-                                            ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
-                                            : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
-                                    )}
-                                    title={
-                                        t === "auto"
-                                            ? "Try WebRTC; fall back to HLS on failure"
-                                            : t === "webrtc"
-                                                ? "Force WebRTC; show error on failure (no auto-fallback)"
-                                                : "Force HLS; never try WebRTC"
-                                    }
-                                >
-                                    {t}
-                                </button>
-                            );
-                        })}
-                    </div>
-                    <Badge variant="outline" className="text-[10px]">
-                        {effectivePath === "webrtc" ? "WebRTC" : "HLS"}
-                    </Badge>
+                    {mode === "live" && (
+                        <div
+                            className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
+                            role="radiogroup"
+                            aria-label="Live stream transport"
+                        >
+                            {(["auto", "webrtc", "hls"] as TransportMode[]).map((t) => {
+                                const active = transport === t;
+                                return (
+                                    <button
+                                        key={t}
+                                        role="radio"
+                                        aria-checked={active}
+                                        onClick={() => setTransport(t)}
+                                        className={cn(
+                                            "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                            active
+                                                ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
+                                                : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
+                                        )}
+                                        title={
+                                            t === "auto"
+                                                ? "Try WebRTC; fall back to HLS on failure"
+                                                : t === "webrtc"
+                                                    ? "Force WebRTC; show error on failure (no auto-fallback)"
+                                                    : "Force HLS; never try WebRTC"
+                                        }
+                                    >
+                                        {t}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    )}
+                    {mode === "live" && (
+                        <Badge variant="outline" className="text-[10px]">
+                            {effectivePath === "webrtc" ? "WebRTC" : "HLS"}
+                        </Badge>
+                    )}
+                    {/* Mode tabs — only visible once we've left
+                     * preview. Switching to live tears down the
+                     * recording blob; switching to playback tears
+                     * down the WebRTC/HLS pipeline. */}
+                    {mode !== "preview" && (
+                        <div
+                            className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
+                            role="radiogroup"
+                            aria-label="View mode"
+                        >
+                            <button
+                                role="radio"
+                                aria-checked={mode === "live"}
+                                onClick={() => setMode("live")}
+                                className={cn(
+                                    "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                    mode === "live"
+                                        ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
+                                        : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
+                                )}
+                                title="Live stream"
+                            >
+                                Live
+                            </button>
+                            <button
+                                role="radio"
+                                aria-checked={mode === "playback"}
+                                onClick={() => setMode("playback")}
+                                className={cn(
+                                    "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                    mode === "playback"
+                                        ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
+                                        : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
+                                )}
+                                title="Recording playback"
+                            >
+                                Playback
+                            </button>
+                        </div>
+                    )}
+                    {/* Stop button — return to preview mode. Tears
+                     * down whichever engine is active. */}
+                    {mode !== "preview" && (
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-6 px-2 text-[10px] glass-subtle hover:bg-white/10"
+                            onClick={() => setMode("preview")}
+                            title="Return to preview"
+                        >
+                            <Square size={10} className="mr-1" />
+                            Stop
+                        </Button>
+                    )}
+                    {/* Recording toggle — admin only. Always
+                     * visible so the operator can start/stop
+                     * recording without entering playback mode. */}
+                    {isAdmin && (
+                        <Button
+                            size="sm"
+                            variant={recordingEnabled ? "danger" : "primary"}
+                            onClick={onToggleRecording}
+                            disabled={toggling || !onRefresh}
+                            className="h-6 px-2 text-[10px]"
+                            title={
+                                recordingEnabled
+                                    ? `Recording ON · ${camera.meta.recording?.segment_seconds ?? 600}s · ${camera.meta.recording?.retention_days ?? 7}d retention`
+                                    : "Recording OFF"
+                            }
+                        >
+                            {toggling && <Loader2 size={10} className="animate-spin" />}
+                            <span
+                                className={cn(
+                                    "mr-1 inline-block h-1.5 w-1.5 rounded-full",
+                                    recordingEnabled ? "bg-rose-200" : "bg-slate-200",
+                                )}
+                            />
+                            Rec
+                        </Button>
+                    )}
                     <Badge variant="outline" className={cn("ring-1 ring-inset", statusColor)}>
                         <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-current" />
                         {status}
@@ -262,20 +541,55 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
             </CardHeader>
             <CardContent className="space-y-3 p-0">
                 <div className="relative aspect-video w-full bg-black">
-                    {effectivePath === "webrtc" ? (
-                        <WebRTCVideo
-                            key={`webrtc-${generation}`}
+                    {mode === "preview" && (
+                        <PreviewFrame
                             cameraId={camera.id}
-                            streamName={camera.stream.stream_name}
-                            webrtcUrl={camera.stream.webrtc_url}
-                            onFallback={onWebRTCFallback}
+                            onPlay={() => setMode("live")}
                         />
-                    ) : (
-                        <HLSVideo
-                            key={`hls-${generation}`}
-                            src={camera.stream.hls_url}
-                            onRetry={retry}
-                        />
+                    )}
+                    {mode === "live" && (
+                        effectivePath === "webrtc" ? (
+                            <WebRTCVideo
+                                key={`webrtc-${generation}`}
+                                cameraId={camera.id}
+                                streamName={camera.stream.stream_name}
+                                webrtcUrl={camera.stream.webrtc_url}
+                                onFallback={onWebRTCFallback}
+                            />
+                        ) : (
+                            <HLSVideo
+                                key={`hls-${generation}`}
+                                src={camera.stream.hls_url}
+                                onRetry={retry}
+                            />
+                        )
+                    )}
+                    {mode === "playback" && (
+                        videoUrl && playingId !== null ? (
+                            <video
+                                key={videoUrl}
+                                src={videoUrl}
+                                controls
+                                autoPlay
+                                className="h-full w-full object-contain"
+                            />
+                        ) : (
+                            <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
+                                {loadingRecs ? (
+                                    <>
+                                        <Loader2 className="mb-2 h-5 w-5 animate-spin" />
+                                        <span className="text-xs">loading recordings…</span>
+                                    </>
+                                ) : recordings.length === 0 ? (
+                                    <>
+                                        <AlertTriangle className="mb-2 h-5 w-5 text-slate-500" />
+                                        <span className="text-xs">no recordings</span>
+                                    </>
+                                ) : (
+                                    <span className="text-xs">select a recording below</span>
+                                )}
+                            </div>
+                        )
                     )}
                     {eventToast && (
                         <div className="absolute right-2 top-2 rounded-lg backdrop-blur-xl bg-black/50 px-3 py-1.5 text-xs font-semibold text-white shadow-lg border border-white/10">
@@ -284,123 +598,273 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                     )}
                 </div>
 
-                <div className="grid grid-cols-[auto_1fr] gap-3 p-4">
-                    {/* PTZ pad */}
-                    <div className="grid grid-cols-3 gap-1">
-                        <span />
-                        <Button
-                            size="icon"
-                            variant="outline"
-                            disabled={!isAdmin || busy || !camera.capabilities.ptz}
-                            onClick={() => sendPTZ("up")}
-                            aria-label="PTZ up"
-                            className="glass-subtle hover:bg-white/10"
-                        >
-                            <ChevronUp size={16} />
-                        </Button>
-                        <span />
-                        <Button
-                            size="icon"
-                            variant="outline"
-                            disabled={!isAdmin || busy || !camera.capabilities.ptz}
-                            onClick={() => sendPTZ("left")}
-                            aria-label="PTZ left"
-                            className="glass-subtle hover:bg-white/10"
-                        >
-                            <ChevronLeft size={16} />
-                        </Button>
-                        <Button
-                            size="icon"
-                            variant="outline"
-                            disabled={!isAdmin || busy}
-                            onClick={() => sendPTZ("stop")}
-                            aria-label="PTZ stop"
-                            className="glass-subtle hover:bg-white/10"
-                        >
-                            <Square size={14} />
-                        </Button>
-                        <Button
-                            size="icon"
-                            variant="outline"
-                            disabled={!isAdmin || busy || !camera.capabilities.ptz}
-                            onClick={() => sendPTZ("right")}
-                            aria-label="PTZ right"
-                            className="glass-subtle hover:bg-white/10"
-                        >
-                            <ChevronRight size={16} />
-                        </Button>
-                        <span />
-                        <Button
-                            size="icon"
-                            variant="outline"
-                            disabled={!isAdmin || busy || !camera.capabilities.ptz}
-                            onClick={() => sendPTZ("down")}
-                            aria-label="PTZ down"
-                            className="glass-subtle hover:bg-white/10"
-                        >
-                            <ChevronDown size={16} />
-                        </Button>
-                        <span />
-                    </div>
-
-                    {/* Zoom + presets + last seen */}
-                    <div className="flex flex-col gap-2">
-                        <div className="flex flex-wrap items-center gap-1">
-                            <Button
-                                size="sm"
-                                variant="outline"
-                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
-                                onClick={() => sendPTZ("zoom_in")}
-                                className="glass-subtle hover:bg-white/10"
-                            >
-                                <ZoomIn size={14} className="mr-1" />
-                                Zoom+
-                            </Button>
-                            <Button
-                                size="sm"
-                                variant="outline"
-                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
-                                onClick={() => sendPTZ("zoom_out")}
-                                className="glass-subtle hover:bg-white/10"
-                            >
-                                <ZoomOut size={14} className="mr-1" />
-                                Zoom-
-                            </Button>
-                            {!isAdmin && (
-                                <Badge variant="outline" className="text-[10px]">
-                                    <Power size={10} className="mr-1" />
-                                    view-only
-                                </Badge>
-                            )}
-                        </div>
-                        {Object.keys(camera.presets ?? {}).length > 0 && (
-                            <div className="flex flex-wrap items-center gap-1">
-                                {Object.entries(camera.presets).map(([alias]) => (
-                                    <Button
-                                        key={alias}
-                                        size="sm"
-                                        variant="secondary"
-                                        disabled={!isAdmin || busy}
-                                        onClick={() => sendPreset(alias)}
-                                        className="glass-subtle hover:bg-white/10"
-                                    >
-                                        {alias}
-                                    </Button>
-                                ))}
+                {/* Recording list — playback mode only. Mirrors the
+                 * previous RecordingPanel layout: each row shows
+                 * start time, duration, size, play/stop + delete
+                 * buttons. Inline video player is rendered in the
+                 * aspect-video area above when a recording is
+                 * playing. */}
+                {mode === "playback" && (
+                    <div className="space-y-2 px-4 pb-3 pt-1">
+                        {recError && (
+                            <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-2.5 py-1.5 text-[11px]">
+                                {recError}
                             </div>
                         )}
-                        {ptzError && (
-                            <p className="text-xs text-[rgb(var(--accent-danger))]">{ptzError}</p>
-                        )}
-                        {lastSeen && (
-                            <p className="text-[10px] text-slate-500">
-                                last seen {new Date(lastSeen).toLocaleString()}
-                            </p>
-                        )}
+
+                        <div className="space-y-1">
+                            <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-fg-subtle">
+                                <span>最近录制</span>
+                                <button
+                                    type="button"
+                                    onClick={loadRecordings}
+                                    disabled={loadingRecs}
+                                    className="inline-flex items-center gap-1 text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
+                                >
+                                    <RefreshCcw size={10} className={loadingRecs ? "animate-spin" : ""} />
+                                    刷新
+                                </button>
+                            </div>
+
+                            {loadingRecs && recordings.length === 0 ? (
+                                <div className="flex items-center justify-center py-4 text-[11px] text-fg-muted">
+                                    <Loader2 size={12} className="mr-1 animate-spin" />
+                                    加载中…
+                                </div>
+                            ) : recordings.length === 0 ? (
+                                <div className="py-3 text-center text-[11px] text-fg-subtle">
+                                    暂无录制
+                                </div>
+                            ) : (
+                                <ul className="max-h-56 space-y-1 overflow-y-auto pr-0.5">
+                                    {recordings.map((rec) => (
+                                        <li
+                                            key={rec.id}
+                                            className="flex items-center gap-2 glass-subtle rounded-lg px-2 py-1.5 text-[11px] hover:bg-[rgb(var(--bg-subtle)/0.3)] transition-colors"
+                                        >
+                                            <div className="min-w-0 flex-1">
+                                                <div className="truncate font-medium text-fg">
+                                                    {new Date(rec.start_at).toLocaleString()}
+                                                </div>
+                                                <div className="truncate text-[10px] text-fg-muted">
+                                                    {formatDuration(rec.duration_seconds)} · {rec.size_human}
+                                                </div>
+                                            </div>
+                                            {playingId === rec.id && videoUrl ? (
+                                                <button
+                                                    type="button"
+                                                    onClick={onStopPlay}
+                                                    className="inline-flex h-6 items-center gap-1 rounded-md glass-subtle px-2 text-[10px] text-fg-muted transition-colors hover:text-fg"
+                                                    title="停止播放"
+                                                >
+                                                    <Square size={10} />
+                                                    停止
+                                                </button>
+                                            ) : (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => onPlay(rec)}
+                                                    disabled={fetchingPlay !== null}
+                                                    className="inline-flex h-6 items-center gap-1 rounded-md bg-[rgb(var(--accent-primary)/0.15)] px-2 text-[10px] text-[rgb(var(--accent-primary))] transition-colors hover:bg-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50"
+                                                    title="播放"
+                                                >
+                                                    {fetchingPlay === rec.id ? (
+                                                        <Loader2 size={10} className="animate-spin" />
+                                                    ) : (
+                                                        <Play size={10} />
+                                                    )}
+                                                    播放
+                                                </button>
+                                            )}
+                                            {isAdmin && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => onDeleteRec(rec)}
+                                                    className="inline-flex h-6 items-center justify-center rounded-md p-1 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
+                                                    aria-label="Delete recording"
+                                                    title="删除录制"
+                                                >
+                                                    <Trash2 size={11} />
+                                                </button>
+                                            )}
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </div>
                     </div>
-                </div>
+                )}
+
+                {/* PTZ pad + presets — live mode only. Hidden in
+                 * preview/playback because PTZ commands only make
+                 * sense while the live stream is rendering. */}
+                {mode === "live" && (
+                    <div className="grid grid-cols-[auto_1fr] gap-3 p-4">
+                        {/* PTZ pad */}
+                        <div className="grid grid-cols-3 gap-1">
+                            <span />
+                            <Button
+                                size="icon"
+                                variant="outline"
+                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                onClick={() => sendPTZ("up")}
+                                aria-label="PTZ up"
+                                className="glass-subtle hover:bg-white/10"
+                            >
+                                <ChevronUp size={16} />
+                            </Button>
+                            <span />
+                            <Button
+                                size="icon"
+                                variant="outline"
+                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                onClick={() => sendPTZ("left")}
+                                aria-label="PTZ left"
+                                className="glass-subtle hover:bg-white/10"
+                            >
+                                <ChevronLeft size={16} />
+                            </Button>
+                            <Button
+                                size="icon"
+                                variant="outline"
+                                disabled={!isAdmin || busy}
+                                onClick={() => sendPTZ("stop")}
+                                aria-label="PTZ stop"
+                                className="glass-subtle hover:bg-white/10"
+                            >
+                                <Square size={14} />
+                            </Button>
+                            <Button
+                                size="icon"
+                                variant="outline"
+                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                onClick={() => sendPTZ("right")}
+                                aria-label="PTZ right"
+                                className="glass-subtle hover:bg-white/10"
+                            >
+                                <ChevronRight size={16} />
+                            </Button>
+                            <span />
+                            <Button
+                                size="icon"
+                                variant="outline"
+                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                onClick={() => sendPTZ("down")}
+                                aria-label="PTZ down"
+                                className="glass-subtle hover:bg-white/10"
+                            >
+                                <ChevronDown size={16} />
+                            </Button>
+                            <span />
+                        </div>
+
+                        {/* Zoom + presets + last seen */}
+                        <div className="flex flex-col gap-2">
+                            <div className="flex flex-wrap items-center gap-1">
+                                <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                    onClick={() => sendPTZ("zoom_in")}
+                                    className="glass-subtle hover:bg-white/10"
+                                >
+                                    <ZoomIn size={14} className="mr-1" />
+                                    Zoom+
+                                </Button>
+                                <Button
+                                    size="sm"
+                                    variant="outline"
+                                    disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                    onClick={() => sendPTZ("zoom_out")}
+                                    className="glass-subtle hover:bg-white/10"
+                                >
+                                    <ZoomOut size={14} className="mr-1" />
+                                    Zoom-
+                                </Button>
+                                {!isAdmin && (
+                                    <Badge variant="outline" className="text-[10px]">
+                                        <Power size={10} className="mr-1" />
+                                        view-only
+                                    </Badge>
+                                )}
+                            </div>
+                            {Object.keys(camera.presets ?? {}).length > 0 && (
+                                <div className="flex flex-wrap items-center gap-1">
+                                    {Object.entries(camera.presets).map(([alias]) => (
+                                        <Button
+                                            key={alias}
+                                            size="sm"
+                                            variant="secondary"
+                                            disabled={!isAdmin || busy}
+                                            onClick={() => sendPreset(alias)}
+                                            className="glass-subtle hover:bg-white/10"
+                                        >
+                                            {alias}
+                                        </Button>
+                                    ))}
+                                </div>
+                            )}
+                            {ptzError && (
+                                <p className="text-xs text-[rgb(var(--accent-danger))]">{ptzError}</p>
+                            )}
+                            {lastSeen && (
+                                <p className="text-[10px] text-slate-500">
+                                    last seen {new Date(lastSeen).toLocaleString()}
+                                </p>
+                            )}
+                        </div>
+                    </div>
+                )}
             </CardContent>
         </Card>
+    );
+}
+
+/**
+ * PreviewFrame — default preview surface. Shows the static JPEG
+ * snapshot from GET /cameras/:id/frame with a Play button overlay;
+ * clicking Play hands control back to the parent, which flips to
+ * live mode and mounts the WebRTC/HLS engine. On image error (404,
+ * 401, codec issue, camera offline) we show a small placeholder
+ * so the card isn't a black rectangle with no signal.
+ */
+function PreviewFrame({
+    cameraId,
+    onPlay,
+}: {
+    cameraId: number;
+    onPlay: () => void;
+}) {
+    const [error, setError] = useState(false);
+    return (
+        <div className="absolute inset-0 flex items-center justify-center bg-black">
+            {error ? (
+                <div className="flex flex-col items-center text-slate-500">
+                    <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
+                    <span className="text-xs">preview unavailable</span>
+                </div>
+            ) : (
+                <>
+                    <img
+                        src={cameraFrameUrl(cameraId)}
+                        alt="camera preview"
+                        onError={() => setError(true)}
+                        className="h-full w-full object-contain"
+                    />
+                    <button
+                        type="button"
+                        onClick={onPlay}
+                        className="absolute inset-0 flex items-center justify-center bg-black/30 hover:bg-black/40 transition-colors group"
+                        aria-label="Play live stream"
+                        title="Play live stream"
+                    >
+                        <span className="flex h-14 w-14 items-center justify-center rounded-full bg-white/20 backdrop-blur-md ring-2 ring-white/40 group-hover:scale-110 transition-transform">
+                            <Play className="ml-1 h-6 w-6 text-white" fill="currentColor" />
+                        </span>
+                    </button>
+                </>
+            )}
+        </div>
     );
 }
 

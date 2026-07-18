@@ -169,7 +169,7 @@ export default function Dashboard() {
             const p = ws.lastMessage.payload as Record<string, unknown>;
             if (p && p.type === "detection") {
                 setLiveAlert({
-                    id: String(p.ts ?? Date.now()),
+                    id: typeof p.event_id === "string" ? p.event_id : String(p.ts ?? Date.now()),
                     camera_slug: String(p.camera_slug ?? ""),
                     camera_id: typeof p.camera_id === "number" ? p.camera_id : undefined,
                     camera_name: typeof p.camera_name === "string" ? p.camera_name : undefined,
@@ -301,6 +301,23 @@ export default function Dashboard() {
                                     : ""}
                             </p>
                         </div>
+                        {liveAlert.has_snapshot && (
+                            <button
+                                type="button"
+                                onClick={() => setSelectedAlert(liveAlert)}
+                                className="relative h-12 w-16 shrink-0 overflow-hidden rounded-lg bg-black/30 transition-transform hover:scale-105"
+                                title="点击查看截图"
+                            >
+                                <img
+                                    src={alertThumbnailUrl(liveAlert.id)}
+                                    alt={liveAlert.label}
+                                    className="h-full w-full object-cover"
+                                />
+                                <span className="absolute inset-0 flex items-center justify-center bg-black/0 opacity-0 transition-all hover:bg-black/30 hover:opacity-100">
+                                    <Eye size={12} className="text-white" />
+                                </span>
+                            </button>
+                        )}
                         <span className="text-[10px] text-fg-subtle">实时</span>
                     </div>
                 </div>
@@ -508,10 +525,19 @@ export default function Dashboard() {
                                         </div>
                                     )}
 
-                                    {/* Info — click navigates to the camera page */}
+                                    {/* Info — click navigates to the camera page with timestamp */}
                                     <button
                                         type="button"
-                                        onClick={() => navigate("/cameras")}
+                                        onClick={() => {
+                                            const search = new URLSearchParams();
+                                            if (alert.camera_id) {
+                                                search.set("camera", String(alert.camera_id));
+                                            }
+                                            if (alert.start_time) {
+                                                search.set("time", String(alert.start_time));
+                                            }
+                                            navigate(`/cameras?${search.toString()}`);
+                                        }}
                                         className="min-w-0 flex-1 cursor-pointer py-0.5 text-left"
                                         title="跳转到摄像头页面"
                                     >

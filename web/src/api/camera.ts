@@ -194,3 +194,17 @@ export function alertSnapshotUrl(eventId: string): string {
 export function alertThumbnailUrl(eventId: string): string {
 	return `/api/v1/cameras/alerts/${encodeURIComponent(eventId)}/thumbnail`;
 }
+
+/**
+ * Build the URL for a single JPEG frame from the camera's live
+ * stream. Used by the camera card to show a static preview before
+ * the operator clicks Play — avoids spinning up a WebRTC/HLS
+ * connection for every camera on the page.
+ *
+ * The JWT cookie is sent automatically because this is a same-
+ * origin GET. Add a cache-busting query param (e.g. `?t=Date.now()`)
+ * to force a fresh frame on reload.
+ */
+export function cameraFrameUrl(cameraId: number): string {
+	return `/api/v1/cameras/${cameraId}/frame`;
+}

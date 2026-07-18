@@ -1,12 +1,11 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { useNavigate } from "react-router-dom";
-import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, ChevronDown, ChevronRight, Play, Square } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { useNavigate, useSearchParams } from "react-router-dom";
+import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
-import { listCameras, deleteCamera, updateCodec, setRecordingPlan, listRecordings, deleteRecording } from "@/api/camera";
-import { authHeaderFor } from "@/api/client";
-import type { Camera, CameraRecording, WsMessage } from "@/types";
+import { listCameras, deleteCamera, updateCodec } from "@/api/camera";
+import type { Camera, WsMessage } from "@/types";
 import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { LiveVideo } from "@/components/LiveVideo";
@@ -32,16 +31,6 @@ function codecBadgeLabel(cam: Camera): string | null {
     return null;
 }
 
-/** Format a recording duration (seconds) as h:mm:ss or m:ss. */
-function formatDuration(sec: number): string {
-    if (!Number.isFinite(sec) || sec < 0) return "--";
-    const s = Math.floor(sec % 60);
-    const m = Math.floor(sec / 60) % 60;
-    const h = Math.floor(sec / 3600);
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
-}
-
 /**
  * Cameras — list + live view + delete.
  *
@@ -50,6 +39,14 @@ function formatDuration(sec: number): string {
  * — the operator can refresh, watch live, and remove a camera, but
  * not stand up a new one inline. This keeps the cards above the
  * fold and gives the create flow its own URL to bookmark / share.
+ *
+ * Recording playback + recording toggle now live inside LiveVideo
+ * itself (preview/live/playback mode switch). The page just routes
+ * the URL params (camera, time) through to the per-card LiveVideo.
+ *
+ * Supports URL query params:
+ *   - camera: camera ID to scroll to
+ *   - time: unix timestamp to auto-play the corresponding recording
  */
 export default function Cameras() {
     const { isAdmin } = useAuth();
@@ -57,6 +54,10 @@ export default function Cameras() {
     const [cams, setCams] = useState<Camera[]>([]);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
+    const [searchParams] = useSearchParams();
+
+    const targetCameraId = searchParams.get("camera") ? Number(searchParams.get("camera")) : undefined;
+    const targetTime = searchParams.get("time") ? Number(searchParams.get("time")) : undefined;
 
     const refresh = useCallback(async () => {
         setLoading(true);
@@ -125,6 +126,7 @@ export default function Cameras() {
                                 onDelete={() => remove(cam.id)}
                                 onRefresh={refresh}
                                 onWsMessage={onMsg}
+                                targetTime={(targetCameraId === cam.id) ? targetTime : undefined}
                             />
                         ))}
                         {cams.length === 0 && !loading && (
@@ -145,12 +147,14 @@ function CamCard({
     onDelete,
     onRefresh,
     onWsMessage,
+    targetTime,
 }: {
     cam: Camera;
     isAdmin: boolean;
     onDelete: () => void;
     onRefresh: () => void | Promise<void>;
     onWsMessage: (handler: (m: WsMessage) => void) => () => void;
+    targetTime?: number;
 }) {
     const statusVariant =
         cam.status === "online"
@@ -253,306 +257,20 @@ function CamCard({
                 </div>
             </div>
 
-            {/* Video */}
+            {/* Video — LiveVideo now owns preview / live / playback
+             * modes plus the recording list and the admin recording
+             * toggle. The aspect-video wrapper is preserved so the
+             * card keeps its frame shape before the LiveVideo Card
+             * mounts its inner surface. */}
             <div className="relative aspect-video bg-black">
-                <LiveVideo camera={cam} isAdmin={isAdmin} onWsMessage={onWsMessage} />
+                <LiveVideo
+                    camera={cam}
+                    isAdmin={isAdmin}
+                    onWsMessage={onWsMessage}
+                    onRefresh={onRefresh}
+                    targetTime={targetTime}
+                />
             </div>
-
-            {/* Recording panel */}
-            <RecordingPanel cam={cam} isAdmin={isAdmin} onRefresh={onRefresh} />
-        </div>
-    );
-}
-
-/**
- * RecordingPanel — collapsible per-camera recording control.
- *
- * - Toggle the recording plan (admin only) via setRecordingPlan.
- * - Lazy-load the most recent 20 recordings when first expanded.
- * - Play a recording by fetching it as a blob with the JWT
- *   Authorization header attached (the file endpoint is behind
- *   JWTAuth, and <video src> cannot set headers), then handing
- *   the blob URL to a <video controls> element. The blob URL is
- *   revoked on stop / switch / unmount to avoid leaks.
- * - Delete a recording (admin only) and refresh the list.
- */
-function RecordingPanel({
-    cam,
-    isAdmin,
-    onRefresh,
-}: {
-    cam: Camera;
-    isAdmin: boolean;
-    onRefresh: () => void | Promise<void>;
-}) {
-    const [open, setOpen] = useState(false);
-    const [recordings, setRecordings] = useState<CameraRecording[]>([]);
-    const [loading, setLoading] = useState(false);
-    const [toggling, setToggling] = useState(false);
-    const [error, setError] = useState<string | null>(null);
-    const [playingId, setPlayingId] = useState<number | null>(null);
-    const [videoUrl, setVideoUrl] = useState<string | null>(null);
-    const [fetchingPlay, setFetchingPlay] = useState<number | null>(null);
-
-    // Track the current blob URL so we can revoke it before
-    // replacing it or on unmount. Keeping it in a ref lets the
-    // cleanup function read the latest value without re-running.
-    const urlRef = useRef<string | null>(null);
-    useEffect(() => {
-        return () => {
-            if (urlRef.current) {
-                URL.revokeObjectURL(urlRef.current);
-                urlRef.current = null;
-            }
-        };
-    }, []);
-
-    const recordingEnabled = cam.meta.recording?.enabled ?? false;
-
-    const loadRecordings = useCallback(async () => {
-        setLoading(true);
-        setError(null);
-        try {
-            const list = await listRecordings(cam.id, 20);
-            setRecordings(list);
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setLoading(false);
-        }
-    }, [cam.id]);
-
-    async function onToggleOpen() {
-        const next = !open;
-        setOpen(next);
-        if (next && recordings.length === 0 && !loading) {
-            await loadRecordings();
-        }
-    }
-
-    async function onToggleRecording() {
-        if (!isAdmin || toggling) return;
-        setToggling(true);
-        setError(null);
-        try {
-            await setRecordingPlan(cam.id, {
-                enabled: !recordingEnabled,
-                segment_seconds: 600,
-                retention_days: 7,
-            });
-            await onRefresh();
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setToggling(false);
-        }
-    }
-
-    function revokeCurrentUrl() {
-        if (urlRef.current) {
-            URL.revokeObjectURL(urlRef.current);
-            urlRef.current = null;
-        }
-        setVideoUrl(null);
-    }
-
-    async function onPlay(rec: CameraRecording) {
-        if (fetchingPlay !== null) return;
-        // Stop any current playback first.
-        revokeCurrentUrl();
-        setPlayingId(null);
-        setFetchingPlay(rec.id);
-        setError(null);
-        try {
-            const h = authHeaderFor();
-            const resp = await fetch(
-                `/api/v1/cameras/${cam.id}/recordings/${rec.id}/file`,
-                { headers: h ? { [h.name]: h.value } : {} },
-            );
-            if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}`);
-            }
-            const blob = await resp.blob();
-            const url = URL.createObjectURL(blob);
-            urlRef.current = url;
-            setVideoUrl(url);
-            setPlayingId(rec.id);
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setFetchingPlay(null);
-        }
-    }
-
-    function onStopPlay() {
-        revokeCurrentUrl();
-        setPlayingId(null);
-    }
-
-    async function onDeleteRec(rec: CameraRecording) {
-        if (!isAdmin) return;
-        if (!confirm(`Delete recording ${rec.id}?`)) return;
-        try {
-            if (playingId === rec.id) onStopPlay();
-            await deleteRecording(cam.id, rec.id);
-            await loadRecordings();
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        }
-    }
-
-    return (
-        <div className="glass rounded-b-2xl">
-            {/* Header row: always-visible recording toggle + collapse button.
-                The recording switch lives here (not inside the collapsible
-                body) so the operator can start/stop recording without
-                expanding the panel. */}
-            <div className="flex items-center justify-between gap-2 px-4 py-2">
-                {/* Left: recording label + status */}
-                <div className="flex min-w-0 items-center gap-2">
-                    <button
-                        type="button"
-                        onClick={onToggleOpen}
-                        className="flex items-center gap-1.5 text-xs font-medium text-fg-muted transition-colors hover:text-fg"
-                        aria-expanded={open}
-                        aria-label="Toggle recording list"
-                    >
-                        {open ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                        录制
-                    </button>
-                    {recordingEnabled ? (
-                        <Badge variant="success" className="text-[9px]">ON</Badge>
-                    ) : (
-                        <Badge variant="outline" className="text-[9px]">OFF</Badge>
-                    )}
-                    {!recordingEnabled && recordings.length > 0 && (
-                        <Badge variant="outline" className="text-[9px]">{recordings.length}</Badge>
-                    )}
-                    <span className="truncate text-[10px] text-fg-subtle">
-                        {recordingEnabled
-                            ? `${cam.meta.recording?.segment_seconds ?? 600}s · ${cam.meta.recording?.retention_days ?? 7}d`
-                            : ""}
-                    </span>
-                </div>
-                {/* Right: recording toggle button (always visible) */}
-                {isAdmin ? (
-                    <Button
-                        size="sm"
-                        variant={recordingEnabled ? "danger" : "primary"}
-                        onClick={onToggleRecording}
-                        disabled={toggling}
-                        className="h-7 px-2.5 text-[11px]"
-                    >
-                        {toggling && <Loader2 size={12} className="animate-spin" />}
-                        {recordingEnabled ? "停止录制" : "启用录制"}
-                    </Button>
-                ) : null}
-            </div>
-
-            {open && (
-                <div className="space-y-2 px-4 pb-3 pt-1">
-                    {error && (
-                        <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-2.5 py-1.5 text-[11px]">
-                            {error}
-                        </div>
-                    )}
-
-                    {/* Recording list */}
-                    <div className="space-y-1">
-                        <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-fg-subtle">
-                            <span>最近录制</span>
-                            <button
-                                type="button"
-                                onClick={loadRecordings}
-                                disabled={loading}
-                                className="inline-flex items-center gap-1 text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
-                            >
-                                <RefreshCcw size={10} className={loading ? "animate-spin" : ""} />
-                                刷新
-                            </button>
-                        </div>
-
-                        {loading && recordings.length === 0 ? (
-                            <div className="flex items-center justify-center py-4 text-[11px] text-fg-muted">
-                                <Loader2 size={12} className="mr-1 animate-spin" />
-                                加载中…
-                            </div>
-                        ) : recordings.length === 0 ? (
-                            <div className="py-3 text-center text-[11px] text-fg-subtle">
-                                暂无录制
-                            </div>
-                        ) : (
-                            <ul className="max-h-56 space-y-1 overflow-y-auto pr-0.5">
-                                {recordings.map((rec) => (
-                                    <li
-                                        key={rec.id}
-                                        className="flex items-center gap-2 glass-subtle rounded-lg px-2 py-1.5 text-[11px] hover:bg-[rgb(var(--bg-subtle)/0.3)] transition-colors"
-                                    >
-                                        <div className="min-w-0 flex-1">
-                                            <div className="truncate font-medium text-fg">
-                                                {new Date(rec.start_at).toLocaleString()}
-                                            </div>
-                                            <div className="truncate text-[10px] text-fg-muted">
-                                                {formatDuration(rec.duration_seconds)} · {rec.size_human}
-                                            </div>
-                                        </div>
-                                        {playingId === rec.id && videoUrl ? (
-                                            <button
-                                                type="button"
-                                                onClick={onStopPlay}
-                                                className="inline-flex h-6 items-center gap-1 rounded-md glass-subtle px-2 text-[10px] text-fg-muted transition-colors hover:text-fg"
-                                                title="停止播放"
-                                            >
-                                                <Square size={10} />
-                                                停止
-                                            </button>
-                                        ) : (
-                                            <button
-                                                type="button"
-                                                onClick={() => onPlay(rec)}
-                                                disabled={fetchingPlay !== null}
-                                                className="inline-flex h-6 items-center gap-1 rounded-md bg-[rgb(var(--accent-primary)/0.15)] px-2 text-[10px] text-[rgb(var(--accent-primary))] transition-colors hover:bg-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50"
-                                                title="播放"
-                                            >
-                                                {fetchingPlay === rec.id ? (
-                                                    <Loader2 size={10} className="animate-spin" />
-                                                ) : (
-                                                    <Play size={10} />
-                                                )}
-                                                播放
-                                            </button>
-                                        )}
-                                        {isAdmin && (
-                                            <button
-                                                type="button"
-                                                onClick={() => onDeleteRec(rec)}
-                                                className="inline-flex h-6 items-center justify-center rounded-md p-1 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
-                                                aria-label="Delete recording"
-                                                title="删除录制"
-                                            >
-                                                <Trash2 size={11} />
-                                            </button>
-                                        )}
-                                    </li>
-                                ))}
-                            </ul>
-                        )}
-                    </div>
-
-                    {/* Inline video player */}
-                    {videoUrl && playingId !== null && (
-                        <div className="overflow-hidden rounded-lg glass border border-white/10 bg-black">
-                            <video
-                                key={videoUrl}
-                                src={videoUrl}
-                                controls
-                                autoPlay
-                                className="aspect-video w-full bg-black"
-                            />
-                        </div>
-                    )}
-                </div>
-            )}
         </div>
     );
 }
