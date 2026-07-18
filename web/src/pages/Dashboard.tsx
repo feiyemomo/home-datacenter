@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import {
     Activity,
     Clock,
@@ -14,10 +15,11 @@ import {
     AlertTriangle,
     Eye,
     X,
+    ExternalLink,
 } from "lucide-react";
 import { getSystemStatus } from "@/api/system";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
-import { listAlerts, alertSnapshotUrl, type CameraAlert } from "@/api/camera";
+import { listAlerts, alertSnapshotUrl, alertThumbnailUrl, type CameraAlert } from "@/api/camera";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { ApiError } from "@/api/client";
 import { formatUptime } from "@/lib/utils";
@@ -120,6 +122,7 @@ function formatAlertTime(ts: number): string {
  * Dashboard: stat cards + live detection alerts.
  */
 export default function Dashboard() {
+    const navigate = useNavigate();
     const [status, setStatus] = useState<SystemStatus | null>(null);
     const [netStatus, setNetStatus] = useState<NetworkStatus | null>(null);
     const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
@@ -481,8 +484,8 @@ export default function Dashboard() {
                                     key={alert.id}
                                     className="group flex gap-3 glass-subtle rounded-xl p-2 transition-colors hover:bg-[rgb(var(--bg-subtle)/0.3)]"
                                 >
-                                    {/* Thumbnail / icon */}
-                                    {alert.thumbnail ? (
+                                    {/* Thumbnail / icon — click opens full-resolution modal */}
+                                    {alert.has_snapshot ? (
                                         <button
                                             type="button"
                                             onClick={() => setSelectedAlert(alert)}
@@ -490,7 +493,7 @@ export default function Dashboard() {
                                             title="点击查看大图"
                                         >
                                             <img
-                                                src={`data:image/jpeg;base64,${alert.thumbnail}`}
+                                                src={alertThumbnailUrl(alert.id)}
                                                 alt={alert.label}
                                                 className="h-full w-full object-cover"
                                                 loading="lazy"
@@ -499,23 +502,19 @@ export default function Dashboard() {
                                                 <Eye size={14} className="text-white" />
                                             </span>
                                         </button>
-                                    ) : alert.has_snapshot ? (
-                                        <button
-                                            type="button"
-                                            onClick={() => setSelectedAlert(alert)}
-                                            className="flex h-16 w-24 shrink-0 items-center justify-center rounded-lg bg-[rgb(var(--accent-warm)/0.1)] text-[rgb(var(--accent-warm)/0.5)] transition-colors hover:bg-[rgb(var(--accent-warm)/0.2)]"
-                                            title="点击查看快照"
-                                        >
-                                            <Eye size={18} />
-                                        </button>
                                     ) : (
                                         <div className="flex h-16 w-24 shrink-0 items-center justify-center rounded-lg bg-[rgb(var(--accent-warm)/0.1)]">
                                             <AlertTriangle size={18} className="text-[rgb(var(--accent-warm)/0.5)]" />
                                         </div>
                                     )}
 
-                                    {/* Info */}
-                                    <div className="min-w-0 flex-1 py-0.5">
+                                    {/* Info — click navigates to the camera page */}
+                                    <button
+                                        type="button"
+                                        onClick={() => navigate("/cameras")}
+                                        className="min-w-0 flex-1 cursor-pointer py-0.5 text-left"
+                                        title="跳转到摄像头页面"
+                                    >
                                         <div className="flex flex-wrap items-center gap-1.5">
                                             <span className="text-sm font-medium text-fg">
                                                 {formatLabel(alert.label)}
@@ -543,6 +542,11 @@ export default function Dashboard() {
                                         <p className="mt-0.5 text-[10px] text-fg-subtle">
                                             {formatAlertTime(alert.start_time)}
                                         </p>
+                                    </button>
+
+                                    {/* Jump icon — visible on hover */}
+                                    <div className="flex shrink-0 items-center self-center text-fg-subtle opacity-0 transition-opacity group-hover:opacity-100">
+                                        <ExternalLink size={14} />
                                     </div>
                                 </li>
                             ))}

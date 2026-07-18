@@ -646,31 +646,20 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		// continue to work.
 		go2rtcStreams[c.StreamName] = go2rtcURL
 	}
-	// Check if any camera has recording enabled. Frigate only
-	// starts the recording ffmpeg pipeline during a restart —
-	// a hot-merge (requires_restart=false) returns 200 but
-	// never starts recording (verified: 0 mp4 files after
-	// config push with requires_restart=false). We therefore
-	// pass requires_restart=true whenever any camera has
-	// recording enabled, so the pipeline is always running.
-	// This causes a brief (~2s) interruption to all streams
-	// on each config push, which is acceptable for the rare
-	// operations that call pushFrigateConfig (boot replay,
-	// camera register/unregister). UpdateCodec does NOT call
-	// this function — it only updates the go2rtc stream URL
-	// via AddStream (hot-reload, no Frigate restart needed).
-	anyRecording := false
-	for _, c := range cams {
-		if raw, ok := c.Meta["recording"]; ok {
-			if m, ok := raw.(map[string]any); ok {
-				if v, ok := m["enabled"].(bool); ok && v {
-					anyRecording = true
-					break
-				}
-			}
-		}
-	}
-	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, anyRecording)
+	// requires_restart=true is always passed. Frigate's ffmpeg pipeline
+	// only picks up changes to detect.fps, record.enabled, or stream URLs
+	// during a restart — a hot-merge (requires_restart=false) returns 200
+	// but keeps the old pipeline running. This affects:
+	//   - detect.fps changes (detector performance tuning)
+	//   - record.enabled changes (recording on/off)
+	//   - stream URL changes (camera credentials, codec)
+	//
+	// A restart causes a brief (~2s) interruption to all streams, which
+	// is acceptable for the rare operations that call pushFrigateConfig
+	// (boot replay, camera register/unregister). UpdateCodec does NOT
+	// call this function — it only updates the go2rtc stream URL via
+	// AddStream (hot-reload, no Frigate restart needed).
+	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, true)
 }
 
 // frigateCameraPath builds the URL Frigate's OWN ffmpeg child
