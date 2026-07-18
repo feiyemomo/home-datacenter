@@ -216,6 +216,20 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 				"days": 7,
 			},
 		},
+		// Enable snapshots globally so Frigate captures a still JPEG
+		// for each detection event. Without this, has_snapshot is
+		// always false and the /api/events thumbnail field is empty,
+		// leaving the dashboard's alert list without preview images.
+		// Snapshots are stored in /media/frigate/clips and are also
+		// served inline (base64) by GET /api/events?include_thumbnails=1.
+		"snapshots": map[string]any{
+			"enabled":   true,
+			"clean_copy": true,
+			"timestamp":  false,
+			"bounding_box": true,
+			"crop":      false,
+			"quality":   70,
+		},
 	}
 	if len(go2rtcStreams) > 0 {
 		partial["go2rtc"] = map[string]any{
@@ -294,17 +308,46 @@ func (c *FrigateClient) fetchConfig(ctx context.Context) (map[string]any, error)
 // FrigateEvent is a simplified view of a Frigate detection event
 // returned by GET /api/events. Only the fields we need for the
 // dashboard's alert list are typed; the rest are ignored.
+//
+// NOTE: Frigate 0.17 moved `top_score` into a nested `data` object.
+// The root-level `top_score` is now null for in-progress events and
+// only populated when the event ends. The `data.top_score` field is
+// always populated with the highest detection score seen so far.
+// We read from `data` and fall back to the root field for older
+// Frigate versions.
 type FrigateEvent struct {
-	ID        string  `json:"id"`
-	Camera    string  `json:"camera"`
-	Label     string  `json:"label"`
-	TopScore  float64 `json:"top_score"`
-	StartTime float64 `json:"start_time"`
-	EndTime   float64 `json:"end_time"`
-	Zones     []string `json:"zones"`
-	HasClip   bool    `json:"has_clip"`
-	HasSnapshot bool  `json:"has_snapshot"`
-	Thumbnail  string `json:"thumbnail,omitempty"`
+	ID          string  `json:"id"`
+	Camera      string  `json:"camera"`
+	Label       string  `json:"label"`
+	TopScore    float64 `json:"top_score"`
+	StartTime   float64 `json:"start_time"`
+	EndTime     float64 `json:"end_time"`
+	Zones       []string `json:"zones"`
+	HasClip     bool    `json:"has_clip"`
+	HasSnapshot bool    `json:"has_snapshot"`
+	Thumbnail   string `json:"thumbnail,omitempty"`
+	Data        FrigateEventData `json:"data,omitempty"`
+}
+
+// FrigateEventData holds the nested detection metadata that Frigate
+// 0.17 puts under the `data` key of each event.
+type FrigateEventData struct {
+	TopScore float64 `json:"top_score"`
+	Score    float64 `json:"score"`
+}
+
+// EffectiveTopScore returns the best-known detection confidence for
+// the event, preferring the nested `data.top_score` (always populated
+// in Frigate 0.17) and falling back to the root-level `top_score`
+// (populated only after the event ends, or in older Frigate versions).
+func (e *FrigateEvent) EffectiveTopScore() float64 {
+	if e.Data.TopScore > 0 {
+		return e.Data.TopScore
+	}
+	if e.Data.Score > 0 {
+		return e.Data.Score
+	}
+	return e.TopScore
 }
 
 // ListEvents queries Frigate for recent detection events.
@@ -367,6 +410,30 @@ func (c *FrigateClient) EventSnapshot(ctx context.Context, eventID string) (io.R
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
 		resp.Body.Close()
 		return nil, "", fmt.Errorf("frigate snapshot: %s: %s", resp.Status, string(raw))
+	}
+	return resp.Body, resp.Header.Get("Content-Type"), nil
+}
+
+// EventThumbnail proxies Frigate's small JPEG thumbnail for an event.
+// Frigate 0.17 no longer inlines base64 thumbnails in /api/events
+// (the `thumbnail` field is null even with include_thumbnails=1), so
+// the dashboard fetches each thumbnail via this endpoint instead.
+// Thumbnails are ~6KB JPEGs suitable for list previews; the full
+// snapshot is served separately via EventSnapshot.
+func (c *FrigateClient) EventThumbnail(ctx context.Context, eventID string) (io.ReadCloser, string, error) {
+	u := fmt.Sprintf("%s/api/events/%s/thumbnail.jpg", c.FrigateBase, url.PathEscape(eventID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("frigate thumbnail: %s: %s", resp.Status, string(raw))
 	}
 	return resp.Body, resp.Header.Get("Content-Type"), nil
 }

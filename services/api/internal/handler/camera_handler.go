@@ -482,7 +482,7 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 			ID:          ev.ID,
 			CameraSlug:  ev.Camera,
 			Label:       ev.Label,
-			Confidence:  ev.TopScore,
+			Confidence:  ev.EffectiveTopScore(),
 			StartTime:   ev.StartTime,
 			EndTime:     ev.EndTime,
 			Zones:       ev.Zones,
@@ -528,6 +528,36 @@ func (h *CameraHandler) AlertSnapshot(c *gin.Context) {
 	defer body.Close()
 
 	// Snapshots are immutable — cache aggressively.
+	c.Header("Cache-Control", "public, max-age=3600")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
+}
+
+// AlertThumbnail — GET /api/v1/cameras/alerts/:id/thumbnail
+//
+// Proxies the small JPEG thumbnail for a Frigate detection event.
+// Frigate 0.17 no longer inlines base64 thumbnails in /api/events
+// (the `thumbnail` field is null), so the dashboard fetches each
+// thumbnail via this endpoint. Thumbnails are ~6KB JPEGs suitable
+// for list previews; the full snapshot is served via AlertSnapshot.
+//
+// The response is cached for 1 hour (thumbnails are immutable).
+func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
+	eventID := c.Param("id")
+	if eventID == "" {
+		utils.Fail(c, http.StatusBadRequest, "missing event id")
+		return
+	}
+
+	body, contentType, err := h.Reg.Frigate.EventThumbnail(c.Request.Context(), eventID)
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch thumbnail: "+err.Error())
+		return
+	}
+	defer body.Close()
+
 	c.Header("Cache-Control", "public, max-age=3600")
 	if contentType == "" {
 		contentType = "image/jpeg"

@@ -301,6 +301,7 @@ func main() {
 			camGroup.GET("ice", camHandler.ICE)
 			camGroup.GET("alerts", camHandler.ListAlerts)
 			camGroup.GET("alerts/:id/snapshot", camHandler.AlertSnapshot)
+			camGroup.GET("alerts/:id/thumbnail", camHandler.AlertThumbnail)
 			camGroup.GET(":id", camHandler.Get)
 			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
 			camGroup.GET(":id/recordings", camHandler.ListRecordings)

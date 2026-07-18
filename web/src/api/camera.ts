@@ -182,5 +182,15 @@ export async function listAlerts(limit = 20): Promise<ListAlertsResponse> {
  * automatically because this is a same-origin GET.
  */
 export function alertSnapshotUrl(eventId: string): string {
-    return `/api/v1/cameras/alerts/${encodeURIComponent(eventId)}/snapshot`;
+	return `/api/v1/cameras/alerts/${encodeURIComponent(eventId)}/snapshot`;
+}
+
+/**
+ * Build the URL for a small JPEG thumbnail of a detection event.
+ * Frigate 0.17 no longer inlines base64 thumbnails in the events
+ * list, so each thumbnail is fetched on demand via this URL.
+ * Use as the `src` of an <img> tag in alert lists.
+ */
+export function alertThumbnailUrl(eventId: string): string {
+	return `/api/v1/cameras/alerts/${encodeURIComponent(eventId)}/thumbnail`;
 }
