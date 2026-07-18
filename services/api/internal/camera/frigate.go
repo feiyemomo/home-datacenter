@@ -291,6 +291,86 @@ func (c *FrigateClient) fetchConfig(ctx context.Context) (map[string]any, error)
 	return cfg, nil
 }
 
+// FrigateEvent is a simplified view of a Frigate detection event
+// returned by GET /api/events. Only the fields we need for the
+// dashboard's alert list are typed; the rest are ignored.
+type FrigateEvent struct {
+	ID        string  `json:"id"`
+	Camera    string  `json:"camera"`
+	Label     string  `json:"label"`
+	TopScore  float64 `json:"top_score"`
+	StartTime float64 `json:"start_time"`
+	EndTime   float64 `json:"end_time"`
+	Zones     []string `json:"zones"`
+	HasClip   bool    `json:"has_clip"`
+	HasSnapshot bool  `json:"has_snapshot"`
+	Thumbnail  string `json:"thumbnail,omitempty"`
+}
+
+// ListEvents queries Frigate for recent detection events.
+// Frigate's GET /api/events returns events sorted newest-first.
+// The limit parameter caps the number of results (0 = server default).
+//
+// When includeThumbnails is true, Frigate returns a small base64-encoded
+// JPEG thumbnail for each event (typically 1-3KB). These are used by
+// the dashboard's alert list for instant preview without a second
+// round-trip per event.
+func (c *FrigateClient) ListEvents(ctx context.Context, limit int, includeThumbnails bool) ([]FrigateEvent, error) {
+	u := c.FrigateBase + "/api/events"
+	params := url.Values{}
+	if limit > 0 {
+		params.Set("limit", strconv.Itoa(limit))
+	}
+	if includeThumbnails {
+		params.Set("include_thumbnails", "1")
+	} else {
+		params.Set("include_thumbnails", "0")
+	}
+	if len(params) > 0 {
+		u += "?" + params.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("frigate list events: %s: %s", resp.Status, string(raw))
+	}
+	var events []FrigateEvent
+	if err := json.NewDecoder(resp.Body).Decode(&events); err != nil {
+		return nil, fmt.Errorf("decode frigate events: %w", err)
+	}
+	return events, nil
+}
+
+// EventSnapshot fetches the full-resolution snapshot JPEG for a given
+// Frigate event ID. Frigate serves these at GET /api/events/<id>/snapshot.jpg.
+// The returned contentType is image/jpeg (or whatever Frigate returns).
+// Caller is responsible for closing the returned ReadCloser.
+func (c *FrigateClient) EventSnapshot(ctx context.Context, eventID string) (io.ReadCloser, string, error) {
+	u := fmt.Sprintf("%s/api/events/%s/snapshot.jpg", c.FrigateBase, url.PathEscape(eventID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("frigate snapshot: %s: %s", resp.Status, string(raw))
+	}
+	return resp.Body, resp.Header.Get("Content-Type"), nil
+}
+
 // camerasAsMap converts the typed camera config slice to the
 // map[string]any shape Frigate's config save expects (cameras is a
 // map keyed by camera name, not a list).

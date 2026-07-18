@@ -74,9 +74,29 @@ func main() {
 	deviceMgr.Start()
 	defer deviceMgr.Stop()
 
+	// ---- Phase 4: Camera platformization (early init) ----
+	//
+	// The camera Registry must be created before the MQTT handler
+	// so it can serve as a slug lookup for Frigate event translation.
+	// SecretBox derives its AES-256-GCM key from the same JWT secret
+	// we already trust (one root secret to rotate, not two). The
+	// go2rtc client talks HTTP to Frigate's bundled go2rtc on port
+	// 1984; the Frigate client talks to Frigate's REST API on port
+	// 5000 for config push (AI detection / recording pipeline).
+	box, err := utils.NewSecretBox(cfg.JWT.Secret)
+	if err != nil {
+		log.Fatalf("camera: secret box init: %v", err)
+	}
+	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
+	frigate := camera.NewFrigateClient(cfg.Frigate.BaseURL, cfg.Go2RTC.BaseURL)
+	camONVIF := camera.NewONVIFController()
+	camReg := camera.NewRegistry(database.DB, go2, frigate, box, camONVIF, cfg.Camera.WebRTCPublicBase)
+
 	// MQTT client connects to Mosquitto and routes messages to
-	// the EventBus via the Handler.
-	mqttHandler := mqtt.NewHandler(bus, deviceMgr)
+	// the EventBus via the Handler. The camera Registry is passed
+	// as the slug lookup so Frigate events (which use ASCII slugs
+	// like "front_door") can be mapped back to camera IDs.
+	mqttHandler := mqtt.NewHandler(bus, deviceMgr, camReg)
 	mqttClient := mqtt.NewClient(mqtt.Config{
 		Broker:   cfg.MQTT.Broker,
 		ClientID: cfg.MQTT.ClientID,
@@ -124,21 +144,10 @@ func main() {
 	}
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 
-	// ---- Phase 4: Camera platformization ----
+	// ---- Phase 4: Camera platformization (continued) ----
 	//
-	// SecretBox derives its AES-256-GCM key from the same JWT secret
-	// we already trust (one root secret to rotate, not two). The
-	// go2rtc client talks HTTP to Frigate's bundled go2rtc on port
-	// 1984; the Frigate client talks to Frigate's REST API on port
-	// 5000 for config push (AI detection / recording pipeline).
-	box, err := utils.NewSecretBox(cfg.JWT.Secret)
-	if err != nil {
-		log.Fatalf("camera: secret box init: %v", err)
-	}
-	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
-	frigate := camera.NewFrigateClient(cfg.Frigate.BaseURL, cfg.Go2RTC.BaseURL)
-	camONVIF := camera.NewONVIFController()
-	camReg := camera.NewRegistry(database.DB, go2, frigate, box, camONVIF, cfg.Camera.WebRTCPublicBase)
+	// camReg was already created above (before MQTT init) so it can
+	// serve as the slug lookup. The remaining camera setup continues here.
 	camRecorder := &camera.Recorder{
 		DB:        database.DB,
 		Go2:       go2,
@@ -290,6 +299,8 @@ func main() {
 			// Read endpoints are available to any authenticated user.
 			camGroup.GET("", camHandler.List)
 			camGroup.GET("ice", camHandler.ICE)
+			camGroup.GET("alerts", camHandler.ListAlerts)
+			camGroup.GET("alerts/:id/snapshot", camHandler.AlertSnapshot)
 			camGroup.GET(":id", camHandler.Get)
 			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
 			camGroup.GET(":id/recordings", camHandler.ListRecordings)
