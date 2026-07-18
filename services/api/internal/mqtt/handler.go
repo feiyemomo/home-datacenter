@@ -15,17 +15,39 @@ import (
 
 // Handler dispatches incoming MQTT messages to the EventBus and
 // DeviceManager. It is stateless beyond the references it holds.
+//
+// In addition to the home-datacenter/ namespace topics, the handler
+// also subscribes to frigate/events to receive object detection
+// alerts from the Frigate NVR and re-publish them on the EventBus
+// as camera.motion events.
 type Handler struct {
 	bus     *eventbus.Bus
 	manager *device.Manager
 	client  pahomqtt.Client // set by Client.Start() via OnConnect
+	// slugLookup resolves a Frigate camera slug (e.g. "front_door")
+	// back to a home-api camera ID. Implemented by camera.Registry.
+	slugLookup SlugLookup
 }
 
-// NewHandler creates a Handler wired to the given EventBus and
-// device Manager.
-func NewHandler(bus *eventbus.Bus, manager *device.Manager) *Handler {
-	return &Handler{bus: bus, manager: manager}
+// SlugLookup resolves a Frigate camera slug to a camera ID.
+// Returns (0, false) if no matching camera is found.
+type SlugLookup interface {
+	LookupByFrigateSlug(slug string) (uint, bool)
 }
+
+// NewHandler creates a Handler wired to the given EventBus,
+// device Manager, and optional slug lookup.
+func NewHandler(bus *eventbus.Bus, manager *device.Manager, slugLookup SlugLookup) *Handler {
+	if slugLookup == nil {
+		slugLookup = &noopSlugLookup{}
+	}
+	return &Handler{bus: bus, manager: manager, slugLookup: slugLookup}
+}
+
+// noopSlugLookup is a fallback that never resolves.
+type noopSlugLookup struct{}
+
+func (n *noopSlugLookup) LookupByFrigateSlug(slug string) (uint, bool) { return 0, false }
 
 // OnMessage is the paho.mqtt message callback. It inspects the topic
 // and routes the payload to the appropriate downstream consumers.
@@ -34,6 +56,12 @@ func (h *Handler) OnMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 	payload := msg.Payload()
 
 	log.Printf("mqtt: rx %s = %s", topic, string(payload))
+
+	// Handle Frigate events on the frigate/events topic.
+	if topic == "frigate/events" {
+		h.handleFrigateEvent(payload)
+		return
+	}
 
 	parsed, ok := ParseTopic(topic)
 	if !ok {
@@ -97,6 +125,112 @@ func (h *Handler) handleCameraEvent(cameraID uint, payload []byte) {
 		Payload: canonical,
 		Source:  eventbus.SourceMQTT,
 	})
+}
+
+// handleFrigateEvent processes a message from the frigate/events MQTT
+// topic. Frigate publishes these when its AI detector finds a tracked
+// object (person, car, dog, etc.) in a camera's video feed.
+//
+// Payload format (simplified):
+//
+//	{
+//	  "type": "new" | "update" | "end",
+//	  "before": { "camera": "front_door", "label": "person", ... },
+//	  "after":  { "camera": "front_door", "label": "person",
+//	              "current_zones": ["driveway"], "top_score": 0.96, ... }
+//	}
+//
+// We only react to "new" events (first detection) to avoid flooding
+// the EventBus with updates. The event is translated into a
+// camera.motion EventBus event with the Frigate camera slug mapped
+// back to a home-api camera ID via the slugLookup interface.
+func (h *Handler) handleFrigateEvent(payload []byte) {
+	var frigEv struct {
+		Type   string `json:"type"`
+		Before struct {
+			Camera string  `json:"camera"`
+			Label  string  `json:"label"`
+			Score  float64 `json:"score"`
+		} `json:"before"`
+		After struct {
+			Camera        string   `json:"camera"`
+			Label         string   `json:"label"`
+			TopScore      float64  `json:"top_score"`
+			Score         float64  `json:"score"`
+			CurrentZones  []string `json:"current_zones"`
+			EnteredZones  []string `json:"entered_zones"`
+			FalsePositive bool     `json:"false_positive"`
+			Stationary    bool     `json:"stationary"`
+			StartTime     float64  `json:"start_time"`
+			EndTime       *float64 `json:"end_time"`
+			HasSnapshot   bool     `json:"has_snapshot"`
+			HasClip       bool     `json:"has_clip"`
+		} `json:"after"`
+	}
+	if err := json.Unmarshal(payload, &frigEv); err != nil {
+		log.Printf("mqtt: invalid frigate event payload: %q", payload)
+		return
+	}
+
+	// Only react to "new" events (initial detection) to avoid
+	// flooding. "update" events fire on every zone change or
+	// snapshot improvement; "end" fires when the object leaves.
+	if frigEv.Type != "new" {
+		return
+	}
+
+	slug := frigEv.After.Camera
+	cameraID, ok := h.slugLookup.LookupByFrigateSlug(slug)
+	if !ok {
+		log.Printf("mqtt: frigate event for unknown camera slug %q", slug)
+		return
+	}
+
+	// Skip false positives — Frigate sends these but they are not
+	// real detections.
+	if frigEv.After.FalsePositive {
+		return
+	}
+
+	confidence := frigEv.After.TopScore
+	if confidence == 0 {
+		confidence = frigEv.After.Score
+	}
+
+	ts := int64(frigEv.After.StartTime)
+	if ts == 0 {
+		ts = time.Now().Unix()
+	}
+
+	canonical, _ := json.Marshal(struct {
+		CameraID    uint     `json:"camera_id"`
+		Type        string   `json:"type"`
+		Label       string   `json:"label"`
+		Confidence  float64  `json:"confidence"`
+		Zones       []string `json:"zones,omitempty"`
+		HasSnapshot bool     `json:"has_snapshot"`
+		HasClip     bool     `json:"has_clip"`
+		TS          int64    `json:"ts"`
+	}{
+		CameraID:    cameraID,
+		Type:        "detection",
+		Label:       frigEv.After.Label,
+		Confidence:  confidence,
+		Zones:       frigEv.After.CurrentZones,
+		HasSnapshot: frigEv.After.HasSnapshot,
+		HasClip:     frigEv.After.HasClip,
+		TS:          ts,
+	})
+
+	h.bus.Publish(eventbus.Event{
+		Topic:    eventbus.TopicCameraMotion,
+		Source:   eventbus.SourceMQTT,
+		Severity: eventbus.SeverityInfo,
+		Payload:  canonical,
+	})
+
+	log.Printf("mqtt: frigate detection: camera=%s id=%d label=%s confidence=%.2f zones=%v",
+		slug, cameraID, frigEv.After.Label, confidence, frigEv.After.CurrentZones)
 }
 
 // handleDeviceMessage processes messages under "devices/{id}/*".
@@ -370,6 +504,10 @@ func (h *Handler) OnConnect(client pahomqtt.Client) {
 		{SubscribeDeviceTelemetry(), 1},
 		{SubscribeDeviceEvents(), 1},
 		{SubscribeCameraEvent(), 1},
+		// Frigate NVR publishes object detection events on
+		// frigate/events. Subscribe here so the handler can
+		// translate them into EventBus camera.motion events.
+		{"frigate/events", 1},
 	}
 
 	for _, s := range subs {

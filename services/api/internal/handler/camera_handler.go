@@ -432,6 +432,109 @@ func (h *CameraHandler) DeleteRecording(c *gin.Context) {
 	utils.Fail(c, http.StatusMethodNotAllowed, "Frigate manages recording deletion via retention policy; per-segment delete is not supported")
 }
 
+// ListAlerts — GET /api/v1/cameras/alerts
+//
+// Returns recent Frigate detection events (newest first). Each event
+// includes the Frigate camera slug, detected label, confidence score,
+// timestamp, zone information, and a base64 thumbnail (small JPEG)
+// for instant preview in the dashboard. The slug is mapped to the
+// home-api camera ID so the frontend can cross-reference.
+//
+// Query params:
+//
+//	limit — max results (default 20, max 100)
+func (h *CameraHandler) ListAlerts(c *gin.Context) {
+	limit := 20
+	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
+		limit = v
+		if limit > 100 {
+			limit = 100
+		}
+	}
+
+	// Include thumbnails so the dashboard can render preview images
+	// without a second round-trip per event.
+	events, err := h.Reg.Frigate.ListEvents(c.Request.Context(), limit, true)
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch frigate events: "+err.Error())
+		return
+	}
+
+	// Map Frigate camera slugs to home-api camera IDs.
+	type alertEntry struct {
+		ID          string   `json:"id"`
+		CameraSlug  string   `json:"camera_slug"`
+		CameraID    uint     `json:"camera_id,omitempty"`
+		CameraName  string   `json:"camera_name,omitempty"`
+		Label       string   `json:"label"`
+		Confidence  float64  `json:"confidence"`
+		StartTime   float64  `json:"start_time"`
+		EndTime     float64  `json:"end_time"`
+		Zones       []string `json:"zones,omitempty"`
+		HasClip     bool     `json:"has_clip"`
+		HasSnapshot bool     `json:"has_snapshot"`
+		Thumbnail   string   `json:"thumbnail,omitempty"`
+	}
+
+	alerts := make([]alertEntry, 0, len(events))
+	for _, ev := range events {
+		entry := alertEntry{
+			ID:          ev.ID,
+			CameraSlug:  ev.Camera,
+			Label:       ev.Label,
+			Confidence:  ev.TopScore,
+			StartTime:   ev.StartTime,
+			EndTime:     ev.EndTime,
+			Zones:       ev.Zones,
+			HasClip:     ev.HasClip,
+			HasSnapshot: ev.HasSnapshot,
+			Thumbnail:   ev.Thumbnail,
+		}
+		// Resolve slug to camera ID.
+		if camID, ok := h.Reg.LookupByFrigateSlug(ev.Camera); ok {
+			entry.CameraID = camID
+			if cam, err := h.Reg.Get(camID); err == nil {
+				entry.CameraName = cam.StreamName
+			}
+		}
+		alerts = append(alerts, entry)
+	}
+
+	utils.Success(c, gin.H{"alerts": alerts, "total": len(alerts)})
+}
+
+// AlertSnapshot — GET /api/v1/cameras/alerts/:id/snapshot
+//
+// Proxies the full-resolution snapshot JPEG for a Frigate detection
+// event. Frigate serves these at /api/events/<id>/snapshot.jpg but
+// requires nginx auth; home-api proxies the request so the dashboard
+// can load snapshots via an <img> tag without exposing Frigate
+// credentials or CORS issues.
+//
+// The response is cached for 1 hour (snapshots are immutable — once
+// an event ends its snapshot never changes).
+func (h *CameraHandler) AlertSnapshot(c *gin.Context) {
+	eventID := c.Param("id")
+	if eventID == "" {
+		utils.Fail(c, http.StatusBadRequest, "missing event id")
+		return
+	}
+
+	body, contentType, err := h.Reg.Frigate.EventSnapshot(c.Request.Context(), eventID)
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch snapshot: "+err.Error())
+		return
+	}
+	defer body.Close()
+
+	// Snapshots are immutable — cache aggressively.
+	c.Header("Cache-Control", "public, max-age=3600")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
+}
+
 // PlayRecording — GET /api/v1/cameras/:id/recordings/:recId/file
 //
 // Serves a 60-second recording clip. The :recId is the minute-start

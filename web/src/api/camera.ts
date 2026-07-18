@@ -144,3 +144,43 @@ export async function getIceConfig(): Promise<IceConfig> {
     const { data } = await client.get<IceConfig>("/cameras/ice");
     return data;
 }
+
+/**
+ * A Frigate detection alert from GET /api/v1/cameras/alerts.
+ */
+export interface CameraAlert {
+    id: string;
+    camera_slug: string;
+    camera_id?: number;
+    camera_name?: string;
+    label: string;
+    confidence: number;
+    start_time: number;
+    end_time: number;
+    zones?: string[];
+    has_clip: boolean;
+    has_snapshot: boolean;
+    /** Base64-encoded small JPEG thumbnail (may be empty). */
+    thumbnail?: string;
+}
+
+export interface ListAlertsResponse {
+    alerts: CameraAlert[];
+    total: number;
+}
+
+export async function listAlerts(limit = 20): Promise<ListAlertsResponse> {
+    const { data } = await client.get<ListAlertsResponse>(
+        `/cameras/alerts?limit=${limit}`,
+    );
+    return data ?? { alerts: [], total: 0 };
+}
+
+/**
+ * Build the URL for a full-resolution snapshot of a detection event.
+ * Use as the `src` of an <img> tag. The JWT cookie is sent
+ * automatically because this is a same-origin GET.
+ */
+export function alertSnapshotUrl(eventId: string): string {
+    return `/api/v1/cameras/alerts/${encodeURIComponent(eventId)}/snapshot`;
+}

@@ -206,6 +206,23 @@ func (r *Registry) Get(id uint) (*model.Camera, error) {
 	return &c, nil
 }
 
+// LookupByFrigateSlug resolves a Frigate camera slug (e.g.
+// "front_door") back to a home-api camera ID. It scans all cameras
+// and computes each one's Frigate slug until it finds a match.
+// Returns (0, false) if no camera matches.
+func (r *Registry) LookupByFrigateSlug(slug string) (uint, bool) {
+	var cams []model.Camera
+	if err := r.DB.Find(&cams).Error; err != nil {
+		return 0, false
+	}
+	for _, c := range cams {
+		if r.FrigateSlug(&c) == slug {
+			return c.ID, true
+		}
+	}
+	return 0, false
+}
+
 // UpdateCodec changes the output codec for a camera and re-pushes
 // the stream to go2rtc so the new codec takes effect immediately
 // without requiring a container restart.
