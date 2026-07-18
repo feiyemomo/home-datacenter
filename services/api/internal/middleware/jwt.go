@@ -16,31 +16,48 @@ import (
 // ensures the device still exists and is not revoked, and
 // stores user_id / device_id in the gin context.
 //
+// Token resolution order (mirrors auth_handler.go's Verify):
+//  1. Authorization: Bearer <jwt> (the SPA's axios interceptors add
+//     this on /api/ calls).
+//  2. Cookie: home_token=<jwt> (the browser auto-sends this on
+//     same-origin requests like <img src="/api/v1/cameras/.../thumbnail">.
+//     Without this fallback, image tags and other non-JS requests
+//     cannot authenticate, so thumbnails/snapshots/frame previews
+//     would all 401).
+//
 // Revocation is enforced per-request: as soon as an admin calls
 // DeviceRepository.Revoke(), subsequent requests with that
 // device's JWT are rejected immediately.
+//
+// Security note: the cookie is SameSite=Lax (set by /auth/bind),
+// so cross-site XHR/fetch is blocked by the browser — only
+// top-level navigations and same-origin sub-resource requests
+// (images, etc.) carry it. GET requests that go through this
+// middleware are side-effect-free (thumbnail/snapshot/frame
+// proxies), so the CSRF risk is minimal.
 func JWTAuth(
 	deviceRepo *repository.DeviceRepository,
 ) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
 
-		// 1. Read Authorization header
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
+		// 1. Read Authorization header (primary path)
+		tokenString := ""
+		if authHeader := c.GetHeader("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+		// 2. Fall back to the home_token cookie (same-origin
+		//    sub-resource requests like <img> tags).
+		if tokenString == "" {
+			if cookie, err := c.Cookie("home_token"); err == nil && cookie != "" {
+				tokenString = cookie
+			}
+		}
+		if tokenString == "" {
 			utils.Fail(c, http.StatusUnauthorized, "missing authorization header")
 			c.Abort()
 			return
 		}
-
-		// 2. Expect "Bearer <token>"
-		if !strings.HasPrefix(authHeader, "Bearer ") {
-			utils.Fail(c, http.StatusUnauthorized, "invalid authorization format")
-			c.Abort()
-			return
-		}
-
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
 
 		// 3. Parse and verify the JWT
 		claims, err := utils.ParseToken(tokenString)

@@ -248,3 +248,37 @@ func (c *Go2RTCClient) ExchangeSDP(ctx context.Context, streamName string, sdpOf
 func (c *Go2RTCClient) HLSURL(streamName string) string {
 	return fmt.Sprintf("%s/api/stream.m3u8?src=%s&mp4=", c.Base, url.QueryEscape(streamName))
 }
+
+// Frame fetches a single JPEG frame from the go2rtc stream. Used by
+// the dashboard's camera card to show a static preview before the
+// operator clicks Play (avoids spinning up a WebRTC/HLS connection
+// for every camera on the page — a 50KB JPEG is ~100x cheaper than
+// a live stream).
+//
+// go2rtc exposes GET /api/frame.jpeg?src=<name> which grabs the
+// next keyframe from the source. The first call on a cold stream
+// may take 1-2s while go2rtc connects to the RTSP source.
+func (c *Go2RTCClient) Frame(ctx context.Context, streamName string) (io.ReadCloser, string, error) {
+	u := fmt.Sprintf("%s/api/frame.jpeg?src=%s", c.Base, url.QueryEscape(streamName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	// Use the SDP client (longer timeout) because the first frame
+	// on a cold stream can take a few seconds while go2rtc connects
+	// to the RTSP source.
+	hc := c.SDPHC
+	if hc == nil {
+		hc = c.HC
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("go2rtc frame: %s: %s", resp.Status, string(raw))
+	}
+	return resp.Body, resp.Header.Get("Content-Type"), nil
+}

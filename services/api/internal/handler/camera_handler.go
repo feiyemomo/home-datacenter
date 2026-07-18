@@ -565,6 +565,45 @@ func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
 	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
 }
 
+// Frame — GET /api/v1/cameras/:id/frame
+//
+// Proxies a single JPEG frame from the go2rtc stream. Used by the
+// dashboard's camera card to show a static preview before the
+// operator clicks Play — avoids spinning up a WebRTC/HLS
+// connection for every camera on the page. The response is a
+// fresh keyframe from the live RTSP source, so it always
+// reflects the camera's current view.
+//
+// No caching: the frame is a live snapshot and should be fresh
+// on every request. The browser's default inline image cache is
+// acceptable because the dashboard refreshes the preview on
+// each page mount.
+func (h *CameraHandler) Frame(c *gin.Context) {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
+		return
+	}
+	if cam.StreamName == "" {
+		utils.Fail(c, http.StatusNotFound, "camera stream not configured")
+		return
+	}
+
+	body, contentType, err := h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName)
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch frame: "+err.Error())
+		return
+	}
+	defer body.Close()
+
+	// Frames are fresh snapshots — discourage caching so the
+	// operator always sees the latest view on reload.
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	if contentType == "" {
+		contentType = "image/jpeg"
+	}
+	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
+}
+
 // PlayRecording — GET /api/v1/cameras/:id/recordings/:recId/file
 //
 // Serves a 60-second recording clip. The :recId is the minute-start

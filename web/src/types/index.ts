@@ -189,6 +189,19 @@ export interface CameraEventMessage {
     ts: number;
 }
 
+/** Frigate detection event payload from camera.motion WebSocket event. */
+export interface CameraDetectionEvent {
+    event_id: string;
+    camera_id: number;
+    type: "detection";
+    label: string;
+    confidence: number;
+    zones?: string[];
+    has_snapshot: boolean;
+    has_clip: boolean;
+    ts: number;
+}
+
 export interface CameraStream {
     stream_name: string;
     webrtc_url: string;

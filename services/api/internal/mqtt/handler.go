@@ -153,6 +153,7 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 			Score  float64 `json:"score"`
 		} `json:"before"`
 		After struct {
+			ID            string   `json:"id"`
 			Camera        string   `json:"camera"`
 			Label         string   `json:"label"`
 			TopScore      float64  `json:"top_score"`
@@ -203,6 +204,7 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 	}
 
 	canonical, _ := json.Marshal(struct {
+		EventID     string   `json:"event_id"`
 		CameraID    uint     `json:"camera_id"`
 		Type        string   `json:"type"`
 		Label       string   `json:"label"`
@@ -212,6 +214,7 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		HasClip     bool     `json:"has_clip"`
 		TS          int64    `json:"ts"`
 	}{
+		EventID:     frigEv.After.ID,
 		CameraID:    cameraID,
 		Type:        "detection",
 		Label:       frigEv.After.Label,
