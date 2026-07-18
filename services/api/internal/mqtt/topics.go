@@ -97,14 +97,6 @@ func SubscribeCameraEvent() string {
 	return Prefix + "/cameras/+/event"
 }
 
-// SubscribeFrigateEvents returns the MQTT filter for Frigate's event
-// stream. Frigate publishes its own topics under the "frigate/" prefix
-// (independent of the home-datacenter/ prefix). We subscribe at QoS 1
-// to avoid missing events during short reconnects.
-func SubscribeFrigateEvents() string {
-	return "frigate/events"
-}
-
 // ParsedTopic is the result of parsing an MQTT topic string.
 type ParsedTopic struct {
 	Domain  string // "devices" | "cameras" | "users" | "system"

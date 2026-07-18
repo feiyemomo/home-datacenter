@@ -39,11 +39,6 @@ type ServerConfig struct {
 	// (local dev). In production list the dashboard hostname(s),
 	// e.g. ["dashboard.feiyemomo.top"].
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
-
-	// RelayURL is the public Cloudflare Tunnel endpoint used as the
-	// relay fallback in the ConnectionManager. e.g.
-	// "https://dashboard.feiyemomo.top". Empty = relay disabled.
-	RelayURL string `mapstructure:"relay_url"`
 }
 
 // DatabaseConfig holds database connection settings.
@@ -171,32 +166,6 @@ type NetworkConfig struct {
 	// interval, so the API always serves fresh-enough data without
 	// blocking on STUN round-trips.
 	CheckIntervalSeconds int `mapstructure:"check_interval_seconds"`
-
-	// P2PPort is the UDP port for the P2P hole-punching socket. The
-	// server binds a persistent UDP socket on this port, discovers its
-	// public endpoint via STUN, and listens for hole-punching packets
-	// from peers. Set to 0 to disable P2P hole punching (dev default).
-	// In production (fnOS), set to a fixed port (e.g. 19800) and ensure
-	// the port is reachable from the internet (via NAT or IPv6).
-	P2PPort int `mapstructure:"p2p_port"`
-
-	// DirectPort is the TCP port accessible via IPv6 direct connection.
-	// When the server has a public IPv6 address, clients can connect
-	// directly to http://[ipv6]:<direct_port> instead of going through
-	// the Cloudflare Tunnel relay. Set to 0 to disable IPv6 direct
-	// (dev default). In production, set to the port nginx/home-api
-	// listens on (e.g. 80 or 8080).
-	DirectPort int `mapstructure:"direct_port"`
-
-	// PublicIPv6 is a manual override for the server's public IPv6
-	// address. Auto-detection (via external echo services) fails in
-	// Docker Desktop on Windows because WSL2 doesn't support IPv6 NAT
-	// for containers. Set this to the host's public IPv6 address
-	// (e.g. "2409:8a70:37af:7e30::81e") so the server can report the
-	// correct direct_url to clients. The client's probe verifies
-	// actual reachability — the server doesn't need outbound IPv6.
-	// Empty = use auto-detection.
-	PublicIPv6 string `mapstructure:"public_ipv6"`
 }
 
 // STUNServerConfig is a single STUN server entry in the config file.
@@ -231,7 +200,6 @@ func Load(path string) error {
 	// Defaults — keep the app runnable even if a field is omitted.
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.allowed_origins", []string{})
-	v.SetDefault("server.relay_url", "")
 	v.SetDefault("database.path", "/data/sqlite/app.db")
 	v.SetDefault("jwt.secret", "")
 	v.SetDefault("jwt.expire_days", 365)
@@ -264,9 +232,6 @@ func Load(path string) error {
 
 	// Phase 10 defaults — network capability detection
 	v.SetDefault("network.check_interval_seconds", 60)
-	v.SetDefault("network.p2p_port", 0)     // disabled by default (dev)
-	v.SetDefault("network.direct_port", 0)  // disabled by default (dev)
-	v.SetDefault("network.public_ipv6", "") // auto-detect by default
 
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /
@@ -280,6 +245,16 @@ func Load(path string) error {
 	}
 	if envURL := os.Getenv("FRIGATE_BASE_URL"); envURL != "" {
 		v.Set("frigate.base_url", envURL)
+	}
+	// MQTT credentials are injected via env vars in production
+	// (see compose.yaml -> MQTT_USERNAME / MQTT_PASSWORD). Without
+	// this, the API would connect anonymously and be rejected by
+	// `allow_anonymous false` in mosquitto.conf (CONNACK 0x05).
+	if envUser := os.Getenv("MQTT_USERNAME"); envUser != "" {
+		v.Set("mqtt.username", envUser)
+	}
+	if envPass := os.Getenv("MQTT_PASSWORD"); envPass != "" {
+		v.Set("mqtt.password", envPass)
 	}
 
 	v.SetConfigFile(path)

@@ -150,6 +150,12 @@ export interface Camera {
      * transcode cost at a glance.
      */
     transcode?: boolean;
+    /**
+     * Output codec: "passthrough" | "h264" | "h265" | "".
+     * When non-empty, this is the source of truth and overrides
+     * the legacy transcode bool. Empty inherits legacy behavior.
+     */
+    codec?: string;
     created_at: string;
     updated_at: string;
 }
@@ -286,25 +292,7 @@ export interface NetworkStatus {
     /** BEST achievable path after probing. Client upgrades from `initial` to this if probe succeeds. */
     strategy: ConnectionStrategy;
     quality: number; // 1-5
-    /** IPv6 direct URL for client-side probing. Empty when IPv6 unavailable or direct_port not configured. */
-    direct_url?: string;
-    /** Server's UDP endpoint for hole punching. Empty when P2P disabled. */
-    p2p_endpoint?: string;
-    /** Active P2P hole-punching sessions. */
-    p2p_sessions?: P2PSession[];
     checked_at: string;
-}
-
-/** P2P hole-punching session status. */
-export interface P2PSession {
-    peer_id: string;
-    remote_addr: string;
-    status: "punching" | "established" | "failed";
-    established_at?: string;
-    last_packet_at?: string;
-    last_punch_at?: string;
-    punch_count: number;
-    created_at: string;
 }
 
 /** Server's P2P endpoint for UDP hole punching. */
@@ -326,13 +314,15 @@ export interface PeerEndpoint {
     expires_at: string;
 }
 
-/** Persisted event from the Event Center (GET /api/v1/events). */
+// -------------------- Events (Phase 6) --------------------
+
+/** A stored event from GET /api/v1/events. */
 export interface StoredEvent {
     id: number;
     type: string;
     source: string;
-    severity: "info" | "warn" | "error" | "critical";
-    payload: Record<string, unknown>;
-    status: "created" | "processed" | "archived";
+    severity: "info" | "warn" | "error" | "critical" | string;
+    status?: string;
+    payload: Record<string, unknown> | null;
     timestamp: string;
 }

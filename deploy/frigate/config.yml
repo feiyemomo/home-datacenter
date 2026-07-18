@@ -12,16 +12,20 @@
 # ---- Hardware acceleration ----
 #
 # Intel J4125 (UHD Graphics 600) via VAAPI. The container must have
-# the /dev/dri device mounted (see compose.yaml). VAAPI accelerates
-# ffmpeg video decoding — critical for reducing CPU load when
-# processing multiple 1080p streams. The AI detector (CPU-based
-# TensorFlow Lite) runs separately and is not accelerated by VAAPI.
+# /dev/dri mounted (see compose.yaml frigate.devices). VAAPI offloads
+# H.264/H.265 video decode from CPU to GPU — critical for reducing
+# CPU load on the J4125 when running detection + recording + live
+# transcoding simultaneously. The AI detector (CPU-based TensorFlow
+# Lite) is not accelerated by VAAPI.
 #
-# On fnOS / Linux production: uncomment the ffmpeg section below and
-# add `devices: ["/dev/dri:/dev/dri"]` to compose.yaml's frigate
-# service. On Docker Desktop / Windows, GPU passthrough is not
-# supported — keep it commented.
+# Frigate expands preset-vaapi to:
+#   -hwaccel vaapi -hwaccel_output_format vaapi
+# inserted before each ffmpeg -i flag. go2rtc's live transcode path
+# uses #hardware=vaapi in the stream URL instead (handled by
+# home-api's rtspURL()).
 #
+# On Docker Desktop / Windows (no GPU passthrough), comment this out
+# and remove #hardware=vaapi from the go2rtc stream URL in rtspURL().
 ffmpeg:
   hwaccel_args: preset-vaapi
 
@@ -96,6 +100,7 @@ go2rtc:
     listen: :8555
     candidates:
       - 127.0.0.1:8555
+      - 192.168.31.234:8555
   hls:
     # 1s segment: keeps each .m4s under ~1 MB on a 8 Mbps HEVC
     # stream, so it can finish downloading inside the 5s upstream
@@ -144,13 +149,23 @@ cameras:
     record:
       enabled: false
 
-# Recording and snapshots are off by default. home-api sets
-# per-camera record.enabled=false; the operator can toggle recording
-# per camera from the dashboard later.
+# Recording is enabled globally. home-api toggles per-camera
+# record.enabled via PUT /api/config/set; the global block here
+# sets the retention policy for all cameras that have recording
+# enabled.
+#
+# IMPORTANT: Frigate 0.17 record schema:
+#   - record.enabled: master switch for 24/7 continuous recording
+#   - record.continuous.days: retain ALL footage for N days (24/7)
+#   - record.motion.days: retain motion segments for N days
+#   - record.alerts.retain.days/mode: keep alert segments
+#   - record.detections.retain.days/mode: keep detection segments
+# `record.retain` is NOT a valid key in Frigate 0.17 — the Pydantic
+# validator rejects it as extra_forbidden, causing 400.
 record:
-  enabled: false
+  enabled: true
   continuous:
-    days: 0
+    days: 7
   motion:
     days: 7
 snapshots:

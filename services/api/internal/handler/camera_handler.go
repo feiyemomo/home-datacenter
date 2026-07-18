@@ -5,9 +5,13 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -131,6 +135,9 @@ type registerReq struct {
 	// false to match the platform's "HEVC passthrough works on
 	// HEVC-capable browsers, transcode is opt-in" contract.
 	Transcode bool `json:"transcode"`
+	// Codec overrides Transcode: "passthrough"|"h264"|"h265".
+	// Empty string inherits legacy Transcode behavior.
+	Codec string `json:"codec"`
 }
 
 // Register — POST /api/v1/cameras
@@ -159,6 +166,7 @@ func (h *CameraHandler) Register(c *gin.Context) {
 		Motion:       req.Motion,
 		ProfileToken: req.ProfileToken,
 		Transcode:    req.Transcode,
+		Codec:        req.Codec,
 		OwnerID:      uid,
 	})
 	if err != nil {
@@ -270,103 +278,240 @@ func (h *CameraHandler) GotoPreset(c *gin.Context) {
 	utils.Success(c, gin.H{"id": id, "alias": alias, "speed": req.Speed})
 }
 
+// UpdateCodec — PUT /api/v1/cameras/:id/codec
+//
+//	{ "codec": "passthrough" | "h264" | "h265" }
+//
+// Changes the output video codec for a camera and re-pushes the
+// go2rtc stream + Frigate config so the change is live immediately.
+func (h *CameraHandler) UpdateCodec(c *gin.Context) {
+	if _, _, ok := h.callerIsAdmin(c); !ok {
+		return
+	}
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var body struct {
+		Codec string `json:"codec"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.Reg.UpdateCodec(c.Request.Context(), uint(id), body.Codec); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"id": id, "codec": body.Codec})
+}
+
 // SetRecordingPlan — PUT /api/v1/cameras/:id/recording
 //
-//	{ "enabled": true, "segment_seconds": 600, "retention_days": 7,
-//	  "output_dir": "/data/recordings", "cron": "" }
+//	{ "enabled": true, "retention_days": 7 }
+//
+// Toggles Frigate's continuous recording for this camera. Unlike the
+// old go2rtc-based recorder (which used /api/recorder — an endpoint
+// go2rtc does not actually expose), this delegates to Frigate's own
+// record pipeline via the config push API.
 func (h *CameraHandler) SetRecordingPlan(c *gin.Context) {
 	id, err := strconv.Atoi(c.Param("id"))
 	if err != nil {
 		utils.Fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
-	var plan camera.RecordingPlan
-	if err := c.ShouldBindJSON(&plan); err != nil {
+	var body struct {
+		Enabled        bool `json:"enabled"`
+		SegmentSeconds int  `json:"segment_seconds"` // ignored — Frigate uses 1h segments
+		RetentionDays  int  `json:"retention_days"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
 		utils.Fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
-	if plan.SegmentSeconds == 0 {
-		plan.SegmentSeconds = 600
-	}
-	if err := h.Rec.SetPlan(uint(id), plan); err != nil {
+	if err := h.Reg.SetRecordingEnabled(c.Request.Context(), uint(id), body.Enabled, body.RetentionDays); err != nil {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	utils.Success(c, gin.H{"id": id, "plan": plan})
+	utils.Success(c, gin.H{
+		"id": id,
+		"plan": gin.H{
+			"enabled":         body.Enabled,
+			"segment_seconds": 3600,
+			"retention_days":  body.RetentionDays,
+		},
+	})
 }
 
-// ListRecordings — GET /api/v1/cameras/:id/recordings?limit=100
+// ListRecordings — GET /api/v1/cameras/:id/recordings
+//
+// Aggregates Frigate's 10-second recording segments into 60-second
+// buckets for display. Frigate 0.17 stores all recordings as ~10s
+// MP4 files on disk and the /api/<cam>/recordings endpoint returns
+// them individually — that's ~360 entries per hour, which is too
+// granular for the dashboard. We group segments by minute (floor to
+// 60s) and return one entry per minute, with the minute-start
+// timestamp as the "id" so the front-end can build a play URL.
+//
+// We pass after=now-7d, before=now (both required — Frigate returns
+// an empty array when `after` is set but `before` is omitted).
 func (h *CameraHandler) ListRecordings(c *gin.Context) {
-	if _, ok := h.requireCanRead(c); !ok {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
 		return
 	}
-	id, _ := strconv.Atoi(c.Param("id"))
-	limit, _ := strconv.Atoi(c.Query("limit"))
-	recs, err := h.Rec.ListRecordings(uint(id), limit)
+	slug := h.Reg.FrigateSlug(cam)
+	after := time.Now().AddDate(0, 0, -7).Unix()
+	recs, err := h.Reg.Frigate.ListRecordings(c.Request.Context(), slug, after, 0)
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	views := make([]gin.H, 0, len(recs))
+
+	// Aggregate 10s segments into 60s buckets keyed by minute-start.
+	type bucket struct {
+		start    int64
+		end      float64
+		duration float64
+		count    int
+	}
+	buckets := make(map[int64]*bucket)
+	var order []int64
 	for _, r := range recs {
+		minuteStart := (r.StartTime / 60) * 60
+		b, exists := buckets[minuteStart]
+		if !exists {
+			b = &bucket{start: minuteStart, end: r.EndTime, duration: r.Duration, count: 1}
+			buckets[minuteStart] = b
+			order = append(order, minuteStart)
+		} else {
+			if r.EndTime > b.end {
+				b.end = r.EndTime
+			}
+			b.duration += r.Duration
+			b.count++
+		}
+	}
+
+	// Sort newest-first (descending by start time).
+	sort.Slice(order, func(i, j int) bool { return order[i] > order[j] })
+
+	views := make([]gin.H, 0, len(order))
+	for _, ts := range order {
+		b := buckets[ts]
 		views = append(views, gin.H{
-			"id":               r.ID,
-			"camera_id":        r.CameraID,
-			"start_at":         r.StartAt,
-			"end_at":           r.EndAt,
-			"duration_seconds": r.DurationSeconds,
-			"size_bytes":       r.SizeBytes,
-			"size_human":       humanSize(r.SizeBytes),
-			"file_path":        r.FilePath,
+			"id":               b.start,
+			"camera_id":        cam.ID,
+			"start_at":         time.Unix(b.start, 0).UTC().Format(time.RFC3339),
+			"end_at":           time.Unix(int64(b.end), 0).UTC().Format(time.RFC3339),
+			"duration_seconds": int(b.duration),
+			"segment_count":    b.count,
+			"size_bytes":       0,
+			"size_human":       "--",
+			"file_path":        "",
 		})
 	}
 	utils.Success(c, views)
 }
 
 // DeleteRecording — DELETE /api/v1/cameras/:id/recordings/:recId
+//
+// Frigate doesn't expose a per-segment delete API via REST (deletion
+// is handled by retention policy). We return 405 to signal the
+// front-end that this operation is not supported.
 func (h *CameraHandler) DeleteRecording(c *gin.Context) {
-	recID, err := strconv.Atoi(c.Param("recId"))
-	if err != nil {
-		utils.Fail(c, http.StatusBadRequest, "invalid recId")
-		return
-	}
-	if err := h.Rec.DeleteRecording(uint(recID)); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
-		return
-	}
-	utils.Success(c, gin.H{"id": recID})
+	utils.Fail(c, http.StatusMethodNotAllowed, "Frigate manages recording deletion via retention policy; per-segment delete is not supported")
 }
 
 // PlayRecording — GET /api/v1/cameras/:id/recordings/:recId/file
 //
-// Streams the underlying mp4 to the client with HTTP Range support
-// (so the browser <video> element can seek). The file path is
-// resolved through Recorder.RecordingFilePath which enforces that
-// the recording belongs to the camera in the URL — this prevents
-// any /:recId/../ trickery from reading arbitrary files on disk.
+// Serves a 60-second recording clip. The :recId is the minute-start
+// timestamp (from ListRecordings). Frigate stores recordings as 10s
+// MP4 files on disk; this handler finds all 10s segments within the
+// requested minute and concatenates them into a single 60s MP4 using
+// ffmpeg stream copy (no re-encoding — sub-second for ~24MB).
+//
+// Segment file names are NOT aligned to 10-second boundaries — Frigate
+// starts the first segment whenever the recording pipeline spins up,
+// so a minute might contain 13.08.mp4, 13.18.mp4, 13.28.mp4, etc. We
+// therefore list the on-disk directory and filter by the MM prefix
+// rather than constructing paths from minuteStart+offset.
+//
+// If only one segment exists in the minute (e.g., camera was briefly
+// offline), it is served directly without ffmpeg. http.ServeFile
+// provides Content-Type (video/mp4), Content-Length, Range support
+// (for <video> seeking), and ETag/Last-Modified automatically.
 func (h *CameraHandler) PlayRecording(c *gin.Context) {
-	if _, ok := h.requireCanRead(c); !ok {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
 		return
 	}
-	camID, _ := strconv.Atoi(c.Param("id"))
-	recID, err := strconv.Atoi(c.Param("recId"))
+	minuteStart, err := strconv.ParseInt(c.Param("recId"), 10, 64)
 	if err != nil {
-		utils.Fail(c, http.StatusBadRequest, "invalid recId")
+		utils.Fail(c, http.StatusBadRequest, "invalid recId (expected unix timestamp)")
 		return
 	}
-	path, rec, err := h.Rec.RecordingFilePath(uint(camID), uint(recID))
+
+	// List all 10s segment files that fall within this minute.
+	// Frigate's segment SS values are not aligned to 00/10/20/30/40/50,
+	// so we list the directory and match by MM prefix instead of
+	// constructing paths from minuteStart + offset.
+	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
 	if err != nil {
-		utils.Fail(c, http.StatusNotFound, "recording not found")
+		utils.Fail(c, http.StatusNotFound, "no recording directory for this minute: "+err.Error())
 		return
 	}
-	clean := filepath.Clean(path)
-	if strings.Contains(clean, "..") {
-		utils.Fail(c, http.StatusBadRequest, "invalid path")
+	if len(paths) == 0 {
+		utils.Fail(c, http.StatusNotFound, "no recording segments found in this minute")
 		return
 	}
-	_ = rec
-	c.Header("Content-Disposition", "inline")
-	http.ServeFile(c.Writer, c.Request, clean)
+
+	// Single segment: serve directly (fast path, no ffmpeg needed).
+	if len(paths) == 1 {
+		c.Header("Cache-Control", "no-store")
+		http.ServeFile(c.Writer, c.Request, paths[0])
+		return
+	}
+
+	// Multiple segments: concatenate with ffmpeg stream copy.
+	tmpDir, err := os.MkdirTemp("", "rec_")
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "create temp dir: "+err.Error())
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Build ffmpeg concat list: file 'path1'\nfile 'path2'\n...
+	var listBuilder strings.Builder
+	for _, p := range paths {
+		// Escape single quotes for ffmpeg's concat demuxer.
+		escaped := strings.ReplaceAll(p, "'", "'\\''")
+		listBuilder.WriteString(fmt.Sprintf("file '%s'\n", escaped))
+	}
+	listPath := filepath.Join(tmpDir, "list.txt")
+	if err := os.WriteFile(listPath, []byte(listBuilder.String()), 0o644); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "write concat list: "+err.Error())
+		return
+	}
+
+	// Run ffmpeg: concat demuxer + stream copy + faststart (moov at
+	// start for instant playback). Output to temp file, then serve.
+	outPath := filepath.Join(tmpDir, "out.mp4")
+	cmd := exec.Command("ffmpeg", "-y",
+		"-f", "concat", "-safe", "0",
+		"-i", listPath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		outPath)
+	if output, err := cmd.CombinedOutput(); err != nil {
+		log.Printf("PlayRecording: ffmpeg concat failed: %v: %s", err, string(output))
+		utils.Fail(c, http.StatusInternalServerError, "ffmpeg concat failed")
+		return
+	}
+
+	c.Header("Cache-Control", "no-store")
+	http.ServeFile(c.Writer, c.Request, outPath)
 }
 
 // humanSize is exposed at handler scope (mirrors camera.humanSize).
@@ -613,6 +758,7 @@ func cameraView(cam *model.Camera, stream camera.StreamConfig) gin.H {
 		"meta":         cam.Meta,
 		"stream":       stream,
 		"transcode":    cam.Transcode,
+		"codec":        cam.Codec,
 		"created_at":   cam.CreatedAt,
 		"updated_at":   cam.UpdatedAt,
 	}

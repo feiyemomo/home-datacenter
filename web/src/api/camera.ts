@@ -37,6 +37,8 @@ export interface RegisterCameraPayload {
     profile_token?: string;
     /** Opt into ffmpeg-based H.264 transcoding (HEVC → H.264). */
     transcode?: boolean;
+    /** Frigate camera name override (defaults to slugified name). */
+    frigate_camera?: string;
 }
 
 export async function registerCamera(req: RegisterCameraPayload): Promise<Camera> {
@@ -46,6 +48,14 @@ export async function registerCamera(req: RegisterCameraPayload): Promise<Camera
 
 export async function deleteCamera(id: number): Promise<void> {
     await client.delete(`/cameras/${id}`);
+}
+
+/** Update the output codec for a camera. Admin-only. */
+export async function updateCodec(
+    id: number,
+    codec: "passthrough" | "h264" | "h265",
+): Promise<void> {
+    await client.put(`/cameras/${id}/codec`, { codec });
 }
 
 export async function ptzMove(

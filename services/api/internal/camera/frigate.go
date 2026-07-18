@@ -8,6 +8,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -103,6 +105,13 @@ type FrigateDetect struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 }
 
+// FrigateRecord controls Frigate's NVR-style continuous recording.
+// When Enabled=true, Frigate records the camera's video to its media
+// directory (/media/frigate/recordings).
+//
+// NOTE: Frigate's per-camera record config only accepts `enabled`.
+// Retention policy (retain_days, events, motion, etc.) is set at the
+// GLOBAL level via the `record` key in config_data, not per-camera.
 type FrigateRecord struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
 }
@@ -141,27 +150,28 @@ type HLSConfig struct {
 
 // PushConfig generates the camera-list portion of the Frigate config
 // and pushes it via PUT /api/config/set. Frigate validates the change
-// against its Pydantic schema and applies it without a full restart
-// (only affected camera pipelines are reloaded).
+// against its Pydantic schema and applies it.
 //
 // The body is JSON of the form:
 //
 //	{
-//	  "requires_restart": 0,
+//	  "requires_restart": 0|1,
 //	  "update_topic": "config/cameras",
 //	  "config_data": {
 //	    "cameras": { "front_door": {...}, ... },
+//	    "record": { "enabled": true, "motion": { "days": 7 } },
 //	    "go2rtc": { "streams": { "前门": "rtsp://..." } }
 //	  }
 //	}
 //
-// We send ONLY the sections we manage (cameras + go2rtc.streams).
-// Sending the full config would re-send credentials that Frigate
-// has already redacted (e.g. the mqtt.password shows up as
-// REDACTED_CREDENTIAL_SENTINEL in /api/config) and Frigate's
-// validator would reject the round-trip. By sending only our own
-// sections, we let Frigate's deep-merge keep the global settings
-// (mqtt, detectors, environment, etc.) untouched.
+// We send ONLY the sections we manage (cameras + go2rtc.streams +
+// global record retention). Sending the full config would re-send
+// credentials that Frigate has already redacted (e.g. the
+// mqtt.password shows up as REDACTED_CREDENTIAL_SENTINEL in
+// /api/config) and Frigate's validator would reject the round-trip.
+// By sending only our own sections, we let Frigate's deep-merge keep
+// the other global settings (mqtt, detectors, environment, etc.)
+// untouched.
 //
 // Note on camera naming: Frigate's Pydantic model validates each
 // camera name against a strict regex (typically `^[a-zA-Z0-9_-]+$`)
@@ -171,13 +181,40 @@ type HLSConfig struct {
 // ASCII slug (e.g. "front_door") as the camera name; the go2rtc
 // stream is keyed by the original friendly name.
 //
-// requires_restart=0 because camera-list changes do NOT require a
-// Frigate restart — the change is applied via ZMQ to the running
-// processes. update_topic="config/cameras" routes the update to the
-// camera config subscriber.
-func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraConfig, go2rtcStreams map[string]string) error {
+// requires_restart:
+//   - false (0): camera add/remove changes are applied via ZMQ to
+//     the running processes without a full Frigate restart.
+//   - true (1): forces a full Frigate restart after applying the
+//     config. REQUIRED when toggling record.enabled on a camera,
+//     because Frigate only starts/stops the recording ffmpeg
+//     pipeline during a restart — a hot config merge alone does
+//     not spin up the recorder process. Without this, the config
+//     push returns 200 but no recordings are ever produced.
+func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraConfig, go2rtcStreams map[string]string, requiresRestart bool) error {
 	partial := map[string]any{
 		"cameras": camerasAsMap(cameras),
+		// Global record config: enable 24/7 continuous recording
+		// with 7-day retention. Per-camera record.enabled controls
+		// which cameras actually record; this global block sets the
+		// retention policy for all cameras that have recording enabled.
+		//
+		// IMPORTANT: Frigate 0.17 record schema:
+		//   - record.enabled: master switch for 24/7 recording
+		//   - record.continuous.days: retain ALL footage for N days
+		//   - record.motion.days: retain motion segments for N days
+		//   - record.alerts.retain.days/mode: keep alert segments
+		//   - record.detections.retain.days/mode: keep detection segments
+		// `record.retain` is NOT a valid key in Frigate 0.17 — the
+		// Pydantic validator rejects it as extra_forbidden, causing 400.
+		"record": map[string]any{
+			"enabled": true,
+			"continuous": map[string]any{
+				"days": 7,
+			},
+			"motion": map[string]any{
+				"days": 7,
+			},
+		},
 	}
 	if len(go2rtcStreams) > 0 {
 		partial["go2rtc"] = map[string]any{
@@ -187,8 +224,12 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 
 	// Wrap the config in the {config_data: ...} envelope the
 	// /api/config/set endpoint expects.
+	restartVal := 0
+	if requiresRestart {
+		restartVal = 1
+	}
 	body, err := json.Marshal(map[string]any{
-		"requires_restart": 0,
+		"requires_restart": restartVal,
 		"update_topic":     "config/cameras",
 		"config_data":      partial,
 	})
@@ -214,7 +255,7 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 		return fmt.Errorf("frigate config set: %s: %s", resp.Status, string(raw))
 	}
 
-	log.Printf("frigate: config pushed (%d cameras)", len(cameras))
+	log.Printf("frigate: config pushed (%d cameras, requires_restart=%d)", len(cameras), restartVal)
 	return nil
 }
 
@@ -258,4 +299,66 @@ func camerasAsMap(cameras []FrigateCameraConfig) map[string]any {
 		m[c.Name] = c
 	}
 	return m
+}
+
+// FrigateRecording is a single recording segment returned by
+// GET /api/<camera>/recordings. Frigate stores recordings as
+// hour-bounded segments; each entry covers one hour (or part
+// thereof) of continuous video.
+//
+// NOTE: Frigate's API returns end_time and duration as floats
+// (e.g. 1784306209.996875), not ints. We use float64 to avoid
+// JSON unmarshal errors. Callers that need int seconds should
+// cast explicitly.
+type FrigateRecording struct {
+	Camera    string  `json:"camera"`
+	StartTime int64   `json:"start_time"`       // unix seconds
+	EndTime   float64 `json:"end_time"`         // unix seconds (float)
+	Duration  float64 `json:"duration"`         // seconds (float)
+	HasClip   bool    `json:"has_clip"`
+	HasSnap   bool    `json:"has_snapshot"`
+}
+
+// ListRecordings queries Frigate for recording segments of a camera.
+// cameraName is the Frigate slug (ASCII, e.g. "front_door").
+// after/before are unix seconds (0 = no bound). Returns segments
+// newest-first.
+func (c *FrigateClient) ListRecordings(ctx context.Context, cameraName string, after, before int64) ([]FrigateRecording, error) {
+	u := fmt.Sprintf("%s/api/%s/recordings", c.FrigateBase, url.PathEscape(cameraName))
+	params := url.Values{}
+	if after > 0 {
+		params.Set("after", strconv.FormatInt(after, 10))
+		// Frigate's recordings API returns an EMPTY array when
+		// `after` is set but `before` is omitted — it does NOT
+		// default `before` to "now". We must always pair `after`
+		// with an explicit `before` (defaulting to now) or the
+		// response is silently empty.
+		if before <= 0 {
+			before = time.Now().Unix()
+		}
+	}
+	if before > 0 {
+		params.Set("before", strconv.FormatInt(before, 10))
+	}
+	if len(params) > 0 {
+		u += "?" + params.Encode()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("frigate list recordings: %s: %s", resp.Status, string(raw))
+	}
+	var recs []FrigateRecording
+	if err := json.NewDecoder(resp.Body).Decode(&recs); err != nil {
+		return nil, fmt.Errorf("decode recordings: %w", err)
+	}
+	return recs, nil
 }

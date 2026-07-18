@@ -78,14 +78,14 @@ export default function Profile() {
     return (
         <div className="space-y-6">
             <div>
-                <h2 className="text-lg font-semibold text-fg">Profile</h2>
-                <p className="text-xs text-fg-muted">
+                <h2 className="text-lg font-semibold text-slate-100">Profile</h2>
+                <p className="text-xs text-slate-500">
                     Your account, token claims, and bound devices.
                 </p>
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-600 dark:text-rose-300">
+                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
                     {error}
                 </div>
             )}
@@ -166,10 +166,10 @@ export default function Profile() {
                         />
                         {token && (
                             <div className="pt-1">
-                                <div className="mb-1 text-xs uppercase tracking-wider text-fg-muted">
+                                <div className="mb-1 text-xs uppercase tracking-wider text-slate-500">
                                     Raw token
                                 </div>
-                                <div className="max-h-24 overflow-y-auto rounded-md border border-surface-border bg-surface-subtle/60 p-2 font-mono text-[11px] break-all text-fg-muted">
+                                <div className="max-h-24 overflow-y-auto rounded-md border border-slate-800 bg-slate-950/60 p-2 font-mono text-[11px] break-all text-slate-500">
                                     {token}
                                 </div>
                             </div>
@@ -191,7 +191,7 @@ export default function Profile() {
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
-                            <thead className="border-b border-surface-border bg-surface-subtle/40 text-xs uppercase tracking-wider text-fg-muted">
+                            <thead className="border-b border-slate-800 bg-slate-950/40 text-xs uppercase tracking-wider text-slate-500">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">ID</th>
@@ -200,27 +200,27 @@ export default function Profile() {
                                     <th className="px-4 py-3 font-medium">State</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-surface-border">
+                            <tbody className="divide-y divide-slate-800/70">
                                 {devices.length === 0 && (
                                     <tr>
                                         <td
                                             colSpan={5}
-                                            className="px-4 py-10 text-center text-fg-muted"
+                                            className="px-4 py-10 text-center text-slate-500"
                                         >
                                             No devices bound to your account.
                                         </td>
                                     </tr>
                                 )}
                                 {devices.map((d) => (
-                                    <tr key={d.id} className="hover:bg-surface-subtle/30">
-                                        <td className="px-4 py-3 font-medium text-fg">
+                                    <tr key={d.id} className="hover:bg-slate-800/30">
+                                        <td className="px-4 py-3 font-medium text-slate-200">
                                             {d.device_name}
                                         </td>
-                                        <td className="px-4 py-3 text-fg-muted">#{d.id}</td>
-                                        <td className="px-4 py-3 text-fg-muted">
+                                        <td className="px-4 py-3 text-slate-400">#{d.id}</td>
+                                        <td className="px-4 py-3 text-slate-400">
                                             {formatDateTime(d.last_login_at)}
                                         </td>
-                                        <td className="px-4 py-3 text-fg-muted">
+                                        <td className="px-4 py-3 text-slate-400">
                                             {formatDateTime(d.created_at)}
                                         </td>
                                         <td className="px-4 py-3">
@@ -250,11 +250,11 @@ function Row({
     value: React.ReactNode;
 }) {
     return (
-        <div className="flex items-center justify-between gap-4 border-b border-surface-border/60 pb-2 last:border-0 last:pb-0">
-            <span className="text-xs uppercase tracking-wider text-fg-muted">
+        <div className="flex items-center justify-between gap-4 border-b border-slate-800/60 pb-2 last:border-0 last:pb-0">
+            <span className="text-xs uppercase tracking-wider text-slate-500">
                 {label}
             </span>
-            <span className="text-right text-sm text-fg">{value}</span>
+            <span className="text-right text-sm text-slate-200">{value}</span>
         </div>
     );
 }

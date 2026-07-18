@@ -12,33 +12,13 @@ import (
 
 // NetworkHandler exposes the network capability detection API.
 type NetworkHandler struct {
-	svc     *network.Service
-	peers   *network.PeerRegistry
-	puncher *network.HolePuncher // nil = P2P hole punching disabled
-	connMgr *network.ConnectionManager
+	svc    *network.Service
+	peers  *network.PeerRegistry
 }
 
 // NewNetworkHandler creates a handler for network status and P2P signaling.
-// puncher may be nil if P2P hole punching is disabled (p2p_port = 0).
-func NewNetworkHandler(svc *network.Service, peers *network.PeerRegistry, puncher *network.HolePuncher) *NetworkHandler {
-	return &NetworkHandler{svc: svc, peers: peers, puncher: puncher}
-}
-
-// SetConnectionManager sets the optional ConnectionManager for Phase 2.
-// If set, the Connect endpoint becomes available. If nil, Connect
-// returns 503 Not Implemented.
-func (h *NetworkHandler) SetConnectionManager(mgr *network.ConnectionManager) {
-	h.connMgr = mgr
-}
-
-// Probe is a lightweight connectivity endpoint. Clients fetch this via
-// the server's IPv6 address to test if IPv6 direct is reachable.
-// Returns 200 {"ok": true} — no auth required so the probe doesn't
-// need a valid JWT (the client is just testing TCP connectivity).
-//
-//	Route: GET /api/v1/network/probe
-func (h *NetworkHandler) Probe(c *gin.Context) {
-	utils.Success(c, gin.H{"ok": true})
+func NewNetworkHandler(svc *network.Service, peers *network.PeerRegistry) *NetworkHandler {
+	return &NetworkHandler{svc: svc, peers: peers}
 }
 
 // Status returns the network capability report.
@@ -123,25 +103,10 @@ func (h *NetworkHandler) RegisterP2P(c *gin.Context) {
 	}
 
 	peer := h.peers.Register(peerID, req.PublicIP, req.PublicPort, req.IPv6)
-
-	// If the hole puncher is active, start sending hole-punching
-	// packets to this peer's public endpoint. The peer should also
-	// be sending packets to the server's endpoint (returned by
-	// LookupServer) — when both sides are punching, the NAT holes
-	// open and the UDP channel is established.
-	if h.puncher != nil {
-		peerAddr, err := net.ResolveUDPAddr("udp",
-			net.JoinHostPort(req.PublicIP, strconv.Itoa(req.PublicPort)))
-		if err == nil {
-			h.puncher.StartPunching(peerID, peerAddr)
-		}
-	}
-
 	utils.Success(c, gin.H{
-		"peer_id":    peer.PeerID,
-		"registered": true,
-		"expires_at": peer.ExpiresAt,
-		"p2p_active": h.puncher != nil,
+		"peer_id":      peer.PeerID,
+		"registered":   true,
+		"expires_at":   peer.ExpiresAt,
 	})
 }
 
@@ -149,56 +114,18 @@ func (h *NetworkHandler) RegisterP2P(c *gin.Context) {
 // public address). The mobile app uses this to know where to send UDP
 // hole-punching packets.
 //
-// When the hole puncher is active, the endpoint comes from the hole
-// puncher's persistent socket (NOT the NAT detection socket) — this is
-// critical because the NAT mapping is per-socket. If we returned the
-// NAT detection's endpoint, the peer would send packets to a port that
-// the hole puncher isn't listening on.
-//
 //	Route: GET /api/v1/network/p2p/server-endpoint
 func (h *NetworkHandler) LookupServer(c *gin.Context) {
 	status := h.svc.Status()
 
 	resp := gin.H{
-		"ipv6":     status.IPv6.Address,
-		"nat_type": status.NAT.Type,
-		"strategy": status.Strategy,
+		"public_ip":   status.NAT.PublicIP,
+		"public_port": status.NAT.PublicPort,
+		"ipv6":        status.IPv6.Address,
+		"nat_type":    status.NAT.Type,
+		"strategy":    status.Strategy,
 	}
-
-	// Prefer the hole puncher's endpoint (same socket as punching).
-	if h.puncher != nil {
-		if ep := h.puncher.PublicEndpoint(); ep != nil {
-			resp["public_ip"] = ep.IP.String()
-			resp["public_port"] = ep.Port
-			resp["p2p_port"] = h.puncher.LocalPort()
-			utils.Success(c, resp)
-			return
-		}
-	}
-
-	// Fall back to the NAT detection endpoint (different socket, may
-	// not match the hole puncher's mapping — but better than nothing).
-	resp["public_ip"] = status.NAT.PublicIP
-	resp["public_port"] = status.NAT.PublicPort
 	utils.Success(c, resp)
-}
-
-// ListSessions returns all active P2P hole-punching sessions.
-// Admin-only.
-//
-//	Route: GET /api/v1/network/p2p/sessions
-func (h *NetworkHandler) ListSessions(c *gin.Context) {
-	if h.puncher == nil {
-		utils.Success(c, gin.H{"sessions": []interface{}{}, "count": 0, "enabled": false})
-		return
-	}
-	sessions := h.puncher.Sessions()
-	utils.Success(c, gin.H{
-		"sessions":   sessions,
-		"count":      len(sessions),
-		"enabled":    true,
-		"local_port": h.puncher.LocalPort(),
-	})
 }
 
 // LookupPeer returns a specific peer's registered endpoint.
@@ -234,35 +161,5 @@ func (h *NetworkHandler) UnregisterP2P(c *gin.Context) {
 		peerID = c.GetString("username")
 	}
 	h.peers.Unregister(peerID)
-	if h.puncher != nil {
-		h.puncher.StopPunching(peerID)
-	}
 	utils.Success(c, gin.H{"unregistered": true})
-}
-
-// Connect evaluates the server's current network posture and returns
-// the best connection path for a given peer.
-//
-//	Route: POST /api/v1/network/connect
-//
-// Body (optional):
-//
-//	{"peer_id": "42"}   // enables P2P peer lookup
-//
-// The response includes the selected connection_type, status, and the
-// endpoint information the client needs to establish the connection.
-func (h *NetworkHandler) Connect(c *gin.Context) {
-	if h.connMgr == nil {
-		utils.Fail(c, 503, "connection manager not available")
-		return
-	}
-
-	var req struct {
-		PeerID string `json:"peer_id"`
-	}
-	// Body is optional — ignore parse errors (no body = empty peerID).
-	_ = c.ShouldBindJSON(&req)
-
-	result := h.connMgr.Connect(req.PeerID)
-	utils.Success(c, result)
 }

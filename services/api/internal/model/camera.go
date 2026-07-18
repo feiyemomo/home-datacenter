@@ -102,6 +102,14 @@ type Camera struct {
 	// into). Cost is paid once at build time, benefit only
 	// accrues when an admin opts a specific camera in.
 	Transcode bool `gorm:"default:false" json:"transcode"`
+	// Codec controls the output video codec for go2rtc/Frigate.
+	// "" or "passthrough" → use camera's native codec (no transcode)
+	// "h264" → transcode to H.264 via ffmpeg (universal WebRTC support)
+	// "h265" → transcode to H.265 via ffmpeg (HLS only, not WebRTC on Chrome)
+	// When non-empty, this field is the source of truth and overrides
+	// the legacy Transcode bool. When empty, Transcode bool is used
+	// for backward compatibility (true → h264, false → passthrough).
+	Codec string `gorm:"size:16;default:''" json:"codec"`
 	// TranscodeUseSubstream, when true (the default), switches the
 	// RTSP source to the camera's substream channel
 	// (Hikvision: ChannelID + 100, e.g. 101 → 201) before applying
@@ -134,12 +142,6 @@ type Camera struct {
 	// cameras with the same name will fail to register the second
 	// one. URL-encoded on the wire (see camera.Registry.StreamConfig).
 	StreamName string `gorm:"size:64;uniqueIndex" json:"stream_name"` // friendly name; same as go2rtc stream key
-
-	// FrigateCamera is the name of this camera in Frigate's config
-	// (e.g. "front_door"). Frigate uses this identifier in its
-	// MQTT events ({after.camera: "front_door"}) and REST API.
-	// Defaults to an ASCII slug of StreamName when empty.
-	FrigateCamera string `gorm:"size:64;index" json:"frigate_camera"`
 
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`

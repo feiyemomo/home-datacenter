@@ -20,17 +20,20 @@ services:
       context: ./services/api
     container_name: home-api
     restart: unless-stopped
-    # Default-bind to localhost only. Override with MQTT/HTTP ports
-    # for local testing; in production behind the tunnel, prefer not
-    # publishing the API port at all and letting the tunnel reach it
-    # by service name.
+    # Bind to 0.0.0.0 so LAN devices can reach the API directly.
+    # In production behind Cloudflare Tunnel, the tunnel reaches the
+    # API by service name (home-api) on the internal network.
     ports:
-      - "127.0.0.1:8080:8080"
-      # Publish on IPv6 so clients can connect directly via
-      # http://[host-ipv6]:8080 — bypasses Cloudflare Tunnel relay.
-      - ":::8080:8080"
+      - "0.0.0.0:8080:8080"
     volumes:
       - ./data/sqlite:/data/sqlite
+      - ./data/recordings:/data/recordings
+      # Frigate recordings (read-only) so home-api can serve MP4
+      # segments directly from disk via http.ServeFile. Frigate 0.17
+      # has no REST endpoint for downloading individual recording
+      # segments — they are only available as files on disk at
+      # /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4.
+      - ./data/frigate:/media/frigate:ro
       - ./services/api/configs:/configs:ro
     depends_on:
       mosquitto:
@@ -49,7 +52,7 @@ services:
       - home-net
 
   mosquitto:
-    image: docker.m.daocloud.io/library/eclipse-mosquitto:2
+    image: eclipse-mosquitto:2
     container_name: home-mosquitto
     restart: unless-stopped
     # Not published by default. Uncomment and set MQTT_BIND_PORT only
@@ -71,12 +74,10 @@ services:
       context: ./web
     container_name: home-web
     restart: unless-stopped
+    # Port 8088 on the host maps to 80 in the container. Port 80
+    # on the host is typically occupied by the NAS web UI.
     ports:
-      - "127.0.0.1:80:80"
-      # Publish on IPv6 so mobile devices can access the dashboard
-      # directly via http://[host-ipv6]/ — HTTP (no mixed content),
-      # so the IPv6 Direct Probe works in the browser.
-      - ":::80:80"
+      - "0.0.0.0:8088:80"
     depends_on:
       - api
     networks:
@@ -106,9 +107,9 @@ services:
       - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-}
     ports:
       # Frigate REST API (config, events, snapshots)
-      - "127.0.0.1:5000:5000"
+      - "0.0.0.0:5000:5000"
       # Bundled go2rtc HTTP API (HLS, WebRTC SDP signalling)
-      - "127.0.0.1:1984:1984"
+      - "0.0.0.0:1984:1984"
       # WebRTC media: TCP ICE + UDP ICE. Browser needs direct
       # access for ICE connectivity checks.
       - "8555:8555"
@@ -116,14 +117,16 @@ services:
     volumes:
       - ./deploy/frigate/config.yml:/config/config.yml
       - ./data/frigate:/media/frigate
-      - ./data/recordings:/recordings
-    # Intel GPU (UHD Graphics 600) passthrough for VAAPI hardware
-    # decoding. /dev/dri/renderD128 is the compute-only render node
-    # — safer than /dev/dri/card0 which grants display privileges.
-    # On fnOS (Linux) this works out of the box. On Docker Desktop
-    # (Windows/WSL2), GPU passthrough is not supported — uncomment
-    # the line below and remove `ffmpeg.hwaccel_args` from the
-    # Frigate config to fall back to software decoding.
+      - ./data/recordings:/data/recordings
+    # Intel GPU (UHD Graphics 600 on J4125) passthrough for VAAPI
+    # hardware decoding. /dev/dri/renderD128 is the compute-only
+    # render node — safer than /dev/dri/card0 which grants display
+    # privileges. Required for both:
+    #   - Frigate's ffmpeg (detection decode, preset-vaapi)
+    #   - go2rtc's ffmpeg (live transcode, #hardware=vaapi)
+    # Without this, ffmpeg falls back to software decode → high CPU.
+    # On Docker Desktop (Windows/WSL2) GPU passthrough is not
+    # supported — comment out and remove hwaccel_args to fall back.
     devices:
       - /dev/dri:/dev/dri
     # Healthcheck: check the Frigate REST API is responding.
@@ -135,28 +138,26 @@ services:
       start_period: 10s
     networks:
       - home-net
-  # cloudflared — Cloudflare Tunnel connector. Routes public
-  # hostnames (dashboard / api / cam .feiyemomo.top) to the
-  # internal Docker services via the home-net bridge network.
-  # The tunnel ID and credentials are mounted from the host's
-  # ~/.cloudflared directory; the ingress rules live in
-  # deploy/cloudflared/config.yaml.
+
+  # cloudflared — Cloudflare Tunnel for public access. Routes public
+  # hostnames (dashboard.feiyemomo.top, api.feiyemomo.top,
+  # cam.feiyemomo.top) to internal Docker services by name. Must be
+  # on the same network as the other services so it can resolve
+  # "web", "api" etc.
   cloudflared:
-    image: docker.m.daocloud.io/cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:latest
     container_name: home-cloudflared
     restart: unless-stopped
-    command: tunnel --config /etc/cloudflared/config.yaml run
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yaml run
     volumes:
       - ./deploy/cloudflared/config.yaml:/etc/cloudflared/config.yaml:ro
-      # Mount the credentials JSON from the host. On Windows the
-      # path is C:\Users\<user>\.cloudflared\<tunnel-id>.json.
-      - ${USERPROFILE}/.cloudflared/663e45da-2140-4b42-8dbc-b65da7b5956a.json:/etc/cloudflared/credentials.json:ro
+      - ./deploy/cloudflared/credentials.json:/etc/cloudflared/credentials.json:ro
     depends_on:
-      - web
       - api
-      - frigate
+      - web
     networks:
       - home-net
+
   # coturn — optional STUN/TURN for WebRTC across the public
   # internet. Without this, browsers can only reach go2rtc via
   # LAN or Cloudflare Tunnel (HTTP SDP only — no UDP media).
@@ -177,14 +178,3 @@ services:
 networks:
   home-net:
     driver: bridge
-    # Enable IPv6 on the Docker bridge network so containers have
-    # outbound IPv6 connectivity. Requires "Enable IPv6" in Docker
-    # Desktop settings (Settings → Resources → Network). The ULA subnet
-    # is Docker-internal; Docker NATs outbound IPv6 to the host's public
-    # address. The api's CheckIPv6() discovers the public address via
-    # an external echo service, so clients get the right endpoint.
-    enable_ipv6: true
-    ipam:
-      config:
-        - subnet: 172.19.0.0/16
-        - subnet: fd00:dead:beef::/64

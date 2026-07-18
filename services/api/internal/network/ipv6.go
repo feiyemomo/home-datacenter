@@ -2,97 +2,47 @@ package network
 
 import (
 	"fmt"
-	"io"
 	"net"
-	"net/http"
-	"strings"
 	"time"
 )
 
 // IPv6Status is the result of the IPv6 capability check.
 type IPv6Status struct {
 	// Enabled is true if the host has at least one non-loopback,
-	// non-link-local IPv6 address on any interface, OR if outbound
-	// IPv6 connectivity is proven via an external echo service.
+	// non-link-local IPv6 address on any interface.
 	Enabled bool `json:"enabled"`
 
-	// Reachable is true if the host can establish an outbound IPv6
-	// connection to a public service AND receive a response. This
-	// proves end-to-end IPv6 routing, not just local interface config.
+	// Reachable is true if the host can establish a TCP6 connection
+	// to a known public IPv6 service (Cloudflare DNS). This proves
+	// end-to-end IPv6 routing, not just local interface config.
 	Reachable bool `json:"reachable"`
 
-	// Address is the PUBLIC IPv6 address as seen from the internet.
-	// This is discovered via an external IPv6 echo service, so it
-	// works correctly even inside a Docker container (where the
-	// container's local interface address is a private ULA, not the
-	// host's public address). This is the address clients use for
-	// IPv6 direct mode.
+	// Address is the first global-scope IPv6 address found on the
+	// host's interfaces. Empty if none. This is the address the
+	// mobile app would connect to for IPv6 direct mode.
 	Address string `json:"address,omitempty"`
 
 	// CheckedAt is when the check was last run.
 	CheckedAt time.Time `json:"checked_at"`
 }
 
-// IPv6-only echo services that return the caller's public IPv6 address
-// as plain text. These domains have AAAA records but NO A records, so
-// the HTTP client is forced to use IPv6. Listed in order of preference;
-// the first one that responds wins.
-//
-// We list multiple because some may be blocked in certain regions
-// (e.g. api6.ipify.org is sometimes unreachable from China).
-var ipv6EchoServices = []string{
-	"https://api6.ipify.org",
-	"https://ipv6.icanhazip.com",
-	"https://6.ipw.cn", // China-accessible IPv6 echo service
-}	
-
 // CheckIPv6 tests IPv6 availability and public reachability.
 //
 // The check has two stages:
-//  1. HTTP GET to an IPv6-only echo service (e.g. api6.ipify.org).
-//     If it responds, we know IPv6 is reachable AND we get the public
-//     address as seen from the internet. This works inside Docker
-//     containers where the local interface address is a private ULA.
-//  2. Fallback: scan local interfaces for a global IPv6 address and
-//     TCP6-dial Cloudflare DNS to test reachability without address
-//     discovery.
+//  1. Scan net.Interfaces() for a global-scope IPv6 address (not ::1,
+//     not fe80::). If found, IPv6 is "enabled" locally.
+//  2. Attempt a TCP6 dial to [2606:4700:4700::1111]:443 (Cloudflare
+//     DNS-over-HTTPS) with a 3s timeout. If it connects, IPv6 is
+//     "reachable" from the public internet's perspective.
 //
-// Stage 1 is preferred because it discovers the PUBLIC address (what
-// clients actually need), not the container's internal address.
+// Stage 2 is the meaningful test — having a local IPv6 address without
+// routable connectivity is useless for direct connections. The dial
+// target is a well-known anycast address that is extremely unlikely to
+// be down.
 func CheckIPv6() IPv6Status {
 	status := IPv6Status{CheckedAt: time.Now()}
 
-	// Stage 1: query an external IPv6 echo service. This proves
-	// outbound IPv6 connectivity AND discovers the public address.
-	client := &http.Client{Timeout: 4 * time.Second}
-	for _, url := range ipv6EchoServices {
-		resp, err := client.Get(url)
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
-		resp.Body.Close()
-		if err != nil {
-			continue
-		}
-		ipStr := strings.TrimSpace(string(body))
-		// Validate that the response is actually an IPv6 address.
-		ip := net.ParseIP(ipStr)
-		if ip == nil || ip.To4() != nil || ip.To16() == nil {
-			continue
-		}
-		status.Enabled = true
-		status.Reachable = true
-		status.Address = ipStr
-		return status
-	}
-
-	// Stage 2 (fallback): the echo services are unreachable. This
-	// could mean IPv6 is down, OR the echo services are blocked.
-	// Fall back to local interface scan + TCP6 dial for a best-effort
-	// answer.
-
-	// Scan interfaces for a global IPv6 address.
+	// Stage 1: scan interfaces for a global IPv6 address.
 	addrs, err := net.InterfaceAddrs()
 	if err == nil {
 		for _, addr := range addrs {
@@ -107,19 +57,24 @@ func CheckIPv6() IPv6Status {
 			if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
 				continue
 			}
+			// This is a global IPv6 address.
 			status.Enabled = true
 			status.Address = ip.String()
 			break
 		}
 	}
 
-	// TCP6 dial to Cloudflare's anycast DNS — tests reachability
-	// without address discovery.
+	// Stage 2: test public reachability via TCP6 dial.
+	// We use Cloudflare's anycast DNS address (well-known, always up).
+	// A 3s timeout keeps the check snappy even on slow links.
 	dialer := net.Dialer{Timeout: 3 * time.Second}
 	conn, err := dialer.Dial("tcp6", "[2606:4700:4700::1111]:443")
 	if err == nil {
 		conn.Close()
 		status.Reachable = true
+		// If we didn't find a global address on the interfaces but
+		// can still dial out via IPv6, the container is likely using
+		// host networking or an IPv6-enabled bridge. Mark enabled.
 		status.Enabled = true
 	}
 
@@ -127,9 +82,8 @@ func CheckIPv6() IPv6Status {
 }
 
 // LocalIPv6Address returns the first global-scope IPv6 address on any
-// interface, or "" if none. Note: in a Docker container this returns
-// the container's internal address, NOT the host's public address.
-// For the public address, use CheckIPv6().Address instead.
+// interface, or "" if none. This is exposed separately for callers that
+// only need the address without running the full reachability check.
 func LocalIPv6Address() string {
 	addrs, err := net.InterfaceAddrs()
 	if err != nil {
