@@ -197,7 +197,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
     const onWebRTCFallback = transport === "auto" ? () => setPath("hls") : undefined;
 
     return (
-        <Card className="overflow-hidden">
+        <Card className="glass glass-glow glass-hover-lift rounded-2xl overflow-hidden">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-100">
                     {camera.name}
@@ -217,7 +217,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                      * the live path badge so the relationship
                      * (selection → resolved path) is obvious. */}
                     <div
-                        className="inline-flex h-6 items-center rounded-md border border-slate-700 bg-slate-900/40 p-0.5 text-[10px]"
+                        className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
                         role="radiogroup"
                         aria-label="Live stream transport"
                     >
@@ -230,10 +230,10 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                                     aria-checked={active}
                                     onClick={() => setTransport(t)}
                                     className={cn(
-                                        "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-colors",
+                                        "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
                                         active
-                                            ? "bg-sky-500/20 text-sky-300 shadow-sm"
-                                            : "text-slate-500 hover:text-slate-300",
+                                            ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
+                                            : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
                                     )}
                                     title={
                                         t === "auto"
@@ -278,7 +278,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                         />
                     )}
                     {eventToast && (
-                        <div className="absolute right-2 top-2 rounded-md bg-rose-500/80 px-2 py-1 text-xs font-semibold text-white shadow-lg">
+                        <div className="absolute right-2 top-2 rounded-lg backdrop-blur-xl bg-black/50 px-3 py-1.5 text-xs font-semibold text-white shadow-lg border border-white/10">
                             {eventToast}
                         </div>
                     )}
@@ -294,6 +294,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             disabled={!isAdmin || busy || !camera.capabilities.ptz}
                             onClick={() => sendPTZ("up")}
                             aria-label="PTZ up"
+                            className="glass-subtle hover:bg-white/10"
                         >
                             <ChevronUp size={16} />
                         </Button>
@@ -304,6 +305,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             disabled={!isAdmin || busy || !camera.capabilities.ptz}
                             onClick={() => sendPTZ("left")}
                             aria-label="PTZ left"
+                            className="glass-subtle hover:bg-white/10"
                         >
                             <ChevronLeft size={16} />
                         </Button>
@@ -313,6 +315,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             disabled={!isAdmin || busy}
                             onClick={() => sendPTZ("stop")}
                             aria-label="PTZ stop"
+                            className="glass-subtle hover:bg-white/10"
                         >
                             <Square size={14} />
                         </Button>
@@ -322,6 +325,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             disabled={!isAdmin || busy || !camera.capabilities.ptz}
                             onClick={() => sendPTZ("right")}
                             aria-label="PTZ right"
+                            className="glass-subtle hover:bg-white/10"
                         >
                             <ChevronRight size={16} />
                         </Button>
@@ -332,6 +336,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             disabled={!isAdmin || busy || !camera.capabilities.ptz}
                             onClick={() => sendPTZ("down")}
                             aria-label="PTZ down"
+                            className="glass-subtle hover:bg-white/10"
                         >
                             <ChevronDown size={16} />
                         </Button>
@@ -346,6 +351,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                                 variant="outline"
                                 disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("zoom_in")}
+                                className="glass-subtle hover:bg-white/10"
                             >
                                 <ZoomIn size={14} className="mr-1" />
                                 Zoom+
@@ -355,6 +361,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                                 variant="outline"
                                 disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("zoom_out")}
+                                className="glass-subtle hover:bg-white/10"
                             >
                                 <ZoomOut size={14} className="mr-1" />
                                 Zoom-
@@ -375,6 +382,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                                         variant="secondary"
                                         disabled={!isAdmin || busy}
                                         onClick={() => sendPreset(alias)}
+                                        className="glass-subtle hover:bg-white/10"
                                     >
                                         {alias}
                                     </Button>
@@ -382,7 +390,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage }: LiveVideoProps) {
                             </div>
                         )}
                         {ptzError && (
-                            <p className="text-xs text-rose-300">{ptzError}</p>
+                            <p className="text-xs text-[rgb(var(--accent-danger))]">{ptzError}</p>
                         )}
                         {lastSeen && (
                             <p className="text-[10px] text-slate-500">
@@ -504,7 +512,7 @@ function VideoSurface({
                         <Button
                             size="sm"
                             variant="outline"
-                            className="mt-2"
+                            className="mt-2 glass-subtle hover:bg-white/10"
                             onClick={onRetry}
                         >
                             <RefreshCw className="mr-1 h-3 w-3" />
@@ -519,7 +527,7 @@ function VideoSurface({
 
 function Overlay({ children }: { children: React.ReactNode }) {
     return (
-        <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/60 text-slate-300">
+        <div className="absolute inset-0 flex flex-col items-center justify-center backdrop-blur-xl bg-black/50 text-slate-300">
             {children}
         </div>
     );

@@ -172,7 +172,7 @@ export default function DeviceCreate() {
     // of the UI ("you don't have permission to use this form").
     if (!isAdmin) {
         return (
-            <div className="space-y-4">
+            <div className="animate-fade-in space-y-4">
                 <PageHeader onBack={() => nav("/cameras")} />
                 <Card>
                     <CardContent className="p-8 text-center text-sm text-slate-400">
@@ -218,7 +218,7 @@ export default function DeviceCreate() {
     }
 
     return (
-        <div className="mx-auto max-w-3xl space-y-6">
+        <div className="animate-fade-in mx-auto max-w-3xl space-y-6">
             <PageHeader onBack={() => nav("/cameras")} />
 
             {/* Success state — replaces the form after a successful submit.
@@ -249,7 +249,7 @@ export default function DeviceCreate() {
             ) : (
                 <form className="space-y-6" onSubmit={onSubmit}>
                     {submit.kind === "err" && (
-                        <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-200">
+                        <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
                             {submit.message}
                         </div>
                     )}
@@ -428,7 +428,7 @@ export default function DeviceCreate() {
                                     on={(transcode) => setDraft({ ...draft, transcode })}
                                 />
                             </div>
-                            <div className="rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2">
+                            <div className="glass-subtle rounded-xl p-4">
                                 <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-slate-500">
                                     <Badge variant="info" className="text-[9px]">RTSP</Badge>
                                     <span>will be sent to go2rtc as</span>
@@ -503,7 +503,7 @@ function Field({
 
 function Toggle({ label, v, on }: { label: string; v: boolean; on: (v: boolean) => void }) {
     return (
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-slate-700 bg-slate-950/40 px-3 py-1.5 text-xs">
+        <label className="glass-subtle rounded-xl inline-flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs">
             <input type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} />
             {label}
         </label>

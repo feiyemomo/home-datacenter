@@ -1,28 +1,16 @@
 /** @type {import('tailwindcss').Config} */
 export default {
-  // Theme is driven by a `data-theme` attribute on <html> (set
-  // by useTheme). We no longer rely on Tailwind's default `.dark`
-  // class for the palette — the slate colors are themselves
-  // backed by CSS variables that flip when the attribute changes,
-  // so the existing `slate-XXX` classes just work in both modes.
   darkMode: ["selector", '[data-theme="dark"]'],
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   theme: {
     extend: {
       colors: {
-        // Backwards-compatible: the four surface tokens. Light
-        // mode uses near-white / slate-50; dark mode uses the
-        // original navy / slate palette. See index.css for the
-        // CSS variable bindings.
         surface: {
           DEFAULT: "rgb(var(--bg) / <alpha-value>)",
           raised: "rgb(var(--bg-raised) / <alpha-value>)",
           subtle: "rgb(var(--bg-subtle) / <alpha-value>)",
           border: "rgb(var(--border) / <alpha-value>)",
         },
-        // Page foreground / muted text. Components use these
-        // instead of `text-slate-100` / `text-slate-500` so the
-        // color auto-flips.
         fg: {
           DEFAULT: "rgb(var(--fg) / <alpha-value>)",
           muted: "rgb(var(--fg-muted) / <alpha-value>)",
@@ -30,24 +18,38 @@ export default {
           inverted: "rgb(var(--fg-inverted) / <alpha-value>)",
         },
       },
-      // Slate palette -> CSS variables. We define the full range
-      // (50-950) so the existing `slate-XXX` utility classes
-      // resolve to the right color in either theme. Light mode
-      // values are chosen to be a slate-leaning grayscale (not
-      // pure white) so cards/borders still read as "elevated
-      // surfaces" against the background.
-      // The literal slate values are NOT imported from Tailwind
-      // defaults; they're declared via the `colors` block below.
-      // We use `colors: { ... }` to OVERRIDE the default slate.
       fontFamily: {
         sans: ["Inter", "system-ui", "sans-serif"],
         mono: ["JetBrains Mono", "ui-monospace", "monospace"],
       },
+      backdropBlur: {
+        xs: "2px",
+      },
+      animation: {
+        "glass-shimmer": "glass-shimmer 3s ease-in-out infinite",
+        "fade-in": "fade-in 0.3s ease-out",
+        "slide-in": "slide-in 0.25s ease-out",
+        "scale-in": "scale-in 0.2s ease-out",
+      },
+      keyframes: {
+        "glass-shimmer": {
+          "0%, 100%": { opacity: "0.4" },
+          "50%": { opacity: "0.7" },
+        },
+        "fade-in": {
+          from: { opacity: "0", transform: "translateY(8px)" },
+          to: { opacity: "1", transform: "translateY(0)" },
+        },
+        "slide-in": {
+          from: { opacity: "0", transform: "translateX(-12px)" },
+          to: { opacity: "1", transform: "translateX(0)" },
+        },
+        "scale-in": {
+          from: { opacity: "0", transform: "scale(0.95)" },
+          to: { opacity: "1", transform: "scale(1)" },
+        },
+      },
     },
-    // Override the default `slate` palette so every `bg-slate-*`
-    // / `text-slate-*` / `border-slate-*` class picks up theme
-    // via CSS variables. Without this, slate-* is always the
-    // dark palette baked into Tailwind's generated CSS.
     colors: {
       transparent: "transparent",
       current: "currentColor",

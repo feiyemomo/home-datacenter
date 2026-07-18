@@ -1,0 +1,36 @@
+# Cloudflare Tunnel configuration for Home Datacenter
+#
+# Config-file mode: ingress rules are defined locally in this file,
+# NOT managed remotely in the Zero Trust dashboard. This avoids
+# requiring dashboard access for every hostname change.
+#
+# credentials.json (next to this file) contains the AccountTag,
+# TunnelID, and TunnelSecret extracted from the tunnel token. Both
+# files are bind-mounted into the cloudflared container at
+# /etc/cloudflared/ (see compose.yaml).
+
+tunnel: 663e45da-2140-4b42-8dbc-b65da7b5956a
+credentials-file: /etc/cloudflared/credentials.json
+
+# All three public hostnames route through nginx (home-web:80).
+# nginx handles path-based routing:
+#   /          → SPA (static React build)
+#   /api/      → home-api:8080 (REST API)
+#   /go2rtc/   → home-frigate:1984 (HLS + WebRTC SDP, JWT-gated)
+#   /frigate/  → home-frigate:5000 (Frigate UI, JWT-gated)
+#
+# Routing through nginx (not directly to each backend) ensures:
+#   1. auth_request enforces JWT on /go2rtc/ and /frigate/ — go2rtc
+#      and Frigate have no built-in auth, so direct exposure would
+#      leak camera feeds.
+#   2. CORS headers are handled uniformly.
+#   3. Future backend changes only need an nginx.conf edit, not a
+#      tunnel config change.
+ingress:
+  - hostname: dashboard.feiyemomo.top
+    service: http://home-web:80
+  - hostname: api.feiyemomo.top
+    service: http://home-web:80
+  - hostname: cam.feiyemomo.top
+    service: http://home-web:80
+  - service: http_status:404

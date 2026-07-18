@@ -173,7 +173,7 @@ export default function Devices() {
     }
 
     return (
-        <div className="space-y-6">
+        <div className="animate-fade-in space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                     <h2 className="text-lg font-semibold text-slate-100">Devices</h2>
@@ -197,7 +197,7 @@ export default function Devices() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
                     {error}
                 </div>
             )}
@@ -215,7 +215,7 @@ export default function Devices() {
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
-                            <thead className="border-b border-slate-800 bg-slate-950/40 text-xs uppercase tracking-wider text-slate-500">
+                            <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-slate-500">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">User</th>
@@ -225,7 +225,7 @@ export default function Devices() {
                                     <th className="px-4 py-3 text-right font-medium">Actions</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-800/70">
+                            <tbody className="divide-[rgb(var(--border)/0.3)]">
                                 {devices.length === 0 && !loading && (
                                     <tr>
                                         <td
@@ -243,7 +243,7 @@ export default function Devices() {
                                         <tr
                                             key={d.id}
                                             className={cn(
-                                                "transition-colors hover:bg-slate-800/30",
+                                                "transition-colors hover:bg-[rgb(var(--bg-subtle)/0.3)]",
                                                 isRevoked && "opacity-60",
                                             )}
                                         >
@@ -251,10 +251,10 @@ export default function Devices() {
                                                 <div className="flex items-center gap-3">
                                                     <div
                                                         className={cn(
-                                                            "flex h-8 w-8 items-center justify-center rounded-md",
+                                                            "flex h-8 w-8 items-center justify-center rounded-xl",
                                                             isRevoked
                                                                 ? "bg-slate-800 text-slate-500"
-                                                                : "bg-sky-500/10 text-sky-300 ring-1 ring-inset ring-sky-500/30",
+                                                                : "bg-gradient-to-br from-[rgb(var(--accent-primary)/0.3)] to-[rgb(var(--accent-warm)/0.2)] text-sky-300",
                                                         )}
                                                     >
                                                         <HardDrive size={15} />
@@ -375,7 +375,7 @@ function EventLog({ lastMessage }: { lastMessage: WsMessage | null }) {
             {entries.map((m, i) => (
                 <li
                     key={`${m.ts}-${i}`}
-                    className="flex items-start gap-2 rounded bg-slate-950/60 px-3 py-2"
+                    className="glass-subtle rounded-lg flex items-start gap-2 px-3 py-2"
                 >
                     <span className="text-slate-500">
                         {new Date(m.ts * 1000).toLocaleTimeString()}

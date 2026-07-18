@@ -11,12 +11,6 @@ interface LocationState {
     from?: string;
 }
 
-/**
- * Login screen.
- *
- * Collects user_id (number) + access_key (string), calls /auth/bind,
- * then redirects to the originally requested route (or /dashboard).
- */
 export default function Login() {
     const { login, token } = useAuth();
     const navigate = useNavigate();
@@ -28,7 +22,6 @@ export default function Login() {
     const [error, setError] = useState<string | null>(null);
     const [submitting, setSubmitting] = useState(false);
 
-    // Already authenticated -> bounce to the app.
     if (token) {
         return <Navigate to={from} replace />;
     }
@@ -68,17 +61,18 @@ export default function Login() {
 
     return (
         <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-surface px-4">
-            {/* Ambient background glow */}
-            <div className="pointer-events-none absolute -top-32 -left-32 h-96 w-96 rounded-full bg-sky-500/10 blur-3xl" />
-            <div className="pointer-events-none absolute -bottom-32 -right-32 h-96 w-96 rounded-full bg-indigo-500/10 blur-3xl" />
+            {/* Ambient orbs */}
+            <div className="orb orb-warm" style={{ width: 500, height: 500, top: -150, left: -150 }} />
+            <div className="orb orb-cool" style={{ width: 400, height: 400, bottom: -100, right: -100 }} />
+            <div className="orb orb-accent" style={{ width: 300, height: 300, top: "50%", left: "60%" }} />
 
-            <Card className="w-full max-w-md">
+            <Card className="w-full max-w-md animate-scale-in">
                 <CardHeader className="items-center text-center">
-                    <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-xl bg-gradient-to-br from-sky-500 to-indigo-600 text-white shadow-lg shadow-sky-500/30">
-                        <Server size={24} />
+                    <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-primary)/0.6)] to-[rgb(var(--accent-warm)/0.4)] text-white glass-glow">
+                        <Server size={26} />
                     </div>
                     <CardTitle className="text-base">Sign in to Home Datacenter</CardTitle>
-                    <p className="text-xs text-slate-500">
+                    <p className="text-xs text-fg-muted">
                         Bind this browser to an existing device credential.
                     </p>
                 </CardHeader>
@@ -90,7 +84,7 @@ export default function Login() {
                             <div className="relative">
                                 <UserIcon
                                     size={16}
-                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500"
+                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fg-subtle"
                                 />
                                 <Input
                                     id="user_id"
@@ -113,7 +107,7 @@ export default function Login() {
                             <div className="relative">
                                 <KeyRound
                                     size={16}
-                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-500"
+                                    className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-fg-subtle"
                                 />
                                 <Input
                                     id="access_key"
@@ -129,7 +123,7 @@ export default function Login() {
                         </div>
 
                         {error && (
-                            <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                            <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))] animate-fade-in">
                                 {error}
                             </div>
                         )}
@@ -150,7 +144,7 @@ export default function Login() {
                         </Button>
                     </form>
 
-                    <p className="mt-4 text-center text-[11px] text-slate-600">
+                    <p className="mt-4 text-center text-[11px] text-fg-subtle">
                         Tokens are valid for 365 days. Stored locally on this device.
                     </p>
                 </CardContent>

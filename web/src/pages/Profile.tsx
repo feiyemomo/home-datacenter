@@ -76,7 +76,7 @@ export default function Profile() {
     }, [claims, now]);
 
     return (
-        <div className="space-y-6">
+        <div className="animate-fade-in space-y-6">
             <div>
                 <h2 className="text-lg font-semibold text-slate-100">Profile</h2>
                 <p className="text-xs text-slate-500">
@@ -85,7 +85,7 @@ export default function Profile() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-300">
+                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
                     {error}
                 </div>
             )}
@@ -169,7 +169,7 @@ export default function Profile() {
                                 <div className="mb-1 text-xs uppercase tracking-wider text-slate-500">
                                     Raw token
                                 </div>
-                                <div className="max-h-24 overflow-y-auto rounded-md border border-slate-800 bg-slate-950/60 p-2 font-mono text-[11px] break-all text-slate-500">
+                                <div className="glass-subtle rounded-xl max-h-24 overflow-y-auto p-2 font-mono text-[11px] break-all text-slate-500">
                                     {token}
                                 </div>
                             </div>
@@ -191,7 +191,7 @@ export default function Profile() {
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
-                            <thead className="border-b border-slate-800 bg-slate-950/40 text-xs uppercase tracking-wider text-slate-500">
+                            <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-slate-500">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">ID</th>
@@ -200,7 +200,7 @@ export default function Profile() {
                                     <th className="px-4 py-3 font-medium">State</th>
                                 </tr>
                             </thead>
-                            <tbody className="divide-y divide-slate-800/70">
+                            <tbody className="divide-[rgb(var(--border)/0.3)]">
                                 {devices.length === 0 && (
                                     <tr>
                                         <td
@@ -212,7 +212,7 @@ export default function Profile() {
                                     </tr>
                                 )}
                                 {devices.map((d) => (
-                                    <tr key={d.id} className="hover:bg-slate-800/30">
+                                    <tr key={d.id} className="hover:bg-[rgb(var(--bg-subtle)/0.3)]">
                                         <td className="px-4 py-3 font-medium text-slate-200">
                                             {d.device_name}
                                         </td>
@@ -250,7 +250,7 @@ function Row({
     value: React.ReactNode;
 }) {
     return (
-        <div className="flex items-center justify-between gap-4 border-b border-slate-800/60 pb-2 last:border-0 last:pb-0">
+        <div className="flex items-center justify-between gap-4 border-b border-[rgb(var(--border)/0.3)] pb-2 last:border-0 last:pb-0">
             <span className="text-xs uppercase tracking-wider text-slate-500">
                 {label}
             </span>

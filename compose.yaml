@@ -148,6 +148,17 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: home-cloudflared
     restart: unless-stopped
+    # Config-file mode: ingress rules are defined locally in
+    # deploy/cloudflared/config.yaml and the tunnel credentials are
+    # in deploy/cloudflared/credentials.json. This avoids needing
+    # dashboard access to configure Public Hostnames — everything is
+    # in the repo and version-controlled.
+    #
+    # To switch back to token mode (dashboard-managed ingress):
+    #   1. Set CLOUDFLARE_TOKEN in .env
+    #   2. Replace the command below with:
+    #      tunnel --no-autoupdate run --token ${CLOUDFLARE_TOKEN}
+    #   3. Remove the volumes below
     command: tunnel --no-autoupdate --config /etc/cloudflared/config.yaml run
     volumes:
       - ./deploy/cloudflared/config.yaml:/etc/cloudflared/config.yaml:ro
