@@ -27,12 +27,15 @@
 | API | Go 1.26 + Gin | `home-api` | `8080`（仅本地） |
 | Web | React 18 + Vite + Nginx | `home-web` | `80`（仅本地） |
 | MQTT Broker | Eclipse Mosquitto 2 | `home-mosquitto` | 1883（**不对外暴露**） |
-| go2rtc | AlexxIT/go2rtc | `home-go2rtc` | `1984`（仅本地） |
+| NVR / AI Detection | Frigate 0.17 (bundled go2rtc + OpenVINO) | `home-frigate` | `5000` (API) / `1984` (go2rtc)（仅本地） |
 
-Phase 4（摄像头平台化）新增 `home-go2rtc`：所有摄像头的 RTSP 由
-`home-api` 注册并加密入 SQLite，再以**友好名称（如"前门"）**为名推送给
-go2rtc；前端通过 **HLS（主）** 或 **WebRTC（备）** 拉流。详见
-[`docs/platformization.md`](docs/platformization.md)。
+Phase 4（摄像头平台化）新增 go2rtc 桥接服务；Phase 9 升级为 **Frigate 0.17**
+（`home-frigate`）——内置 go2rtc + OpenVINO AI 目标检测 + 24/7 录像。所有摄像头的
+RTSP 由 `home-api` 注册并加密入 SQLite，同时推送给 Frigate 的 go2rtc（用于直播）
+和 Frigate 的检测/录制管道（用于 AI 检测和录像）。前端通过 **HLS（主）** 或
+**WebRTC（备）** 拉流。详见
+[`docs/platformization.md`](docs/platformization.md) 和
+[`docs/ai-context.md`](docs/ai-context.md) 的 Phase 9 一节。
 
 Phase 5（事件驱动 + 自动化引擎）将所有 Device / Camera / MQTT 状态变化统一为
 Event 进入 EventBus，再驱动 WebSocket 推送与 Automation Engine
@@ -76,12 +79,15 @@ list / get 的 scope 过滤）。详见
    │   home-web   │ ◄──────────► │   home-api   │ ◄─────► │ home-mosquitto│
    │  (nginx SPA) │              │ (Go + Gin)   │         │   (broker)   │
    └──────────────┘              └──────┬───────┘         └──────────────┘
-          │                              │ RTSP push             │
-       127.0.0.1:80                 127.0.0.1:8080              │
+          │                              │ config push            │
+       127.0.0.1:80                 127.0.0.1:8080              │ MQTT pub (frigate/#)
           │                              │                ┌──────▼──────┐
-          └────── 外部经 Cloudflare Tunnel 暴露 ────────► │ home-go2rtc │
-                                                           │ :1984      │
-                                                           │ WebRTC/HLS │
+          └────── 外部经 Cloudflare Tunnel 暴露 ────────► │ home-frigate │
+                                                           │ :5000 API   │
+                                                           │ :1984 go2rtc │
+                                                           │ WebRTC/HLS  │
+                                                           │ AI Detection│
+                                                           │ 24/7 Record │
                                                            └────────────┘
 ```
 
@@ -271,7 +277,7 @@ docker exec -it home-mosquitto mosquitto_sub -u home-datacenter -P "$MQTT_PASSWO
 | `home-api` | Up | `127.0.0.1:8080` | Go API（健康检查 `/health`） |
 | `home-web` | Up | `127.0.0.1:80` | Dashboard SPA |
 | `home-mosquitto` | Up | 仅内部 `1883` | MQTT broker |
-| `home-go2rtc` | Up | `127.0.0.1:1984` | 摄像头 RTSP→WebRTC/HLS 桥 |
+| `home-frigate` | Up | `127.0.0.1:5000` / `127.0.0.1:1984` | NVR + AI 检测 + 直播（内置 go2rtc） |
 
 `/api/v1/cameras` 走完后应能看到空列表：
 
@@ -465,8 +471,11 @@ curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
 | `./deploy/mosquitto/mosquitto.conf` | `/mosquitto/config/mosquitto.conf` | Broker 配置（**只读**） |
 | `./deploy/mosquitto/aclfile` | `/mosquitto/config/aclfile` | ACL 文件（**只读**） |
 | `./services/api/configs` | `/configs` | API 配置（**只读**） |
+| `./deploy/frigate/config.yml` | `/config/config.yml` | Frigate 配置（全局设置：detectors、mqtt、go2rtc、record 保留策略；摄像头定义由 home-api 动态推送） |
+| `./data/frigate` | `/media/frigate` | Frigate 数据：录制文件、frigate.db、模型缓存 |
+| `./data/recordings` | `/data/recordings` | Frigate 录制文件（额外挂载点） |
 
-> 注：`go2rtc.yaml` **不**通过 bind mount 挂载，而是在 `deploy/go2rtc/Dockerfile` 中 `COPY` 进镜像，以保证 go2rtc 可在运行时改写该文件（Windows Docker Desktop 的单文件 bind mount 可能导致静默写入失败）。详见 `docs/platformization.md` 的 "go2rtc API integration" 一节。
+> 注：go2rtc 现在内置在 Frigate 容器中，不再使用独立的 `home-go2rtc` 容器。摄像头配置由 home-api 通过 `PUT /api/config/set` 推送给 Frigate，不要手动编辑 config.yml 中的 cameras 段（会被覆盖）。
 
 ### 备份建议
 

@@ -103,6 +103,7 @@ type FrigateInput struct {
 
 type FrigateDetect struct {
 	Enabled bool `yaml:"enabled" json:"enabled"`
+	FPS     int  `yaml:"fps" json:"fps"`
 }
 
 // FrigateRecord controls Frigate's NVR-style continuous recording.
