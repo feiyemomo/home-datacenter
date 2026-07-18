@@ -136,7 +136,7 @@ export default function MqttDebug() {
     }
 
     return (
-        <div className="space-y-6">
+        <div className="animate-fade-in space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                     <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-100">
@@ -187,8 +187,8 @@ export default function MqttDebug() {
                                             className={cn(
                                                 "rounded-full border px-2.5 py-1 text-[11px] font-mono transition-colors",
                                                 topic === t
-                                                    ? "border-sky-500/50 bg-sky-500/10 text-sky-300"
-                                                    : "border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-200",
+                                                    ? "border-[rgb(var(--accent-primary)/0.5)] bg-[rgb(var(--accent-primary)/0.1)] text-sky-300"
+                                                    : "border-[rgb(var(--border)/0.3)] text-slate-400 hover:border-slate-500 hover:text-slate-200",
                                             )}
                                         >
                                             {t}
@@ -271,12 +271,12 @@ export default function MqttDebug() {
                             </div>
 
                             {error && (
-                                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
                                     {error}
                                 </div>
                             )}
                             {result && (
-                                <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-xs text-emerald-300">
+                                <div className="rounded-xl glass bg-[rgb(var(--accent-success)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-success))]">
                                     Published to <code className="font-mono">{result.topic}</code>{" "}
                                     (qos {result.qos}).
                                 </div>
@@ -305,7 +305,7 @@ export default function MqttDebug() {
                         </Button>
                     </CardHeader>
                     <CardContent className="flex-1">
-                        <div className="h-[420px] overflow-y-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
+                        <div className="glass-subtle rounded-xl h-[420px] overflow-y-auto p-2">
                             {log.length === 0 ? (
                                 <p className="p-4 text-xs text-slate-500">
                                     No events yet. The server pushes heartbeat, online_list, and
@@ -316,7 +316,7 @@ export default function MqttDebug() {
                                     {log.map((entry, i) => (
                                         <li
                                             key={`${entry.ts}-${i}`}
-                                            className="rounded bg-slate-900/40 px-2 py-1.5 font-mono text-[11px]"
+                                            className="glass-subtle rounded-lg px-2 py-1.5 font-mono text-[11px]"
                                         >
                                             <div className="flex items-center gap-2">
                                                 <span className="text-slate-500">

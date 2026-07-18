@@ -34,27 +34,41 @@ interface StatCardProps {
     hint?: React.ReactNode;
 }
 
-const accentClasses: Record<StatCardProps["accent"], string> = {
-    sky: "from-sky-500/20 to-sky-500/0 text-sky-700 dark:text-sky-300 ring-sky-500/30",
-    emerald:
-        "from-emerald-500/20 to-emerald-500/0 text-emerald-700 dark:text-emerald-300 ring-emerald-500/30",
-    amber: "from-amber-500/20 to-amber-500/0 text-amber-700 dark:text-amber-300 ring-amber-500/30",
-    violet:
-        "from-violet-500/20 to-violet-500/0 text-violet-700 dark:text-violet-300 ring-violet-500/30",
+const accentClasses: Record<StatCardProps["accent"], { gradient: string; iconBg: string; text: string }> = {
+    sky: {
+        gradient: "from-[rgb(var(--accent-info)/0.15)] to-[rgb(var(--accent-info)/0)]",
+        iconBg: "bg-[rgb(var(--accent-info)/0.15)] ring-[rgb(var(--accent-info)/0.3)] text-[rgb(var(--accent-info))]",
+        text: "text-[rgb(var(--accent-info))]",
+    },
+    emerald: {
+        gradient: "from-[rgb(var(--accent-success)/0.15)] to-[rgb(var(--accent-success)/0)]",
+        iconBg: "bg-[rgb(var(--accent-success)/0.15)] ring-[rgb(var(--accent-success)/0.3)] text-[rgb(var(--accent-success))]",
+        text: "text-[rgb(var(--accent-success))]",
+    },
+    amber: {
+        gradient: "from-[rgb(var(--accent-warm)/0.15)] to-[rgb(var(--accent-warm)/0)]",
+        iconBg: "bg-[rgb(var(--accent-warm)/0.15)] ring-[rgb(var(--accent-warm)/0.3)] text-[rgb(var(--accent-warm))]",
+        text: "text-[rgb(var(--accent-warm))]",
+    },
+    violet: {
+        gradient: "from-[rgb(var(--accent-primary)/0.15)] to-[rgb(var(--accent-warm)/0)]",
+        iconBg: "bg-[rgb(var(--accent-primary)/0.15)] ring-[rgb(var(--accent-primary)/0.3)] text-[rgb(var(--accent-primary))]",
+        text: "text-[rgb(var(--accent-primary))]",
+    },
 };
 
 function StatCard({ label, value, icon, accent, hint }: StatCardProps) {
     return (
         <Card className="relative overflow-hidden">
             <div
-                className={`pointer-events-none absolute inset-0 bg-gradient-to-br ${accentClasses[accent].split(" ")[0]} ${accentClasses[accent].split(" ")[1]}`}
+                className={`pointer-events-none absolute inset-0 bg-gradient-to-br ${accentClasses[accent].gradient}`}
             />
             <CardHeader className="relative flex-row items-center justify-between pb-2">
                 <CardTitle className="text-xs uppercase tracking-wider text-fg-muted">
                     {label}
                 </CardTitle>
                 <div
-                    className={`flex h-9 w-9 items-center justify-center rounded-lg bg-surface-subtle ring-1 ring-inset ${accentClasses[accent].split(" ").slice(2).join(" ")}`}
+                    className={`flex h-9 w-9 items-center justify-center rounded-xl ring-1 ring-inset ${accentClasses[accent].iconBg}`}
                 >
                     {icon}
                 </div>
@@ -131,9 +145,11 @@ export default function Dashboard() {
 
     return (
         <div className="space-y-6">
-            <div className="flex items-center justify-between">
+            <div className="animate-fade-in flex items-center justify-between">
                 <div>
-                    <h2 className="text-lg font-semibold text-fg">Dashboard</h2>
+                    <h2 className="text-lg font-semibold text-fg">
+                        Dashboard
+                    </h2>
                     <p className="text-xs text-fg-muted">
                         Live system metrics, refreshed every 5 seconds.
                     </p>
@@ -143,7 +159,7 @@ export default function Dashboard() {
                 ) : (
                     <Badge variant={error ? "danger" : "success"}>
                         <span
-                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-rose-500 dark:bg-rose-400" : "bg-emerald-500 dark:bg-emerald-400"}`}
+                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-rose-400" : "bg-emerald-400"}`}
                         />
                         {error ? "error" : "live"}
                     </Badge>
@@ -151,12 +167,12 @@ export default function Dashboard() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
+                <div className="animate-fade-in glass rounded-2xl bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-sm text-[rgb(var(--accent-danger))]">
                     {error}
                 </div>
             )}
 
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            <div className="animate-fade-in grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <StatCard
                     label="Online Devices"
                     value={String(onlineCount)}
@@ -173,7 +189,8 @@ export default function Dashboard() {
                 />
                 <StatCard
                     label="MQTT Status"
-                    value={status ? (status.mqtt_connected ? "Connected" : "Down") : "—"}
+                    value={status ? (status.mqtt_connected ? "Connected" : "Down") : "—"
+                    }
                     icon={
                         status?.mqtt_connected ? <Wifi size={18} /> : <WifiOff size={18} />
                     }
@@ -191,7 +208,8 @@ export default function Dashboard() {
                 />
                 <StatCard
                     label="WS Clients"
-                    value={status ? String(status.ws_clients) : "—"}
+                    value={status ? String(status.ws_clients) : "—"
+                    }
                     icon={<Radio size={18} />}
                     accent="sky"
                     hint="connected app clients"
@@ -212,7 +230,7 @@ export default function Dashboard() {
             </div>
 
             {/* Network quality summary */}
-            <Card>
+            <Card className="animate-fade-in">
                 <CardHeader className="flex-row items-center justify-between pb-2">
                     <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
                         <Globe size={16} /> Network Quality
@@ -225,7 +243,7 @@ export default function Dashboard() {
                                     size={14}
                                     className={
                                         n <= netStatus.quality
-                                            ? "fill-amber-400 text-amber-400"
+                                            ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
                                             : "fill-none text-fg-subtle"
                                     }
                                 />
@@ -243,8 +261,8 @@ export default function Dashboard() {
                                 </span>
                                 {netStatus && netStatus.strategy !== netStatus.initial && (
                                     <>
-                                        <ArrowUp size={14} className="text-sky-500" />
-                                        <span className="text-sm text-sky-600 dark:text-sky-400">
+                                        <ArrowUp size={14} className="text-[rgb(var(--accent-info))]" />
+                                        <span className="text-sm text-[rgb(var(--accent-info))]">
                                             upgradable to{" "}
                                             {netStatus.strategy === "ipv6_direct"
                                                 ? "IPv6 Direct"
@@ -294,7 +312,7 @@ export default function Dashboard() {
                 </CardContent>
             </Card>
 
-            <Card>
+            <Card className="animate-fade-in">
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
                         <Server size={16} /> System snapshot
@@ -304,7 +322,7 @@ export default function Dashboard() {
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
-                    <pre className="overflow-x-auto rounded-lg border border-surface-border bg-surface-subtle/50 p-4 text-xs leading-relaxed text-fg">
+                    <pre className="glass-subtle overflow-x-auto rounded-2xl p-4 text-xs leading-relaxed text-fg">
                         {status ? JSON.stringify(status, null, 2) : "// no data yet"}
                     </pre>
                 </CardContent>

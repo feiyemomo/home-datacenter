@@ -87,10 +87,10 @@ export default function Cameras() {
     }
 
     return (
-        <div className="space-y-4">
+        <div className="space-y-4 animate-fade-in">
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                    <CameraIcon className="h-5 w-5 text-sky-600 dark:text-sky-300" />
+                    <CameraIcon className="h-5 w-5 text-[rgb(var(--accent-primary))]" />
                     <h2 className="text-lg font-semibold text-fg">Cameras</h2>
                     <Badge variant="outline">{cams.length}</Badge>
                 </div>
@@ -109,7 +109,7 @@ export default function Cameras() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-sm text-rose-700 dark:text-rose-200">
+                <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-3 py-2 text-sm">
                     {error}
                 </div>
             )}
@@ -128,7 +128,7 @@ export default function Cameras() {
                             />
                         ))}
                         {cams.length === 0 && !loading && (
-                            <div className="col-span-full rounded-md border border-dashed border-surface-border p-8 text-center text-sm text-fg-muted">
+                            <div className="col-span-full glass rounded-2xl p-8 text-center text-sm text-fg-muted animate-fade-in">
                                 No cameras registered. {isAdmin ? "Click Register to add one." : "Ask an admin to register one."}
                             </div>
                         )}
@@ -193,9 +193,9 @@ function CamCard({
     const badgeLabel = codecBadgeLabel(cam);
 
     return (
-        <div className="flex flex-col overflow-hidden rounded-xl border border-surface-border bg-surface-raised shadow-sm shadow-black/5 transition-shadow hover:shadow-md hover:shadow-black/10 dark:bg-surface-raised/90 dark:shadow-black/20 dark:hover:shadow-black/30">
+        <div className="flex flex-col overflow-hidden glass glass-glow glass-hover-lift rounded-2xl animate-fade-in">
             {/* Header */}
-            <div className="flex items-center justify-between gap-3 border-b border-surface-border bg-surface-subtle/40 px-4 py-3">
+            <div className="flex items-center justify-between gap-3 glass-subtle rounded-t-2xl px-4 py-3">
                 <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                         <h3 className="truncate text-sm font-semibold text-fg">
@@ -209,7 +209,7 @@ function CamCard({
                         {cam.vendor} · {cam.host}
                     </p>
                     {codecError && (
-                        <p className="mt-0.5 truncate text-[10px] text-rose-600 dark:text-rose-300" title={codecError}>
+                        <p className="mt-0.5 truncate text-[10px] text-[rgb(var(--accent-danger))]" title={codecError}>
                             codec: {codecError}
                         </p>
                     )}
@@ -223,7 +223,7 @@ function CamCard({
                                 disabled={codecLoading}
                                 aria-label="Output codec"
                                 title="Output codec (H.264 required for WebRTC)"
-                                className="h-7 w-[104px] rounded-md px-1.5 py-0 text-[11px]"
+                                className="glass-subtle rounded-lg h-7 w-[104px] px-1.5 py-0 text-[11px]"
                             >
                                 {currentCodec !== "h264" && (
                                     <option value={currentCodec} disabled>
@@ -242,7 +242,7 @@ function CamCard({
                     </Badge>
                     {isAdmin && (
                         <button
-                            className="rounded-md p-1.5 text-fg-subtle transition-colors hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-300"
+                            className="rounded-md p-1.5 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
                             onClick={onDelete}
                             aria-label="Delete camera"
                             title="Delete camera"
@@ -402,7 +402,7 @@ function RecordingPanel({
     }
 
     return (
-        <div className="border-t border-surface-border bg-surface-subtle/30">
+        <div className="glass rounded-b-2xl">
             {/* Header row: always-visible recording toggle + collapse button.
                 The recording switch lives here (not inside the collapsible
                 body) so the operator can start/stop recording without
@@ -452,7 +452,7 @@ function RecordingPanel({
             {open && (
                 <div className="space-y-2 px-4 pb-3 pt-1">
                     {error && (
-                        <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-2.5 py-1.5 text-[11px] text-rose-700 dark:text-rose-200">
+                        <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-2.5 py-1.5 text-[11px]">
                             {error}
                         </div>
                     )}
@@ -486,7 +486,7 @@ function RecordingPanel({
                                 {recordings.map((rec) => (
                                     <li
                                         key={rec.id}
-                                        className="flex items-center gap-2 rounded-md border border-surface-border bg-surface-raised/60 px-2 py-1.5 text-[11px]"
+                                        className="flex items-center gap-2 glass-subtle rounded-lg px-2 py-1.5 text-[11px] hover:bg-[rgb(var(--bg-subtle)/0.3)] transition-colors"
                                     >
                                         <div className="min-w-0 flex-1">
                                             <div className="truncate font-medium text-fg">
@@ -500,7 +500,7 @@ function RecordingPanel({
                                             <button
                                                 type="button"
                                                 onClick={onStopPlay}
-                                                className="inline-flex h-6 items-center gap-1 rounded-md border border-surface-border bg-surface-subtle px-2 text-[10px] text-fg-muted transition-colors hover:text-fg"
+                                                className="inline-flex h-6 items-center gap-1 rounded-md glass-subtle px-2 text-[10px] text-fg-muted transition-colors hover:text-fg"
                                                 title="停止播放"
                                             >
                                                 <Square size={10} />
@@ -511,7 +511,7 @@ function RecordingPanel({
                                                 type="button"
                                                 onClick={() => onPlay(rec)}
                                                 disabled={fetchingPlay !== null}
-                                                className="inline-flex h-6 items-center gap-1 rounded-md bg-sky-500/15 px-2 text-[10px] text-sky-700 transition-colors hover:bg-sky-500/25 disabled:opacity-50 dark:text-sky-300"
+                                                className="inline-flex h-6 items-center gap-1 rounded-md bg-[rgb(var(--accent-primary)/0.15)] px-2 text-[10px] text-[rgb(var(--accent-primary))] transition-colors hover:bg-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50"
                                                 title="播放"
                                             >
                                                 {fetchingPlay === rec.id ? (
@@ -526,7 +526,7 @@ function RecordingPanel({
                                             <button
                                                 type="button"
                                                 onClick={() => onDeleteRec(rec)}
-                                                className="inline-flex h-6 items-center justify-center rounded-md p-1 text-fg-subtle transition-colors hover:bg-rose-500/10 hover:text-rose-600 dark:hover:text-rose-300"
+                                                className="inline-flex h-6 items-center justify-center rounded-md p-1 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
                                                 aria-label="Delete recording"
                                                 title="删除录制"
                                             >
@@ -541,7 +541,7 @@ function RecordingPanel({
 
                     {/* Inline video player */}
                     {videoUrl && playingId !== null && (
-                        <div className="overflow-hidden rounded-md border border-surface-border bg-black">
+                        <div className="overflow-hidden rounded-lg glass border border-white/10 bg-black">
                             <video
                                 key={videoUrl}
                                 src={videoUrl}

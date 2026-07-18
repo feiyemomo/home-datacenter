@@ -3,18 +3,18 @@ import { cn } from "@/lib/utils";
 
 export interface InputProps extends InputHTMLAttributes<HTMLInputElement> { }
 
-/** Single-line text/number/password input. */
 export const Input = forwardRef<HTMLInputElement, InputProps>(
     ({ className, type = "text", ...props }, ref) => (
         <input
             ref={ref}
             type={type}
             className={cn(
-                "flex h-9 w-full rounded-lg border border-surface-border bg-white px-3 py-1 text-sm text-fg dark:bg-surface-raised",
+                "flex h-9 w-full rounded-xl px-3 py-1 text-sm text-fg",
+                "glass-subtle",
                 "placeholder:text-fg-subtle",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:border-transparent",
-                "disabled:cursor-not-allowed disabled:opacity-50",
-                "transition-colors",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-primary)/0.5)] focus-visible:bg-[rgb(var(--glass-bg)/0.5)]",
+                "disabled:cursor-not-allowed disabled:opacity-40",
+                "transition-all duration-300 ease-out",
                 className,
             )}
             {...props}
@@ -31,11 +31,12 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
         <textarea
             ref={ref}
             className={cn(
-                "flex min-h-[120px] w-full rounded-lg border border-surface-border bg-white px-3 py-2 text-sm text-fg dark:bg-surface-raised",
-                "placeholder:text-fg-subtle font-mono",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:border-transparent",
-                "disabled:cursor-not-allowed disabled:opacity-50",
-                "transition-colors",
+                "flex min-h-[120px] w-full rounded-xl px-3 py-2 text-sm text-fg font-mono",
+                "glass-subtle",
+                "placeholder:text-fg-subtle",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-primary)/0.5)] focus-visible:bg-[rgb(var(--glass-bg)/0.5)]",
+                "disabled:cursor-not-allowed disabled:opacity-40",
+                "transition-all duration-300 ease-out",
                 className,
             )}
             {...props}
@@ -52,9 +53,11 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
         <select
             ref={ref}
             className={cn(
-                "flex h-9 w-full rounded-lg border border-surface-border bg-white px-3 py-1 text-sm text-fg dark:bg-surface-raised",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500 focus-visible:ring-offset-2 focus-visible:ring-offset-surface focus-visible:border-transparent",
-                "disabled:cursor-not-allowed disabled:opacity-50",
+                "flex h-9 w-full rounded-xl px-3 py-1 text-sm text-fg",
+                "glass-subtle",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-primary)/0.5)]",
+                "disabled:cursor-not-allowed disabled:opacity-40",
+                "transition-all duration-300 ease-out",
                 className,
             )}
             {...props}

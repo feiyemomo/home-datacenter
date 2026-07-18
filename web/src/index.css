@@ -3,92 +3,89 @@
 @tailwind utilities;
 
 /* ---------------------------------------------------------------------------
- * Theme variables.
+ * Liquid Glass Design System
  *
- * Two themes (light / dark) selected by `data-theme` on <html>. Tailwind's
- * slate palette is wired up to these variables in tailwind.config.js, so
- * every `slate-XXX` utility class auto-flips when the attribute changes.
- *
- * The light mode is intentionally a cool slate-leaning grayscale (not pure
- * white) so cards / borders / scrollbar tracks still read as distinct
- * surfaces against the background. The dark mode preserves the original
- * navy / slate palette the dashboard was designed around.
- *
- * When adding a new color elsewhere, prefer the semantic `surface` / `fg`
- * tokens over `slate-XXX` — they alias to the variables below and the
- * theme change is automatic.
+ * Warm, cozy, minimalist glassmorphism inspired by frosted glass,
+ * soft gradients, and gentle light refractions. Two themes (light/dark)
+ * selected by `data-theme` on <html>.
  * --------------------------------------------------------------------------- */
 :root,
 [data-theme="light"] {
     color-scheme: light;
-    /* Light mode uses slightly darker backgrounds so white cards
-     * read as elevated surfaces and text doesn't fight with the
-     * background. Foreground tokens stay at least slate-600 for
-     * WCAG AA against the raised white surface. */
-    --bg: 226 232 240;
-    /* slate-200 */
-    --bg-raised: 255 255 255;
-    /* white */
-    --bg-subtle: 241 245 249;
-    /* slate-100 */
-    --border: 203 213 225;
-    /* slate-300 */
-    /* Foreground. */
-    --fg: 15 23 42;
-    /* slate-900 */
-    --fg-muted: 51 65 85;
-    /* slate-700 */
-    --fg-subtle: 100 116 139;
-    /* slate-500 */
-    --fg-inverted: 248 250 252;
-    /* slate-50 (on dark buttons) */
-    /* Slate scale. Mirrors Tailwind's default `slate` palette
-     * values (50 -> 950) so the existing `slate-XXX` utility
-     * classes resolve identically to the default in light mode. */
-    --slate-50: 248 250 252;
-    --slate-100: 241 245 249;
-    --slate-200: 226 232 240;
-    --slate-300: 203 213 225;
-    --slate-400: 148 163 184;
-    --slate-500: 100 116 139;
-    --slate-600: 71 85 105;
-    --slate-700: 51 65 85;
-    --slate-800: 30 41 59;
-    --slate-900: 15 23 42;
-    --slate-950: 2 6 23;
+
+    /* Warm cream / peach tint background */
+    --bg: 245 240 235;
+    --bg-raised: 255 252 248;
+    --bg-subtle: 250 245 240;
+    --border: 225 215 205;
+
+    /* Warm foreground */
+    --fg: 45 40 35;
+    --fg-muted: 100 90 80;
+    --fg-subtle: 140 130 120;
+    --fg-inverted: 250 248 245;
+
+    /* Warm-tinted slate scale */
+    --slate-50: 252 250 248;
+    --slate-100: 248 244 240;
+    --slate-200: 235 228 222;
+    --slate-300: 215 205 195;
+    --slate-400: 175 165 155;
+    --slate-500: 130 120 110;
+    --slate-600: 95 85 75;
+    --slate-700: 70 62 55;
+    --slate-800: 50 44 38;
+    --slate-900: 35 30 26;
+    --slate-950: 20 18 15;
+
+    /* Accent colors - warm pastels */
+    --glass-bg: 255 252 248;
+    --glass-border: 255 255 255;
+    --glass-glow: 255 200 150;
+    --accent-primary: 120 160 200;
+    --accent-warm: 200 140 100;
+    --accent-success: 130 190 150;
+    --accent-danger: 210 130 130;
+    --accent-info: 150 170 210;
 }
 
 [data-theme="dark"] {
     color-scheme: dark;
-    --bg: 11 17 32;
-    /* #0b1120 - navy */
-    --bg-raised: 17 24 39;
-    /* #111827 */
-    --bg-subtle: 30 41 59;
-    /* #1e293b - slate-800 */
-    --border: 51 65 85;
-    /* #334155 - slate-700 */
-    --fg: 241 245 249;
-    /* slate-100 */
-    --fg-muted: 100 116 139;
-    /* slate-500 */
-    --fg-subtle: 71 85 105;
-    /* slate-600 */
-    --fg-inverted: 15 23 42;
-    /* slate-900 */
-    /* Dark-mode slate scale. Tighter contrast (700, 800 are
-     * close to the bg) gives the chrome its "hud" look. */
-    --slate-50: 248 250 252;
-    --slate-100: 241 245 249;
-    --slate-200: 226 232 240;
-    --slate-300: 203 213 225;
-    --slate-400: 148 163 184;
-    --slate-500: 100 116 139;
-    --slate-600: 71 85 105;
-    --slate-700: 51 65 85;
-    --slate-800: 30 41 59;
-    --slate-900: 15 23 42;
-    --slate-950: 2 6 23;
+
+    /* Deep warm navy background */
+    --bg: 18 16 24;
+    --bg-raised: 28 25 38;
+    --bg-subtle: 40 36 52;
+    --border: 60 55 75;
+
+    /* Soft cool-white foreground */
+    --fg: 240 238 245;
+    --fg-muted: 160 155 170;
+    --fg-subtle: 110 105 125;
+    --fg-inverted: 30 28 36;
+
+    /* Warm purple-tinted slate scale */
+    --slate-50: 248 246 252;
+    --slate-100: 240 236 248;
+    --slate-200: 220 214 235;
+    --slate-300: 195 188 210;
+    --slate-400: 160 152 175;
+    --slate-500: 125 118 140;
+    --slate-600: 90 84 108;
+    --slate-700: 65 60 80;
+    --slate-800: 45 40 58;
+    --slate-900: 30 26 40;
+    --slate-950: 16 14 22;
+
+    /* Glass accent - cool purples and warm ambers */
+    --glass-bg: 35 32 50;
+    --glass-border: 80 75 100;
+    --glass-glow: 180 140 255;
+    --accent-primary: 140 130 220;
+    --accent-warm: 220 170 120;
+    --accent-success: 120 200 160;
+    --accent-danger: 220 120 120;
+    --accent-info: 140 160 220;
 }
 
 @layer base {
@@ -102,15 +99,16 @@
     body {
         @apply bg-surface text-fg;
         font-feature-settings: "cv02", "cv03", "cv04", "cv11";
-        /* Smooth transition between themes to avoid the page
-         * "flashing" white on toggle. */
-        transition: background-color 150ms ease, color 150ms ease;
+        transition: background-color 0.5s cubic-bezier(0.4, 0, 0.2, 1),
+                    color 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
     }
 
-    /* Subtle scrollbars that match the active theme. */
+    /* Glassmorphism scrollbar */
     ::-webkit-scrollbar {
-        width: 10px;
-        height: 10px;
+        width: 6px;
+        height: 6px;
     }
 
     ::-webkit-scrollbar-track {
@@ -118,16 +116,109 @@
     }
 
     ::-webkit-scrollbar-thumb {
-        @apply rounded-full bg-slate-700/70;
+        background: rgb(var(--border) / 0.5);
+        border-radius: 99px;
+        backdrop-filter: blur(4px);
     }
 
     ::-webkit-scrollbar-thumb:hover {
-        @apply bg-slate-600;
+        background: rgb(var(--fg-subtle) / 0.4);
     }
 
-    /* Always render <code> in the mono stack. */
     code,
     pre {
         font-family: theme("fontFamily.mono");
+    }
+}
+
+/* ---------------------------------------------------------------------------
+ * Liquid Glass Utility Classes
+ * --------------------------------------------------------------------------- */
+@layer components {
+
+    /* Frosted glass surface */
+    .glass {
+        background: rgb(var(--glass-bg) / 0.6);
+        backdrop-filter: blur(20px) saturate(1.8);
+        -webkit-backdrop-filter: blur(20px) saturate(1.8);
+        border: 1px solid rgb(var(--glass-border) / 0.3);
+    }
+
+    .glass-subtle {
+        background: rgb(var(--glass-bg) / 0.35);
+        backdrop-filter: blur(12px) saturate(1.4);
+        -webkit-backdrop-filter: blur(12px) saturate(1.4);
+        border: 1px solid rgb(var(--glass-border) / 0.15);
+    }
+
+    .glass-strong {
+        background: rgb(var(--glass-bg) / 0.8);
+        backdrop-filter: blur(30px) saturate(2);
+        -webkit-backdrop-filter: blur(30px) saturate(2);
+        border: 1px solid rgb(var(--glass-border) / 0.4);
+    }
+
+    /* Soft glow effect */
+    .glass-glow {
+        box-shadow:
+            0 0 30px rgb(var(--glass-glow) / 0.08),
+            0 4px 20px rgb(0 0 0 / 0.06),
+            inset 0 1px 0 rgb(255 255 255 / 0.15);
+    }
+
+    .glass-glow-hover {
+        box-shadow:
+            0 0 40px rgb(var(--glass-glow) / 0.12),
+            0 8px 32px rgb(0 0 0 / 0.1),
+            inset 0 1px 0 rgb(255 255 255 / 0.2);
+    }
+
+    /* Ambient background orbs */
+    .orb {
+        position: absolute;
+        border-radius: 50%;
+        filter: blur(80px);
+        pointer-events: none;
+        animation: orb-float 20s ease-in-out infinite;
+    }
+
+    .orb-warm {
+        background: rgb(var(--accent-warm) / 0.15);
+    }
+
+    .orb-cool {
+        background: rgb(var(--accent-primary) / 0.12);
+    }
+
+    .orb-accent {
+        background: rgb(var(--glass-glow) / 0.1);
+    }
+}
+
+/* Keyframes not in Tailwind config */
+@keyframes orb-float {
+    0%, 100% { transform: translate(0, 0) scale(1); }
+    25% { transform: translate(20px, -30px) scale(1.05); }
+    50% { transform: translate(-10px, 20px) scale(0.95); }
+    75% { transform: translate(15px, 10px) scale(1.02); }
+}
+
+/* Smooth focus transitions */
+@layer utilities {
+    .glass-transition {
+        transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .glass-hover-lift {
+        transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1),
+                    box-shadow 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+
+    .glass-hover-lift:hover {
+        transform: translateY(-2px);
+        box-shadow:
+            0 0 40px rgb(var(--glass-glow) / 0.15),
+            0 12px 40px rgb(0 0 0 / 0.12),
+            inset 0 1px 0 rgb(255 255 255 / 0.2);
     }
 }

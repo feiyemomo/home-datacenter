@@ -84,7 +84,7 @@ export default function Network() {
         status?.ipv6?.reachable === true && clientIPv6 === true;
 
     return (
-        <div className="space-y-6">
+        <div className="animate-fade-in space-y-6">
             {/* Header */}
             <div className="flex items-center justify-between">
                 <div>
@@ -105,7 +105,7 @@ export default function Network() {
             </div>
 
             {error && (
-                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-4 py-3 text-sm text-rose-700 dark:text-rose-300">
+                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
                     {error}
                 </div>
             )}
@@ -141,7 +141,7 @@ export default function Network() {
                     {status ? (
                         <div className="space-y-3">
                             {/* Step 1: Relay (initial) */}
-                            <div className="flex items-center gap-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 px-4 py-3">
+                            <div className="glass-subtle rounded-xl border-[rgb(var(--accent-success)/0.3)] bg-[rgb(var(--accent-success)/0.05)] flex items-center gap-3 px-4 py-3">
                                 <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-sm font-bold text-white">
                                     1
                                 </div>
@@ -163,10 +163,10 @@ export default function Network() {
 
                             {/* Step 2: Probe & Upgrade */}
                             <div
-                                className={`flex items-center gap-3 rounded-lg border px-4 py-3 ${
+                                className={`glass-subtle rounded-xl flex items-center gap-3 border px-4 py-3 ${
                                     hasUpgrade
-                                        ? "border-sky-500/30 bg-sky-500/5"
-                                        : "border-surface-border bg-surface-subtle/30"
+                                        ? "border-[rgb(var(--accent-primary)/0.3)] bg-[rgb(var(--accent-primary)/0.05)]"
+                                        : "border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-subtle)/0.1)]"
                                 }`}
                             >
                                 <div
@@ -225,7 +225,7 @@ export default function Network() {
                 <CardContent>
                     <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
                         {/* Server side */}
-                        <div className="rounded-lg border border-surface-border bg-surface-subtle/30 p-4">
+                        <div className="glass-subtle rounded-xl p-4">
                             <div className="mb-2 flex items-center gap-2">
                                 <Server size={14} className="text-fg-muted" />
                                 <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
@@ -262,7 +262,7 @@ export default function Network() {
                         </div>
 
                         {/* Client side */}
-                        <div className="rounded-lg border border-surface-border bg-surface-subtle/30 p-4">
+                        <div className="glass-subtle rounded-xl p-4">
                             <div className="mb-2 flex items-center gap-2">
                                 <Smartphone size={14} className="text-fg-muted" />
                                 <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
@@ -387,7 +387,7 @@ export default function Network() {
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
-                    <pre className="overflow-x-auto rounded-lg border border-surface-border bg-surface-subtle/50 p-4 text-xs leading-relaxed text-fg">
+                    <pre className="glass-subtle rounded-xl overflow-x-auto p-4 text-xs leading-relaxed text-fg">
                         {status ? JSON.stringify(status, null, 2) : "// no data yet"}
                     </pre>
                 </CardContent>

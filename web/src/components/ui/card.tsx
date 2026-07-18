@@ -3,15 +3,13 @@ import { cn } from "@/lib/utils";
 
 export interface CardProps extends HTMLAttributes<HTMLDivElement> { }
 
-/** Outer card container. */
 export const Card = forwardRef<HTMLDivElement, CardProps>(
     ({ className, ...props }, ref) => (
         <div
             ref={ref}
             className={cn(
-                "rounded-xl border border-surface-border bg-surface-raised shadow-sm",
-                "shadow-black/5 transition-shadow hover:shadow-md hover:shadow-black/10",
-                "dark:bg-surface-raised/90 dark:shadow-black/20 dark:hover:shadow-black/30",
+                "glass glass-glow glass-hover-lift",
+                "rounded-2xl p-0 overflow-hidden",
                 className,
             )}
             {...props}
@@ -24,7 +22,7 @@ export const CardHeader = forwardRef<HTMLDivElement, CardProps>(
     ({ className, ...props }, ref) => (
         <div
             ref={ref}
-            className={cn("flex flex-col gap-1 p-5 pb-3", className)}
+            className={cn("flex flex-col gap-1.5 p-5 pb-3", className)}
             {...props}
         />
     ),
@@ -48,7 +46,7 @@ export const CardDescription = forwardRef<
 >(({ className, ...props }, ref) => (
     <p
         ref={ref}
-        className={cn("text-xs text-fg-muted", className)}
+        className={cn("text-xs text-fg-muted leading-relaxed", className)}
         {...props}
     />
 ));
