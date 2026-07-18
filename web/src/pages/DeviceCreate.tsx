@@ -88,7 +88,6 @@ interface DraftCam {
     audio: boolean;
     motion: boolean;
     transcode: boolean;
-    frigate_camera: string;
 }
 
 const EMPTY_DRAFT: DraftCam = {
@@ -104,7 +103,6 @@ const EMPTY_DRAFT: DraftCam = {
     audio: true,
     motion: true,
     transcode: false,
-    frigate_camera: "",
 };
 
 type SubmitState =
@@ -177,8 +175,8 @@ export default function DeviceCreate() {
             <div className="space-y-4">
                 <PageHeader onBack={() => nav("/cameras")} />
                 <Card>
-                    <CardContent className="p-8 text-center text-sm text-fg-muted">
-                        <Info className="mx-auto mb-2 h-6 w-6 text-fg-muted" />
+                    <CardContent className="p-8 text-center text-sm text-slate-400">
+                        <Info className="mx-auto mb-2 h-6 w-6 text-slate-500" />
                         Only administrators can register new devices. Ask an admin
                         to add this camera, or sign in as admin.
                     </CardContent>
@@ -204,7 +202,6 @@ export default function DeviceCreate() {
                 audio: draft.audio,
                 motion: draft.motion,
                 transcode: draft.transcode,
-                frigate_camera: draft.frigate_camera || undefined,
             });
             setSubmit({ kind: "ok", id: cam.id, name: cam.name });
         } catch (err) {
@@ -232,10 +229,10 @@ export default function DeviceCreate() {
                     <CardContent className="space-y-4 p-8 text-center">
                         <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400" />
                         <div>
-                            <p className="text-base font-semibold text-fg">
+                            <p className="text-base font-semibold text-slate-100">
                                 "{submit.name}" registered
                             </p>
-                            <p className="mt-1 text-xs text-fg-muted">
+                            <p className="mt-1 text-xs text-slate-400">
                                 Camera #{submit.id} is now in go2rtc and the cameras list.
                             </p>
                         </div>
@@ -293,24 +290,10 @@ export default function DeviceCreate() {
                                 </Select>
                             </Field>
                             <div className="sm:col-span-2">
-                                <p className="text-xs text-fg-muted">
+                                <p className="text-xs text-slate-500">
                                     {VENDOR_PRESETS[draft.vendor]?.notes ??
                                         "Pick a vendor to autofill ports and channel id."}
                                 </p>
-                            </div>
-                            <div className="space-y-2">
-                                <label className="text-xs font-medium text-fg-muted">
-                                    Frigate camera name (optional)
-                                </label>
-                                <p className="text-[10px] text-fg-muted/60">
-                                    ASCII identifier used by Frigate. Leave empty to auto-derive from camera name (e.g. "前门" → "front_door").
-                                </p>
-                                <input
-                                    className="w-full rounded-md border border-surface-border bg-surface px-3 py-2 text-sm text-fg placeholder:text-fg-muted/40"
-                                    placeholder="e.g. front_door"
-                                    value={draft.frigate_camera}
-                                    onChange={(e) => setDraft({ ...draft, frigate_camera: e.target.value })}
-                                />
                             </div>
                         </CardContent>
                     </Card>
@@ -398,7 +381,7 @@ export default function DeviceCreate() {
                                     <button
                                         type="button"
                                         onClick={() => setShowPassword((s) => !s)}
-                                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-fg-muted hover:text-fg"
+                                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 hover:text-slate-200"
                                         aria-label={showPassword ? "Hide password" : "Show password"}
                                     >
                                         {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -423,7 +406,7 @@ export default function DeviceCreate() {
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="space-y-4">
-                            <div className="flex flex-wrap gap-3 text-sm text-fg-muted">
+                            <div className="flex flex-wrap gap-3 text-sm text-slate-300">
                                 <Toggle
                                     label="PTZ"
                                     v={draft.ptz}
@@ -445,12 +428,12 @@ export default function DeviceCreate() {
                                     on={(transcode) => setDraft({ ...draft, transcode })}
                                 />
                             </div>
-                            <div className="rounded-md border border-surface-border bg-surface-subtle/60 px-3 py-2">
-                                <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-fg-muted">
+                            <div className="rounded-md border border-slate-800 bg-slate-950/60 px-3 py-2">
+                                <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-slate-500">
                                     <Badge variant="info" className="text-[9px]">RTSP</Badge>
                                     <span>will be sent to go2rtc as</span>
                                 </div>
-                                <code className="block break-all font-mono text-xs text-fg">
+                                <code className="block break-all font-mono text-xs text-slate-200">
                                     {rtspPreview}
                                 </code>
                             </div>
@@ -486,8 +469,8 @@ function PageHeader({ onBack }: { onBack: () => void }) {
                 <ChevronLeft size={18} />
             </Button>
             <div>
-                <h2 className="text-lg font-semibold text-fg">Register a new device</h2>
-                <p className="text-xs text-fg-muted">
+                <h2 className="text-lg font-semibold text-slate-100">Register a new device</h2>
+                <p className="text-xs text-slate-500">
                     Add a camera to the platform. ONVIF profile token and stream
                     are auto-discovered if blank.
                 </p>
@@ -509,7 +492,7 @@ function Field({
 }) {
     return (
         <label className={cn("flex flex-col gap-1", className)}>
-            <span className="text-xs text-fg-muted">
+            <span className="text-xs text-slate-400">
                 {label}
                 {required && <span className="ml-0.5 text-rose-400">*</span>}
             </span>
@@ -520,7 +503,7 @@ function Field({
 
 function Toggle({ label, v, on }: { label: string; v: boolean; on: (v: boolean) => void }) {
     return (
-        <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-surface-border bg-surface-subtle/40 px-3 py-1.5 text-xs">
+        <label className="inline-flex cursor-pointer items-center gap-2 rounded-md border border-slate-700 bg-slate-950/40 px-3 py-1.5 text-xs">
             <input type="checkbox" checked={v} onChange={(e) => on(e.target.checked)} />
             {label}
         </label>

@@ -14,6 +14,43 @@ type IceServer struct {
 	Credential string   `json:"credential,omitempty"`
 }
 
+// UnmarshalJSON accepts both the single-string form
+// (`{"urls":"stun:..."}`) and the array form
+// (`{"urls":["stun:...","turn:..."]}`) for `urls`, matching the
+// W3C RTCIceServer spec. The config file commonly uses the
+// single-string form, while the array form is used for multi-URL
+// TURN servers.
+func (s *IceServer) UnmarshalJSON(b []byte) error {
+	type alias struct {
+		URLs       json.RawMessage `json:"urls"`
+		Username   string          `json:"username"`
+		Credential string          `json:"credential"`
+	}
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	s.Username = a.Username
+	s.Credential = a.Credential
+	if len(a.URLs) == 0 {
+		return nil
+	}
+	// Try array first (most common in our codebase), then fall
+	// back to single string. A quoted string fails to unmarshal
+	// into []string, so we use the failure as the signal.
+	var arr []string
+	if err := json.Unmarshal(a.URLs, &arr); err == nil {
+		s.URLs = arr
+		return nil
+	}
+	var single string
+	if err := json.Unmarshal(a.URLs, &single); err == nil {
+		s.URLs = []string{single}
+		return nil
+	}
+	return nil
+}
+
 // IceConfig is what the handler returns from
 // GET /api/v1/cameras/ice.
 //

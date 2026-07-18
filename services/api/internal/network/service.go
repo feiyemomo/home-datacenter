@@ -2,7 +2,6 @@ package network
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -83,21 +82,13 @@ type NetworkStatus struct {
 	// 5 = IPv6 direct, 4 = P2P, 3 = relay, 1-2 = limited connectivity.
 	Quality int `json:"quality"`
 
-	// DirectURL is the IPv6 direct connection URL. The client probes
-	// this URL to test if IPv6 direct is reachable. Empty when IPv6
-	// is unavailable or direct_port is not configured.
-	// e.g. "http://[2001:db8::1]:8080"
+	// DirectURL is the server's IPv6 HTTP endpoint (empty if ipv6
+	// is not reachable). Used by connection_manager.go.
 	DirectURL string `json:"direct_url,omitempty"`
 
-	// P2PEndpoint is the server's UDP endpoint for hole punching.
-	// Empty when P2P is disabled (p2p_port = 0). The mobile app sends
-	// its hole-punching packets to this address.
-	// e.g. "203.0.113.42:19800"
+	// P2PEndpoint is the server's UDP endpoint for hole punching
+	// (empty if P2P is not available).
 	P2PEndpoint string `json:"p2p_endpoint,omitempty"`
-
-	// P2PSessions is the list of active hole-punching sessions.
-	// Empty when P2P is disabled or no peers are punching.
-	P2PSessions []*P2PSession `json:"p2p_sessions,omitempty"`
 
 	// CheckedAt is the timestamp of the last detection run.
 	CheckedAt time.Time `json:"checked_at"`
@@ -107,11 +98,8 @@ type NetworkStatus struct {
 // results for a configurable TTL to avoid hammering public STUN servers
 // on every API call.
 type Service struct {
-	servers     []STUNServer
-	ttl         time.Duration
-	directPort  int          // 0 = IPv6 direct disabled
-	publicIPv6  string       // manual override; empty = auto-detect
-	holePuncher *HolePuncher // nil = P2P hole punching disabled
+	servers []STUNServer
+	ttl     time.Duration
 
 	mu     sync.RWMutex
 	cached *NetworkStatus
@@ -119,25 +107,14 @@ type Service struct {
 
 // NewService creates a network service with the given STUN servers and
 // cache TTL. If servers is empty, DefaultSTUNServers are used.
-// directPort is the TCP port for IPv6 direct (0 = disabled).
-// publicIPv6 is a manual override for the server's public IPv6 address
-// (empty = auto-detect via echo services; needed on Docker Desktop
-// where container IPv6 NAT is unavailable).
-// holePuncher is the optional P2P hole punching server (nil = disabled).
-func NewService(servers []STUNServer, ttl time.Duration, directPort int, publicIPv6 string, holePuncher *HolePuncher) *Service {
+func NewService(servers []STUNServer, ttl time.Duration) *Service {
 	if len(servers) == 0 {
 		servers = DefaultSTUNServers
 	}
 	if ttl <= 0 {
 		ttl = 60 * time.Second
 	}
-	return &Service{
-		servers:     servers,
-		ttl:         ttl,
-		directPort:  directPort,
-		publicIPv6:  publicIPv6,
-		holePuncher: holePuncher,
-	}
+	return &Service{servers: servers, ttl: ttl}
 }
 
 // Status returns the cached network status, running a fresh detection
@@ -218,17 +195,6 @@ func (s *Service) detect() NetworkStatus {
 	ipv6Status := <-ipv6Ch
 	natStatus := <-natCh
 
-	// Apply manual public_ipv6 override. This is needed on Docker
-	// Desktop (Windows) where the container can't do outbound IPv6
-	// (WSL2 has no IPv6 NAT), so auto-detection always fails. The
-	// admin sets the host's public IPv6 address here; the client's
-	// probe verifies actual reachability.
-	if s.publicIPv6 != "" {
-		ipv6Status.Enabled = true
-		ipv6Status.Reachable = true
-		ipv6Status.Address = s.publicIPv6
-	}
-
 	// Determine P2P feasibility.
 	p2p := P2PStatus{}
 	switch {
@@ -279,43 +245,18 @@ func (s *Service) detect() NetworkStatus {
 		quality = 3
 	}
 
-	// Compute the IPv6 direct URL — only when IPv6 is reachable AND
-	// a direct_port is configured. The client probes this URL to test
-	// if IPv6 direct is feasible.
-	directURL := ""
-	if ipv6Status.Reachable && s.directPort > 0 && ipv6Status.Address != "" {
-		directURL = fmt.Sprintf("http://[%s]:%d", ipv6Status.Address, s.directPort)
-	}
-
-	// Compute the P2P endpoint — the server's public UDP address for
-	// hole punching. This comes from the HolePuncher's STUN discovery
-	// (which uses the same socket as the hole punching, ensuring NAT
-	// mapping consistency).
-	p2pEndpoint := ""
-	var p2pSessions []*P2PSession
-	if s.holePuncher != nil {
-		if ep := s.holePuncher.PublicEndpoint(); ep != nil {
-			p2pEndpoint = ep.String()
-		}
-		p2pSessions = s.holePuncher.Sessions()
-	}
-
-	log.Printf("network: ipv6=%v/%v nat=%s p2p=%v initial=%s strategy=%s quality=%d/5 direct=%s p2p_ep=%s sessions=%d",
+	log.Printf("network: ipv6=%v/%v nat=%s p2p=%v initial=%s strategy=%s quality=%d/5",
 		ipv6Status.Enabled, ipv6Status.Reachable,
-		natStatus.Type, p2p.Supported, initial, strategy, quality,
-		directURL, p2pEndpoint, len(p2pSessions))
+		natStatus.Type, p2p.Supported, initial, strategy, quality)
 
 	return NetworkStatus{
-		IPv6:        ipv6Status,
-		NAT:         natStatus,
-		P2P:         p2p,
-		Relay:       relay,
-		Initial:     initial,
-		Strategy:    strategy,
-		Quality:     quality,
-		DirectURL:   directURL,
-		P2PEndpoint: p2pEndpoint,
-		P2PSessions: p2pSessions,
-		CheckedAt:   time.Now(),
+		IPv6:      ipv6Status,
+		NAT:       natStatus,
+		P2P:       p2p,
+		Relay:     relay,
+		Initial:   initial,
+		Strategy:  strategy,
+		Quality:   quality,
+		CheckedAt: time.Now(),
 	}
 }

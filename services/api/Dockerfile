@@ -1,4 +1,4 @@
-FROM docker.m.daocloud.io/library/golang:1.26-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
 
@@ -15,9 +15,14 @@ COPY . .
 
 RUN go build -o server ./cmd
 
-FROM docker.m.daocloud.io/library/alpine:latest
+FROM alpine:latest
 
 WORKDIR /
+
+# ffmpeg is used by PlayRecording to concatenate Frigate's 10s
+# recording segments into 60s clips on the fly (stream copy, no
+# re-encoding — sub-second for ~24MB of data).
+RUN apk add --no-cache ffmpeg
 
 COPY --from=builder /app/server .
 COPY --from=builder /app/configs ./configs

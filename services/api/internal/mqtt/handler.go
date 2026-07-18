@@ -35,13 +35,6 @@ func (h *Handler) OnMessage(client pahomqtt.Client, msg pahomqtt.Message) {
 
 	log.Printf("mqtt: rx %s = %s", topic, string(payload))
 
-	// Frigate publishes on its own topic prefix (frigate/...),
-	// not on home-datacenter/. Handle those outside ParseTopic.
-	if strings.HasPrefix(topic, "frigate/") {
-		h.handleFrigateMessage(topic, payload)
-		return
-	}
-
 	parsed, ok := ParseTopic(topic)
 	if !ok {
 		log.Printf("mqtt: unparseable topic %q", topic)
@@ -353,49 +346,6 @@ func (h *Handler) handleTelemetry(deviceID uint, payload []byte) {
 	})
 }
 
-// handleFrigateMessage forwards a Frigate MQTT event to the EventBus
-// as a raw `frigate.event`. The Camera Service subscribes to this and
-// performs camera-name lookup + translation into `camera.object.detected`.
-//
-// Frigate publishes on `frigate/events` with JSON like:
-//
-//	{"type":"new","after":{"id":"...","camera":"front_door","label":"person",...}}
-//
-// We only forward "new" and "update" events; "end" events are
-// tracking-termination markers with no actionable payload.
-func (h *Handler) handleFrigateMessage(topic string, payload []byte) {
-	// Quick pre-parse: skip "end" events (tracking termination).
-	if h.isFrigateEndEvent(payload) {
-		return
-	}
-
-	h.bus.Publish(eventbus.Event{
-		Topic:   "frigate.event",
-		Payload: payload,
-		Source:  eventbus.SourceMQTT,
-	})
-}
-
-// isFrigateEndEvent returns true if the JSON payload has "type":"end".
-// Frigate sends "end" events when an object leaves the frame — we don't
-// need to persist these.
-func (h *Handler) isFrigateEndEvent(payload []byte) bool {
-	// The payload always starts with {"type":"... — cheap prefix check.
-	if len(payload) < 20 {
-		return false
-	}
-	// Look for "end" within the first ~40 bytes (the "type" field).
-	s := string(payload[:min(len(payload), 40)])
-	return strings.Contains(s, `"type":"end"`)
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
 // handleEvents processes a device events message. Forwarded as-is.
 func (h *Handler) handleEvents(deviceID uint, payload []byte) {
 	h.manager.Heartbeat(deviceID)
@@ -420,7 +370,6 @@ func (h *Handler) OnConnect(client pahomqtt.Client) {
 		{SubscribeDeviceTelemetry(), 1},
 		{SubscribeDeviceEvents(), 1},
 		{SubscribeCameraEvent(), 1},
-		{SubscribeFrigateEvents(), 1},
 	}
 
 	for _, s := range subs {

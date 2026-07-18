@@ -30,14 +30,23 @@ import (
 // Reference: https://go2rtc.org/api/  (OpenAPI spec)
 type Go2RTCClient struct {
 	Base string       // e.g. http://home-go2rtc:1984
-	HC   *http.Client // overridable for tests
+	HC   *http.Client // short-timeout client for stream CRUD + health
+	// SDPHC is a long-timeout client used exclusively for WebRTC SDP
+	// exchange. go2rtc needs to connect to the RTSP source (and start
+	// an ffmpeg transcoder when a codec directive is present) before
+	// it can generate the SDP answer, which can take 10-20s on the
+	// first request. The default 5s HC timeout causes "context
+	// deadline exceeded" 502s.
+	SDPHC *http.Client
 }
 
-// NewGo2RTCClient returns a client with a sensible 5s timeout.
+// NewGo2RTCClient returns a client with a sensible 5s timeout for
+// stream management and a 30s timeout for WebRTC SDP exchange.
 func NewGo2RTCClient(base string) *Go2RTCClient {
 	return &Go2RTCClient{
-		Base: base,
-		HC:   &http.Client{Timeout: 5 * time.Second},
+		Base:  base,
+		HC:    &http.Client{Timeout: 5 * time.Second},
+		SDPHC: &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -192,7 +201,15 @@ func (c *Go2RTCClient) ExchangeSDP(ctx context.Context, streamName string, sdpOf
 	}
 	req.Header.Set("Content-Type", "application/sdp")
 
-	resp, err := c.HC.Do(req)
+	// Use the long-timeout client (SDPHC) instead of the default
+	// 5s HC. go2rtc must connect to the RTSP source and possibly
+	// start an ffmpeg transcoder before it can produce the SDP
+	// answer — the first request for a cold stream can take 10-20s.
+	hc := c.SDPHC
+	if hc == nil {
+		hc = c.HC // fallback for tests that only set HC
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, err
 	}

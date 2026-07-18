@@ -139,10 +139,10 @@ export default function MqttDebug() {
         <div className="space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                    <h2 className="flex items-center gap-2 text-lg font-semibold text-fg">
+                    <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-100">
                         <Radio size={18} /> MQTT Debug
                     </h2>
-                    <p className="text-xs text-fg-muted">
+                    <p className="text-xs text-slate-500">
                         Publish raw messages and watch live events. Admin only.
                     </p>
                 </div>
@@ -188,7 +188,7 @@ export default function MqttDebug() {
                                                 "rounded-full border px-2.5 py-1 text-[11px] font-mono transition-colors",
                                                 topic === t
                                                     ? "border-sky-500/50 bg-sky-500/10 text-sky-300"
-                                                    : "border-surface-border text-fg-muted hover:border-fg-subtle hover:text-fg",
+                                                    : "border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-200",
                                             )}
                                         >
                                             {t}
@@ -271,7 +271,7 @@ export default function MqttDebug() {
                             </div>
 
                             {error && (
-                                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-600 dark:text-rose-300">
+                                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
                                     {error}
                                 </div>
                             )}
@@ -305,9 +305,9 @@ export default function MqttDebug() {
                         </Button>
                     </CardHeader>
                     <CardContent className="flex-1">
-                        <div className="h-[420px] overflow-y-auto rounded-md border border-surface-border bg-surface-subtle/60 p-2">
+                        <div className="h-[420px] overflow-y-auto rounded-md border border-slate-800 bg-slate-950/60 p-2">
                             {log.length === 0 ? (
-                                <p className="p-4 text-xs text-fg-muted">
+                                <p className="p-4 text-xs text-slate-500">
                                     No events yet. The server pushes heartbeat, online_list, and
                                     device.* events here automatically.
                                 </p>
@@ -316,10 +316,10 @@ export default function MqttDebug() {
                                     {log.map((entry, i) => (
                                         <li
                                             key={`${entry.ts}-${i}`}
-                                            className="rounded bg-surface-subtle/40 px-2 py-1.5 font-mono text-[11px]"
+                                            className="rounded bg-slate-900/40 px-2 py-1.5 font-mono text-[11px]"
                                         >
                                             <div className="flex items-center gap-2">
-                                                <span className="text-fg-muted">
+                                                <span className="text-slate-500">
                                                     {new Date(entry.ts).toLocaleTimeString()}
                                                 </span>
                                                 <Badge
@@ -335,14 +335,14 @@ export default function MqttDebug() {
                                                     {entry.type}
                                                 </Badge>
                                                 {entry.topic && (
-                                                    <span className="text-fg-muted">{entry.topic}</span>
+                                                    <span className="text-slate-400">{entry.topic}</span>
                                                 )}
                                             </div>
                                             {entry.text && (
-                                                <div className="mt-0.5 text-fg-muted">{entry.text}</div>
+                                                <div className="mt-0.5 text-slate-400">{entry.text}</div>
                                             )}
                                             {entry.payload != null && (
-                                                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-fg-muted">
+                                                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-slate-500">
                                                     {typeof entry.payload === "string"
                                                         ? entry.payload
                                                         : JSON.stringify(entry.payload, null, 2)}
