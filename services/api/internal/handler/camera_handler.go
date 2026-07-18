@@ -135,8 +135,11 @@ type registerReq struct {
 	// false to match the platform's "HEVC passthrough works on
 	// HEVC-capable browsers, transcode is opt-in" contract.
 	Transcode bool `json:"transcode"`
-	// Codec overrides Transcode: "passthrough"|"h264"|"h265".
-	// Empty string inherits legacy Transcode behavior.
+	// Codec overrides Transcode. Only "h264" is accepted via the
+	// dashboard; "passthrough"/"h265" are legacy values that may
+	// exist in the DB (set before the WebRTC-only-H.264 restriction)
+	// but cannot be set via UpdateCodec. Empty string inherits
+	// legacy Transcode behavior.
 	Codec string `json:"codec"`
 }
 
@@ -280,10 +283,15 @@ func (h *CameraHandler) GotoPreset(c *gin.Context) {
 
 // UpdateCodec — PUT /api/v1/cameras/:id/codec
 //
-//	{ "codec": "passthrough" | "h264" | "h265" }
+//	{ "codec": "h264" }
 //
 // Changes the output video codec for a camera and re-pushes the
-// go2rtc stream + Frigate config so the change is live immediately.
+// go2rtc stream so the change is live immediately. Only "h264" is
+// accepted — WebRTC's RTP codec registry does not include H.265,
+// so passthrough/h265 always 502 on Chrome/Edge/Firefox WebRTC.
+// Legacy cameras with codec=passthrough/h265 (set before this
+// restriction) still work for backward compatibility but cannot be
+// (re)set to those values via this API.
 func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 	if _, _, ok := h.callerIsAdmin(c); !ok {
 		return

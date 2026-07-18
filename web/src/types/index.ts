@@ -152,7 +152,14 @@ export interface Camera {
     transcode?: boolean;
     /**
      * Output codec: "passthrough" | "h264" | "h265" | "".
-     * When non-empty, this is the source of truth and overrides
+     *
+     * Only "h264" is settable via the dashboard / PUT /cameras/:id/codec
+     * — WebRTC's RTP codec registry does not include H.265, so
+     * passthrough/h265 always 502 on Chrome/Edge/Firefox WebRTC.
+     * Legacy cameras may still carry "passthrough" or "h265" in the
+     * DB (set before this restriction); the dashboard shows them as
+     * "(legacy)" in the codec dropdown and offers "H.264" for migration.
+     * When non-empty, this field is the source of truth and overrides
      * the legacy transcode bool. Empty inherits legacy behavior.
      */
     codec?: string;

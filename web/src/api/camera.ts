@@ -50,10 +50,16 @@ export async function deleteCamera(id: number): Promise<void> {
     await client.delete(`/cameras/${id}`);
 }
 
-/** Update the output codec for a camera. Admin-only. */
+/**
+ * Update the output codec for a camera. Admin-only.
+ *
+ * Only "h264" is accepted — WebRTC's RTP codec registry does not
+ * include H.265, so passthrough/h265 always 502 on Chrome/Edge/Firefox.
+ * The backend rejects other values with 400.
+ */
 export async function updateCodec(
     id: number,
-    codec: "passthrough" | "h264" | "h265",
+    codec: "h264",
 ): Promise<void> {
     await client.put(`/cameras/${id}/codec`, { codec });
 }

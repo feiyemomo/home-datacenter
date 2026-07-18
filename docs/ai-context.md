@@ -485,6 +485,39 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 
 **Security hardening pass (2026-07-04):** see `docs/Security` section below.
 
+**Codec restriction (2026-07-18): WebRTC only supports H.264**
+
+The dashboard codec dropdown (`web/src/pages/Cameras.tsx`) and the
+backend `PUT /api/v1/cameras/:id/codec` endpoint
+(`services/api/internal/camera/registry.go` `UpdateCodec`) now only
+accept `"h264"`. The `"passthrough"` and `"h265"` options were removed
+because WebRTC's RTP codec registry mandates H.264 (plus VP8/VP9/AV1)
+but does NOT include H.265 — `codec=h265` and `codec=passthrough`
+(with an H.265 camera) always return SDP 502 "codecs not matched:
+video:H265 => video:VP8, video:VP9, video:H264, video:AV1" on
+Chrome/Edge/Firefox. This is a protocol-level limitation, not a bug.
+
+- **Frontend** (`web/src/pages/Cameras.tsx`): the `<Select>` only
+  renders `<option value="h264">H.264</option>`. Legacy cameras with
+  `codec=passthrough`/`h265` (set before this restriction) get a
+  disabled `<option value={currentCodec} disabled>…(legacy)</option>`
+  so the dropdown still reflects server state; the operator can
+  select "H.264" to migrate. `codecBadgeLabel` still renders the
+  actual codec label ("直通" / "H.265") in the badge for observability.
+- **Frontend API** (`web/src/api/camera.ts`): `updateCodec` signature
+  tightened from `"passthrough" | "h264" | "h265"` to `"h264"`.
+- **Backend** (`UpdateCodec`): the switch now only matches `case "h264"`
+  (and `case ""` → `"h264"`); any other value returns 400 with
+  `invalid codec %q (only "h264" is accepted — WebRTC does not support H.265)`.
+- **Backward compat**: `effectiveCodec` / `rtspURL` still handle
+  `passthrough` and `h265` for existing DB rows so legacy cameras
+  don't break on boot replay — they just can't be (re)set to those
+  values via the API. The `RegisterInput.Codec` field is unchanged
+  (registration uses the `transcode` boolean toggle, not the codec
+  string, so no UI change needed there).
+- **Model** (`model.Camera.Codec`): doc comment updated to mark
+  `passthrough`/`h265` as LEGACY (not settable via `UpdateCodec`).
+
 **Next Items (Optional):**
 
 - PostgreSQL migration
@@ -596,4 +629,4 @@ rate limit on `/auth/bind`. Defence-in-depth layers applied:
 
 ---
 
-**Last Updated:** 2026-07-11 (Phase 8: User Management API + last-admin/self-delete/self-demote state guards)
+**Last Updated:** 2026-07-18 (Codec restriction: WebRTC only supports H.264 — passthrough/h265 options removed from dashboard + UpdateCodec API)

@@ -11,6 +11,13 @@ import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { LiveVideo } from "@/components/LiveVideo";
 
+// Only H.264 is offered in the dashboard codec selector. WebRTC's RTP
+// codec registry mandates H.264 (plus VP8/VP9/AV1) but NOT H.265, so
+// `passthrough` and `h265` always 502 on Chrome/Edge/Firefox WebRTC.
+// Legacy cameras with `codec=passthrough`/`h265` (set before this
+// restriction) still render correctly in the badge via
+// `codecBadgeLabel`, and the dropdown shows a disabled "(legacy)"
+// entry plus the selectable "H.264" so the operator can migrate.
 type CodecOption = "passthrough" | "h264" | "h265";
 
 /** Resolve the human-readable codec label for a camera badge. */
@@ -164,9 +171,12 @@ function CamCard({
             ? "h264"
             : "passthrough";
 
-    async function onCodecChange(e: React.ChangeEvent<HTMLSelectElement>) {
+    async function onCodecChange(_: React.ChangeEvent<HTMLSelectElement>) {
         if (!isAdmin) return;
-        const next = e.target.value as CodecOption;
+        // Only "h264" is selectable now; the disabled "(legacy)" entry
+        // for non-h264 cameras can't be re-selected, so any onChange
+        // event means the operator chose "H.264" (migrate from legacy).
+        const next = "h264" as const;
         if (next === currentCodec) return;
         setCodecLoading(true);
         setCodecError(null);
@@ -212,12 +222,15 @@ function CamCard({
                                 onChange={onCodecChange}
                                 disabled={codecLoading}
                                 aria-label="Output codec"
-                                title="Output codec"
+                                title="Output codec (H.264 required for WebRTC)"
                                 className="h-7 w-[104px] rounded-md px-1.5 py-0 text-[11px]"
                             >
-                                <option value="passthrough">直通</option>
+                                {currentCodec !== "h264" && (
+                                    <option value={currentCodec} disabled>
+                                        {codecBadgeLabel(cam)} (legacy)
+                                    </option>
+                                )}
                                 <option value="h264">H.264</option>
-                                <option value="h265">H.265</option>
                             </Select>
                             {codecLoading && (
                                 <Loader2 size={11} className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 animate-spin text-fg-muted" />

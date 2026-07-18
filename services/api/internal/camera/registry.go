@@ -207,16 +207,25 @@ func (r *Registry) Get(id uint) (*model.Camera, error) {
 }
 
 // UpdateCodec changes the output codec for a camera and re-pushes
-// the stream to go2rtc + Frigate so the new codec takes effect
-// immediately without requiring a container restart.
+// the stream to go2rtc so the new codec takes effect immediately
+// without requiring a container restart.
+//
+// Only "h264" is accepted. WebRTC's RTP codec registry mandates
+// H.264 (plus VP8/VP9/AV1) but does NOT include H.265, so
+// "passthrough" and "h265" always 502 on Chrome/Edge/Firefox WebRTC.
+// Legacy cameras with codec=passthrough/h265 (set before this
+// restriction) still work via effectiveCodec/rtspURL for backward
+// compatibility, but cannot be (re)set to those values via this API.
+// The dashboard dropdown only offers "H.264" and shows legacy values
+// as a disabled "(legacy)" entry so the operator can migrate.
 func (r *Registry) UpdateCodec(ctx context.Context, id uint, codec string) error {
 	codec = strings.TrimSpace(codec)
 	switch codec {
-	case "passthrough", "h264", "h265":
+	case "h264":
 	case "":
-		codec = "passthrough"
+		codec = "h264"
 	default:
-		return fmt.Errorf("invalid codec %q (want passthrough/h264/h265)", codec)
+		return fmt.Errorf("invalid codec %q (only \"h264\" is accepted — WebRTC does not support H.265)", codec)
 	}
 	var cam model.Camera
 	if err := r.DB.First(&cam, id).Error; err != nil {
@@ -232,16 +241,20 @@ func (r *Registry) UpdateCodec(ctx context.Context, id uint, codec string) error
 		return err
 	}
 	// Re-push the go2rtc stream with the new URL so the codec
-	// change is live immediately.
+	// change is live immediately. go2rtc hot-reloads the stream
+	// without interrupting other cameras.
+	//
+	// We do NOT call pushFrigateConfig here because Frigate's
+	// recording pipeline uses the camera's NATIVE stream (plain
+	// rtsp:// URL from frigateCameraPath), which does NOT change
+	// when codec changes. The codec setting only affects go2rtc's
+	// live transcode path. Avoiding pushFrigateConfig here prevents
+	// an unnecessary Frigate restart (which would briefly interrupt
+	// all streams and the recording pipeline).
 	user, pass, err := r.DecryptCredentials(&cam)
 	if err == nil {
 		rtspURL := r.rtspURL(&cam, user, pass)
 		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
-	}
-	if r.Frigate != nil {
-		if err := r.pushFrigateConfig(ctx); err != nil {
-			log.Printf("camera: updateCodec: frigate config push (non-fatal): %v", err)
-		}
 	}
 	return nil
 }
@@ -616,13 +629,31 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		// continue to work.
 		go2rtcStreams[c.StreamName] = go2rtcURL
 	}
-	// Boot replay / camera add-remove: no restart needed. The
-	// recording pipeline is started by the static config.yml which
-	// has record.enabled=true globally. Per-camera record.enabled
-	// is set here but only takes effect on the next Frigate restart
-	// (triggered by SetRecordingEnabled when the user toggles the
-	// dashboard button).
-	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, false)
+	// Check if any camera has recording enabled. Frigate only
+	// starts the recording ffmpeg pipeline during a restart —
+	// a hot-merge (requires_restart=false) returns 200 but
+	// never starts recording (verified: 0 mp4 files after
+	// config push with requires_restart=false). We therefore
+	// pass requires_restart=true whenever any camera has
+	// recording enabled, so the pipeline is always running.
+	// This causes a brief (~2s) interruption to all streams
+	// on each config push, which is acceptable for the rare
+	// operations that call pushFrigateConfig (boot replay,
+	// camera register/unregister). UpdateCodec does NOT call
+	// this function — it only updates the go2rtc stream URL
+	// via AddStream (hot-reload, no Frigate restart needed).
+	anyRecording := false
+	for _, c := range cams {
+		if raw, ok := c.Meta["recording"]; ok {
+			if m, ok := raw.(map[string]any); ok {
+				if v, ok := m["enabled"].(bool); ok && v {
+					anyRecording = true
+					break
+				}
+			}
+		}
+	}
+	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, anyRecording)
 }
 
 // frigateCameraPath builds the URL Frigate's OWN ffmpeg child
@@ -641,17 +672,18 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 //     same directive syntax.
 //   - transcode=false → raw RTSP, Frigate handles the
 //     codec (HEVC, H.264, etc.) directly.
+// frigateCameraPath returns the RTSP URL that Frigate's ffmpeg
+// connects to. Frigate records the camera's NATIVE stream (it uses
+// `-c:v copy` in its record preset) — the codec setting only
+// affects go2rtc's live transcode path (see rtspURL). We therefore
+// return a plain RTSP URL WITHOUT go2rtc directives like
+// `#video=h264` or `#width=1280`: those are go2rtc-specific and
+// Frigate's ffmpeg silently ignores them (treats `#...` as a URL
+// fragment), so they were harmless but useless. Keeping the URL
+// clean avoids confusion about which directives apply where.
 func (r *Registry) frigateCameraPath(cam *model.Camera, user, pass string) string {
-	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
-	codec := effectiveCodec(cam)
-	if codec == "passthrough" {
-		return raw + "#audio=0"
-	}
-	if codec == "h265" {
-		return raw + "#video=h265"
-	}
-	return raw + "#video=h264#width=1280"
 }
 
 // slugifyName converts a human-friendly camera name (which may
