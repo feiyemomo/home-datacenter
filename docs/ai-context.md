@@ -42,6 +42,7 @@
 | Config | YAML + viper |
 | Container | Docker + Compose |
 | Real-time | MQTT (Mosquitto) + WebSocket (gorilla/websocket) |
+| NVR / AI Detection | Frigate 0.17 (bundled go2rtc + OpenVINO CPU detector) |
 | Frontend | React + Vite + Tailwind (dashboard SPA) |
 
 ---
@@ -152,10 +153,11 @@ services/api/
 │   ├── config/config.go         // YAML loader (viper) + secret validation
 │   ├── database/sqlite.go       // DB init
 │   ├── device/manager.go        // Online/offline + heartbeat + MarkAllOffline on disconnect
-│   ├── camera/                  // Phase 4 — camera platformization
+│   ├── camera/                  // Phase 4 — camera platformization; Phase 9 — Frigate NVR integration
 │   │   ├── doc.go
-│   │   ├── go2rtc.go            // HTTP client for /api/streams (query params), /api/webrtc, /api/stream.m3u8
-│   │   ├── registry.go          // CRUD + go2rtc sync + BootReplay + UpdateStatus + SaveProfileToken
+│   │   ├── go2rtc.go            // HTTP client for bundled go2rtc: /api/streams, /api/webrtc, /api/stream.m3u8
+│   │   ├── frigate.go           // FrigateClient: PushConfig (PUT /api/config/set), ListRecordings, Alive check
+│   │   ├── registry.go          // CRUD + go2rtc sync + Frigate config push + BootReplay + UpdateStatus + SaveProfileToken
 │   │   ├── onvif.go             // ONVIF PTZ dispatcher (raw SOAP, WS-Security PasswordDigest, lazy-cached)
 │   │   ├── health.go            // Background TCP probe → device.status / camera.online / camera.offline on EventBus
 │   │   └── json.go
@@ -223,8 +225,9 @@ web/                             // React + Vite + Tailwind dashboard SPA
 
 deploy/
 ├── mosquitto/{mosquitto.conf,aclfile,passwd}  // broker + ACL + creds
+├── frigate/config.yml            // Frigate base config (detectors, mqtt, go2rtc, record retention)
 ├── cloudflared/config.yml        // dashboard + api + cam hostnames
-├── go2rtc/{Dockerfile,go2rtc.yaml} // RTSP→WebRTC/HLS bridge (go2rtc.yaml COPY'd into image, not bind-mounted)
+├── go2rtc/{Dockerfile,go2rtc.yaml} // RTSP→WebRTC/HLS bridge (legacy; now bundled in Frigate)
 └── android/HomeDatacenterClient.kt
 ```
 
@@ -314,6 +317,11 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 7. **JWT secret** → never commit a real secret; app boots only with a ≥32-char non-placeholder secret
 8. **CRLF on Windows** → `core.autocrlf=true` means gofmt may flag CRLF files locally; the canonical line ending in the repo is LF
 9. **Device status payload parsing** → `mqtt.Handler.handleStatus` accepts both strict JSON (`{"status":"online","ts":1}`) and unquoted-key pseudo-JSON (`{status:online,ts:1}`). A bare `status=...` is also tolerated as a last-ditch fallback. Canonical JSON is re-emitted on the EventBus, so downstream consumers can rely on strict JSON. Always re-emit canonical JSON when adding new publishers; do not pass the raw payload downstream.
+10. **Frigate `requires_restart` does not actually restart ffmpeg** → `PUT /api/config/set` with `requires_restart: 1` does NOT restart ffmpeg processes for already-running cameras. detect.fps / record.enabled changes only take effect after `docker compose up -d --force-recreate frigate`. The restart flag is reliable for adding/removing cameras but not for modifying existing ones.
+11. **Frigate env var prefix** → Frigate's config env var substitutor ONLY reads env vars starting with `FRIGATE_`. MQTT credentials etc. must be named `FRIGATE_MQTT_USERNAME` in the container, not `MQTT_USERNAME`. And the YAML values must be quoted (e.g. `user: "{FRIGATE_MQTT_USERNAME}"`) — otherwise YAML parses `{...}` as a flow mapping (dict), not a string.
+12. **OpenVINO `num_threads: 1` can be faster on low-core CPUs** → On the J4125 (4 cores, single-threaded per core), SSDLite MobileNet v2 inference is actually faster with 1 thread (~43ms) than with 4 threads (~71ms). The thread synchronization overhead exceeds the parallelism benefit for this lightweight model. Single thread also uses less overall CPU.
+13. **Frigate `detect.fps` only affects the detection pipeline, not recording** → A single ffmpeg process has two outputs: one `-c:v copy` for recording (original framerate) and one `-r N -vf fps=N` for detection. Lowering detect.fps reduces AI load without affecting recording quality.
+14. **Go2rtc is now bundled in Frigate** → The standalone `home-go2rtc` container is deprecated. All go2rtc functionality (streams, WebRTC, HLS) is served by Frigate's built-in go2rtc on port 1984. The API talks to `http://home-frigate:1984` for go2rtc operations.
 
 ---
 
@@ -518,6 +526,53 @@ Chrome/Edge/Firefox. This is a protocol-level limitation, not a bug.
 - **Model** (`model.Camera.Codec`): doc comment updated to mark
   `passthrough`/`h265` as LEGACY (not settable via `UpdateCodec`).
 
+**Phase 9 (Frigate NVR + OpenVINO AI Detection):** Complete (2026-07-18)
+
+- **Frigate 0.17** deployed as `home-frigate` container, replacing
+  the standalone `home-go2rtc`. Frigate bundles go2rtc internally,
+  so we get both NVR features and WebRTC/HLS streaming from one
+  container.
+- **OpenVINO CPU detector** configured as the object detector
+  (type: `openvino`, device: `CPU`). Uses SSDLite MobileNet v2
+  FP16 IR model from Intel Open Model Zoo at `/openvino-model/`.
+  On the J4125, single-threaded inference is ~43ms (faster than
+  multi-threaded due to thread-sync overhead on this lightweight
+  model). Configured with `num_threads: 1` to limit CPU usage.
+- **Detection throttled to 2 fps** (`detect.fps: 2`) — sufficient
+  for a residential front-door camera and keeps CPU usage low
+  (~70-90% of one core for the whole Frigate container, down from
+  110-190% with default 5-fps detection).
+- **home-api ↔ Frigate integration**:
+  - `FrigateClient.PushConfig()` pushes camera definitions via
+    `PUT /api/config/set` (JSON body, partial merge).
+  - `FrigateDetect.FPS` field added to the Go struct so the API
+    controls detection framerate per camera.
+  - `BootReplay` re-pushes the full camera list on home-api
+    startup; `pushFrigateConfig` sets `requires_restart=1` when
+    any camera has recording enabled (Frigate only starts the
+    recording ffmpeg pipeline during a restart).
+  - `ListRecordings()` queries `GET /api/<camera>/recordings`
+    for per-camera hourly recording segments.
+- **MQTT bridge**: Frigate publishes detection events and stats
+  to Mosquitto under `frigate/#`. The ACL file grants the
+  `home-datacenter` user `readwrite` on `frigate/#`.
+- **VAAPI hardware decode** via `/dev/dri/renderD128` passthrough
+  (UHD Graphics 600 on J4125). HEVC main-stream decode has
+  periodic non-fatal errors from Hikvision's SVC-like multi-layer
+  HEVC, but ffmpeg recovers and the detection pipeline stays up.
+- **Configuration split**: `deploy/frigate/config.yml` holds the
+  static global settings (detectors, mqtt, go2rtc webrtc/hls,
+  record retention, auth proxy mode). Camera definitions are
+  added/removed dynamically by home-api — they must NOT be
+  manually added to config.yml (they get overwritten on the
+  next push).
+- **Important pitfall**: Frigate's `PUT /api/config/set` with
+  `requires_restart: 1` does NOT actually restart ffmpeg
+  processes for running cameras. To make a detect.fps or
+  record.enabled change take effect, you need
+  `docker compose up -d --force-recreate frigate` — the API
+  restart flag is only reliable for adding/removing cameras.
+
 **Next Items (Optional):**
 
 - PostgreSQL migration
@@ -629,4 +684,4 @@ rate limit on `/auth/bind`. Defence-in-depth layers applied:
 
 ---
 
-**Last Updated:** 2026-07-18 (Codec restriction: WebRTC only supports H.264 — passthrough/h265 options removed from dashboard + UpdateCodec API)
+**Last Updated:** 2026-07-18 (Phase 9: Frigate 0.17 NVR with OpenVINO CPU detector deployed; detection throttled to 2 fps with num_threads=1; home-api pushes camera configs via FrigateClient)

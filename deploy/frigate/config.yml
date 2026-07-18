@@ -11,25 +11,51 @@
 
 # ---- Hardware acceleration ----
 #
-# VAAPI is NOT enabled for Frigate's own ffmpeg. The J4125's UHD
-# Graphics 600 (12 EU, Gen 9.5) fails to VAAPI-decode the Hikvision
-# camera's HEVC stream — ffmpeg crashes with "Invalid NAL unit" and
-# "Failed to sync surface" errors, causing the watchdog to restart
-# the ffmpeg pipeline in a loop. This kills BOTH detection AND
-# recording (they share one ffmpeg process per input).
+# Frigate 0.17 AUTO-DETECTS /dev/dri and auto-enables preset-vaapi
+# for its own ffmpeg REGARDLESS of whether the ffmpeg.hwaccel_args
+# key is present in config.yml. Deleting frigate.db does NOT disable
+# this auto-detection. The running ffmpeg command line confirms
+# VAAPI is active: "-hwaccel vaapi -hwaccel_device /dev/dri/renderD128
+# -hwaccel_output_format vaapi".
 #
-# Frigate's detection pipeline only decodes at 5 fps, so software
-# decode is light (~20-30% CPU on the J4125). Hardware decode is
-# instead reserved for go2rtc's live transcode path (30 fps full
-# decode + re-encode to H.264 for WebRTC), where the CPU savings
-# matter. go2rtc gets VAAPI via `#hardware=vaapi` in the stream URL
-# (see home-api's rtspURL()), NOT via this global ffmpeg config.
+# On the J4125 (UHD Graphics 600, 12 EU, Gen 9.5) with a Hikvision
+# HEVC main stream (Channels/101), VAAPI decode produces periodic
+# non-fatal errors:
+#   - "[rtsp] Multi-layer HEVC coding is not implemented"
+#     (Hikvision uses SVC-like multi-layer HEVC; ffmpeg drops those
+#      NALUs but continues decoding the base layer)
+#   - "[hevc] Could not find ref with POC N"
+#     (lost reference frames from the dropped NALUs)
+#   - "[AVHWFramesContext] Failed to sync surface"
+#     (VAAPI surface sync failure on the corrupted frame)
+# These cause the watchdog to restart ffmpeg occasionally (a few
+# times per hour), but between restarts the detection pipeline runs
+# at 2 fps feed (detect.fps=2) / ~0.4-2.0 fps detection (Frigate's
+# motion pre-filter means not every frame is sent to the detector).
+# The recording pipeline (-c:v copy) is unaffected because it
+# doesn't decode — recordings use the camera's native framerate.
 #
-# To re-enable VAAPI for Frigate (e.g., on a more capable GPU):
-#   ffmpeg:
-#     hwaccel_args: preset-vaapi
-# But test that `ffmpeg -hwaccel vaapi -i rtsp://...` can actually
-# decode your camera's stream without errors first.
+# Verified working state (2026-07-18):
+#   - detectors.ov: openvino CPU, num_threads=1, inference_speed ~43ms
+#     (single-threaded is FASTER than multi-threaded on J4125 for
+#     this lightweight model — thread sync overhead > parallelism gain)
+#   - cameras.front_door: camera_fps=2.0, process_fps=2.0,
+#     detection_fps=0.4-2.1, detection_enabled=true, skipped_fps=0.0
+#   - Total Frigate container CPU: ~70-90% of one core
+#   - ffmpeg running with VAAPI, stable between watchdog restarts
+#
+# To DISABLE VAAPI for Frigate's ffmpeg (force software decode):
+#   1. Comment out the `devices: ["/dev/dri:/dev/dri"]` line in
+#      compose.yaml — but this also disables VAAPI for go2rtc's live
+#      transcode path, which IS needed for WebRTC.
+#   2. OR keep /dev/dri mounted (for go2rtc) and accept the periodic
+#      non-fatal HEVC decode errors (current state).
+# Software decode at 2 fps is ~10-15% CPU on the J4125, which is
+# acceptable for 1-2 cameras.
+#
+# The ffmpeg.hwaccel_args key below is intentionally commented out
+# because Frigate's auto-detection overrides it anyway. Keeping it
+# commented avoids confusion about whether it's the source of truth.
 #
 # ffmpeg:
 #   hwaccel_args: preset-vaapi
@@ -37,6 +63,25 @@
 mqtt:
   host: mosquitto
   topic_prefix: frigate
+  # Frigate uses env var substitution {VAR} to read credentials from
+  # the container environment. compose.yaml maps the .env file's
+  # MQTT_USERNAME/MQTT_PASSWORD to FRIGATE_MQTT_USERNAME/
+  # FRIGATE_MQTT_PASSWORD in the frigate container (the FRIGATE_
+  # prefix is REQUIRED — frigate/config/env.py only reads env vars
+  # starting with "FRIGATE_"). The ACL (deploy/mosquitto/aclfile)
+  # grants the home-datacenter user readwrite on both
+  # home-datacenter/# and frigate/# topics.
+  #
+  # NOTE: the values MUST be quoted. Without quotes, YAML parses
+  # {FRIGATE_MQTT_USERNAME} as a flow mapping (dict) instead of a
+  # string, causing Frigate's Pydantic validator to reject the entire
+  # config.yml ("Input should be a valid string") and fall back to
+  # safe mode (default cpu detector, mqtt disabled). With quotes,
+  # YAML parses it as the string "{FRIGATE_MQTT_USERNAME}", and
+  # Frigate's env var substitutor (str.format(**FRIGATE_ENV_VARS))
+  # replaces it with the actual value.
+  user: "{FRIGATE_MQTT_USERNAME}"
+  password: "{FRIGATE_MQTT_PASSWORD}"
   # client_id: frigate
 
 # Frigate's own authentication is enabled in PROXY MODE — the
@@ -80,19 +125,46 @@ proxy:
     role: Remote-Role
   default_role: admin
 
-# Detectors: CPU-based object detection. No Coral USB accelerator
-# required — works out of the box with ~10-15% CPU per camera at
-# 5 fps. For production with 3+ cameras, add a Google Coral TPU
-# (USB or PCIe) and uncomment the detector block below.
+# Detectors: OpenVINO CPU detector. The default `stable` Frigate
+# image ships with the OpenVINO 2025.3.0 runtime + the SSDLite
+# MobileNet v2 IR model (FP16) at /openvino-model/. OpenVINO's CPU
+# backend uses Intel oneDNN + the IR format, which is significantly
+# faster than the tflite CPU detector on Intel hardware (the tflite
+# CPU detector is officially "not recommended" per Frigate docs —
+# "in most cases OpenVINO can be used in CPU mode with better
+# results").
+#
+# The model is SSDLite MobileNet v2 from Intel's Open Model Zoo,
+# converted to FP16 precision IR. Input is 300x300 NHWC BGR.
+# Labelmap is COCO 91-class (with background at index 0).
+#
+# Performance on J4125 (Celeron, 4 cores, UHD Graphics 600):
+#   - num_threads=1: ~43ms per inference (faster than 4 threads —
+#     thread sync overhead > parallelism benefit for this model)
+#   - detect.fps=2 with 1 camera: ~70-90% of one CPU core total
+#     (includes ffmpeg VAAPI decode + OpenVINO inference + go2rtc)
+#
+# To add a Google Coral TPU for 3+ cameras, see:
+# https://docs.frigate.video/configuration/object_detectors/#edge-tpu-detector
 detectors:
-  cpu:
-    type: cpu
-    num_threads: 3
-
-# model:
-#   path: /cpu_model.tflite
-#   width: 320
-#   height: 320
+  ov:
+    type: openvino
+    device: CPU
+    # Limit OpenVINO to a single inference thread. The J4125 has 4
+    # cores; without this OpenVINO spawns threads across all of them,
+    # causing CPU spikes during inference. With detect.fps=2, even a
+    # single-threaded inference (~80-120ms) easily keeps up (2 fps ×
+    # 120ms = 240ms/s = 24% of one core). The remaining 3 cores stay
+    # free for ffmpeg VAAPI decode, go2rtc WebRTC transcode, and the
+    # rest of the system.
+    num_threads: 1
+model:
+  width: 300
+  height: 300
+  input_tensor: nhwc
+  input_pixel_format: bgr
+  path: /openvino-model/ssdlite_mobilenet_v2.xml
+  labelmap_path: /openvino-model/coco_91cl_bkgr.txt
 
 # go2rtc subsystem — bundled inside Frigate. These settings are
 # the same as the old standalone go2rtc.yaml.
@@ -134,25 +206,30 @@ go2rtc:
 # JSON-encoded push is not subject to YAML's comment rules), but
 # quoting here is the durable fix.
   streams:
-    前门: 
-      ffmpeg:rtsp://admin:Haikangcam@192.168.31.100:554/Streaming/Channels/101#video=h264#width=1280
+    前门:
+      ffmpeg:rtsp://admin:Haikangcam@192.168.31.100:554/Streaming/Channels/101#video=h264#width=1280#hardware=vaapi
 cameras:
   front_door:
     name: front_door
     enabled: true
     ffmpeg:
       inputs:
-        # Same `#` comment pitfall — quote the path so Frigate's
-        # own ffmpeg child receives the transcode directives.
-        - path: 
-            rtsp://admin:Haikangcam@192.168.31.100:554/Streaming/Channels/101#video=h264#width=1280
+        # Frigate's OWN ffmpeg path — plain RTSP without any `#`
+        # directives. go2rtc-specific directives (#video=, #hardware=)
+        # are silently ignored by Frigate's ffmpeg (treated as a URL
+        # fragment). Frigate records the camera's NATIVE stream
+        # (HEVC) with -c:v copy and decodes at 2 fps for detection.
+        # See home-api's frigateCameraPath().
+        - path:
+            rtsp://admin:Haikangcam@192.168.31.100:554/Streaming/Channels/101
           roles:
             - detect
             - record
     detect:
       enabled: true
+      fps: 2
     record:
-      enabled: false
+      enabled: true
 
 # Recording is enabled globally. home-api toggles per-camera
 # record.enabled via PUT /api/config/set; the global block here

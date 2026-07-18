@@ -105,6 +105,14 @@ services:
     environment:
       - SET_CONFIG_BY_API=true
       - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-}
+      # MQTT credentials — shared with home-api so Frigate can publish
+      # detection events and stats to the same mosquitto broker.
+      # Frigate's env var substitutor (frigate/config/env.py) ONLY
+      # reads env vars starting with "FRIGATE_", so the names MUST
+      # be prefixed. config.yml references them via
+      # {FRIGATE_MQTT_USERNAME} / {FRIGATE_MQTT_PASSWORD}.
+      - FRIGATE_MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
+      - FRIGATE_MQTT_PASSWORD=${MQTT_PASSWORD:-}
     ports:
       # Frigate REST API (config, events, snapshots)
       - "0.0.0.0:5000:5000"

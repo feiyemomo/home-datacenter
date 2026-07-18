@@ -3,8 +3,13 @@
 # Restricts what each authenticated client may do on the broker.
 
 # ---- API server (home-datacenter) ----
+# Also used by Frigate (shares the same account via MQTT_USERNAME/
+# MQTT_PASSWORD env vars). Frigate publishes to frigate/# topics
+# (topic_prefix: frigate in config.yml), so the ACL must grant
+# readwrite on both namespaces.
 user home-datacenter
 topic readwrite home-datacenter/#
+topic readwrite frigate/#
 
 # ---- Default (anonymous / unlisted users) ----
 # With allow_anonymous=false, anonymous clients are already rejected

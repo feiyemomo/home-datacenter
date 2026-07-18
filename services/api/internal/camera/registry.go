@@ -379,11 +379,11 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 				Inputs: []FrigateInput{
 					{
 						Path:  frigatePath,
-						Roles: []string{"record"},
+						Roles: []string{"detect", "record"},
 					},
 				},
 			},
-			Detect: FrigateDetect{Enabled: false},
+			Detect: FrigateDetect{Enabled: true, FPS: 2},
 			Record: FrigateRecord{Enabled: recEnabled},
 		})
 		go2rtcStreams[c.StreamName] = go2rtcURL
@@ -617,11 +617,11 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 				Inputs: []FrigateInput{
 					{
 						Path:  frigatePath,
-						Roles: []string{"record"},
+						Roles: []string{"detect", "record"},
 					},
 				},
 			},
-			Detect: FrigateDetect{Enabled: false},
+			Detect: FrigateDetect{Enabled: true, FPS: 2},
 			Record: FrigateRecord{Enabled: true},
 		})
 		// go2rtc stream key keeps the original friendly name so
