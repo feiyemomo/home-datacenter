@@ -11,23 +11,28 @@
 
 # ---- Hardware acceleration ----
 #
-# Intel J4125 (UHD Graphics 600) via VAAPI. The container must have
-# /dev/dri mounted (see compose.yaml frigate.devices). VAAPI offloads
-# H.264/H.265 video decode from CPU to GPU — critical for reducing
-# CPU load on the J4125 when running detection + recording + live
-# transcoding simultaneously. The AI detector (CPU-based TensorFlow
-# Lite) is not accelerated by VAAPI.
+# VAAPI is NOT enabled for Frigate's own ffmpeg. The J4125's UHD
+# Graphics 600 (12 EU, Gen 9.5) fails to VAAPI-decode the Hikvision
+# camera's HEVC stream — ffmpeg crashes with "Invalid NAL unit" and
+# "Failed to sync surface" errors, causing the watchdog to restart
+# the ffmpeg pipeline in a loop. This kills BOTH detection AND
+# recording (they share one ffmpeg process per input).
 #
-# Frigate expands preset-vaapi to:
-#   -hwaccel vaapi -hwaccel_output_format vaapi
-# inserted before each ffmpeg -i flag. go2rtc's live transcode path
-# uses #hardware=vaapi in the stream URL instead (handled by
-# home-api's rtspURL()).
+# Frigate's detection pipeline only decodes at 5 fps, so software
+# decode is light (~20-30% CPU on the J4125). Hardware decode is
+# instead reserved for go2rtc's live transcode path (30 fps full
+# decode + re-encode to H.264 for WebRTC), where the CPU savings
+# matter. go2rtc gets VAAPI via `#hardware=vaapi` in the stream URL
+# (see home-api's rtspURL()), NOT via this global ffmpeg config.
 #
-# On Docker Desktop / Windows (no GPU passthrough), comment this out
-# and remove #hardware=vaapi from the go2rtc stream URL in rtspURL().
-ffmpeg:
-  hwaccel_args: preset-vaapi
+# To re-enable VAAPI for Frigate (e.g., on a more capable GPU):
+#   ffmpeg:
+#     hwaccel_args: preset-vaapi
+# But test that `ffmpeg -hwaccel vaapi -i rtsp://...` can actually
+# decode your camera's stream without errors first.
+#
+# ffmpeg:
+#   hwaccel_args: preset-vaapi
 
 mqtt:
   host: mosquitto

@@ -103,12 +103,17 @@ type Camera struct {
 	// accrues when an admin opts a specific camera in.
 	Transcode bool `gorm:"default:false" json:"transcode"`
 	// Codec controls the output video codec for go2rtc/Frigate.
-	// "" or "passthrough" → use camera's native codec (no transcode)
 	// "h264" → transcode to H.264 via ffmpeg (universal WebRTC support)
-	// "h265" → transcode to H.265 via ffmpeg (HLS only, not WebRTC on Chrome)
+	// "passthrough" → use camera's native codec (no transcode) — LEGACY,
+	//   not settable via UpdateCodec; only exists for backward compat
+	//   with cameras registered before the WebRTC-only-H.264 restriction
+	// "h265" → transcode to H.265 via ffmpeg — LEGACY, same as above
 	// When non-empty, this field is the source of truth and overrides
 	// the legacy Transcode bool. When empty, Transcode bool is used
 	// for backward compatibility (true → h264, false → passthrough).
+	// UpdateCodec only accepts "h264" — WebRTC's RTP codec registry
+	// does not include H.265, so passthrough/h265 always 502 on
+	// Chrome/Edge/Firefox WebRTC.
 	Codec string `gorm:"size:16;default:''" json:"codec"`
 	// TranscodeUseSubstream, when true (the default), switches the
 	// RTSP source to the camera's substream channel
