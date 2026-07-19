@@ -315,6 +315,38 @@ func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 	utils.Success(c, gin.H{"id": id, "codec": body.Codec})
 }
 
+// UpdateAudio — PUT /api/v1/cameras/:id/audio
+//
+//	{ "enabled": true }
+//
+// Toggles live audio for a camera. When enabled, the camera's PCMA
+// audio track is transcoded to AAC and exposed in the HLS/MP4 stream
+// so ExoPlayer and modern browsers can decode it. Disabling strips
+// the audio track at the source (saves bandwidth). Re-pushes the
+// go2rtc stream so the change is live immediately.
+func (h *CameraHandler) UpdateAudio(c *gin.Context) {
+	if _, _, ok := h.callerIsAdmin(c); !ok {
+		return
+	}
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var body struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := h.Reg.UpdateAudio(c.Request.Context(), uint(id), body.Enabled); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"id": id, "audio": body.Enabled})
+}
+
 // SetRecordingPlan — PUT /api/v1/cameras/:id/recording
 //
 //	{ "enabled": true, "retention_days": 7 }
@@ -601,6 +633,50 @@ func (h *CameraHandler) Frame(c *gin.Context) {
 	if contentType == "" {
 		contentType = "image/jpeg"
 	}
+	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
+}
+
+// StreamMP4 — GET /api/v1/cameras/:id/stream.mp4
+//
+// Proxies a streaming fragmented-MP4 feed from go2rtc to the
+// Android client. ExoPlayer's ProgressiveMediaSource consumes this
+// directly (no HLS playlist round-trips), reducing first-frame
+// latency from 5-10s on a cold stream to ~1-2s.
+//
+// The response is an infinite, length-delimited fMP4 stream — we
+// pass the body through verbatim and let the client disconnect
+// when playback stops. We deliberately do NOT set Content-Length
+// (unknown) or Cache-Control (live stream) headers.
+func (h *CameraHandler) StreamMP4(c *gin.Context) {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
+		return
+	}
+	if cam.StreamName == "" {
+		utils.Fail(c, http.StatusNotFound, "camera stream not configured")
+		return
+	}
+
+	// Use the request's context so the upstream connection is
+	// cancelled when the client disconnects (ExoPlayer stops, the
+	// user navigates away, etc.) — without this go2rtc would keep
+	// the RTSP source connection alive indefinitely.
+	body, contentType, err := h.Reg.Go2.StreamMP4(c.Request.Context(), cam.StreamName)
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to open stream: "+err.Error())
+		return
+	}
+	defer body.Close()
+
+	// Disable buffering — ExoPlayer needs bytes as they arrive.
+	c.Writer.Flush()
+
+	if contentType == "" {
+		contentType = "video/mp4"
+	}
+	// -1 tells gin DataFromReader to chunked transfer (no
+	// Content-Length header). This is what we want for a stream
+	// of unknown length.
 	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
 }
 
