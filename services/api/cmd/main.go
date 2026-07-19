@@ -286,6 +286,12 @@ func main() {
 			system.GET("/status", systemHandler.Status)
 		}
 
+		// Weather proxy: serves cached wttr.in JSON so the Android
+		// app can show current weather on the dashboard. JWT-protected
+		// (auth users only — no anonymous weather queries).
+		weatherHandler := handler.NewWeatherHandler()
+		api.GET("/weather", middleware.JWTAuth(deviceRepo), weatherHandler.Weather)
+
 		mqttGroup := api.Group("/mqtt")
 		mqttGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
@@ -304,6 +310,10 @@ func main() {
 			camGroup.GET("alerts/:id/thumbnail", camHandler.AlertThumbnail)
 			camGroup.GET(":id", camHandler.Get)
 			camGroup.GET(":id/frame", camHandler.Frame)
+			// Streaming fMP4 — used by Android's ExoPlayer ProgressiveMediaSource
+			// to skip HLS playlist round-trips and cut first-frame latency from
+			// 5-10s to ~1-2s on cold streams.
+			camGroup.GET(":id/stream.mp4", camHandler.StreamMP4)
 			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
 			camGroup.GET(":id/recordings", camHandler.ListRecordings)
 			camGroup.GET(":id/recordings/:recId/file", camHandler.PlayRecording)
@@ -327,6 +337,7 @@ func main() {
 				adminCam.POST(":id/preset/:alias", camHandler.GotoPreset)
 				adminCam.PUT(":id/recording", camHandler.SetRecordingPlan)
 				adminCam.PUT(":id/codec", camHandler.UpdateCodec)
+				adminCam.PUT(":id/audio", camHandler.UpdateAudio)
 				adminCam.DELETE(":id/recordings/:recId", camHandler.DeleteRecording)
 			}
 		}

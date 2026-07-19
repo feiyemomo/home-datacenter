@@ -155,6 +155,18 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		return nil, fmt.Errorf("go2rtc add stream: %w", err)
 	}
 
+	// Preheat the go2rtc stream: force an RTSP source connection now
+	// so the operator's first frame doesn't pay the 1-10s cold-start
+	// latency. Best-effort and non-blocking — a failure here simply
+	// means the first user request warms the source instead. We use
+	// a detached context (no cancellation tied to this HTTP request)
+	// so preheat continues after the handler returns.
+	go func(streamName string) {
+		preheatCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		r.Go2.Preheat(preheatCtx, streamName)
+	}(cam.StreamName)
+
 	// Push the full config to Frigate so its AI detection and
 	// recording pipelines pick up the new camera. Best-effort:
 	// if Frigate is down, the go2rtc stream is still live and
@@ -268,6 +280,47 @@ func (r *Registry) UpdateCodec(ctx context.Context, id uint, codec string) error
 	// live transcode path. Avoiding pushFrigateConfig here prevents
 	// an unnecessary Frigate restart (which would briefly interrupt
 	// all streams and the recording pipeline).
+	user, pass, err := r.DecryptCredentials(&cam)
+	if err == nil {
+		rtspURL := r.rtspURL(&cam, user, pass)
+		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
+	}
+	return nil
+}
+
+// UpdateAudio — PUT /api/v1/cameras/:id/audio
+//
+//	{ "enabled": true }
+//
+// Toggles the audio capability flag on a camera. When enabled, the
+// next go2rtc stream push (performed inline here) rewrites the source
+// URL to include `#audio=aac` so the camera's PCMA track is transcoded
+// to AAC and exposed in the HLS/MP4 stream. ExoPlayer and modern
+// browsers decode AAC natively; the original PCMA from Hikvision
+// cameras is not browser-decodable.
+//
+// This endpoint does NOT touch Frigate's recording config — Frigate
+// records the camera's native stream and is unaffected by the live
+// audio toggle. Audio is only added to live HLS/MP4/WebRTC playback.
+func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error {
+	var cam model.Camera
+	if err := r.DB.First(&cam, id).Error; err != nil {
+		return err
+	}
+	if cam.Capabilities == nil {
+		cam.Capabilities = model.JSON{}
+	}
+	cam.Capabilities["audio"] = enabled
+	if err := r.DB.Model(&cam).Updates(map[string]any{
+		"capabilities": cam.Capabilities,
+		"updated_at":   time.Now(),
+	}).Error; err != nil {
+		return err
+	}
+	// Re-push the go2rtc stream so the audio change is live
+	// immediately. The new rtspURL() picks up the new audio flag
+	// and produces a URL with `#audio=aac` (or stripped if
+	// disabled).
 	user, pass, err := r.DecryptCredentials(&cam)
 	if err == nil {
 		rtspURL := r.rtspURL(&cam, user, pass)
@@ -558,6 +611,14 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 				continue
 			}
 			log.Printf("camera: boot replay: cam %d (%s): stream added", c.ID, c.StreamName)
+			// Preheat each stream so the first user request after a
+			// container restart doesn't pay the cold-start cost. Best-effort,
+			// non-blocking; a slow preheat must not hold up boot replay.
+			go func(streamName string) {
+				pCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				defer cancel()
+				r.Go2.Preheat(pCtx, streamName)
+			}(c.StreamName)
 		}
 
 		// Push the full config to Frigate so its AI detection and
@@ -800,10 +861,19 @@ func slugifyName(name string) string {
 //
 // rtspURL is the canonical RTSP source go2rtc pulls from.
 //
-// We always strip audio at the source (`#audio=0`) because the
-// home dashboard doesn't play sound and the only consumer that
-// would benefit is the mobile app — the savings in bandwidth and
-// decode cost are not worth the extra wiring.
+// Audio policy: by default we strip audio (`#audio=0` on passthrough,
+// no `audio=` directive on the ffmpeg path so go2rtc injects `-an`).
+// The home dashboard never plays sound; the only consumer that
+// benefits is the mobile app. When the camera has
+// `Capabilities["audio"]==true` (set at registration time) we opt in
+// to audio:
+//   - Passthrough path: switch to `ffmpeg:rtsp://...#video=copy#audio=aac`
+//     so the camera's native video codec is preserved and PCMA is
+//     transcoded to AAC (universally browser- and Android-decodable).
+//   - Transcode path: append `#audio=aac` to the existing
+//     `ffmpeg:rtsp://...#video=h264...` URL — ffmpeg encodes audio
+//     alongside the video transcode at ~96 kbps, a negligible cost
+//     compared to the video bitrate.
 //
 // `cam.Transcode` opts the camera into ffmpeg-backed H.264
 // transcoding, which is required for HEVC sources on browsers
@@ -822,12 +892,13 @@ func slugifyName(name string) string {
 //
 // Fragment form: `ffmpeg:rtsp://...#video=h264`
 // — we deliberately do NOT add `#audio=...` to the ffmpeg
-// URL. go2rtc's parseArgs adds `-an` automatically when
-// `query["audio"]` is empty, and any non-empty value (e.g.
-// "0", "anull") is fed straight to ffmpeg as a raw codec
-// arg, which produces a malformed command line. The Hikvision
-// audio (PCMA) is not browser-decodable anyway, so dropping
-// it is the right default.
+// URL when audio is disabled. go2rtc's parseArgs adds `-an`
+// automatically when `query["audio"]` is empty, and any
+// non-empty value (e.g. "0", "anull") is fed straight to
+// ffmpeg as a raw codec arg, which produces a malformed
+// command line. The Hikvision audio (PCMA) is not
+// browser-decodable as raw PCMA, so when audio is enabled we
+// transcode to AAC.
 // effectiveCodec resolves the codec choice from the Codec field
 // (source of truth when non-empty) or the legacy Transcode bool.
 // Returns one of "passthrough", "h264", "h265".
@@ -845,11 +916,46 @@ func effectiveCodec(cam *model.Camera) string {
 	return "passthrough"
 }
 
+// cameraHasAudio reports whether the camera was registered with
+// audio capability. The flag is stored as a generic JSON value in
+// Capabilities, so we tolerate bool / numeric / string forms
+// defensively (any non-empty truthy value counts).
+func cameraHasAudio(cam *model.Camera) bool {
+	if cam.Capabilities == nil {
+		return false
+	}
+	v, ok := cam.Capabilities["audio"]
+	if !ok || v == nil {
+		return false
+	}
+	switch t := v.(type) {
+	case bool:
+		return t
+	case float64:
+		return t != 0
+	case int:
+		return t != 0
+	case string:
+		return t != "" && t != "false" && t != "0"
+	}
+	return false
+}
+
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 	codec := effectiveCodec(cam)
+	audioOn := cameraHasAudio(cam)
 	if codec == "passthrough" {
+		if audioOn {
+			// Audio requested but we're on the passthrough path —
+			// the rtsp:// scheme cannot transcode PCMA to AAC, so
+			// switch to ffmpeg with video=copy (passthrough video)
+			// + audio=aac (transcode audio only). Adds ~5% CPU
+			// for the AAC encoder but preserves the camera's
+			// native video codec (no quality loss).
+			return "ffmpeg:" + raw + "#video=copy#audio=aac"
+		}
 		// Native path: no ffmpeg, no transcode. Camera
 		// delivers whatever codec it has (H.264 / H.265)
 		// and we hope the consumer supports it. HLS
@@ -865,9 +971,11 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// Transcode path: route through go2rtc's ffmpeg
 	// pipeline. `video=<codec>` selects a go2rtc ffmpeg
 	// preset (h264: H.264 high@4.1 superfast/zerolatency;
-	// h265: libx265). Omitting `audio=` causes parseArgs
-	// to inject `-an` so ffmpeg drops the camera's PCMA
-	// track entirely.
+	// h265: libx265). When audio is enabled we append
+	// `#audio=aac` so ffmpeg encodes the camera's PCMA
+	// audio to AAC alongside the video transcode. Without
+	// the audio directive, parseArgs injects `-an` so
+	// ffmpeg drops the camera's PCMA track entirely.
 	//
 	// `width=1280` downscales to 720p for h264 (bandwidth
 	// optimization for Cloudflare Tunnel). h265 keeps
@@ -882,10 +990,14 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// Frigate container (see compose.yaml). On hosts without
 	// an Intel GPU, omit this directive to fall back to
 	// software decode.
-	if codec == "h265" {
-		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi"
+	audioFrag := ""
+	if audioOn {
+		audioFrag = "#audio=aac"
 	}
-	return "ffmpeg:" + raw + "#video=h264#width=1280#hardware=vaapi"
+	if codec == "h265" {
+		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag
+	}
+	return "ffmpeg:" + raw + "#video=h264#width=1280#hardware=vaapi" + audioFrag
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into

@@ -282,3 +282,62 @@ func (c *Go2RTCClient) Frame(ctx context.Context, streamName string) (io.ReadClo
 	}
 	return resp.Body, resp.Header.Get("Content-Type"), nil
 }
+
+// StreamMP4 opens a streaming fMP4 connection to go2rtc. Used by
+// Android's ExoPlayer ProgressiveMediaSource to skip HLS playlist
+// round-trips (master → media → init.mp4 → segment.m4s) and
+// therefore dramatically reduce first-frame latency on cold starts.
+//
+// Unlike HLS, the response is a single, infinite, length-delimited
+// fMP4 stream — ExoPlayer consumes it as bytes arrive. The body
+// MUST be streamed (not buffered) because go2rtc keeps writing
+// until the client disconnects.
+//
+// Caller is responsible for closing the returned ReadCloser.
+func (c *Go2RTCClient) StreamMP4(ctx context.Context, streamName string) (io.ReadCloser, string, error) {
+	u := fmt.Sprintf("%s/api/stream.mp4?src=%s", c.Base, url.QueryEscape(streamName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	// Long timeout: the stream is unbounded; we just need a long
+	// read window between writes. The client disconnects when done.
+	hc := c.SDPHC
+	if hc == nil {
+		hc = c.HC
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("go2rtc stream.mp4: %s: %s", resp.Status, string(raw))
+	}
+	return resp.Body, resp.Header.Get("Content-Type"), nil
+}
+
+// Preheat opens a single JPEG frame request to go2rtc and discards
+// the body. The purpose is to force go2rtc to connect to the RTSP
+// source (and start any transcoder) before the first real client
+// request arrives, eliminating the 1-10s cold-start latency that
+// would otherwise fall on the user's first frame.
+//
+// This call is best-effort: errors are logged but not returned,
+// because preheating is an optimization — a failure here simply
+// means the first user request pays the cold-start cost.
+//
+// The RTSP connection go2rtc opens is kept alive (go2rtc's default
+// keepalive is 5s on the bundled upstream version), so subsequent
+// HLS/MP4/WebRTC requests reuse the warm source connection.
+func (c *Go2RTCClient) Preheat(ctx context.Context, streamName string) {
+	body, _, err := c.Frame(ctx, streamName)
+	if err != nil {
+		// Don't propagate — preheat is best-effort.
+		return
+	}
+	// Drain and close so the connection returns to the pool.
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 256<<10))
+	_ = body.Close()
+}
