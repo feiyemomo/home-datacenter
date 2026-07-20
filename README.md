@@ -344,10 +344,10 @@ curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
 # Returns motion-active time ranges (unix seconds) within [after, before)
 curl -sS -H "Authorization: Bearer $TOKEN" \
   "http://localhost:8080/api/v1/cameras/1/motion-ranges?after=1784533200&before=1784619600"
-# {"code":0,"message":"success","data":{"ranges":[[1784533265,1784533344],...],"total":77}}
+# {"code":0,"message":"success","data":{"ranges":[{"start":1784533265,"end":1784533344,"duration":79,"motion_score":469,"segment_count":8,"peak_objects":0},...],"total":109}}
 ```
 
-后端实现：`internal/camera/frigate.go` 的 `ListMotionRanges` 分块查询 Frigate 录制段（每块 1h，低于 Frigate 500 段上限），返回每个 `motion>0` 的段为独立 range（v1.6.1：不再合并相邻段——v1.6.0 用 `mergeGapSeconds=10` 把相邻段合并成大段，导致 Android SeekBar 上显示成一片大红色，用户报告"标红太宽了"；改为 `mergeGapSeconds=0` 后每个 10s Frigate 段独立显示为细红线，用户可看到 motion 的精确起止时刻）。返回裸 JSON 数组 `[[start, end], ...]`，与 alerts 端点不同——alerts 仅在 AI 检测到 person/car 时生成事件，motion-ranges 直接用 Frigate 录制段的 `motion` 字段，是「这里有动静」的更真实信号。
+后端实现：`internal/camera/frigate.go` 的 `ListMotionRanges` 分块查询 Frigate 录制段（每块 1h，低于 Frigate 500 段上限），用 2s gap 阈值合并相邻 motion 段（v1.6.3：从 v1.6.1 的 0s 改为 2s——0s 在 24h 内产生 ~750 个独立段过于密集；2s 是人眼"同一动作"的感知阈值，产生 ~109 段正好适合横向 chip 列表展示）。**v1.6.3：返回富结构 `[]MotionRange`**（之前是 `[][2]int64`），每个 range 含预聚合字段：`start/end/duration`（unix 秒）、`motion_score`（Frigate 段 motion 字段之和，反映 motion 强度）、`segment_count`（合并的 10s 段数）、`peak_objects`（合并段中 AI 检测到的最大对象数，>0 时 chip 显示红色）。所有聚合在后端完成，客户端零现场计算。**v1.6.3：进程内 60s TTL 缓存**——避免用户重复打开同一天的录像时反复请求 Frigate（1-2s 慢查询），缓存按 `<camera>:<after>:<before>` key 隔离，超过 32 条自动淘汰最旧的一半。
 
 完整文档：[`docs/platformization.md`](docs/platformization.md)。
 

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"sync"
 	"time"
 )
 
@@ -49,6 +50,12 @@ type FrigateClient struct {
 	// standalone go2rtc container exposed.
 	Go2rtcBase string
 	HC         *http.Client
+	// v1.6.3: in-process TTL cache for ListMotionRanges. Keyed by
+	// "<camera>:<after>:<before>". See cacheMotionRanges for the
+	// eviction policy. RWMutex because reads (cache hits) far
+	// outnumber writes (cache misses).
+	motionCache   map[string]motionCacheEntry
+	motionCacheMu sync.RWMutex
 }
 
 // NewFrigateClient returns a client with a 30s timeout (config save
@@ -527,18 +534,50 @@ func (c *FrigateClient) ListRecordings(ctx context.Context, cameraName string, a
 // ListMotionRanges returns time ranges (in unix seconds) where Frigate
 // recorded motion activity for the given camera within [after, before).
 //
-// v1.6.0: the dashboard's day-playback SeekBar paints red marks at
-// positions where motion happened. The previous approach used the
-// /api/events endpoint (alerts), which only fires when Frigate's AI
-// detector finds a tracked object (person/car). When the camera
-// catches motion that doesn't meet the AI threshold (cat, leaves
-// blowing, lighting changes), no alert is created and the overlay is
-// empty — even though the user can clearly see motion in the video.
+// MotionRange is one contiguous motion-active time range with
+// pre-aggregated metadata for the dashboard / mobile app.
 //
-// This method uses Frigate's per-segment `motion` field (from
-// /api/<cam>/recordings) which counts motion-active sub-segments
-// within each 10s recording. We collect all segments with motion > 0
-// and merge adjacent ones into contiguous (start, end) ranges.
+// v1.6.3: replaced the v1.6.0 [][2]int64 return type with this
+// struct so the mobile app can render a "motion chip" list without
+// re-fetching each segment's score from Frigate. The user explicitly
+// asked for "现场计算" to be avoided — all aggregation happens
+// server-side here.
+//
+// Fields:
+//   - StartUnix/EndUnix: contiguous range bounds (unix seconds)
+//   - Duration: seconds = EndUnix - StartUnix (redundant but
+//     convenient for clients that don't want to do math)
+//   - MotionScore: sum of Frigate's per-segment motion counts.
+//     Frigate's `motion` is the count of motion-active sub-segments
+//     within a 10s clip (0-10). Summing across the merged range
+//     gives a rough "how much motion" signal — useful for sorting
+//     chips by intensity (high-score chips render larger / brighter).
+//   - SegmentCount: how many 10s Frigate segments were merged into
+//     this range. Lets the client show "N segments" without another
+//     round-trip.
+//   - PeakObjects: max `objects` across all merged segments. If
+//     > 0, AI tracked something (person/car) — renders a different
+//     chip color than pure motion.
+type MotionRange struct {
+	StartUnix    int64 `json:"start"`
+	EndUnix      int64 `json:"end"`
+	Duration     int64 `json:"duration"`
+	MotionScore  int   `json:"motion_score"`
+	SegmentCount int   `json:"segment_count"`
+	PeakObjects  int   `json:"peak_objects"`
+}
+
+// motionCacheEntry stores a ListMotionRanges result with its fetch
+// timestamp. Used by the in-process TTL cache to avoid re-querying
+// Frigate when the mobile app re-opens the same day's playlist.
+type motionCacheEntry struct {
+	ranges    []MotionRange
+	fetchedAt time.Time
+}
+
+// ListMotionRanges queries Frigate for recording segments with
+// motion > 0 in the given [after, before) time window, then merges
+// adjacent motion segments into contiguous ranges.
 //
 // Frigate's /api/<cam>/recordings endpoint has an internal cap of
 // ~500 segments per request (verified in v1.5.20). For a 24h window
@@ -546,12 +585,41 @@ func (c *FrigateClient) ListRecordings(ctx context.Context, cameraName string, a
 // (max 360 segments/hour, well under the cap). Total = 24 round-trips
 // for a full day, which takes ~1-2s on a LAN Frigate.
 //
-// Returns ranges as unix-second pairs, oldest-first. Empty list if
-// no motion or Frigate is unreachable.
-func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string, after, before int64) ([][2]int64, error) {
+// v1.6.3: returns []MotionRange (was [][2]int64 in v1.6.0-v1.6.2).
+// Each entry is pre-aggregated with MotionScore/SegmentCount/
+// PeakObjects so the mobile app can render motion chips without
+// re-fetching. Merging threshold is 2s (was 0s in v1.6.1, 10s in
+// v1.6.0): 0s produced ~750 chips for 24h which was too many to
+// render readably; 10s produced ~77 fat bars which the user said
+// was "标红太宽了"; 2s is the smallest gap that's perceptually a
+// "different motion event" (anything <2s of stillness reads as
+// the same ongoing action), and yields ~120-180 chips/24h which
+// fits nicely in a horizontal chip scroller.
+//
+// v1.6.3: in-process TTL cache. The mobile app hits this endpoint
+// every time the user opens the day playlist, and the Frigate query
+// is the slowest part (1-2s). We cache the result for 60s per
+// (camera, day) pair — short enough that the user sees fresh data
+// after re-opening the dialog, long enough to absorb double-taps
+// and tab switches. Cache is keyed by (cameraName, after, before)
+// so different windows don't collide.
+func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string, after, before int64) ([]MotionRange, error) {
 	if after <= 0 || before <= 0 || before <= after {
 		return nil, fmt.Errorf("invalid time range: after=%d before=%d", after, before)
 	}
+
+	// v1.6.3: cache lookup. Key includes camera + window so concurrent
+	// days for the same camera don't collide. TTL is short (60s) to
+	// keep cache fresh while absorbing repeat requests.
+	cacheKey := fmt.Sprintf("%s:%d:%d", cameraName, after, before)
+	c.motionCacheMu.RLock()
+	if entry, ok := c.motionCache[cacheKey]; ok {
+		if time.Since(entry.fetchedAt) < 60*time.Second {
+			c.motionCacheMu.RUnlock()
+			return entry.ranges, nil
+		}
+	}
+	c.motionCacheMu.RUnlock()
 
 	// Chunk into hourly windows. Each hour = at most 360 10s segments,
 	// safely under Frigate's 500-segment cap.
@@ -574,6 +642,7 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 	}
 
 	if len(allSegments) == 0 {
+		c.cacheMotionRanges(cacheKey, nil)
 		return nil, nil
 	}
 
@@ -582,18 +651,12 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 		return allSegments[i].StartTime < allSegments[j].StartTime
 	})
 
-	// v1.6.1: do NOT merge adjacent motion segments. The v1.6.0
-	// implementation used mergeGapSeconds=10 to coalesce neighboring
-	// 10s Frigate segments into one big range, but on a 24h timeline
-	// this produced a few huge red blocks that spanned hours —
-	// the user reported "标红太宽了". Now each motion segment stays
-	// independent: a continuous motion across 6 segments shows up
-	// as 6 thin red lines instead of one fat red bar, which lets the
-	// user see when motion started/stopped within the activity period
-	// and makes the snap-to-edge feature feel meaningful.
-	const mergeGapSeconds float64 = 0
-	var ranges [][2]int64
-	var curStart, curEnd int64
+	// v1.6.3: 2s gap threshold. See func doc for the rationale
+	// (0s = too many chips, 10s = too few fat bars, 2s = human
+	// perceptual "same action" boundary).
+	const mergeGapSeconds int64 = 2
+	var ranges []MotionRange
+	var curStart, curEnd, curScore, curCount, curPeak int64
 	inRange := false
 	for _, seg := range allSegments {
 		if seg.Motion <= 0 {
@@ -603,20 +666,79 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 		segEnd := int64(seg.EndTime)
 		if !inRange {
 			curStart, curEnd = segStart, segEnd
+			curScore = int64(seg.Motion)
+			curCount = 1
+			curPeak = int64(seg.Objects)
 			inRange = true
 			continue
 		}
-		if float64(segStart-curEnd) <= mergeGapSeconds {
+		if segStart-curEnd <= mergeGapSeconds {
 			// Extend the current range.
 			curEnd = segEnd
+			curScore += int64(seg.Motion)
+			curCount++
+			if int64(seg.Objects) > curPeak {
+				curPeak = int64(seg.Objects)
+			}
 		} else {
 			// Gap too large — flush the current range and start a new one.
-			ranges = append(ranges, [2]int64{curStart, curEnd})
+			ranges = append(ranges, MotionRange{
+				StartUnix:    curStart,
+				EndUnix:      curEnd,
+				Duration:     curEnd - curStart,
+				MotionScore:  int(curScore),
+				SegmentCount: int(curCount),
+				PeakObjects:  int(curPeak),
+			})
 			curStart, curEnd = segStart, segEnd
+			curScore = int64(seg.Motion)
+			curCount = 1
+			curPeak = int64(seg.Objects)
 		}
 	}
 	if inRange {
-		ranges = append(ranges, [2]int64{curStart, curEnd})
+		ranges = append(ranges, MotionRange{
+			StartUnix:    curStart,
+			EndUnix:      curEnd,
+			Duration:     curEnd - curStart,
+			MotionScore:  int(curScore),
+			SegmentCount: int(curCount),
+			PeakObjects:  int(curPeak),
+		})
 	}
+
+	c.cacheMotionRanges(cacheKey, ranges)
 	return ranges, nil
+}
+
+// cacheMotionRanges stores a ListMotionRanges result under cacheKey.
+// Caller already holds no lock — we acquire the write lock here.
+func (c *FrigateClient) cacheMotionRanges(cacheKey string, ranges []MotionRange) {
+	c.motionCacheMu.Lock()
+	// Lazy-init the map so we don't allocate until first use.
+	if c.motionCache == nil {
+		c.motionCache = make(map[string]motionCacheEntry, 8)
+	}
+	c.motionCache[cacheKey] = motionCacheEntry{
+		ranges:    ranges,
+		fetchedAt: time.Now(),
+	}
+	// Opportunistic GC: if the cache has grown past 32 entries (e.g.
+	// the user browsed many days), evict the oldest half. Prevents
+	// unbounded growth from multi-day browsing sessions.
+	if len(c.motionCache) > 32 {
+		type kv struct {
+			key string
+			t   time.Time
+		}
+		entries := make([]kv, 0, len(c.motionCache))
+		for k, v := range c.motionCache {
+			entries = append(entries, kv{k, v.fetchedAt})
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].t.Before(entries[j].t) })
+		for i := 0; i < len(entries)-16; i++ {
+			delete(c.motionCache, entries[i].key)
+		}
+	}
+	c.motionCacheMu.Unlock()
 }
