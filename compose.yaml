@@ -42,6 +42,11 @@ services:
         condition: service_healthy
     environment:
       - APP_CONFIG=${APP_CONFIG:-/configs/config.yaml}
+      # v1.5.13: match Frigate's TZ so PlayRecording path lookups
+      # use LOCAL date components (the disk layout is now LOCAL
+      # after Frigate TZ change). Also makes any Go time.Now() calls
+      # return LOCAL time, which is what the user expects in logs.
+      - TZ=Asia/Shanghai
       # Secret material via env (preferred). See .env.example.
       - JWT_SECRET=${JWT_SECRET:-}
       - MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
@@ -105,6 +110,14 @@ services:
     environment:
       - SET_CONFIG_BY_API=true
       - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-}
+      # v1.5.13: Frigate stores recordings under /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4
+      # using UTC date components. Without TZ=Asia/Shanghai, "a day's
+      # recordings" as seen by the dashboard spans 7.19 08:00 LOCAL
+      # to 7.20 08:00 LOCAL (because UTC 7.19 00:00 = LOCAL 7.19 08:00).
+      # Setting TZ fixes both the directory partitioning AND the
+      # Frigate REST API start_time interpretation so the user's
+      # "play 7.19" actually plays 7.19 00:00..7.20 00:00 LOCAL.
+      - TZ=Asia/Shanghai
       # MQTT credentials — shared with home-api so Frigate can publish
       # detection events and stats to the same mosquitto broker.
       # Frigate's env var substitutor (frigate/config/env.py) ONLY
