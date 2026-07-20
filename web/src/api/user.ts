@@ -1,6 +1,7 @@
 import client from "./client";
 import type {
     CreateUserRequest,
+    CreateUserResponse,
     UpdateUserRequest,
     User,
     UserDeleteResponse,
@@ -21,21 +22,14 @@ export async function listUsers(): Promise<UserListResponse["users"]> {
  * Create a new user. Admin-only.
  *
  * POST /api/v1/user
+ *
+ * When `initial_device_name` is provided in the request, the
+ * response includes a `device` object and `access_key` with
+ * the plaintext AccessKey (only available at creation time).
  */
-export async function createUser(req: CreateUserRequest): Promise<User> {
-    const { data } = await client.post<{
-        id: number;
-        name: string;
-        is_admin: boolean;
-    }>("/user", req);
-    // The handler returns the user fields at the top level of
-    // the data envelope, not as a `{user: ...}` wrapper. Unwrap
-    // manually so callers receive a User shape.
-    return {
-        id: data.id,
-        name: data.name,
-        is_admin: data.is_admin,
-    };
+export async function createUser(req: CreateUserRequest): Promise<CreateUserResponse> {
+    const { data } = await client.post<CreateUserResponse>("/user", req);
+    return data;
 }
 
 /**

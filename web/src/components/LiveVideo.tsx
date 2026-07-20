@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
-import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power, Play, Trash2, RefreshCcw } from "lucide-react";
+import { useEffect, useState } from "react";
+import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power, Play } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -10,12 +10,10 @@ import {
     ptzMove,
     gotoPreset,
     cameraFrameUrl,
-    listRecordings,
-    deleteRecording,
     setRecordingPlan,
 } from "@/api/camera";
-import { authHeaderFor } from "@/api/client";
-import type { Camera, CameraEventMessage, CameraRecording, CameraStatusEvent, WsMessage } from "@/types";
+import { RecordingTimeline } from "@/components/RecordingTimeline";
+import type { Camera, CameraEventMessage, CameraStatusEvent, WsMessage } from "@/types";
 
 interface LiveVideoProps {
     camera: Camera;
@@ -58,16 +56,6 @@ function readTransport(): TransportMode {
         if (v === "auto" || v === "webrtc" || v === "hls") return v;
     } catch { /* private browsing etc. */ }
     return "auto";
-}
-
-/** Format a recording duration (seconds) as h:mm:ss or m:ss. */
-function formatDuration(sec: number): string {
-    if (!Number.isFinite(sec) || sec < 0) return "--";
-    const s = Math.floor(sec % 60);
-    const m = Math.floor(sec / 60) % 60;
-    const h = Math.floor(sec / 3600);
-    const pad = (n: number) => n.toString().padStart(2, "0");
-    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
 /**
@@ -212,102 +200,17 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     }
 
     // ----------------- Recording playback state -----------------
-    // Ported from the previous standalone RecordingPanel. The
-    // playback mode mounts this state; leaving playback mode
-    // revokes any in-flight blob URL so we don't leak the MP4.
-    const [recordings, setRecordings] = useState<CameraRecording[]>([]);
-    const [loadingRecs, setLoadingRecs] = useState(false);
+    // Recording playback is now fully owned by the RecordingTimeline
+    // component (day picker, 24h seekbar, motion overlay, fisheye
+    // chips, custom controls). LiveVideo only tracks the recording
+    // toggle (admin) and whether we're in playback mode.
     const [toggling, setToggling] = useState(false);
-    const [recError, setRecError] = useState<string | null>(null);
-    const [playingId, setPlayingId] = useState<number | null>(null);
-    const [videoUrl, setVideoUrl] = useState<string | null>(null);
-    const [fetchingPlay, setFetchingPlay] = useState<number | null>(null);
-
-    // Track the current blob URL so we can revoke it before
-    // replacing it or on unmount. Keeping it in a ref lets the
-    // cleanup function read the latest value without re-running.
-    const urlRef = useRef<string | null>(null);
-    useEffect(() => {
-        return () => {
-            if (urlRef.current) {
-                URL.revokeObjectURL(urlRef.current);
-                urlRef.current = null;
-            }
-        };
-    }, []);
 
     const recordingEnabled = camera.meta.recording?.enabled ?? false;
-
-    const loadRecordings = useCallback(async () => {
-        setLoadingRecs(true);
-        setRecError(null);
-        try {
-            const list = await listRecordings(camera.id, 20);
-            setRecordings(list);
-        } catch (e) {
-            setRecError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setLoadingRecs(false);
-        }
-    }, [camera.id]);
-
-    function revokeCurrentUrl() {
-        if (urlRef.current) {
-            URL.revokeObjectURL(urlRef.current);
-            urlRef.current = null;
-        }
-        setVideoUrl(null);
-    }
-
-    async function onPlay(rec: CameraRecording) {
-        if (fetchingPlay !== null) return;
-        // Stop any current playback first.
-        revokeCurrentUrl();
-        setPlayingId(null);
-        setFetchingPlay(rec.id);
-        setRecError(null);
-        try {
-            const h = authHeaderFor();
-            const resp = await fetch(
-                `/api/v1/cameras/${camera.id}/recordings/${rec.id}/file`,
-                { headers: h ? { [h.name]: h.value } : {} },
-            );
-            if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}`);
-            }
-            const blob = await resp.blob();
-            const url = URL.createObjectURL(blob);
-            urlRef.current = url;
-            setVideoUrl(url);
-            setPlayingId(rec.id);
-        } catch (e) {
-            setRecError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setFetchingPlay(null);
-        }
-    }
-
-    function onStopPlay() {
-        revokeCurrentUrl();
-        setPlayingId(null);
-    }
-
-    async function onDeleteRec(rec: CameraRecording) {
-        if (!isAdmin) return;
-        if (!confirm(`Delete recording ${rec.id}?`)) return;
-        try {
-            if (playingId === rec.id) onStopPlay();
-            await deleteRecording(camera.id, rec.id);
-            await loadRecordings();
-        } catch (e) {
-            setRecError(e instanceof Error ? e.message : String(e));
-        }
-    }
 
     async function onToggleRecording() {
         if (!isAdmin || toggling || !onRefresh) return;
         setToggling(true);
-        setRecError(null);
         try {
             await setRecordingPlan(camera.id, {
                 enabled: !recordingEnabled,
@@ -315,57 +218,18 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                 retention_days: 7,
             });
             await onRefresh();
-        } catch (e) {
-            setRecError(e instanceof Error ? e.message : String(e));
         } finally {
             setToggling(false);
         }
     }
 
     // targetTime auto-playback — when the URL carries ?time=… the
-    // parent routes it in here. We switch to playback mode, load
-    // the recordings (if not already loaded), and play the one
-    // whose start minute matches the requested minute. Logic
-    // preserved verbatim from the previous RecordingPanel.
+    // parent routes it in here. We switch to playback mode; the
+    // RecordingTimeline component handles the actual seek.
     useEffect(() => {
         if (targetTime === undefined || targetTime === 0) return;
         setMode("playback");
-        if (recordings.length === 0 && !loadingRecs) {
-            void loadRecordings();
-        }
     }, [targetTime]); // eslint-disable-line react-hooks/exhaustive-deps
-
-    useEffect(() => {
-        if (targetTime === undefined || targetTime === 0) return;
-        if (recordings.length === 0 || loadingRecs) return;
-
-        const targetMinuteStart = Math.floor(targetTime / 60) * 60;
-        const matchingRec = recordings.find((rec) => {
-            const recStartTime = new Date(rec.start_at).getTime() / 1000;
-            const recStartMinute = Math.floor(recStartTime / 60) * 60;
-            return recStartMinute === targetMinuteStart;
-        });
-
-        if (matchingRec && playingId !== matchingRec.id && fetchingPlay === null) {
-            void onPlay(matchingRec);
-        }
-    }, [recordings, targetTime, loadingRecs, playingId, fetchingPlay]); // eslint-disable-line react-hooks/exhaustive-deps
-
-    // When entering playback mode, lazy-load the recording list.
-    useEffect(() => {
-        if (mode === "playback" && recordings.length === 0 && !loadingRecs) {
-            void loadRecordings();
-        }
-    }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
-
-    // Leaving playback mode revokes the blob URL so the MP4
-    // doesn't keep a fetched-but-hidden reference. The next
-    // entry into playback will re-fetch on demand.
-    useEffect(() => {
-        if (mode !== "playback" && videoUrl) {
-            onStopPlay();
-        }
-    }, [mode]); // eslint-disable-line react-hooks/exhaustive-deps
 
     const statusColor =
         status === "online"
@@ -565,31 +429,16 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         )
                     )}
                     {mode === "playback" && (
-                        videoUrl && playingId !== null ? (
-                            <video
-                                key={videoUrl}
-                                src={videoUrl}
-                                controls
-                                autoPlay
-                                className="h-full w-full object-contain"
-                            />
-                        ) : (
-                            <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
-                                {loadingRecs ? (
-                                    <>
-                                        <Loader2 className="mb-2 h-5 w-5 animate-spin" />
-                                        <span className="text-xs">loading recordings…</span>
-                                    </>
-                                ) : recordings.length === 0 ? (
-                                    <>
-                                        <AlertTriangle className="mb-2 h-5 w-5 text-slate-500" />
-                                        <span className="text-xs">no recordings</span>
-                                    </>
-                                ) : (
-                                    <span className="text-xs">select a recording below</span>
-                                )}
-                            </div>
-                        )
+                        // RecordingTimeline owns the entire playback
+                        // surface (day picker + 24h seekbar + custom
+                        // video controls + motion overlay + fisheye
+                        // chips). The aspect-video wrapper here is
+                        // just a placeholder so the card keeps its
+                        // frame shape before RecordingTimeline
+                        // mounts its inner video surface.
+                        <div className="absolute inset-0 flex items-center justify-center text-slate-400">
+                            <span className="text-xs">切换至下方时间轴开始播放</span>
+                        </div>
                     )}
                     {eventToast && (
                         <div className="absolute right-2 top-2 rounded-lg backdrop-blur-xl bg-black/50 px-3 py-1.5 text-xs font-semibold text-white shadow-lg border border-white/10">
@@ -598,101 +447,17 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                     )}
                 </div>
 
-                {/* Recording list — playback mode only. Mirrors the
-                 * previous RecordingPanel layout: each row shows
-                 * start time, duration, size, play/stop + delete
-                 * buttons. Inline video player is rendered in the
-                 * aspect-video area above when a recording is
-                 * playing. */}
+                {/* RecordingTimeline — playback mode only. Renders
+                 * its own aspect-video surface with custom controls,
+                 * a 24h seekbar with motion overlay, day picker, and
+                 * fisheye chips. Replaces the previous "最近录制"
+                 * list. The targetTime prop is forwarded so alert
+                 * clicks (?time=…&mode=recording) auto-seek. */}
                 {mode === "playback" && (
-                    <div className="space-y-2 px-4 pb-3 pt-1">
-                        {recError && (
-                            <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-2.5 py-1.5 text-[11px]">
-                                {recError}
-                            </div>
-                        )}
-
-                        <div className="space-y-1">
-                            <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-fg-subtle">
-                                <span>最近录制</span>
-                                <button
-                                    type="button"
-                                    onClick={loadRecordings}
-                                    disabled={loadingRecs}
-                                    className="inline-flex items-center gap-1 text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
-                                >
-                                    <RefreshCcw size={10} className={loadingRecs ? "animate-spin" : ""} />
-                                    刷新
-                                </button>
-                            </div>
-
-                            {loadingRecs && recordings.length === 0 ? (
-                                <div className="flex items-center justify-center py-4 text-[11px] text-fg-muted">
-                                    <Loader2 size={12} className="mr-1 animate-spin" />
-                                    加载中…
-                                </div>
-                            ) : recordings.length === 0 ? (
-                                <div className="py-3 text-center text-[11px] text-fg-subtle">
-                                    暂无录制
-                                </div>
-                            ) : (
-                                <ul className="max-h-56 space-y-1 overflow-y-auto pr-0.5">
-                                    {recordings.map((rec) => (
-                                        <li
-                                            key={rec.id}
-                                            className="flex items-center gap-2 glass-subtle rounded-lg px-2 py-1.5 text-[11px] hover:bg-[rgb(var(--bg-subtle)/0.3)] transition-colors"
-                                        >
-                                            <div className="min-w-0 flex-1">
-                                                <div className="truncate font-medium text-fg">
-                                                    {new Date(rec.start_at).toLocaleString()}
-                                                </div>
-                                                <div className="truncate text-[10px] text-fg-muted">
-                                                    {formatDuration(rec.duration_seconds)} · {rec.size_human}
-                                                </div>
-                                            </div>
-                                            {playingId === rec.id && videoUrl ? (
-                                                <button
-                                                    type="button"
-                                                    onClick={onStopPlay}
-                                                    className="inline-flex h-6 items-center gap-1 rounded-md glass-subtle px-2 text-[10px] text-fg-muted transition-colors hover:text-fg"
-                                                    title="停止播放"
-                                                >
-                                                    <Square size={10} />
-                                                    停止
-                                                </button>
-                                            ) : (
-                                                <button
-                                                    type="button"
-                                                    onClick={() => onPlay(rec)}
-                                                    disabled={fetchingPlay !== null}
-                                                    className="inline-flex h-6 items-center gap-1 rounded-md bg-[rgb(var(--accent-primary)/0.15)] px-2 text-[10px] text-[rgb(var(--accent-primary))] transition-colors hover:bg-[rgb(var(--accent-primary)/0.25)] disabled:opacity-50"
-                                                    title="播放"
-                                                >
-                                                    {fetchingPlay === rec.id ? (
-                                                        <Loader2 size={10} className="animate-spin" />
-                                                    ) : (
-                                                        <Play size={10} />
-                                                    )}
-                                                    播放
-                                                </button>
-                                            )}
-                                            {isAdmin && (
-                                                <button
-                                                    type="button"
-                                                    onClick={() => onDeleteRec(rec)}
-                                                    className="inline-flex h-6 items-center justify-center rounded-md p-1 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
-                                                    aria-label="Delete recording"
-                                                    title="删除录制"
-                                                >
-                                                    <Trash2 size={11} />
-                                                </button>
-                                            )}
-                                        </li>
-                                    ))}
-                                </ul>
-                            )}
-                        </div>
-                    </div>
+                    <RecordingTimeline
+                        cameraId={camera.id}
+                        targetTime={targetTime}
+                    />
                 )}
 
                 {/* PTZ pad + presets — live mode only. Hidden in
