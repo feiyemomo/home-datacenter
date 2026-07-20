@@ -654,9 +654,33 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 	// v1.6.3: 2s gap threshold. See func doc for the rationale
 	// (0s = too many chips, 10s = too few fat bars, 2s = human
 	// perceptual "same action" boundary).
-	const mergeGapSeconds int64 = 2
+	// v1.6.4 rev6: tier-aware gap threshold. The user said "将同种
+	// 颜色的chip段多合并一些吧（尤其是绿色）". Previously every
+	// segment used the same 2s gap, which split low-motion segments
+	// (motion=1-2, green tier) into many tiny chips that cluttered
+	// the fisheye scroller. Now low-motion segments use a 60s gap
+	// (still perceived as the same "quiet period"), while mid/high
+	// motion keeps the strict 2s gap to preserve precise event
+	// boundaries. Tiers map to the client's color buckets:
+	//   - LOW (teal/green):   seg.Motion <= 2
+	//   - MID (amber):        seg.Motion 3..5
+	//   - HIGH (orange):      seg.Motion 6..8
+	//   - ALERT (red):        seg.Objects > 0 (AI detected)
+	// We compute a per-segment tier to decide the gap, but only
+	// EXTEND a range if both the current range's "dominant tier"
+	// and the incoming segment's tier are LOW — otherwise high
+	// motion events stay precisely bounded.
+	const (
+		mergeGapLowSeconds    int64 = 60 // low-motion: 60s gap (merge "quiet" stretches)
+		mergeGapDefaultSeconds int64 = 2  // mid/high motion: 2s strict gap
+	)
+	isLowTier := func(motion, objects int) bool {
+		// Objects > 0 always = ALERT tier, never "low".
+		return objects <= 0 && motion <= 2
+	}
 	var ranges []MotionRange
 	var curStart, curEnd, curScore, curCount, curPeak int64
+	curLowTier := false // whether the current range is dominated by low-tier segs
 	inRange := false
 	for _, seg := range allSegments {
 		if seg.Motion <= 0 {
@@ -664,21 +688,35 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 		}
 		segStart := seg.StartTime
 		segEnd := int64(seg.EndTime)
+		segLow := isLowTier(int(seg.Motion), int(seg.Objects))
 		if !inRange {
 			curStart, curEnd = segStart, segEnd
 			curScore = int64(seg.Motion)
 			curCount = 1
 			curPeak = int64(seg.Objects)
+			curLowTier = segLow
 			inRange = true
 			continue
 		}
-		if segStart-curEnd <= mergeGapSeconds {
+		// Pick the gap based on both the current range and the
+		// incoming segment: only LOW+LOW uses the larger gap.
+		effectiveGap := mergeGapDefaultSeconds
+		if curLowTier && segLow {
+			effectiveGap = mergeGapLowSeconds
+		}
+		if segStart-curEnd <= effectiveGap {
 			// Extend the current range.
 			curEnd = segEnd
 			curScore += int64(seg.Motion)
 			curCount++
 			if int64(seg.Objects) > curPeak {
 				curPeak = int64(seg.Objects)
+			}
+			// If the incoming segment is non-low (mid/high/alert),
+			// the range is no longer "dominantly low" — switch it
+			// off so subsequent segments use the strict 2s gap.
+			if !segLow {
+				curLowTier = false
 			}
 		} else {
 			// Gap too large — flush the current range and start a new one.
@@ -694,6 +732,7 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 			curScore = int64(seg.Motion)
 			curCount = 1
 			curPeak = int64(seg.Objects)
+			curLowTier = segLow
 		}
 	}
 	if inRange {
