@@ -670,17 +670,48 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 	// EXTEND a range if both the current range's "dominant tier"
 	// and the incoming segment's tier are LOW — otherwise high
 	// motion events stay precisely bounded.
+	// v1.6.5 rev7: user said "chip还是很多" after rev6. Bumped LOW
+	// gap from 60s → 180s (3 minutes — a single "quiet period" chip
+	// can now span 3 minutes of near-zero activity) and added a MID
+	// tier (15s gap) so consecutive amber segments also merge into
+	// a single chip. HIGH/ALERT keep the strict 2s gap so fast-
+	// moving events stay precisely bounded. Effective merge
+	// decisions: curTier and segTier must match exactly (LOW+LOW
+	// uses 180s, MID+MID uses 15s); cross-tier escalation always
+	// uses the strict 2s gap to avoid blurring event boundaries.
 	const (
-		mergeGapLowSeconds    int64 = 60 // low-motion: 60s gap (merge "quiet" stretches)
-		mergeGapDefaultSeconds int64 = 2  // mid/high motion: 2s strict gap
+		mergeGapLowSeconds     int64 = 180 // low-motion: 3min gap (was 60s)
+		mergeGapMidSeconds     int64 = 15  // mid-motion: 15s gap (NEW)
+		mergeGapDefaultSeconds int64 = 2   // high/alert: strict 2s gap
 	)
-	isLowTier := func(motion, objects int) bool {
-		// Objects > 0 always = ALERT tier, never "low".
-		return objects <= 0 && motion <= 2
+	// tier returns 0=LOW, 1=MID, 2=HIGH/ALERT. Two segments with
+	// the same tier can use that tier's gap; different tiers use
+	// the strict 2s gap.
+	tierOf := func(motion, objects int) int {
+		if objects > 0 {
+			return 2 // ALERT
+		}
+		if motion <= 2 {
+			return 0 // LOW
+		}
+		if motion <= 5 {
+			return 1 // MID
+		}
+		return 2 // HIGH
+	}
+	gapForTier := func(t int) int64 {
+		switch t {
+		case 0:
+			return mergeGapLowSeconds
+		case 1:
+			return mergeGapMidSeconds
+		default:
+			return mergeGapDefaultSeconds
+		}
 	}
 	var ranges []MotionRange
 	var curStart, curEnd, curScore, curCount, curPeak int64
-	curLowTier := false // whether the current range is dominated by low-tier segs
+	curTier := 2 // dominant tier of the current range; 2 = HIGH/ALERT (strict)
 	inRange := false
 	for _, seg := range allSegments {
 		if seg.Motion <= 0 {
@@ -688,21 +719,21 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 		}
 		segStart := seg.StartTime
 		segEnd := int64(seg.EndTime)
-		segLow := isLowTier(int(seg.Motion), int(seg.Objects))
+		segTier := tierOf(int(seg.Motion), int(seg.Objects))
 		if !inRange {
 			curStart, curEnd = segStart, segEnd
 			curScore = int64(seg.Motion)
 			curCount = 1
 			curPeak = int64(seg.Objects)
-			curLowTier = segLow
+			curTier = segTier
 			inRange = true
 			continue
 		}
-		// Pick the gap based on both the current range and the
-		// incoming segment: only LOW+LOW uses the larger gap.
+		// Same tier: use that tier's gap (LOW 180s, MID 15s).
+		// Cross-tier: use strict 2s gap to preserve boundaries.
 		effectiveGap := mergeGapDefaultSeconds
-		if curLowTier && segLow {
-			effectiveGap = mergeGapLowSeconds
+		if curTier == segTier {
+			effectiveGap = gapForTier(segTier)
 		}
 		if segStart-curEnd <= effectiveGap {
 			// Extend the current range.
@@ -712,11 +743,14 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 			if int64(seg.Objects) > curPeak {
 				curPeak = int64(seg.Objects)
 			}
-			// If the incoming segment is non-low (mid/high/alert),
-			// the range is no longer "dominantly low" — switch it
-			// off so subsequent segments use the strict 2s gap.
-			if !segLow {
-				curLowTier = false
+			// If the incoming segment escalates tier (e.g. range
+			// was LOW but incoming is MID/HIGH/ALERT), the range is
+			// no longer "dominated by low" — promote the dominant
+			// tier to the higher value so subsequent merges use the
+			// stricter gap. Demotion never happens (a HIGH range
+			// stays HIGH even if a stray LOW seg follows).
+			if segTier > curTier {
+				curTier = segTier
 			}
 		} else {
 			// Gap too large — flush the current range and start a new one.
@@ -732,7 +766,7 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 			curScore = int64(seg.Motion)
 			curCount = 1
 			curPeak = int64(seg.Objects)
-			curLowTier = segLow
+			curTier = segTier
 		}
 	}
 	if inRange {
