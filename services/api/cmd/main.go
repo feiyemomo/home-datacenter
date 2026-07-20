@@ -286,6 +286,23 @@ func main() {
 			system.GET("/status", systemHandler.Status)
 		}
 
+		// v1.6.11: in-app self-update endpoints. JWT-protected so
+		// anonymous clients cannot enumerate or download APKs.
+		// GET  /release/latest     → metadata (version, size, url)
+		// GET  /release/latest/apk → stream the APK file
+		//
+		// The handler scans config.AppConfig.Releases.Dir for files
+		// matching "app-debug-vX.Y.Z.apk" and returns the highest
+		// version. Publishing a new release is just scp'ing a new
+		// APK into the directory — no DB row, no restart.
+		releaseHandler := handler.NewReleaseHandler(config.AppConfig.Releases.Dir)
+		releaseGroup := api.Group("/release")
+		releaseGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			releaseGroup.GET("/latest", releaseHandler.Latest)
+			releaseGroup.GET("/latest/apk", releaseHandler.Download)
+		}
+
 		// Weather proxy: serves cached wttr.in JSON so the Android
 		// app can show current weather on the dashboard. JWT-protected
 		// (auth users only — no anonymous weather queries).
