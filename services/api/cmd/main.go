@@ -317,6 +317,10 @@ func main() {
 			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
 			camGroup.GET(":id/recordings", camHandler.ListRecordings)
 			camGroup.GET(":id/recordings/:recId/file", camHandler.PlayRecording)
+			// v1.6.0: motion ranges for day-playback SeekBar overlay.
+			// Replaces alerts-as-overlay-source — motion fires on any
+			// pixel-diff activity, alerts only fire on AI detection.
+			camGroup.GET(":id/motion-ranges", camHandler.MotionRanges)
 			// WebRTC SDP exchange. Lives in the cameras group so it
 			// shares the JWT middleware (any authenticated user with
 			// read access to the camera can call it). The SDP body

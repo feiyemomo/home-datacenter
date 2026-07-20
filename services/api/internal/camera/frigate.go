@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"time"
 )
@@ -451,13 +452,23 @@ func camerasAsMap(cameras []FrigateCameraConfig) map[string]any {
 
 // FrigateRecording is a single recording segment returned by
 // GET /api/<camera>/recordings. Frigate stores recordings as
-// hour-bounded segments; each entry covers one hour (or part
-// thereof) of continuous video.
+// ~10s MP4 files on disk; each entry in the API response covers
+// one 10s segment.
 //
 // NOTE: Frigate's API returns end_time and duration as floats
 // (e.g. 1784306209.996875), not ints. We use float64 to avoid
 // JSON unmarshal errors. Callers that need int seconds should
 // cast explicitly.
+//
+// v1.6.0: added Motion and Objects fields. Frigate's per-segment
+// `motion` is the count of motion-active sub-segments within the
+// 10s clip (0 = no motion, 1-10 = sub-segments with pixel-diff
+// motion). `objects` is the count of sub-segments with tracked
+// object detections (person, car, etc.). The dashboard uses
+// motion > 0 to paint red marks on the day-playback SeekBar —
+// without this field the overlay relied on /api/events (alerts)
+// which only fires when AI detection finds a person/car, leaving
+// the overlay empty even when there's clear motion activity.
 type FrigateRecording struct {
 	Camera    string  `json:"camera"`
 	StartTime int64   `json:"start_time"`       // unix seconds
@@ -465,6 +476,8 @@ type FrigateRecording struct {
 	Duration  float64 `json:"duration"`         // seconds (float)
 	HasClip   bool    `json:"has_clip"`
 	HasSnap   bool    `json:"has_snapshot"`
+	Motion    int     `json:"motion"`           // v1.6.0: motion-active sub-segments (0-10)
+	Objects   int     `json:"objects"`          // v1.6.0: object-detection sub-segments (0-10)
 }
 
 // ListRecordings queries Frigate for recording segments of a camera.
@@ -509,4 +522,95 @@ func (c *FrigateClient) ListRecordings(ctx context.Context, cameraName string, a
 		return nil, fmt.Errorf("decode recordings: %w", err)
 	}
 	return recs, nil
+}
+
+// ListMotionRanges returns time ranges (in unix seconds) where Frigate
+// recorded motion activity for the given camera within [after, before).
+//
+// v1.6.0: the dashboard's day-playback SeekBar paints red marks at
+// positions where motion happened. The previous approach used the
+// /api/events endpoint (alerts), which only fires when Frigate's AI
+// detector finds a tracked object (person/car). When the camera
+// catches motion that doesn't meet the AI threshold (cat, leaves
+// blowing, lighting changes), no alert is created and the overlay is
+// empty — even though the user can clearly see motion in the video.
+//
+// This method uses Frigate's per-segment `motion` field (from
+// /api/<cam>/recordings) which counts motion-active sub-segments
+// within each 10s recording. We collect all segments with motion > 0
+// and merge adjacent ones into contiguous (start, end) ranges.
+//
+// Frigate's /api/<cam>/recordings endpoint has an internal cap of
+// ~500 segments per request (verified in v1.5.20). For a 24h window
+// that's 8640 segments, so we chunk the request into hourly calls
+// (max 360 segments/hour, well under the cap). Total = 24 round-trips
+// for a full day, which takes ~1-2s on a LAN Frigate.
+//
+// Returns ranges as unix-second pairs, oldest-first. Empty list if
+// no motion or Frigate is unreachable.
+func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string, after, before int64) ([][2]int64, error) {
+	if after <= 0 || before <= 0 || before <= after {
+		return nil, fmt.Errorf("invalid time range: after=%d before=%d", after, before)
+	}
+
+	// Chunk into hourly windows. Each hour = at most 360 10s segments,
+	// safely under Frigate's 500-segment cap.
+	const chunkSeconds int64 = 3600
+	var allSegments []FrigateRecording
+	for start := after; start < before; start += chunkSeconds {
+		end := start + chunkSeconds
+		if end > before {
+			end = before
+		}
+		recs, err := c.ListRecordings(ctx, cameraName, start, end)
+		if err != nil {
+			// Best-effort: a single chunk failure shouldn't abort
+			// the whole query. Log and continue — the dashboard
+			// will show partial motion data with a gap.
+			log.Printf("frigate: ListMotionRanges chunk [%d,%d) failed: %v", start, end, err)
+			continue
+		}
+		allSegments = append(allSegments, recs...)
+	}
+
+	if len(allSegments) == 0 {
+		return nil, nil
+	}
+
+	// Sort by start time (Frigate returns newest-first by default).
+	sort.Slice(allSegments, func(i, j int) bool {
+		return allSegments[i].StartTime < allSegments[j].StartTime
+	})
+
+	// Merge motion-active segments into contiguous ranges. A gap of
+	// <=1 segment (10s) is treated as continuous (accounts for the
+	// occasional dropped frame between two motion segments).
+	const mergeGapSeconds float64 = 10
+	var ranges [][2]int64
+	var curStart, curEnd int64
+	inRange := false
+	for _, seg := range allSegments {
+		if seg.Motion <= 0 {
+			continue
+		}
+		segStart := seg.StartTime
+		segEnd := int64(seg.EndTime)
+		if !inRange {
+			curStart, curEnd = segStart, segEnd
+			inRange = true
+			continue
+		}
+		if float64(segStart-curEnd) <= mergeGapSeconds {
+			// Extend the current range.
+			curEnd = segEnd
+		} else {
+			// Gap too large — flush the current range and start a new one.
+			ranges = append(ranges, [2]int64{curStart, curEnd})
+			curStart, curEnd = segStart, segEnd
+		}
+	}
+	if inRange {
+		ranges = append(ranges, [2]int64{curStart, curEnd})
+	}
+	return ranges, nil
 }
