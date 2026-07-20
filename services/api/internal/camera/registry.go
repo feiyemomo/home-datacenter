@@ -541,6 +541,169 @@ func (r *Registry) RecordingSegmentsForMinute(cam *model.Camera, minuteStart int
 	return paths, nil
 }
 
+// RecordingMinute is a single aggregated minute of recordings on disk.
+// The ID is the unix-second timestamp of the minute's start (floor to 60s),
+// which the front-end uses to build play URLs (/recordings/<id>/file).
+type RecordingMinute struct {
+	StartUnix    int64
+	EndUnix      int64
+	SegmentCount int
+}
+
+// ListRecordingMinutesFromDisk walks Frigate's on-disk recording
+// directory and aggregates 10s MP4 segment files into 60s buckets
+// keyed by minute-start (unix seconds, floor to 60).
+//
+// Why this exists: Frigate 0.17's /api/<cam>/recordings endpoint has
+// an internal limit of ~500 segments (verified by probing with
+// after=1h, 6h, 24h, 7d — all return exactly 503 segments, ~83
+// minutes). For a home-surveillance app that needs to show 7 days
+// of history, this is unusable — the user only sees the last ~80
+// minutes of recordings. Disk has the full retention (verified:
+// 18233 mp4 files across 3 days when record.continuous.days=7).
+//
+// Layout walked:
+//
+//	/media/frigate/recordings/YYYY-MM-DD/HH/<slug>/MM.SS.mp4
+//
+// YYYY-MM-DD and HH are UTC (verified — see RecordingSegmentsForMinute
+// comment). MM.SS is the minute and second within that UTC hour. We
+// parse each filename's MM.SS back to a unix-second timestamp by
+// combining it with the YYYY-MM-DD/HH directory components, then floor
+// to 60s for the bucket key.
+//
+// `afterUnix` and `beforeUnix` are unix-second bounds (inclusive).
+// Pass 0 to skip the bound. The walk still honors disk retention —
+// Frigate's cleanup process deletes files older than
+// record.continuous.days, so we don't need to re-filter by age here.
+//
+// Returns buckets sorted newest-first (descending start_unix),
+// matching the order the Frigate API returned, so the handler can
+// drop-in replace the API call.
+func (r *Registry) ListRecordingMinutesFromDisk(cam *model.Camera, afterUnix, beforeUnix int64) ([]RecordingMinute, error) {
+	slug := r.FrigateSlug(cam)
+	root := "/media/frigate/recordings"
+
+	// Bucket aggregation: map minute-start-unix -> aggregate.
+	type bucket struct {
+		startUnix int64
+		endUnix   int64
+		count     int
+	}
+	buckets := make(map[int64]*bucket)
+
+	// Layout: YYYY-MM-DD/HH/<slug>/MM.SS.mp4
+	// Walk the top-level date dirs. We could glob directly but
+	// os.ReadDir is cheap and lets us skip non-existent slugs
+	// without touching every file.
+	dateEntries, err := os.ReadDir(root)
+	if err != nil {
+		return nil, fmt.Errorf("read recordings root: %w", err)
+	}
+	for _, dateEntry := range dateEntries {
+		if !dateEntry.IsDir() {
+			continue
+		}
+		dateStr := dateEntry.Name() // "2026-07-20"
+		// Quick filter: skip dates entirely outside [after, before]
+		// when both bounds are set. Parse as UTC midnight.
+		dateStart, err := time.Parse("2006-01-02", dateStr)
+		if err != nil {
+			continue // not a date dir (e.g. "lost+found")
+		}
+		dateStartUnix := dateStart.Unix()
+		dateEndUnix := dateStartUnix + 24*3600
+		if afterUnix > 0 && dateEndUnix < afterUnix {
+			continue
+		}
+		if beforeUnix > 0 && dateStartUnix > beforeUnix {
+			continue
+		}
+
+		hourEntries, err := os.ReadDir(root + "/" + dateStr)
+		if err != nil {
+			continue
+		}
+		for _, hourEntry := range hourEntries {
+			if !hourEntry.IsDir() {
+				continue
+			}
+			hourStr := hourEntry.Name() // "09"
+			hour, err := strconv.Atoi(hourStr)
+			if err != nil || hour < 0 || hour > 23 {
+				continue
+			}
+			// Compute the unix-second start of this UTC hour.
+			hourStart := time.Date(dateStart.Year(), dateStart.Month(),
+				dateStart.Day(), hour, 0, 0, 0, time.UTC).Unix()
+			if afterUnix > 0 && hourStart+3600 < afterUnix {
+				continue
+			}
+			if beforeUnix > 0 && hourStart > beforeUnix {
+				continue
+			}
+
+			slugDir := fmt.Sprintf("%s/%s/%s/%s", root, dateStr, hourStr, slug)
+			segEntries, err := os.ReadDir(slugDir)
+			if err != nil {
+				continue // slug subdir missing for this hour
+			}
+			for _, segEntry := range segEntries {
+				if segEntry.IsDir() {
+					continue
+				}
+				name := segEntry.Name() // "13.38.mp4"
+				if !strings.HasSuffix(name, ".mp4") {
+					continue
+				}
+				// Parse "MM.SS" — split off ".mp4" then split on ".".
+				stem := strings.TrimSuffix(name, ".mp4")
+				parts := strings.SplitN(stem, ".", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				min, err1 := strconv.Atoi(parts[0])
+				sec, err2 := strconv.Atoi(parts[1])
+				if err1 != nil || err2 != nil || min < 0 || min > 59 || sec < 0 || sec > 59 {
+					continue
+				}
+				segStartUnix := hourStart + int64(min)*60 + int64(sec)
+				if afterUnix > 0 && segStartUnix < afterUnix {
+					continue
+				}
+				if beforeUnix > 0 && segStartUnix > beforeUnix {
+					continue
+				}
+				// Floor to 60s for the bucket key.
+				minuteStart := (segStartUnix / 60) * 60
+				b, ok := buckets[minuteStart]
+				if !ok {
+					b = &bucket{startUnix: minuteStart, endUnix: segStartUnix + 10, count: 1}
+					buckets[minuteStart] = b
+				} else {
+					b.count++
+					end := segStartUnix + 10
+					if end > b.endUnix {
+						b.endUnix = end
+					}
+				}
+			}
+		}
+	}
+
+	// Sort newest-first (descending start_unix).
+	out := make([]RecordingMinute, 0, len(buckets))
+	for _, b := range buckets {
+		out = append(out, RecordingMinute{
+			StartUnix:    b.startUnix,
+			EndUnix:      b.endUnix,
+			SegmentCount: b.count,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartUnix > out[j].StartUnix })
+	return out, nil
+}
+
 // ListForOwner returns the cameras visible to a given user. Admins
 // (isAdmin=true) see every row; non-admins only see cameras whose
 // OwnerID matches their user id.
