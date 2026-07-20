@@ -347,7 +347,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 # {"code":0,"message":"success","data":{"ranges":[[1784533265,1784533344],...],"total":77}}
 ```
 
-后端实现：`internal/camera/frigate.go` 的 `ListMotionRanges` 分块查询 Frigate 录制段（每块 1h，低于 Frigate 500 段上限），合并 `motion>0` 的相邻段（间隙 ≤10s 视为连续）。返回裸 JSON 数组 `[[start, end], ...]`，与 alerts 端点不同——alerts 仅在 AI 检测到 person/car 时生成事件，motion-ranges 直接用 Frigate 录制段的 `motion` 字段，是「这里有动静」的更真实信号。
+后端实现：`internal/camera/frigate.go` 的 `ListMotionRanges` 分块查询 Frigate 录制段（每块 1h，低于 Frigate 500 段上限），返回每个 `motion>0` 的段为独立 range（v1.6.1：不再合并相邻段——v1.6.0 用 `mergeGapSeconds=10` 把相邻段合并成大段，导致 Android SeekBar 上显示成一片大红色，用户报告"标红太宽了"；改为 `mergeGapSeconds=0` 后每个 10s Frigate 段独立显示为细红线，用户可看到 motion 的精确起止时刻）。返回裸 JSON 数组 `[[start, end], ...]`，与 alerts 端点不同——alerts 仅在 AI 检测到 person/car 时生成事件，motion-ranges 直接用 Frigate 录制段的 `motion` 字段，是「这里有动静」的更真实信号。
 
 完整文档：[`docs/platformization.md`](docs/platformization.md)。
 
