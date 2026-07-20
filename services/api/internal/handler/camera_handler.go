@@ -516,6 +516,69 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 	utils.Success(c, gin.H{"alerts": alerts, "total": len(alerts)})
 }
 
+// MotionRanges — GET /api/v1/cameras/:id/motion-ranges?after=UNIX&before=UNIX
+//
+// Returns time ranges (unix seconds) where Frigate recorded motion
+// activity for the given camera within [after, before). Used by the
+// Android app's day-playback SeekBar to paint red marks at positions
+// where motion happened.
+//
+// v1.6.0: replaces the previous approach of using /api/events
+// (alerts) for the overlay. Alerts only fire when Frigate's AI
+// detector finds a tracked object (person/car), which leaves the
+// overlay empty when the camera catches motion that doesn't meet
+// the AI threshold. Motion data comes from Frigate's per-segment
+// `motion` field (pixel-diff pre-filter) and is more reliable for
+// the user's "show me when something happened" mental model.
+//
+// Query params:
+//
+//	after  — unix seconds, range start (required)
+//	before — unix seconds, range end (required)
+//
+// Response:
+//
+//	{
+//	  "ranges": [[startUnix, endUnix], ...],
+//	  "total": N
+//	}
+func (h *CameraHandler) MotionRanges(c *gin.Context) {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
+		return
+	}
+	after, err := strconv.ParseInt(c.Query("after"), 10, 64)
+	if err != nil || after <= 0 {
+		utils.Fail(c, http.StatusBadRequest, "missing or invalid 'after' param (unix seconds)")
+		return
+	}
+	before, err := strconv.ParseInt(c.Query("before"), 10, 64)
+	if err != nil || before <= 0 {
+		utils.Fail(c, http.StatusBadRequest, "missing or invalid 'before' param (unix seconds)")
+		return
+	}
+	if before <= after {
+		utils.Fail(c, http.StatusBadRequest, "'before' must be greater than 'after'")
+		return
+	}
+
+	if h.Reg.Frigate == nil {
+		utils.Success(c, gin.H{"ranges": []any{}, "total": 0})
+		return
+	}
+
+	slug := h.Reg.FrigateSlug(cam)
+	ranges, err := h.Reg.Frigate.ListMotionRanges(c.Request.Context(), slug, after, before)
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch motion ranges: "+err.Error())
+		return
+	}
+	if ranges == nil {
+		ranges = [][2]int64{}
+	}
+	utils.Success(c, gin.H{"ranges": ranges, "total": len(ranges)})
+}
+
 // AlertSnapshot — GET /api/v1/cameras/alerts/:id/snapshot
 //
 // Proxies the full-resolution snapshot JPEG for a Frigate detection

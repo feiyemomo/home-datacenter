@@ -338,6 +338,17 @@ curl -sS -X POST http://localhost:8080/api/v1/cameras/1/ptz \
 
 > `profile_token` 可省略——首次 PTZ 调用时自动通过 ONVIF `GetProfiles` 发现并持久化，后续调用直接复用。ONVIF 认证使用 WS-Security PasswordDigest（非 HTTP Basic Auth）。
 
+**v1.6.0 Motion Ranges**（用于 Android 端录像 SeekBar 红标覆盖）：
+
+```bash
+# Returns motion-active time ranges (unix seconds) within [after, before)
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "http://localhost:8080/api/v1/cameras/1/motion-ranges?after=1784533200&before=1784619600"
+# {"code":0,"message":"success","data":{"ranges":[[1784533265,1784533344],...],"total":77}}
+```
+
+后端实现：`internal/camera/frigate.go` 的 `ListMotionRanges` 分块查询 Frigate 录制段（每块 1h，低于 Frigate 500 段上限），合并 `motion>0` 的相邻段（间隙 ≤10s 视为连续）。返回裸 JSON 数组 `[[start, end], ...]`，与 alerts 端点不同——alerts 仅在 AI 检测到 person/car 时生成事件，motion-ranges 直接用 Frigate 录制段的 `motion` 字段，是「这里有动静」的更真实信号。
+
 完整文档：[`docs/platformization.md`](docs/platformization.md)。
 
 ### Automation Engine（Phase 5，管理员 only）
