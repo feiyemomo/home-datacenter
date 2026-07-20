@@ -8,7 +8,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -394,59 +393,41 @@ func (h *CameraHandler) SetRecordingPlan(c *gin.Context) {
 // 60s) and return one entry per minute, with the minute-start
 // timestamp as the "id" so the front-end can build a play URL.
 //
-// We pass after=now-7d, before=now (both required — Frigate returns
-// an empty array when `after` is set but `before` is omitted).
+// v1.5.20: switched from Frigate API to direct disk scan. Frigate
+// 0.17's /api/<cam>/recordings endpoint has an internal cap of ~500
+// segments regardless of the `after`/`before` window (verified by
+// probing with after=1h, 6h, 24h, 7d — all return exactly 503
+// segments, ~83 minutes). For a 7-day retention that's unusable —
+// the user only sees the last ~80 minutes. Disk has the full
+// retention (18233 mp4 files across 3 days when
+// record.continuous.days=7), so we walk the disk directly via
+// Registry.ListRecordingMinutesFromDisk.
+//
+// `after` defaults to now-7d (matches Frigate's record.continuous.days
+// retention config); `before` defaults to now.
 func (h *CameraHandler) ListRecordings(c *gin.Context) {
 	cam, ok := h.requireCanRead(c)
 	if !ok {
 		return
 	}
-	slug := h.Reg.FrigateSlug(cam)
 	after := time.Now().AddDate(0, 0, -7).Unix()
-	recs, err := h.Reg.Frigate.ListRecordings(c.Request.Context(), slug, after, 0)
+	before := time.Now().Unix()
+	buckets, err := h.Reg.ListRecordingMinutesFromDisk(cam, after, before)
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	// Aggregate 10s segments into 60s buckets keyed by minute-start.
-	type bucket struct {
-		start    int64
-		end      float64
-		duration float64
-		count    int
-	}
-	buckets := make(map[int64]*bucket)
-	var order []int64
-	for _, r := range recs {
-		minuteStart := (r.StartTime / 60) * 60
-		b, exists := buckets[minuteStart]
-		if !exists {
-			b = &bucket{start: minuteStart, end: r.EndTime, duration: r.Duration, count: 1}
-			buckets[minuteStart] = b
-			order = append(order, minuteStart)
-		} else {
-			if r.EndTime > b.end {
-				b.end = r.EndTime
-			}
-			b.duration += r.Duration
-			b.count++
-		}
-	}
-
-	// Sort newest-first (descending by start time).
-	sort.Slice(order, func(i, j int) bool { return order[i] > order[j] })
-
-	views := make([]gin.H, 0, len(order))
-	for _, ts := range order {
-		b := buckets[ts]
+	// buckets is already sorted newest-first by ListRecordingMinutesFromDisk.
+	views := make([]gin.H, 0, len(buckets))
+	for _, b := range buckets {
 		views = append(views, gin.H{
-			"id":               b.start,
+			"id":               b.StartUnix,
 			"camera_id":        cam.ID,
-			"start_at":         time.Unix(b.start, 0).UTC().Format(time.RFC3339),
-			"end_at":           time.Unix(int64(b.end), 0).UTC().Format(time.RFC3339),
-			"duration_seconds": int(b.duration),
-			"segment_count":    b.count,
+			"start_at":         time.Unix(b.StartUnix, 0).UTC().Format(time.RFC3339),
+			"end_at":           time.Unix(b.EndUnix, 0).UTC().Format(time.RFC3339),
+			"duration_seconds": int(b.EndUnix - b.StartUnix),
+			"segment_count":    b.SegmentCount,
 			"size_bytes":       0,
 			"size_human":       "--",
 			"file_path":        "",
