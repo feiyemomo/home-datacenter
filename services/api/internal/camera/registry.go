@@ -2,6 +2,8 @@ package camera
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net/url"
@@ -121,7 +123,7 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		Name:              name,
 		Vendor:            in.Vendor,
 		Host:              in.Host,
-		ONVIFPort:         in.ONVIFPort,
+		ONVIFPort:          in.ONVIFPort,
 		RTSPPort:          in.RTSPPort,
 		ChannelID:         in.ChannelID,
 		Status:            "unknown",
@@ -129,7 +131,16 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		OnvifProfileToken: profile,
 		Capabilities: model.JSON{
 			"ptz":    in.PTZ,
-			"audio":  in.Audio,
+			// v1.5.14: default audio=true so the mobile app hears
+			// sound on live streams + recordings. The previous
+			// default (false) made rtspURL emit #audio=0, which
+			// silently stripped the audio track from go2rtc's
+			// source — the user saw video but no sound. Audio
+			// costs ~96 kbps/stream (AAC) and ~5% CPU per ffmpeg
+			// transcode, an acceptable trade for working mobile
+			// audio. Admins can still opt out per-camera via the
+			// dashboard's audio switch (PUT /audio endpoint).
+			"audio":  true,
 			"motion": in.Motion,
 		},
 		Credentials: creds,
@@ -569,10 +580,45 @@ func (r *Registry) UpdateStatus(id uint, status string, seen *time.Time) {
 // container starts. We retry the whole replay pass with backoff so
 // a slow-starting Frigate doesn't leave all cameras unregistered.
 // Errors are logged, not swallowed silently.
+//
+// v1.5.14: BootReplay now also performs a one-time migration of
+// Capabilities["audio"] from false → true for any camera that was
+// registered before v1.5.14 (when audio defaulted to false). The
+// migration is idempotent — it only updates cameras whose audio
+// flag is currently false/missing. This brings existing cameras in
+// line with the new v1.5.14 default (audio=true) so the mobile app
+// can hear sound without requiring admins to manually toggle each
+// camera's audio switch. The rtspURL function emits #audio=aac
+// (transcode path) or #video=copy#audio=aac (passthrough) when
+// audio is enabled, so go2rtc receives a source with audio.
 func (r *Registry) BootReplay(ctx context.Context) error {
 	cams := r.List()
 	if len(cams) == 0 {
 		return nil
+	}
+
+	// v1.5.14: migrate legacy cameras to audio=true. Best-effort:
+	// if the DB update fails, we log and continue — the camera
+	// still gets replayed with its current (false) audio flag, so
+	// the user sees no audio until they manually toggle the audio
+	// switch in the dashboard. Non-fatal.
+	migrated := 0
+	for i := range cams {
+		c := &cams[i]
+		if !cameraHasAudio(c) {
+			if c.Capabilities == nil {
+				c.Capabilities = model.JSON{}
+			}
+			c.Capabilities["audio"] = true
+			if err := r.DB.Model(c).Update("capabilities", c.Capabilities).Error; err != nil {
+				log.Printf("camera: boot replay: cam %d: failed to migrate audio=true: %v", c.ID, err)
+				continue
+			}
+			migrated++
+		}
+	}
+	if migrated > 0 {
+		log.Printf("camera: boot replay: migrated %d camera(s) to audio=true (v1.5.14 default)", migrated)
 	}
 
 	const maxAttempts = 5
@@ -784,11 +830,23 @@ func slugifyName(name string) string {
 	}
 	// Generic: keep alnum + _ + -, replace everything else with _,
 	// collapse runs of underscores, trim leading/trailing _.
+	// v1.5.14: convert ASCII letters to lowercase so "Front Door"
+	// and "front door" produce the same slug. The previous version
+	// kept the original case, which caused Android's lowercased
+	// client-side slugify to never match backend's mixed-case
+	// camera_slug field — alert overlay stayed empty.
 	var b strings.Builder
 	prevUnderscore := false
 	for _, r := range name {
 		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+			prevUnderscore = false
+		case r >= 'A' && r <= 'Z':
+			// v1.5.14: lowercase ASCII letters.
+			b.WriteRune(r + ('a' - 'A'))
+			prevUnderscore = false
+		case r >= '0' && r <= '9':
 			b.WriteRune(r)
 			prevUnderscore = false
 		case r == '_' || r == '-':
@@ -803,7 +861,15 @@ func slugifyName(name string) string {
 	}
 	out := strings.Trim(b.String(), "_")
 	if out == "" {
-		out = "camera"
+		// v1.5.14: pure non-ASCII names (e.g. "前门摄像头", "室内监控")
+		// used to fall back to the literal string "camera" — every
+		// such camera collided on the same Frigate camera key,
+		// causing pushFrigateConfig to silently overwrite earlier
+		// cameras and LookupByFrigateSlug to return the wrong
+		// camera ID. Use a stable hash of the original name so each
+		// camera gets a unique, reproducible slug.
+		h := sha256.Sum256([]byte(name))
+		out = "cam_" + hex.EncodeToString(h[:4]) // 8 hex chars
 	}
 	return out
 }
