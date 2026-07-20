@@ -129,7 +129,7 @@ export default function Network() {
                                     size={20}
                                     className={
                                         n <= status.quality
-                                            ? "fill-amber-400 text-amber-400"
+                                            ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
                                             : "fill-none text-fg-subtle"
                                     }
                                 />
@@ -142,7 +142,7 @@ export default function Network() {
                         <div className="space-y-3">
                             {/* Step 1: Relay (initial) */}
                             <div className="glass-subtle rounded-xl border-[rgb(var(--accent-success)/0.3)] bg-[rgb(var(--accent-success)/0.05)] flex items-center gap-3 px-4 py-3">
-                                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500 text-sm font-bold text-white">
+                                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--accent-success))] text-sm font-bold text-white">
                                     1
                                 </div>
                                 <div className="min-w-0 flex-1">
@@ -172,8 +172,8 @@ export default function Network() {
                                 <div
                                     className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-sm font-bold ${
                                         hasUpgrade
-                                            ? "bg-sky-500 text-white"
-                                            : "bg-surface-subtle text-fg-muted"
+                                            ? "bg-[rgb(var(--accent-info))] text-white"
+                                            : "bg-[rgb(var(--glass-base))] text-fg-muted"
                                     }`}
                                 >
                                     2
@@ -236,9 +236,9 @@ export default function Network() {
                                 <div className="space-y-2">
                                     <div className="flex items-center gap-2">
                                         {status.ipv6.reachable ? (
-                                            <CheckCircle2 size={16} className="text-emerald-500" />
+                                            <CheckCircle2 size={16} className="text-[rgb(var(--accent-success))]" />
                                         ) : (
-                                            <XCircle size={16} className="text-rose-500" />
+                                            <XCircle size={16} className="text-[rgb(var(--accent-danger))]" />
                                         )}
                                         <span className="text-sm text-fg">
                                             {status.ipv6.reachable
@@ -274,9 +274,9 @@ export default function Network() {
                                     {clientIPv6 === null ? (
                                         <RefreshCw size={16} className="animate-spin text-fg-subtle" />
                                     ) : clientIPv6 ? (
-                                        <CheckCircle2 size={16} className="text-emerald-500" />
+                                        <CheckCircle2 size={16} className="text-[rgb(var(--accent-success))]" />
                                     ) : (
-                                        <XCircle size={16} className="text-rose-500" />
+                                        <XCircle size={16} className="text-[rgb(var(--accent-danger))]" />
                                     )}
                                     <span className="text-sm text-fg">
                                         {clientIPv6 === null

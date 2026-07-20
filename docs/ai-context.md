@@ -752,4 +752,75 @@ app (see `APP_VS_DASHBOARD_FEATURES.md`). Key additions:
 
 ---
 
-**Last Updated:** 2026-07-20 (Dashboard improvements: weather card, LAN/Remote chip, system theme, 24-hour recording playback with motion overlay + fisheye chips + custom controls + gestures, alert→recording seek, MP4 fallback middle tier)
+## UI Refinements (2026-07-21, v1.8.0)
+
+### Theme-aware color migration
+- All 9 page/component files previously used hardcoded Tailwind
+  colors (`text-slate-1xx/2xx/3xx/4xx/5xx`, `text-emerald-400`,
+  `text-rose-400`, `text-amber-400`, `text-sky-300`,
+  `bg-emerald-400`, `fill-amber-400`, …). These render correctly
+  in dark mode but become invisible/low-contrast in light mode.
+- Replaced with CSS-variable-based classes: `text-fg`,
+  `text-fg-muted`, `text-fg-subtle`, `text-[rgb(var(--accent-success))]`,
+  `bg-[rgb(var(--accent-success)/0.2)]`, etc. The variables are
+  defined per-theme in `web/src/index.css` (`data-theme="light"`
+  and `data-theme="dark"` blocks).
+- Files touched: Dashboard.tsx, Network.tsx, Users.tsx, Profile.tsx,
+  MqttDebug.tsx, Devices.tsx, DeviceCreate.tsx, LiveVideo.tsx,
+  RecordingTimeline.tsx.
+
+### LiveVideo header cleanup (kebab menu)
+- The live-mode header used to cram 7+ controls into one row
+  (transport segmented control, transport badge, mode tabs, Stop,
+  Rec, status badge, vendor info), overflowing on narrow viewports.
+- Restructured: visible header is now `[title + x264]` `[status
+  badge]` `[mode tabs]` `[Stop]` `[⋮]`. The kebab (⋮) dropdown
+  holds: vendor + last seen info, transport selector (live mode
+  only), recording toggle (admin only). Click-outside handler
+  closes the dropdown.
+
+### Player merge (live ↔ playback)
+- `RecordingTimeline` previously rendered its own
+  `<div class="aspect-video">` below `LiveVideo`'s main video
+  area, leaving the main area showing a placeholder ("切换至下方
+  时间轴开始播放") during playback mode.
+- Now `RecordingTimeline` accepts a `videoPortalTarget?: HTMLElement
+  | null` prop and uses `createPortal` from `react-dom` to render
+  its `<video>` + custom controls into `LiveVideo`'s main video
+  area. Live and playback share the same physical surface.
+- `LiveVideo` uses a state-backed ref
+  (`const [videoAreaEl, setVideoAreaEl] = useState<HTMLDivElement
+  | null>(null)`) so the RecordingTimeline mount is triggered
+  once the target element is in the DOM.
+
+### RecordingTimeline simplification
+- Removed: fisheye chip scroller (the Top-50-by-motion_score
+  chip row from v1.7.0).
+- Added: prominent event ribbon above the 24h seekbar. Each
+  `MotionRange` renders as a tall colored bar —
+  `bg-[rgb(var(--accent-danger))]` when `peak_objects > 0`
+  (personnel/AI activity), `bg-[rgb(var(--accent-warm))]` for
+  motion-only events. A legend below shows counts of each type.
+- The fisheye chip and the event ribbon visualize the same
+  `MotionRange` data; the ribbon is more compact and glanceable.
+
+### useCachedFetch hook (plugin caching)
+- New: `web/src/hooks/useCachedFetch.ts`. Generic
+  sessionStorage-cached fetcher with optional silent background
+  refresh (`refetchMs`) and `enabled` gate.
+- Pattern: on first mount, synchronously read cached value from
+  `sessionStorage[key]` (so the UI paints immediately); show
+  `loading: true` only when no cache exists; kick off a background
+  fetch; on success, update state + write back to sessionStorage.
+  If `refetchMs > 0`, set an interval to silently refresh.
+- Applied to Dashboard's three polling widgets:
+  - `home.dashboard.weather` → `getWeather()`, 10 min refresh
+  - `home.dashboard.status` → `Promise.all([getSystemStatus(),
+    getNetworkStatus()])`, 5 s refresh
+  - `home.dashboard.alerts` → `listAlerts(20)`, 30 s refresh
+- Navigating away from the dashboard and back now shows the
+  last-known values instantly instead of a loading spinner.
+
+---
+
+**Last Updated:** 2026-07-21 (v1.8.0 UI refinements: theme-aware color migration across 9 files, LiveVideo header kebab menu, live/playback player merge via React Portal, RecordingTimeline fisheye removal + event ribbon, useCachedFetch hook for dashboard widgets)

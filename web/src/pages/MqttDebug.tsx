@@ -139,10 +139,10 @@ export default function MqttDebug() {
         <div className="animate-fade-in space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                    <h2 className="flex items-center gap-2 text-lg font-semibold text-slate-100">
+                    <h2 className="flex items-center gap-2 text-lg font-semibold text-fg">
                         <Radio size={18} /> MQTT Debug
                     </h2>
-                    <p className="text-xs text-slate-500">
+                    <p className="text-xs text-fg-subtle">
                         Publish raw messages and watch live events. Admin only.
                     </p>
                 </div>
@@ -150,7 +150,7 @@ export default function MqttDebug() {
                     <span
                         className={cn(
                             "mr-1 inline-block h-1.5 w-1.5 rounded-full",
-                            isConnected ? "bg-emerald-400 animate-pulse" : "bg-slate-500",
+                            isConnected ? "bg-[rgb(var(--accent-success))] animate-pulse" : "bg-[rgb(var(--fg-subtle))]",
                         )}
                     />
                     {isConnected ? "ws connected" : "ws offline"}
@@ -187,8 +187,8 @@ export default function MqttDebug() {
                                             className={cn(
                                                 "rounded-full border px-2.5 py-1 text-[11px] font-mono transition-colors",
                                                 topic === t
-                                                    ? "border-[rgb(var(--accent-primary)/0.5)] bg-[rgb(var(--accent-primary)/0.1)] text-sky-300"
-                                                    : "border-[rgb(var(--border)/0.3)] text-slate-400 hover:border-slate-500 hover:text-slate-200",
+                                                    ? "border-[rgb(var(--accent-primary)/0.5)] bg-[rgb(var(--accent-primary)/0.1)] text-[rgb(var(--accent-info))]"
+                                                    : "border-[rgb(var(--border)/0.3)] text-fg-muted hover:border-[rgb(var(--border))] hover:text-fg",
                                             )}
                                         >
                                             {t}
@@ -203,7 +203,7 @@ export default function MqttDebug() {
                                     <span
                                         className={cn(
                                             "ml-2 inline-flex items-center gap-1 normal-case tracking-normal",
-                                            valid ? "text-emerald-400" : "text-rose-400",
+                                            valid ? "text-[rgb(var(--accent-success))]" : "text-[rgb(var(--accent-danger))]",
                                         )}
                                     >
                                         {valid ? (
@@ -223,13 +223,13 @@ export default function MqttDebug() {
                                     onChange={(e) => setPayload(e.target.value)}
                                     className={cn(
                                         "min-h-[140px]",
-                                        !valid && "border-rose-500/60 focus-visible:ring-rose-500",
+                                        !valid && "border-[rgb(var(--accent-danger)/0.6)] focus-visible:ring-[rgb(var(--accent-danger))]",
                                     )}
                                     spellCheck={false}
                                     disabled={submitting}
                                 />
                                 {parseError && (
-                                    <p className="font-mono text-[11px] text-rose-400">
+                                    <p className="font-mono text-[11px] text-[rgb(var(--accent-danger))]">
                                         {parseError}
                                     </p>
                                 )}
@@ -307,7 +307,7 @@ export default function MqttDebug() {
                     <CardContent className="flex-1">
                         <div className="glass-subtle rounded-xl h-[420px] overflow-y-auto p-2">
                             {log.length === 0 ? (
-                                <p className="p-4 text-xs text-slate-500">
+                                <p className="p-4 text-xs text-fg-subtle">
                                     No events yet. The server pushes heartbeat, online_list, and
                                     device.* events here automatically.
                                 </p>
@@ -319,7 +319,7 @@ export default function MqttDebug() {
                                             className="glass-subtle rounded-lg px-2 py-1.5 font-mono text-[11px]"
                                         >
                                             <div className="flex items-center gap-2">
-                                                <span className="text-slate-500">
+                                                <span className="text-fg-subtle">
                                                     {new Date(entry.ts).toLocaleTimeString()}
                                                 </span>
                                                 <Badge
@@ -335,14 +335,14 @@ export default function MqttDebug() {
                                                     {entry.type}
                                                 </Badge>
                                                 {entry.topic && (
-                                                    <span className="text-slate-400">{entry.topic}</span>
+                                                    <span className="text-fg-muted">{entry.topic}</span>
                                                 )}
                                             </div>
                                             {entry.text && (
-                                                <div className="mt-0.5 text-slate-400">{entry.text}</div>
+                                                <div className="mt-0.5 text-fg-muted">{entry.text}</div>
                                             )}
                                             {entry.payload != null && (
-                                                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-slate-500">
+                                                <pre className="mt-1 overflow-x-auto whitespace-pre-wrap break-all text-fg-subtle">
                                                     {typeof entry.payload === "string"
                                                         ? entry.payload
                                                         : JSON.stringify(entry.payload, null, 2)}

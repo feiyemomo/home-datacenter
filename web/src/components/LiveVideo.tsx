@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power, Play } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power, Play, MoreVertical } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -65,7 +65,9 @@ function readTransport(): TransportMode {
  *              spinning up a WebRTC/HLS connection for every camera
  *              on the page until the operator actually wants video.
  *   live     — WebRTC/HLS live stream with PTZ + transport picker.
- *   playback — recording list + inline `<video>` player.
+ *   playback — 24h recording timeline; the <video> is rendered into
+ *              this card's main video area via React Portal, sharing
+ *              the same physical surface as the live stream.
  *
  * Streaming strategy (Phase 6)
  * ---------------------------
@@ -90,16 +92,21 @@ function readTransport(): TransportMode {
  * WebRTC or HLS suppresses the auto-fallback so the operator can
  * pin a single transport for debugging.
  *
- * Online status is updated either from the camera row's `status`
- * field (initial render) or from the WebSocket "device.<id>.status"
- * event the parent routes in via onWsMessage.
+ * Header layout (v1.8.0):
+ *   The header used to cram 7+ controls (transport segmented control,
+ *   transport badge, mode tabs, Stop, Rec, status, vendor) into one
+ *   row, which overflowed on narrow viewports. The restructure moves
+ *   infrequently-used controls (transport selector, recording toggle)
+ *   into a kebab (⋮) dropdown, keeping the visible header to:
+ *     [title + x264] [status badge] [mode tabs] [stop] [⋮]
  *
- * Recording playback uses the same JWT-authenticated blob fetch
- * path that the previous standalone RecordingPanel used: fetch
- * the MP4 with the Authorization header attached (the file
- * endpoint is behind JWTAuth, and <video src> cannot set
- * headers), then hand the blob URL to a <video controls>
- * element. The blob URL is revoked on stop / switch / unmount.
+ * Player merge (v1.8.0):
+ *   Recording playback previously rendered its own <video> surface
+ *   in a separate aspect-video container below the main video area,
+ *   leaving the main area showing a "切换至下方时间轴" placeholder.
+ *   RecordingTimeline now portals its <video> + custom controls
+ *   into this card's main video area, so live and playback share
+ *   the same physical surface.
  */
 export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime }: LiveVideoProps) {
     // Mode drives which surface is mounted. Preview is the
@@ -119,6 +126,22 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // Generation counter increments on every retry; changing it
     // forces a remount of the active sub-component.
     const [generation, setGeneration] = useState(0);
+
+    // Kebab menu (⋮) open state for the header overflow menu.
+    const [menuOpen, setMenuOpen] = useState(false);
+    const menuRef = useRef<HTMLDivElement>(null);
+
+    // Click-outside handler for the kebab menu.
+    useEffect(() => {
+        if (!menuOpen) return;
+        function onDocClick(e: MouseEvent) {
+            if (menuRef.current && !menuRef.current.contains(e.target as Node)) {
+                setMenuOpen(false);
+            }
+        }
+        document.addEventListener("mousedown", onDocClick);
+        return () => document.removeEventListener("mousedown", onDocClick);
+    }, [menuOpen]);
 
     function retry() {
         setGeneration((g) => g + 1);
@@ -146,6 +169,12 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     const [busy, setBusy] = useState(false);
     const [ptzError, setPtzError] = useState<string | null>(null);
     const [eventToast, setEventToast] = useState<string | null>(null);
+
+    // Video area element — RecordingTimeline portals its <video>
+    // here when in playback mode, so live and playback share the
+    // same physical surface. Using a state-backed ref so the
+    // RecordingTimeline render is triggered once the element mounts.
+    const [videoAreaEl, setVideoAreaEl] = useState<HTMLDivElement | null>(null);
 
     // Subscribe to "device.<id>" over the existing WS layer.
     useEffect(() => {
@@ -201,8 +230,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
 
     // ----------------- Recording playback state -----------------
     // Recording playback is now fully owned by the RecordingTimeline
-    // component (day picker, 24h seekbar, motion overlay, fisheye
-    // chips, custom controls). LiveVideo only tracks the recording
+    // component (day picker, 24h seekbar, event ribbon, motion
+    // overlay, custom controls). LiveVideo only tracks the recording
     // toggle (admin) and whether we're in playback mode.
     const [toggling, setToggling] = useState(false);
 
@@ -233,10 +262,10 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
 
     const statusColor =
         status === "online"
-            ? "bg-emerald-500/20 text-emerald-300 ring-emerald-500/30"
+            ? "bg-[rgb(var(--accent-success)/0.2)] text-[rgb(var(--accent-success))] ring-[rgb(var(--accent-success)/0.3)]"
             : status === "offline"
-                ? "bg-rose-500/20 text-rose-300 ring-rose-500/30"
-                : "bg-slate-500/20 text-slate-300 ring-slate-500/30";
+                ? "bg-[rgb(var(--accent-danger)/0.2)] text-[rgb(var(--accent-danger))] ring-[rgb(var(--accent-danger)/0.3)]"
+                : "bg-[rgb(var(--fg-subtle)/0.2)] text-fg-muted ring-[rgb(var(--border)/0.3)]";
 
     // Compute the "effective" transport for the badge label
     // and the fallback handler. In auto mode the effective
@@ -258,7 +287,18 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     return (
         <Card className="glass glass-glow glass-hover-lift rounded-2xl overflow-hidden">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="flex items-center gap-2 text-base font-semibold text-slate-100">
+                <CardTitle className="flex items-center gap-2 text-base font-semibold text-fg">
+                    <span
+                        className={cn(
+                            "inline-block h-1.5 w-1.5 rounded-full",
+                            status === "online"
+                                ? "bg-[rgb(var(--accent-success))]"
+                                : status === "offline"
+                                    ? "bg-[rgb(var(--accent-danger))]"
+                                    : "bg-[rgb(var(--fg-subtle))]",
+                        )}
+                        title={`status: ${status}`}
+                    />
                     {camera.name}
                     {camera.transcode && (
                         <Badge
@@ -270,50 +310,11 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         </Badge>
                     )}
                 </CardTitle>
-                <div className="flex items-center gap-2">
-                    {/* Transport segmented control — live mode only.
-                     * Compact three-button toggle, visually adjacent
-                     * to the live path badge so the relationship
-                     * (selection → resolved path) is obvious. */}
-                    {mode === "live" && (
-                        <div
-                            className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
-                            role="radiogroup"
-                            aria-label="Live stream transport"
-                        >
-                            {(["auto", "webrtc", "hls"] as TransportMode[]).map((t) => {
-                                const active = transport === t;
-                                return (
-                                    <button
-                                        key={t}
-                                        role="radio"
-                                        aria-checked={active}
-                                        onClick={() => setTransport(t)}
-                                        className={cn(
-                                            "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
-                                            active
-                                                ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
-                                                : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
-                                        )}
-                                        title={
-                                            t === "auto"
-                                                ? "Try WebRTC; fall back to HLS on failure"
-                                                : t === "webrtc"
-                                                    ? "Force WebRTC; show error on failure (no auto-fallback)"
-                                                    : "Force HLS; never try WebRTC"
-                                        }
-                                    >
-                                        {t}
-                                    </button>
-                                );
-                            })}
-                        </div>
-                    )}
-                    {mode === "live" && (
-                        <Badge variant="outline" className="text-[10px]">
-                            {effectivePath === "webrtc" ? "WebRTC" : "HLS"}
-                        </Badge>
-                    )}
+                <div className="flex items-center gap-1.5">
+                    {/* Status badge — always visible, compact. */}
+                    <Badge variant="outline" className={cn("ring-1 ring-inset text-[10px]", statusColor)}>
+                        {status}
+                    </Badge>
                     {/* Mode tabs — only visible once we've left
                      * preview. Switching to live tears down the
                      * recording blob; switching to playback tears
@@ -331,8 +332,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 className={cn(
                                     "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
                                     mode === "live"
-                                        ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
-                                        : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
+                                        ? "bg-white/15 text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
+                                        : "text-fg-muted hover:text-fg hover:bg-white/5",
                                 )}
                                 title="Live stream"
                             >
@@ -345,8 +346,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 className={cn(
                                     "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
                                     mode === "playback"
-                                        ? "bg-white/15 text-sky-300 shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
-                                        : "text-slate-400 hover:text-slate-200 hover:bg-white/5",
+                                        ? "bg-white/15 text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
+                                        : "text-fg-muted hover:text-fg hover:bg-white/5",
                                 )}
                                 title="Recording playback"
                             >
@@ -368,43 +369,121 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             Stop
                         </Button>
                     )}
-                    {/* Recording toggle — admin only. Always
-                     * visible so the operator can start/stop
-                     * recording without entering playback mode. */}
-                    {isAdmin && (
+                    {/* Kebab menu (⋮) — overflow controls.
+                     * Holds the transport selector (live mode only)
+                     * and the recording toggle (admin only).
+                     * Visible at all times so admin operators can
+                     * toggle recording without entering playback. */}
+                    <div className="relative" ref={menuRef}>
                         <Button
                             size="sm"
-                            variant={recordingEnabled ? "danger" : "primary"}
-                            onClick={onToggleRecording}
-                            disabled={toggling || !onRefresh}
-                            className="h-6 px-2 text-[10px]"
-                            title={
-                                recordingEnabled
-                                    ? `Recording ON · ${camera.meta.recording?.segment_seconds ?? 600}s · ${camera.meta.recording?.retention_days ?? 7}d retention`
-                                    : "Recording OFF"
-                            }
+                            variant="outline"
+                            className="h-6 w-6 p-0 glass-subtle hover:bg-white/10"
+                            onClick={() => setMenuOpen((o) => !o)}
+                            title="More controls"
+                            aria-label="More controls"
+                            aria-expanded={menuOpen}
                         >
-                            {toggling && <Loader2 size={10} className="animate-spin" />}
-                            <span
-                                className={cn(
-                                    "mr-1 inline-block h-1.5 w-1.5 rounded-full",
-                                    recordingEnabled ? "bg-rose-200" : "bg-slate-200",
-                                )}
-                            />
-                            Rec
+                            <MoreVertical size={12} />
                         </Button>
-                    )}
-                    <Badge variant="outline" className={cn("ring-1 ring-inset", statusColor)}>
-                        <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-current" />
-                        {status}
-                    </Badge>
-                    <Badge variant="outline" className="text-[10px]">
-                        {camera.vendor || "onvif"}
-                    </Badge>
+                        {menuOpen && (
+                            <div className="absolute right-0 top-full mt-1 z-20 min-w-[200px] rounded-lg glass-strong p-2.5 shadow-lg space-y-2.5">
+                                {/* Vendor + last seen info */}
+                                <div className="space-y-0.5 text-[10px] text-fg-subtle">
+                                    <div>vendor: <span className="text-fg-muted">{camera.vendor || "onvif"}</span></div>
+                                    {lastSeen && (
+                                        <div>last seen: <span className="text-fg-muted">{new Date(lastSeen).toLocaleString()}</span></div>
+                                    )}
+                                </div>
+                                {/* Transport selector — live mode only */}
+                                {mode === "live" && (
+                                    <div className="space-y-1 pt-1 border-t border-[rgb(var(--border)/0.2)]">
+                                        <div className="text-[10px] uppercase tracking-wider text-fg-subtle">Transport</div>
+                                        <div
+                                            className="inline-flex h-6 w-full items-center glass-subtle rounded-lg p-0.5 text-[10px]"
+                                            role="radiogroup"
+                                            aria-label="Live stream transport"
+                                        >
+                                            {(["auto", "webrtc", "hls"] as TransportMode[]).map((t) => {
+                                                const active = transport === t;
+                                                return (
+                                                    <button
+                                                        key={t}
+                                                        role="radio"
+                                                        aria-checked={active}
+                                                        onClick={() => setTransport(t)}
+                                                        className={cn(
+                                                            "h-5 flex-1 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                                            active
+                                                                ? "bg-white/15 text-[rgb(var(--accent-info))]"
+                                                                : "text-fg-muted hover:text-fg hover:bg-white/5",
+                                                        )}
+                                                        title={
+                                                            t === "auto"
+                                                                ? "Try WebRTC; fall back to HLS on failure"
+                                                                : t === "webrtc"
+                                                                    ? "Force WebRTC; show error on failure (no auto-fallback)"
+                                                                    : "Force HLS; never try WebRTC"
+                                                        }
+                                                    >
+                                                        {t}
+                                                    </button>
+                                                );
+                                            })}
+                                        </div>
+                                        <div className="text-[9px] text-fg-subtle">
+                                            effective: <span className="text-fg-muted">{effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
+                                        </div>
+                                    </div>
+                                )}
+                                {/* Recording toggle — admin only */}
+                                {isAdmin && (
+                                    <div className="space-y-1 pt-1 border-t border-[rgb(var(--border)/0.2)]">
+                                        <div className="flex items-center justify-between">
+                                            <div className="text-[10px] uppercase tracking-wider text-fg-subtle">Recording</div>
+                                            <span
+                                                className={cn(
+                                                    "inline-flex items-center gap-1 text-[10px] font-medium",
+                                                    recordingEnabled
+                                                        ? "text-[rgb(var(--accent-danger))]"
+                                                        : "text-fg-muted",
+                                                )}
+                                            >
+                                                <span
+                                                    className={cn(
+                                                        "inline-block h-1.5 w-1.5 rounded-full",
+                                                        recordingEnabled
+                                                            ? "bg-[rgb(var(--accent-danger))] animate-pulse"
+                                                            : "bg-[rgb(var(--fg-subtle))]",
+                                                    )}
+                                                />
+                                                {recordingEnabled ? "ON" : "OFF"}
+                                            </span>
+                                        </div>
+                                        <Button
+                                            size="sm"
+                                            variant={recordingEnabled ? "danger" : "primary"}
+                                            onClick={onToggleRecording}
+                                            disabled={toggling || !onRefresh}
+                                            className="w-full h-6 text-[10px]"
+                                            title={
+                                                recordingEnabled
+                                                    ? `Recording ON · ${camera.meta.recording?.segment_seconds ?? 600}s · ${camera.meta.recording?.retention_days ?? 7}d retention`
+                                                    : "Recording OFF"
+                                            }
+                                        >
+                                            {toggling && <Loader2 size={10} className="animate-spin mr-1" />}
+                                            {recordingEnabled ? "Stop recording" : "Start recording"}
+                                        </Button>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 </div>
             </CardHeader>
             <CardContent className="space-y-3 p-0">
-                <div className="relative aspect-video w-full bg-black">
+                <div ref={setVideoAreaEl} className="relative aspect-video w-full bg-black overflow-hidden">
                     {mode === "preview" && (
                         <PreviewFrame
                             cameraId={camera.id}
@@ -428,35 +507,30 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             />
                         )
                     )}
-                    {mode === "playback" && (
-                        // RecordingTimeline owns the entire playback
-                        // surface (day picker + 24h seekbar + custom
-                        // video controls + motion overlay + fisheye
-                        // chips). The aspect-video wrapper here is
-                        // just a placeholder so the card keeps its
-                        // frame shape before RecordingTimeline
-                        // mounts its inner video surface.
-                        <div className="absolute inset-0 flex items-center justify-center text-slate-400">
-                            <span className="text-xs">切换至下方时间轴开始播放</span>
-                        </div>
-                    )}
+                    {/* Playback mode: RecordingTimeline portals its
+                     * <video> + custom controls into this same video
+                     * area (see videoAreaEl above). No placeholder
+                     * needed — RecordingTimeline handles the empty
+                     * state ("点击下方时间轴开始播放") inside the
+                     * portaled surface. */}
                     {eventToast && (
-                        <div className="absolute right-2 top-2 rounded-lg backdrop-blur-xl bg-black/50 px-3 py-1.5 text-xs font-semibold text-white shadow-lg border border-white/10">
+                        <div className="absolute right-2 top-2 rounded-lg backdrop-blur-xl bg-black/50 px-3 py-1.5 text-xs font-semibold text-white shadow-lg border border-white/10 pointer-events-none">
                             {eventToast}
                         </div>
                     )}
                 </div>
 
                 {/* RecordingTimeline — playback mode only. Renders
-                 * its own aspect-video surface with custom controls,
-                 * a 24h seekbar with motion overlay, day picker, and
-                 * fisheye chips. Replaces the previous "最近录制"
-                 * list. The targetTime prop is forwarded so alert
-                 * clicks (?time=…&mode=recording) auto-seek. */}
-                {mode === "playback" && (
+                 * its <video> surface into the main video area above
+                 * (via portal) and its day picker + 24h seekbar +
+                 * event ribbon below. The targetTime prop is
+                 * forwarded so alert clicks (?time=…&mode=recording)
+                 * auto-seek. */}
+                {mode === "playback" && videoAreaEl && (
                     <RecordingTimeline
                         cameraId={camera.id}
                         targetTime={targetTime}
+                        videoPortalTarget={videoAreaEl}
                     />
                 )}
 
@@ -573,7 +647,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 <p className="text-xs text-[rgb(var(--accent-danger))]">{ptzError}</p>
                             )}
                             {lastSeen && (
-                                <p className="text-[10px] text-slate-500">
+                                <p className="text-[10px] text-fg-subtle">
                                     last seen {new Date(lastSeen).toLocaleString()}
                                 </p>
                             )}
@@ -604,7 +678,7 @@ function PreviewFrame({
     return (
         <div className="absolute inset-0 flex items-center justify-center bg-black">
             {error ? (
-                <div className="flex flex-col items-center text-slate-500">
+                <div className="flex flex-col items-center text-slate-400">
                     <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
                     <span className="text-xs">preview unavailable</span>
                 </div>

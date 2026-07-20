@@ -175,8 +175,8 @@ export default function DeviceCreate() {
             <div className="animate-fade-in space-y-4">
                 <PageHeader onBack={() => nav("/cameras")} />
                 <Card>
-                    <CardContent className="p-8 text-center text-sm text-slate-400">
-                        <Info className="mx-auto mb-2 h-6 w-6 text-slate-500" />
+                    <CardContent className="p-8 text-center text-sm text-fg-muted">
+                        <Info className="mx-auto mb-2 h-6 w-6 text-fg-subtle" />
                         Only administrators can register new devices. Ask an admin
                         to add this camera, or sign in as admin.
                     </CardContent>
@@ -227,12 +227,12 @@ export default function DeviceCreate() {
             {submit.kind === "ok" ? (
                 <Card>
                     <CardContent className="space-y-4 p-8 text-center">
-                        <CheckCircle2 className="mx-auto h-10 w-10 text-emerald-400" />
+                        <CheckCircle2 className="mx-auto h-10 w-10 text-[rgb(var(--accent-success))]" />
                         <div>
-                            <p className="text-base font-semibold text-slate-100">
+                            <p className="text-base font-semibold text-fg">
                                 "{submit.name}" registered
                             </p>
-                            <p className="mt-1 text-xs text-slate-400">
+                            <p className="mt-1 text-xs text-fg-muted">
                                 Camera #{submit.id} is now in go2rtc and the cameras list.
                             </p>
                         </div>
@@ -258,7 +258,7 @@ export default function DeviceCreate() {
                     <Card>
                         <CardHeader>
                             <CardTitle className="flex items-center gap-2 text-base">
-                                <CameraIcon size={16} className="text-sky-300" />
+                                <CameraIcon size={16} className="text-[rgb(var(--accent-info))]" />
                                 Identity
                             </CardTitle>
                             <CardDescription>
@@ -290,7 +290,7 @@ export default function DeviceCreate() {
                                 </Select>
                             </Field>
                             <div className="sm:col-span-2">
-                                <p className="text-xs text-slate-500">
+                                <p className="text-xs text-fg-subtle">
                                     {VENDOR_PRESETS[draft.vendor]?.notes ??
                                         "Pick a vendor to autofill ports and channel id."}
                                 </p>
@@ -302,7 +302,7 @@ export default function DeviceCreate() {
                     <Card>
                         <CardHeader>
                             <CardTitle className="flex items-center gap-2 text-base">
-                                <Plug size={16} className="text-sky-300" />
+                                <Plug size={16} className="text-[rgb(var(--accent-info))]" />
                                 Network
                             </CardTitle>
                             <CardDescription>
@@ -381,7 +381,7 @@ export default function DeviceCreate() {
                                     <button
                                         type="button"
                                         onClick={() => setShowPassword((s) => !s)}
-                                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 hover:text-slate-200"
+                                        className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-fg-subtle hover:text-fg"
                                         aria-label={showPassword ? "Hide password" : "Show password"}
                                     >
                                         {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
@@ -406,7 +406,7 @@ export default function DeviceCreate() {
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="space-y-4">
-                            <div className="flex flex-wrap gap-3 text-sm text-slate-300">
+                            <div className="flex flex-wrap gap-3 text-sm text-fg-muted">
                                 <Toggle
                                     label="PTZ"
                                     v={draft.ptz}
@@ -429,11 +429,11 @@ export default function DeviceCreate() {
                                 />
                             </div>
                             <div className="glass-subtle rounded-xl p-4">
-                                <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-slate-500">
+                                <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-fg-subtle">
                                     <Badge variant="info" className="text-[9px]">RTSP</Badge>
                                     <span>will be sent to go2rtc as</span>
                                 </div>
-                                <code className="block break-all font-mono text-xs text-slate-200">
+                                <code className="block break-all font-mono text-xs text-fg">
                                     {rtspPreview}
                                 </code>
                             </div>
@@ -469,8 +469,8 @@ function PageHeader({ onBack }: { onBack: () => void }) {
                 <ChevronLeft size={18} />
             </Button>
             <div>
-                <h2 className="text-lg font-semibold text-slate-100">Register a new device</h2>
-                <p className="text-xs text-slate-500">
+                <h2 className="text-lg font-semibold text-fg">Register a new device</h2>
+                <p className="text-xs text-fg-subtle">
                     Add a camera to the platform. ONVIF profile token and stream
                     are auto-discovered if blank.
                 </p>
@@ -492,9 +492,9 @@ function Field({
 }) {
     return (
         <label className={cn("flex flex-col gap-1", className)}>
-            <span className="text-xs text-slate-400">
+            <span className="text-xs text-fg-muted">
                 {label}
-                {required && <span className="ml-0.5 text-rose-400">*</span>}
+                {required && <span className="ml-0.5 text-[rgb(var(--accent-danger))]">*</span>}
             </span>
             {children}
         </label>
