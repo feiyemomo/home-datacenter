@@ -103,3 +103,12 @@ network:
   #     port: 19302
   #   - host: stun.cloudflare.com
   #     port: 3478
+
+# v1.6.11: Android APK release directory. The Android app's in-app
+# updater calls GET /api/v1/release/latest to discover new versions,
+# then streams the APK via GET /api/v1/release/latest/apk. Publishing
+# a new release is just `scp app-debug-vX.Y.Z.apk nas:/.../data/releases/`
+# — no DB row, no config edit, no restart. The handler scans this
+# directory on every request and returns the highest version found.
+releases:
+  dir: /data/releases

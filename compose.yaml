@@ -35,6 +35,14 @@ services:
       # /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4.
       - ./data/frigate:/media/frigate:ro
       - ./services/api/configs:/configs:ro
+      # v1.6.11: APK releases directory. The host's
+      # ./data/releases/ holds app-debug-vX.Y.Z.apk files pushed
+      # here by push-apk.ps1 (or any other deploy tool). The api
+      # container scans this directory and serves the highest
+      # version via GET /api/v1/release/latest and
+      # GET /api/v1/release/latest/apk. Read-only — the API never
+      # writes here, deploy tools do.
+      - ./data/releases:/data/releases:ro
     depends_on:
       mosquitto:
         condition: service_started

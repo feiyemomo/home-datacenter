@@ -28,6 +28,7 @@ type Config struct {
 	Frigate   FrigateConfig   `mapstructure:"frigate"`
 	Camera    CameraConfig    `mapstructure:"camera"`
 	Network   NetworkConfig   `mapstructure:"network"`
+	Releases  ReleasesConfig  `mapstructure:"releases"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -174,6 +175,15 @@ type STUNServerConfig struct {
 	Port int    `mapstructure:"port"`
 }
 
+// ReleasesConfig holds the directory where Android APK release
+// files are stored. The release handler scans this directory for
+// files matching "app-debug-vX.Y.Z.apk" and serves the highest
+// version. Default: /data/releases (mapped to ./data/releases on
+// the host in compose.yaml).
+type ReleasesConfig struct {
+	Dir string `mapstructure:"dir"`
+}
+
 // AppConfig is the globally accessible configuration instance,
 // populated by Load(). It is safe to read after Load returns nil.
 var AppConfig *Config
@@ -232,6 +242,13 @@ func Load(path string) error {
 
 	// Phase 10 defaults — network capability detection
 	v.SetDefault("network.check_interval_seconds", 60)
+
+	// v1.6.11: APK releases directory. The host bind-mount in
+	// compose.yaml maps ./data/releases → /data/releases inside
+	// the api container. The release handler scans this directory
+	// for files named "app-debug-vX.Y.Z.apk" and serves the
+	// highest version to the Android in-app updater.
+	v.SetDefault("releases.dir", "/data/releases")
 
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /
