@@ -582,10 +582,16 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 		return allSegments[i].StartTime < allSegments[j].StartTime
 	})
 
-	// Merge motion-active segments into contiguous ranges. A gap of
-	// <=1 segment (10s) is treated as continuous (accounts for the
-	// occasional dropped frame between two motion segments).
-	const mergeGapSeconds float64 = 10
+	// v1.6.1: do NOT merge adjacent motion segments. The v1.6.0
+	// implementation used mergeGapSeconds=10 to coalesce neighboring
+	// 10s Frigate segments into one big range, but on a 24h timeline
+	// this produced a few huge red blocks that spanned hours —
+	// the user reported "标红太宽了". Now each motion segment stays
+	// independent: a continuous motion across 6 segments shows up
+	// as 6 thin red lines instead of one fat red bar, which lets the
+	// user see when motion started/stopped within the activity period
+	// and makes the snap-to-edge feature feel meaningful.
+	const mergeGapSeconds float64 = 0
 	var ranges [][2]int64
 	var curStart, curEnd int64
 	inRange := false
