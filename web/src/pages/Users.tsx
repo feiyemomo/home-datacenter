@@ -286,7 +286,7 @@ export default function Users() {
                                     type="checkbox"
                                     checked={newIsAdmin}
                                     onChange={(e) => setNewIsAdmin(e.target.checked)}
-                                    className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-sky-500 focus:ring-sky-500"
+                                    className="h-4 w-4 rounded border-[rgb(var(--border))] bg-[rgb(var(--glass-base))] text-[rgb(var(--accent-info))] focus:ring-[rgb(var(--accent-info))]"
                                 />
                                 admin
                             </label>
@@ -332,7 +332,7 @@ export default function Users() {
                             >
                                 {copied ? (
                                     <>
-                                        <Check size={14} className="mr-1 text-emerald-400" />
+                                        <Check size={14} className="mr-1 text-[rgb(var(--accent-success))]" />
                                         Copied
                                     </>
                                 ) : (
@@ -408,8 +408,8 @@ export default function Users() {
                                                         className={cn(
                                                             "flex h-8 w-8 items-center justify-center rounded-xl text-sm font-semibold",
                                                             u.is_admin
-                                                                ? "bg-gradient-to-br from-[rgb(var(--accent-warm)/0.3)] to-[rgb(var(--accent-warm)/0.1)] text-amber-300"
-                                                                : "bg-gradient-to-br from-[rgb(var(--accent-primary)/0.3)] to-[rgb(var(--accent-warm)/0.2)] text-sky-300",
+                                                                ? "bg-gradient-to-br from-[rgb(var(--accent-warm)/0.3)] to-[rgb(var(--accent-warm)/0.1)] text-[rgb(var(--accent-warm))]"
+                                                                : "bg-gradient-to-br from-[rgb(var(--accent-primary)/0.3)] to-[rgb(var(--accent-warm)/0.2)] text-[rgb(var(--accent-info))]",
                                                         )}
                                                     >
                                                         {u.name.slice(0, 1).toUpperCase()}
@@ -485,7 +485,7 @@ export default function Users() {
                                                             isMe
                                                         }
                                                         onChange={() => handleToggleAdmin(u)}
-                                                        className="h-3.5 w-3.5 rounded border-slate-400 bg-white text-sky-500 focus:ring-sky-500 disabled:cursor-not-allowed dark:border-slate-600 dark:bg-slate-800"
+                                                        className="h-3.5 w-3.5 rounded border-[rgb(var(--border))] bg-white text-[rgb(var(--accent-info))] focus:ring-[rgb(var(--accent-info))] disabled:cursor-not-allowed dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--glass-base))]"
                                                     />
                                                     <span className="text-fg-muted">
                                                         {u.is_admin ? "admin" : "user"}
@@ -581,7 +581,7 @@ export default function Users() {
                                                         <Button
                                                             variant="ghost"
                                                             size="sm"
-                                                            className="text-fg-muted hover:text-rose-300"
+                                                            className="text-fg-muted hover:text-[rgb(var(--accent-danger))]"
                                                             onClick={() => setConfirmDeleteId(u.id)}
                                                             disabled={isMe || isOnlyAdmin}
                                                             title={

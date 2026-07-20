@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
     Activity,
@@ -34,7 +34,7 @@ import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
 import { listAlerts, alertSnapshotUrl, alertThumbnailUrl, type CameraAlert } from "@/api/camera";
 import { getWeather, wmoToIcon, type WeatherResponse } from "@/api/weather";
 import { useWebSocket } from "@/hooks/useWebSocket";
-import { ApiError } from "@/api/client";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { formatUptime } from "@/lib/utils";
 import type { SystemStatus, NetworkStatus } from "@/types";
 import {
@@ -142,45 +142,18 @@ function formatAlertTime(ts: number): string {
  * unavailable" badge instead of a blank card.
  */
 function WeatherCard() {
-    const [weather, setWeather] = useState<WeatherResponse | null>(null);
-    const [error, setError] = useState<string | null>(null);
-    const [loading, setLoading] = useState(true);
-
-    useEffect(() => {
-        let cancelled = false;
-        let timer: number | null = null;
-
-        async function load() {
-            try {
-                const w = await getWeather();
-                if (cancelled) return;
-                setWeather(w);
-                setError(null);
-            } catch (err) {
-                if (cancelled) return;
-                setError(
-                    err instanceof ApiError
-                        ? err.message
-                        : err instanceof Error
-                            ? err.message
-                            : "weather unavailable",
-                );
-            } finally {
-                if (!cancelled) setLoading(false);
-                // wttr.in updates ~every 10 min; the backend caches
-                // for 5 min. We re-fetch every 10 min to refresh the
-                // card without hammering the proxy.
-                if (!cancelled) {
-                    timer = window.setTimeout(load, 10 * 60 * 1000);
-                }
-            }
-        }
-        load();
-        return () => {
-            cancelled = true;
-            if (timer !== null) window.clearTimeout(timer);
-        };
-    }, []);
+    // Cached fetch with silent background refresh every 10 min.
+    // wttr.in updates ~every 10 min and the backend caches for 5,
+    // so this rate is well-aligned with upstream freshness.
+    // The cache makes re-mounts (e.g. switching tabs back to the
+    // dashboard) instant — the previous weather payload is shown
+    // immediately from sessionStorage while a refresh runs in
+    // the background.
+    const { data: weather, loading, error } = useCachedFetch<WeatherResponse>(
+        "home.dashboard.weather",
+        getWeather,
+        { refetchMs: 10 * 60 * 1000 },
+    );
 
     const cond = weather?.current_condition?.[0];
     const area = weather?.nearest_area?.[0];
@@ -250,7 +223,7 @@ function WeatherCard() {
                     <div className="flex items-center gap-2 text-fg-muted">
                         <Cloud size={20} className="opacity-50" />
                         <span className="text-xs">
-                            {error ?? "weather unavailable"}
+                            {error ? error.message : "weather unavailable"}
                         </span>
                     </div>
                 ) : (
@@ -324,15 +297,7 @@ function detectApiPath(): "lan" | "remote" {
  */
 export default function Dashboard() {
     const navigate = useNavigate();
-    const [status, setStatus] = useState<SystemStatus | null>(null);
-    const [netStatus, setNetStatus] = useState<NetworkStatus | null>(null);
     const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
-    const [error, setError] = useState<string | null>(null);
-    const [loading, setLoading] = useState(true);
-
-    // Alerts state
-    const [alerts, setAlerts] = useState<CameraAlert[]>([]);
-    const [alertsLoading, setAlertsLoading] = useState(false);
     const [liveAlert, setLiveAlert] = useState<CameraAlert | null>(null);
     // Alert selected for full-resolution snapshot viewing (modal).
     const [selectedAlert, setSelectedAlert] = useState<CameraAlert | null>(null);
@@ -340,25 +305,38 @@ export default function Dashboard() {
     // WebSocket for real-time alerts
     const ws = useWebSocket(true);
 
-    // Load historical alerts
-    const loadAlerts = useCallback(async () => {
-        setAlertsLoading(true);
-        try {
-            const res = await listAlerts(20);
-            setAlerts(res.alerts);
-        } catch {
-            // Non-fatal: alerts are supplementary info
-        } finally {
-            setAlertsLoading(false);
-        }
-    }, []);
+    // System + network status: cached fetch with 5s silent background
+    // refresh. The cache lets us paint the last-known values instantly
+    // when the dashboard remounts (e.g. navigating back from another
+    // page), instead of showing a loading spinner for the first 5s.
+    const {
+        data: statusData,
+        loading: statusLoading,
+        error: statusError,
+    } = useCachedFetch<[SystemStatus, NetworkStatus]>(
+        "home.dashboard.status",
+        () => Promise.all([getSystemStatus(), getNetworkStatus()]),
+        { refetchMs: 5000 },
+    );
+    const status = statusData?.[0] ?? null;
+    const netStatus = statusData?.[1] ?? null;
+    const error = statusError ? statusError.message : null;
+    const loading = statusLoading && status === null;
 
-    useEffect(() => {
-        void loadAlerts();
-        // Refresh alerts every 30s
-        const id = window.setInterval(loadAlerts, 30000);
-        return () => window.clearInterval(id);
-    }, [loadAlerts]);
+    // Historical alerts: cached fetch with 30s silent background
+    // refresh. The cache preserves the recent alert list across
+    // remounts so the operator doesn't see an empty list flash
+    // when navigating away and back.
+    const {
+        data: alertsData,
+        loading: alertsLoading,
+        refetch: refetchAlerts,
+    } = useCachedFetch<{ alerts: CameraAlert[] }>(
+        "home.dashboard.alerts",
+        () => listAlerts(20),
+        { refetchMs: 30000 },
+    );
+    const alerts = alertsData?.alerts ?? [];
 
     // Listen for real-time camera.motion events via WebSocket
     useEffect(() => {
@@ -390,49 +368,9 @@ export default function Dashboard() {
         }
     }, [ws.lastMessage]);
 
-    useEffect(() => {
-        let cancelled = false;
-        let timer: number | null = null;
-
-        async function tick() {
-            try {
-                const [s, n] = await Promise.all([
-                    getSystemStatus(),
-                    getNetworkStatus(),
-                ]);
-                if (!cancelled) {
-                    setStatus(s);
-                    setNetStatus(n);
-                    setError(null);
-                }
-            } catch (err) {
-                if (!cancelled) {
-                    setError(
-                        err instanceof ApiError
-                            ? err.message
-                            : err instanceof Error
-                                ? err.message
-                                : "failed to load status",
-                    );
-                }
-            } finally {
-                if (!cancelled) setLoading(false);
-                if (!cancelled) {
-                    timer = window.setTimeout(tick, 5000);
-                }
-            }
-        }
-
-        tick();
-        return () => {
-            cancelled = true;
-            if (timer !== null) window.clearTimeout(timer);
-        };
-    }, []);
-
-    // Client-side IPv6 check — runs once on mount (client IPv6 doesn't
+    // Client-side IPv6 check — runs once on mount. Client IPv6 doesn't
     // change frequently; re-checking every 5s would be wasteful and
-    // could cause CORS noise in the console).
+    // could cause CORS noise in the console.
     useEffect(() => {
         checkClientIPv6().then((v) => setClientIPv6(v));
     }, []);
@@ -467,7 +405,7 @@ export default function Dashboard() {
                 ) : (
                     <Badge variant={error ? "danger" : "success"}>
                         <span
-                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-rose-400" : "bg-emerald-400"}`}
+                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
                         />
                         {error ? "error" : "live"}
                     </Badge>
@@ -556,7 +494,7 @@ export default function Dashboard() {
                         status ? (
                             <span className="inline-flex items-center gap-1.5">
                                 <span
-                                    className={`inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-emerald-400" : "bg-rose-400"}`}
+                                    className={`inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                 />
                                 {status.mqtt_connected ? "broker reachable" : "broker offline"}
                             </span>
@@ -609,7 +547,7 @@ export default function Dashboard() {
                             <NetworkIcon size={10} />
                             <span
                                 className={`inline-block h-1.5 w-1.5 rounded-full ${
-                                    apiPath === "lan" ? "bg-emerald-400" : "bg-amber-400"
+                                    apiPath === "lan" ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-warm))]"
                                 }`}
                             />
                             {apiPath === "lan" ? "LAN" : "Remote"}
@@ -658,7 +596,7 @@ export default function Dashboard() {
                                 <span className="inline-flex items-center gap-1" title="Server IPv6">
                                     <Server size={11} />
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.ipv6?.reachable ? "bg-emerald-400" : "bg-rose-400"}`}
+                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.ipv6?.reachable ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                     />
                                     IPv6
                                 </span>
@@ -666,23 +604,23 @@ export default function Dashboard() {
                                     <Smartphone size={11} />
                                     <span
                                         className={`inline-block h-2 w-2 rounded-full ${clientIPv6 === null
-                                                ? "bg-slate-400"
+                                                ? "bg-[rgb(var(--fg-subtle))]"
                                                 : clientIPv6
-                                                    ? "bg-emerald-400"
-                                                    : "bg-rose-400"
+                                                    ? "bg-[rgb(var(--accent-success))]"
+                                                    : "bg-[rgb(var(--accent-danger))]"
                                             }`}
                                     />
                                     You
                                 </span>
                                 <span className="inline-flex items-center gap-1" title="Server P2P">
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.p2p?.supported ? "bg-emerald-400" : "bg-rose-400"}`}
+                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.p2p?.supported ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                     />
                                     P2P
                                 </span>
                                 <span className="inline-flex items-center gap-1" title="Relay">
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.relay?.available ? "bg-emerald-400" : "bg-rose-400"}`}
+                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.relay?.available ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                     />
                                     Relay
                                 </span>
@@ -704,7 +642,7 @@ export default function Dashboard() {
                         </Badge>
                         <button
                             type="button"
-                            onClick={loadAlerts}
+                            onClick={refetchAlerts}
                             disabled={alertsLoading}
                             className="inline-flex items-center gap-1 text-[10px] text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
                         >

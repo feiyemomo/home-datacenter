@@ -176,8 +176,8 @@ export default function Devices() {
         <div className="animate-fade-in space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                    <h2 className="text-lg font-semibold text-slate-100">Devices</h2>
-                    <p className="text-xs text-slate-500">
+                    <h2 className="text-lg font-semibold text-fg">Devices</h2>
+                    <p className="text-xs text-fg-subtle">
                         Bound device credentials and live online state.
                     </p>
                 </div>
@@ -215,7 +215,7 @@ export default function Devices() {
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
-                            <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-slate-500">
+                            <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-fg-subtle">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">User</th>
@@ -230,7 +230,7 @@ export default function Devices() {
                                     <tr>
                                         <td
                                             colSpan={6}
-                                            className="px-4 py-10 text-center text-slate-500"
+                                            className="px-4 py-10 text-center text-fg-subtle"
                                         >
                                             No devices found.
                                         </td>
@@ -253,24 +253,24 @@ export default function Devices() {
                                                         className={cn(
                                                             "flex h-8 w-8 items-center justify-center rounded-xl",
                                                             isRevoked
-                                                                ? "bg-slate-800 text-slate-500"
-                                                                : "bg-gradient-to-br from-[rgb(var(--accent-primary)/0.3)] to-[rgb(var(--accent-warm)/0.2)] text-sky-300",
+                                                                ? "bg-[rgb(var(--glass-base))] text-fg-subtle"
+                                                                : "bg-gradient-to-br from-[rgb(var(--accent-primary)/0.3)] to-[rgb(var(--accent-warm)/0.2)] text-[rgb(var(--accent-info))]",
                                                         )}
                                                     >
                                                         <HardDrive size={15} />
                                                     </div>
                                                     <div>
-                                                        <div className="font-medium text-slate-200">
+                                                        <div className="font-medium text-fg">
                                                             {d.device_name}
                                                         </div>
-                                                        <div className="text-[11px] text-slate-500">
+                                                        <div className="text-[11px] text-fg-subtle">
                                                             id #{d.id}
                                                             {d.last_ip ? ` · ${d.last_ip}` : ""}
                                                         </div>
                                                     </div>
                                                 </div>
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-fg-muted">
                                                 #{d.user_id}
                                             </td>
                                             <td className="px-4 py-3">
@@ -278,17 +278,17 @@ export default function Devices() {
                                                     <Badge variant="danger">revoked</Badge>
                                                 ) : isOnline ? (
                                                     <Badge variant="success">
-                                                        <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />
+                                                        <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--accent-success))]" />
                                                         online
                                                     </Badge>
                                                 ) : (
                                                     <Badge variant="outline">offline</Badge>
                                                 )}
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-fg-muted">
                                                 {formatDateTime(d.last_login_at)}
                                             </td>
-                                            <td className="px-4 py-3 text-slate-400">
+                                            <td className="px-4 py-3 text-fg-muted">
                                                 {formatDateTime(d.created_at)}
                                             </td>
                                             <td className="px-4 py-3 text-right">
@@ -320,7 +320,7 @@ export default function Devices() {
                                                     <Button
                                                         variant="ghost"
                                                         size="sm"
-                                                        className="text-slate-400 hover:text-rose-300"
+                                                        className="text-fg-muted hover:text-[rgb(var(--accent-danger))]"
                                                         onClick={() => setConfirmId(d.id)}
                                                         disabled={isRevoked}
                                                     >
@@ -364,7 +364,7 @@ function EventLog({ lastMessage }: { lastMessage: WsMessage | null }) {
 
     if (entries.length === 0) {
         return (
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-fg-subtle">
                 Waiting for events… (subscribed to <code>device</code>)
             </p>
         );
@@ -377,16 +377,16 @@ function EventLog({ lastMessage }: { lastMessage: WsMessage | null }) {
                     key={`${m.ts}-${i}`}
                     className="glass-subtle rounded-lg flex items-start gap-2 px-3 py-2"
                 >
-                    <span className="text-slate-500">
+                    <span className="text-fg-subtle">
                         {new Date(m.ts * 1000).toLocaleTimeString()}
                     </span>
                     <Badge variant="info" className="text-[10px]">
                         {m.type}
                     </Badge>
                     {m.topic && (
-                        <span className="text-slate-400">{m.topic}</span>
+                        <span className="text-fg-muted">{m.topic}</span>
                     )}
-                    <span className="ml-auto max-w-[60%] truncate text-slate-500">
+                    <span className="ml-auto max-w-[60%] truncate text-fg-subtle">
                         {JSON.stringify(m.payload)}
                     </span>
                 </li>

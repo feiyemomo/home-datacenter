@@ -78,8 +78,8 @@ export default function Profile() {
     return (
         <div className="animate-fade-in space-y-6">
             <div>
-                <h2 className="text-lg font-semibold text-slate-100">Profile</h2>
-                <p className="text-xs text-slate-500">
+                <h2 className="text-lg font-semibold text-fg">Profile</h2>
+                <p className="text-xs text-fg-subtle">
                     Your account, token claims, and bound devices.
                 </p>
             </div>
@@ -152,7 +152,7 @@ export default function Profile() {
                                 <span
                                     className={cn(
                                         "inline-flex items-center gap-1 font-mono",
-                                        expiry.expired ? "text-rose-400" : "text-emerald-400",
+                                        expiry.expired ? "text-[rgb(var(--accent-danger))]" : "text-[rgb(var(--accent-success))]",
                                     )}
                                 >
                                     <Clock size={12} />
@@ -166,10 +166,10 @@ export default function Profile() {
                         />
                         {token && (
                             <div className="pt-1">
-                                <div className="mb-1 text-xs uppercase tracking-wider text-slate-500">
+                                <div className="mb-1 text-xs uppercase tracking-wider text-fg-subtle">
                                     Raw token
                                 </div>
-                                <div className="glass-subtle rounded-xl max-h-24 overflow-y-auto p-2 font-mono text-[11px] break-all text-slate-500">
+                                <div className="glass-subtle rounded-xl max-h-24 overflow-y-auto p-2 font-mono text-[11px] break-all text-fg-subtle">
                                     {token}
                                 </div>
                             </div>
@@ -191,7 +191,7 @@ export default function Profile() {
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
-                            <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-slate-500">
+                            <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-fg-subtle">
                                 <tr>
                                     <th className="px-4 py-3 font-medium">Name</th>
                                     <th className="px-4 py-3 font-medium">ID</th>
@@ -205,7 +205,7 @@ export default function Profile() {
                                     <tr>
                                         <td
                                             colSpan={5}
-                                            className="px-4 py-10 text-center text-slate-500"
+                                            className="px-4 py-10 text-center text-fg-subtle"
                                         >
                                             No devices bound to your account.
                                         </td>
@@ -213,14 +213,14 @@ export default function Profile() {
                                 )}
                                 {devices.map((d) => (
                                     <tr key={d.id} className="hover:bg-[rgb(var(--bg-subtle)/0.3)]">
-                                        <td className="px-4 py-3 font-medium text-slate-200">
+                                        <td className="px-4 py-3 font-medium text-fg">
                                             {d.device_name}
                                         </td>
-                                        <td className="px-4 py-3 text-slate-400">#{d.id}</td>
-                                        <td className="px-4 py-3 text-slate-400">
+                                        <td className="px-4 py-3 text-fg-muted">#{d.id}</td>
+                                        <td className="px-4 py-3 text-fg-muted">
                                             {formatDateTime(d.last_login_at)}
                                         </td>
-                                        <td className="px-4 py-3 text-slate-400">
+                                        <td className="px-4 py-3 text-fg-muted">
                                             {formatDateTime(d.created_at)}
                                         </td>
                                         <td className="px-4 py-3">
@@ -251,10 +251,10 @@ function Row({
 }) {
     return (
         <div className="flex items-center justify-between gap-4 border-b border-[rgb(var(--border)/0.3)] pb-2 last:border-0 last:pb-0">
-            <span className="text-xs uppercase tracking-wider text-slate-500">
+            <span className="text-xs uppercase tracking-wider text-fg-subtle">
                 {label}
             </span>
-            <span className="text-right text-sm text-slate-200">{value}</span>
+            <span className="text-right text-sm text-fg">{value}</span>
         </div>
     );
 }
