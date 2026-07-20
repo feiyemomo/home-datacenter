@@ -140,6 +140,74 @@ export async function deleteRecording(
     await client.delete(`/cameras/${id}/recordings/${recId}`);
 }
 
+/**
+ * A motion-active time range for a camera. Returned by
+ * GET /api/v1/cameras/:id/motion-ranges?after=&before=.
+ *
+ * The backend pre-aggregates Frigate's per-segment motion data
+ * into 2s-gap-merged ranges with motion_score (intensity),
+ * segment_count, and peak_objects (AI detection max objects).
+ *
+ *   start/end     — unix seconds (absolute)
+ *   duration      — seconds
+ *   motion_score  — sum of motion pixels across merged segments
+ *   segment_count — number of 10s Frigate segments merged
+ *   peak_objects  — max AI-detected object count in any segment
+ *
+ * `peak_objects > 0` is the signal the dashboard uses to color a
+ * chip red (AI-detected motion) vs amber (motion-only).
+ */
+export interface MotionRange {
+    start: number;
+    end: number;
+    duration: number;
+    motion_score: number;
+    segment_count: number;
+    peak_objects: number;
+}
+
+export interface MotionRangesResponse {
+    ranges: MotionRange[];
+    total: number;
+}
+
+/**
+ * Fetch motion-active time ranges within [after, before) for a camera.
+ *
+ * Used by the recording-playback SeekBar overlay (red marks at
+ * positions where motion happened) and the fisheye chip scroller
+ * (each chip = one motion range).
+ *
+ * The backend has a 60s TTL cache per <camera>:<after>:<before>,
+ * so repeat opens of the same day are instant.
+ */
+export async function getMotionRanges(
+    id: number,
+    after: number,
+    before: number,
+): Promise<MotionRangesResponse> {
+    const { data } = await client.get<MotionRangesResponse>(
+        `/cameras/${id}/motion-ranges?after=${after}&before=${before}`,
+    );
+    return data ?? { ranges: [], total: 0 };
+}
+
+/**
+ * Build the URL for a 60-second recording clip (concatenated from
+ * Frigate's 10s segments server-side via ffmpeg stream copy).
+ *
+ * `recId` is the minute-start unix timestamp (the `id` field of a
+ * CameraRecording returned by listRecordings). The endpoint streams
+ * a single MP4 with Content-Length + Range support.
+ *
+ * The JWT cookie is sent automatically for same-origin <video> tags,
+ * but for fetch()-based blob loading (used when we need byte ranges
+ * or want to use MSE), attach the Authorization header manually.
+ */
+export function recordingFileUrl(cameraId: number, recId: number): string {
+    return `/api/v1/cameras/${cameraId}/recordings/${recId}/file`;
+}
+
 export async function getIceConfig(): Promise<IceConfig> {
     const { data } = await client.get<IceConfig>("/cameras/ice");
     return data;

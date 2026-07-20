@@ -11,6 +11,7 @@ import (
 
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/repository"
+	"home-datacenter-api/internal/utils"
 )
 
 // Domain-level errors returned by the user-management API. Handlers
@@ -153,9 +154,26 @@ type UserSummary struct {
 	DeviceCount int64 `json:"device_count"`
 }
 
+// CreateResult pairs a newly created user with an optional
+// first device and its plaintext AccessKey. The AccessKey is
+// only available at creation time — it's never stored in plain
+// text in the DB (only the SHA256 hash), so callers must
+// surface it to the admin immediately after creation.
+type CreateResult struct {
+	User      *model.User
+	Device    *model.Device
+	AccessKey string // empty if no initial device was created
+}
+
 // Create inserts a new user. The caller is the acting admin; the
 // isAdmin flag chooses whether the new user is also an admin.
-func (s *UserService) Create(name string, isAdmin bool) (*model.User, error) {
+//
+// When initialDeviceName is non-empty, a first auth device is
+// created alongside the user (the AccessKey is returned in the
+// result so the admin can hand it to the new user). This is a
+// convenience path — the admin could also create the user first,
+// then create a device separately via DeviceService.CreateDevice.
+func (s *UserService) Create(name string, isAdmin bool, initialDeviceName string) (*CreateResult, error) {
 	n, err := normalizeUserName(name)
 	if err != nil {
 		return nil, err
@@ -183,7 +201,35 @@ func (s *UserService) Create(name string, isAdmin bool) (*model.User, error) {
 		}
 		return nil, err
 	}
-	return u, nil
+
+	result := &CreateResult{User: u}
+
+	// Optionally create a first auth device. If device creation
+	// fails, we still return the user (it's already committed)
+	// plus the error — the admin can retry device creation via
+	// the device API. We deliberately do NOT roll back the user:
+	// the user record is useful on its own, and rolling back a
+	// successful user insert because a device failed would
+	// create a weird partial-state UX where the admin has to
+	// recreate the user too.
+	if initialDeviceName != "" {
+		accessKey, err := utils.GenerateAccessKey()
+		if err != nil {
+			return result, fmt.Errorf("generate access key: %w", err)
+		}
+		device := &model.Device{
+			UserID:        u.ID,
+			DeviceName:    initialDeviceName,
+			AccessKeyHash: utils.HashAccessKey(accessKey),
+		}
+		if err := s.deviceRepo.Create(device); err != nil {
+			return result, fmt.Errorf("create initial device: %w", err)
+		}
+		result.Device = device
+		result.AccessKey = accessKey
+	}
+
+	return result, nil
 }
 
 // Update performs a partial update. Either field may be nil to

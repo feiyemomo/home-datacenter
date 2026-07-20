@@ -684,4 +684,72 @@ rate limit on `/auth/bind`. Defence-in-depth layers applied:
 
 ---
 
-**Last Updated:** 2026-07-18 (Phase 9: Frigate 0.17 NVR with OpenVINO CPU detector deployed; detection throttled to 2 fps with num_threads=1; home-api pushes camera configs via FrigateClient)
+## Dashboard Improvements (2026-07-20)
+
+The web dashboard was extended to close feature gaps with the Android
+app (see `APP_VS_DASHBOARD_FEATURES.md`). Key additions:
+
+### Weather card
+- `GET /api/v1/weather` proxies wttr.in's `j1` format with a 5-min
+  server cache. The `WeatherCard` on the dashboard renders current
+  temp, "feels like", humidity, wind, location label, and a WMO-code
+  icon. wttr.in's legacy 1xx weather codes are normalized to WMO
+  equivalents (`web/src/api/weather.ts` `wmoToIcon`).
+
+### LAN / Remote path chip
+- The Network Quality card now shows a chip indicating whether the
+  dashboard was loaded from the LAN path (RFC1918 hostname) or via
+  Cloudflare Tunnel (any other hostname). Pure client-side
+  detection via `window.location.hostname`.
+
+### System theme support
+- `useTheme` now accepts `"light" | "dark" | "system"`. The
+  `resolved` field exposes the actual applied theme. The header
+  theme picker is a 3-state dropdown (Light / Dark / System) with
+  an outside-click + Escape close handler. The `system` option
+  subscribes to `prefers-color-scheme` changes so OS theme switches
+  propagate live without a reload. The `applyThemeEarly()` helper
+  in `main.tsx` reads the choice before React mounts so the first
+  paint uses the correct theme (no flash).
+
+### 24-hour recording playback
+- New `RecordingTimeline` component (`web/src/components/RecordingTimeline.tsx`)
+  replaces the old "最近录制" list inside `LiveVideo`'s playback
+  mode. Features:
+    - **7-day picker** (今天 / 昨天 / 前天 / 周X / MM-DD) —
+      matches Frigate's default `record.continuous.days=7` retention
+    - **24-hour seekbar** with 1440 minute-buckets; recorded
+      minutes highlighted, motion minutes overlaid in red (AI) or
+      amber (motion-only)
+    - **Click-to-seek** on the seekbar plays the matching 60s
+      bucket and seeks to the offset within the recording
+    - **Fisheye chip scroller** for the selected day's motion
+      events, sorted by `motion_score` (top 50), click to seek
+    - **Custom video controls**: play/pause, ±10s skip, current
+      time / duration, recording start time, and a speed dropdown
+      with `[0.5, 1, 1.5, 2, 3, 5]` options
+    - **Double-tap ±10s** gesture (left/right side of video)
+    - **Long-press 5x** speed gesture (overrides playbackRate
+      while pressed, restores on release)
+    - **Auto-advance**: when a recording ends, the next bucket
+      is auto-loaded (continuous 24h playback)
+    - **Alert seek**: `?time=UNIX&mode=recording` URL params
+      auto-select the matching day and play the matching bucket
+
+### Alert click → recording seek
+- Dashboard alert entries navigate to
+  `/cameras?camera=<id>&time=<unix>&mode=recording` on click.
+  The `Cameras` page forwards `targetTime` to `LiveVideo` →
+  `RecordingTimeline`, which auto-selects the matching day and
+  plays the recording containing that timestamp.
+
+### MP4 fallback middle tier
+- `RecordingTimeline` uses JWT-authenticated `fetch` to download
+  the 60s MP4 as a Blob and plays it via `URL.createObjectURL`.
+  This works on every browser that supports MP4 (no MSE / HEVC
+  requirement), making it a reliable middle tier between WebRTC
+  (live, codec-restricted) and HLS (live, HEVC-only).
+
+---
+
+**Last Updated:** 2026-07-20 (Dashboard improvements: weather card, LAN/Remote chip, system theme, 24-hour recording playback with motion overlay + fisheye chips + custom controls + gestures, alert→recording seek, MP4 fallback middle tier)

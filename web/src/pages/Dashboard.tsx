@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
     Activity,
@@ -16,10 +16,23 @@ import {
     Eye,
     X,
     ExternalLink,
+    Sun,
+    Cloud,
+    CloudSun,
+    CloudRain,
+    CloudSnow,
+    CloudFog,
+    CloudLightning,
+    CloudDrizzle,
+    Droplets,
+    Wind,
+    MapPin,
+    Network as NetworkIcon,
 } from "lucide-react";
 import { getSystemStatus } from "@/api/system";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
 import { listAlerts, alertSnapshotUrl, alertThumbnailUrl, type CameraAlert } from "@/api/camera";
+import { getWeather, wmoToIcon, type WeatherResponse } from "@/api/weather";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { ApiError } from "@/api/client";
 import { formatUptime } from "@/lib/utils";
@@ -116,6 +129,194 @@ function formatConfidence(c: number): string {
 function formatAlertTime(ts: number): string {
     if (!ts) return "—";
     return new Date(ts * 1000).toLocaleString();
+}
+
+/**
+ * WeatherCard — top-of-dashboard weather summary, mirrors the
+ * Android DashboardFragment's weather card. Calls GET /api/v1/weather
+ * (proxied wttr.in j1) and renders current temp, "feels like",
+ * WMO-code icon, location label, humidity + wind.
+ *
+ * The card degrades gracefully: if wttr.in is unreachable (the
+ * backend's 5-min cache also helps), we show a compact "weather
+ * unavailable" badge instead of a blank card.
+ */
+function WeatherCard() {
+    const [weather, setWeather] = useState<WeatherResponse | null>(null);
+    const [error, setError] = useState<string | null>(null);
+    const [loading, setLoading] = useState(true);
+
+    useEffect(() => {
+        let cancelled = false;
+        let timer: number | null = null;
+
+        async function load() {
+            try {
+                const w = await getWeather();
+                if (cancelled) return;
+                setWeather(w);
+                setError(null);
+            } catch (err) {
+                if (cancelled) return;
+                setError(
+                    err instanceof ApiError
+                        ? err.message
+                        : err instanceof Error
+                            ? err.message
+                            : "weather unavailable",
+                );
+            } finally {
+                if (!cancelled) setLoading(false);
+                // wttr.in updates ~every 10 min; the backend caches
+                // for 5 min. We re-fetch every 10 min to refresh the
+                // card without hammering the proxy.
+                if (!cancelled) {
+                    timer = window.setTimeout(load, 10 * 60 * 1000);
+                }
+            }
+        }
+        load();
+        return () => {
+            cancelled = true;
+            if (timer !== null) window.clearTimeout(timer);
+        };
+    }, []);
+
+    const cond = weather?.current_condition?.[0];
+    const area = weather?.nearest_area?.[0];
+
+    const code = cond?.weatherCode ? parseInt(cond.weatherCode, 10) : NaN;
+    // wttr.in's WMO codes match the open-meteo table for 0..99, but
+    // they also emit 113/116/119/122/143/176/200/227/230/248/260/263/266/281/284/293/296/299/302/305/308/311/314/317/320/323/326/329/332/335/338/350/353/356/359/362/365/368/371/374/377/386/389/392/395
+    // (legacy Codes). We normalize the common ones to the WMO table.
+    const wmo = useMemo(() => {
+        if (Number.isNaN(code)) return { icon: "cloud", label: "—" };
+        // Map wttr.in's 1xx codes down to WMO equivalents
+        const m: Record<number, number> = {
+            113: 0, 116: 2, 119: 3, 122: 3, 143: 45, 176: 51,
+            200: 95, 227: 71, 230: 75, 248: 45, 260: 45,
+            263: 51, 266: 53, 281: 53, 284: 55, 293: 61, 296: 61,
+            299: 63, 302: 63, 305: 65, 308: 67, 311: 65, 314: 67,
+            317: 67, 320: 71, 323: 71, 326: 73, 329: 75, 332: 75,
+            335: 75, 338: 75, 350: 51, 353: 61, 356: 65, 359: 67,
+            362: 71, 365: 73, 368: 71, 371: 73, 374: 75, 377: 75,
+            386: 95, 389: 95, 392: 95, 395: 95,
+        };
+        const normalized = m[code] ?? code;
+        return wmoToIcon(normalized);
+    }, [code]);
+
+    // Map icon name → lucide component
+    const Icon = ({
+        sun: Sun,
+        cloud: Cloud,
+        "cloud-sun": CloudSun,
+        "cloud-rain": CloudRain,
+        "cloud-snow": CloudSnow,
+        "cloud-fog": CloudFog,
+        "cloud-lightning": CloudLightning,
+        "cloud-drizzle": CloudDrizzle,
+    } as Record<string, typeof Sun>)[wmo.icon] ?? Cloud;
+
+    const tempC = cond?.temp_C ? parseInt(cond.temp_C, 10) : null;
+    const feelsC = cond?.FeelsLikeC ? parseInt(cond.FeelsLikeC, 10) : null;
+    const humidity = cond?.humidity ? parseInt(cond.humidity, 10) : null;
+    const windKmph = cond?.windspeedKmph ? parseInt(cond.windspeedKmph, 10) : null;
+    const windDir = cond?.winddir16Point;
+    const areaName = area?.areaName?.[0]?.value;
+    const region = area?.region?.[0]?.value;
+
+    return (
+        <Card className="animate-fade-in relative overflow-hidden">
+            <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.15)] via-[rgb(var(--accent-primary)/0.05)] to-transparent" />
+            <CardHeader className="relative flex-row items-center justify-between pb-2">
+                <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
+                    <Icon size={16} className="text-[rgb(var(--accent-warm))]" /> 天气
+                </CardTitle>
+                {areaName && (
+                    <Badge variant="outline" className="text-[10px] gap-1">
+                        <MapPin size={10} />
+                        {areaName}{region ? ` · ${region}` : ""}
+                    </Badge>
+                )}
+            </CardHeader>
+            <CardContent className="relative">
+                {loading ? (
+                    <div className="flex items-center gap-2 text-fg-muted">
+                        <RefreshCw size={14} className="animate-spin" />
+                        <span className="text-xs">加载中…</span>
+                    </div>
+                ) : error || !cond ? (
+                    <div className="flex items-center gap-2 text-fg-muted">
+                        <Cloud size={20} className="opacity-50" />
+                        <span className="text-xs">
+                            {error ?? "weather unavailable"}
+                        </span>
+                    </div>
+                ) : (
+                    <div className="flex items-center gap-4">
+                        {/* Big icon + temp */}
+                        <div className="flex items-center gap-3">
+                            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[rgb(var(--accent-warm)/0.15)] ring-1 ring-inset ring-[rgb(var(--accent-warm)/0.3)]">
+                                <Icon size={28} className="text-[rgb(var(--accent-warm))]" />
+                            </div>
+                            <div>
+                                <div className="flex items-baseline gap-1">
+                                    <span className="text-3xl font-semibold tracking-tight text-fg">
+                                        {tempC ?? "—"}
+                                    </span>
+                                    <span className="text-sm text-fg-muted">°C</span>
+                                </div>
+                                <span className="text-xs text-fg-muted">{wmo.label}</span>
+                            </div>
+                        </div>
+                        {/* Secondary stats */}
+                        <div className="ml-auto grid grid-cols-3 gap-3 text-xs">
+                            <div className="flex flex-col items-center">
+                                <span className="text-fg-subtle">体感</span>
+                                <span className="font-medium text-fg">
+                                    {feelsC ?? "—"}°
+                                </span>
+                            </div>
+                            <div className="flex flex-col items-center">
+                                <Droplets size={12} className="text-fg-subtle" />
+                                <span className="font-medium text-fg">
+                                    {humidity ?? "—"}%
+                                </span>
+                            </div>
+                            <div className="flex flex-col items-center">
+                                <Wind size={12} className="text-fg-subtle" />
+                                <span className="font-medium text-fg">
+                                    {windKmph ?? "—"}
+                                    <span className="text-fg-subtle"> km/h</span>
+                                    {windDir ? ` ${windDir}` : ""}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                )}
+            </CardContent>
+        </Card>
+    );
+}
+
+/**
+ * Determine whether the current dashboard origin is the LAN path
+ * (192.168.x.x or 10.x or 172.16-31.x) or the remote path
+ * (Cloudflare Tunnel via api.feiyemomo.top).
+ *
+ * Used by the LAN/Remote chip on the Network Quality card. The
+ * Android app uses BaseUrlResolver to actually probe both paths;
+ * on web we're bound to the current origin so we just classify it.
+ */
+function detectApiPath(): "lan" | "remote" {
+    if (typeof window === "undefined") return "remote";
+    const h = window.location.hostname;
+    if (h === "localhost" || h === "127.0.0.1") return "lan";
+    if (/^192\.168\./.test(h)) return "lan";
+    if (/^10\./.test(h)) return "lan";
+    if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return "lan";
+    return "remote";
 }
 
 /**
@@ -248,6 +449,7 @@ export default function Dashboard() {
 
     const onlineCount = status?.online_device_count ?? 0;
     const uptime = status ? formatUptime(status.uptime_seconds) : "—";
+    const apiPath = useMemo(() => detectApiPath(), []);
 
     return (
         <div className="space-y-6">
@@ -277,6 +479,10 @@ export default function Dashboard() {
                     {error}
                 </div>
             )}
+
+            {/* Weather card — mirrors Android DashboardFragment's weather card.
+             * Calls the existing /api/v1/weather proxy (5-min server cache). */}
+            <WeatherCard />
 
             {/* Live detection alert banner */}
             {liveAlert && (
@@ -386,21 +592,44 @@ export default function Dashboard() {
                     <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
                         <Globe size={16} /> Network Quality
                     </CardTitle>
-                    {netStatus && (
-                        <div className="flex items-center gap-0.5">
-                            {[1, 2, 3, 4, 5].map((n) => (
-                                <Star
-                                    key={n}
-                                    size={14}
-                                    className={
-                                        n <= netStatus.quality
-                                            ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
-                                            : "fill-none text-fg-subtle"
-                                    }
-                                />
-                            ))}
-                        </div>
-                    )}
+                    <div className="flex items-center gap-2">
+                        {/* LAN/Remote path chip — mirrors Android's
+                         * network-quality card chip. Green dot = LAN
+                         * (low latency, ~10ms TTFB), amber dot = remote
+                         * (Cloudflare Tunnel, ~1.4s+ TTFB). */}
+                        <Badge
+                            variant="outline"
+                            className="text-[10px] gap-1"
+                            title={
+                                apiPath === "lan"
+                                    ? "Dashboard is loaded from the LAN path (low latency)"
+                                    : "Dashboard is loaded via Cloudflare Tunnel (remote)"
+                            }
+                        >
+                            <NetworkIcon size={10} />
+                            <span
+                                className={`inline-block h-1.5 w-1.5 rounded-full ${
+                                    apiPath === "lan" ? "bg-emerald-400" : "bg-amber-400"
+                                }`}
+                            />
+                            {apiPath === "lan" ? "LAN" : "Remote"}
+                        </Badge>
+                        {netStatus && (
+                            <div className="flex items-center gap-0.5">
+                                {[1, 2, 3, 4, 5].map((n) => (
+                                    <Star
+                                        key={n}
+                                        size={14}
+                                        className={
+                                            n <= netStatus.quality
+                                                ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
+                                                : "fill-none text-fg-subtle"
+                                        }
+                                    />
+                                ))}
+                            </div>
+                        )}
+                    </div>
                 </CardHeader>
                 <CardContent>
                     <div className="flex items-center gap-4">
@@ -525,7 +754,12 @@ export default function Dashboard() {
                                         </div>
                                     )}
 
-                                    {/* Info — click navigates to the camera page with timestamp */}
+                                    {/* Info — click navigates to the camera page with
+                                     * timestamp + mode=recording so the LiveVideo
+                                     * auto-plays the matching 60s recording bucket
+                                     * and seeks to the alert's timestamp. This
+                                     * mirrors Android's "查看录像" → recording
+                                     * playback with pendingAlertSeekMs flow. */}
                                     <button
                                         type="button"
                                         onClick={() => {
@@ -536,10 +770,11 @@ export default function Dashboard() {
                                             if (alert.start_time) {
                                                 search.set("time", String(alert.start_time));
                                             }
+                                            search.set("mode", "recording");
                                             navigate(`/cameras?${search.toString()}`);
                                         }}
                                         className="min-w-0 flex-1 cursor-pointer py-0.5 text-left"
-                                        title="跳转到摄像头页面"
+                                        title="查看录像 — 跳转到对应时间点的录像回放"
                                     >
                                         <div className="flex flex-wrap items-center gap-1.5">
                                             <span className="text-sm font-medium text-fg">

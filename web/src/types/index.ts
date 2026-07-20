@@ -71,6 +71,21 @@ export interface UserDeleteResponse {
 export interface CreateUserRequest {
     name: string;
     is_admin: boolean;
+    initial_device_name?: string;
+}
+
+/** Response of POST /api/v1/user (create). */
+export interface CreateUserResponse {
+    id: number;
+    name: string;
+    is_admin: boolean;
+    created_at: string;
+    updated_at: string;
+    device?: {
+        id: number;
+        device_name: string;
+    };
+    access_key?: string;
 }
 
 /** Request body for PUT /api/v1/user/:id (partial update). */

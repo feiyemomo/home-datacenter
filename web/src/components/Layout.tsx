@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { NavLink } from "react-router-dom";
 import {
     Activity,
@@ -14,11 +14,13 @@ import {
     Camera as CameraIcon,
     Sun,
     Moon,
+    Monitor,
     Network as NetworkIcon,
+    Check,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
-import { useTheme } from "@/hooks/useTheme";
+import { useTheme, type Theme } from "@/hooks/useTheme";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 
@@ -170,10 +172,101 @@ interface LayoutProps {
     children: ReactNode;
 }
 
+/**
+ * ThemeMenu — 3-state theme picker (light / dark / system) with a
+ * glass dropdown. Replaces the old binary Sun/Moon toggle so the
+ * operator can opt into "system" (follow OS prefers-color-scheme).
+ *
+ * The dropdown closes on outside-click, Escape, or option pick.
+ * The icon reflects the *resolved* theme (what's actually applied
+ * to <html>), while the highlighted option reflects the user's
+ * choice (so "system" stays highlighted even if it resolves to
+ * dark on this OS).
+ */
+function ThemeMenu() {
+    const { theme, resolved, setTheme } = useTheme();
+    const [open, setOpen] = useState(false);
+    const ref = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (!open) return;
+        const onClick = (e: MouseEvent) => {
+            if (ref.current && !ref.current.contains(e.target as Node)) {
+                setOpen(false);
+            }
+        };
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setOpen(false);
+        };
+        window.addEventListener("mousedown", onClick);
+        window.addEventListener("keydown", onKey);
+        return () => {
+            window.removeEventListener("mousedown", onClick);
+            window.removeEventListener("keydown", onKey);
+        };
+    }, [open]);
+
+    const options: { value: Theme; label: string; icon: typeof Sun }[] = [
+        { value: "light", label: "Light", icon: Sun },
+        { value: "dark", label: "Dark", icon: Moon },
+        { value: "system", label: "System", icon: Monitor },
+    ];
+
+    const ActiveIcon = resolved === "dark" ? Moon : Sun;
+
+    return (
+        <div ref={ref} className="relative">
+            <Button
+                size="icon"
+                variant="ghost"
+                onClick={() => setOpen((v) => !v)}
+                aria-label={`Theme: ${theme}`}
+                title={`Theme: ${theme} (resolved: ${resolved})`}
+                aria-expanded={open}
+                aria-haspopup="menu"
+            >
+                <ActiveIcon size={16} />
+            </Button>
+            {open && (
+                <div
+                    role="menu"
+                    className="absolute right-0 top-full mt-1 min-w-[140px] overflow-hidden rounded-xl glass-strong p-1 shadow-lg z-50 animate-fade-in"
+                >
+                    {options.map((opt) => {
+                        const Icon = opt.icon;
+                        const active = theme === opt.value;
+                        return (
+                            <button
+                                key={opt.value}
+                                role="menuitemradio"
+                                aria-checked={active}
+                                onClick={() => {
+                                    setTheme(opt.value);
+                                    setOpen(false);
+                                }}
+                                className={cn(
+                                    "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs transition-colors",
+                                    active
+                                        ? "bg-[rgb(var(--accent-primary)/0.15)] text-[rgb(var(--accent-primary))]"
+                                        : "text-fg-muted hover:bg-[rgb(var(--bg-subtle)/0.5)] hover:text-fg",
+                                )}
+                            >
+                                <Icon size={13} />
+                                <span className="flex-1 text-left">{opt.label}</span>
+                                {active && <Check size={12} />}
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
+        </div>
+    );
+}
+
 /** App shell with liquid glass layout */
 export function Layout({ children }: LayoutProps) {
     const [sidebarOpen, setSidebarOpen] = useState(false);
-    const [theme, setTheme] = useTheme();
+    const { resolved } = useTheme();
 
     return (
         <div className="relative flex h-screen overflow-hidden bg-surface">
@@ -201,7 +294,7 @@ export function Layout({ children }: LayoutProps) {
                         </h1>
                         <Badge variant="outline" className="hidden sm:inline-flex">
                             <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-fg-subtle" />
-                            {theme}
+                            {resolved}
                         </Badge>
                     </div>
 
@@ -214,23 +307,7 @@ export function Layout({ children }: LayoutProps) {
                         >
                             /health
                         </a>
-                        <Button
-                            size="icon"
-                            variant="ghost"
-                            onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-                            aria-label={
-                                theme === "dark"
-                                    ? "Switch to light theme"
-                                    : "Switch to dark theme"
-                            }
-                            title={
-                                theme === "dark"
-                                    ? "Switch to light theme"
-                                    : "Switch to dark theme"
-                            }
-                        >
-                            {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
-                        </Button>
+                        <ThemeMenu />
                     </div>
                 </header>
 
