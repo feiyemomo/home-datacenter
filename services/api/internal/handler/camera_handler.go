@@ -574,7 +574,10 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 		return
 	}
 	if ranges == nil {
-		ranges = [][2]int64{}
+		// v1.6.3: ranges is now []MotionRange, not [][2]int64.
+		// Keep the empty-array serialization so clients don't have
+		// to handle null separately.
+		ranges = []camera.MotionRange{}
 	}
 	utils.Success(c, gin.H{"ranges": ranges, "total": len(ranges)})
 }
