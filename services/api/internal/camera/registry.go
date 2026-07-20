@@ -503,7 +503,23 @@ func (r *Registry) FrigateSlug(cam *model.Camera) string {
 // 404s. The only way to serve recordings is to read files from disk.
 func (r *Registry) RecordingSegmentsForMinute(cam *model.Camera, minuteStart int64) ([]string, error) {
 	slug := r.FrigateSlug(cam)
-	t := time.Unix(minuteStart, 0).UTC()
+	// v1.5.15: use Asia/Shanghai timezone (matching the Frigate
+	// container's TZ env) to compute the on-disk directory path.
+	// Frigate stores recordings under
+	// /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4 where
+	// the timestamp components are in the container's LOCAL time
+	// (Asia/Shanghai after v1.5.13's TZ fix). The previous code used
+	// .UTC() which produced UTC date/hour components — fine when
+	// Frigate ran with TZ=UTC (pre-v1.5.13), but now points to a
+	// non-existent directory (8 hours behind the real one). The
+	// user saw "time差8小时" because clicking a recording at 03:31
+	// LOCAL made the backend look in the 19:00 UTC bucket from the
+	// previous day, returning 404 or playing the wrong segment.
+	loc, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		loc = time.Local // fallback: container TZ should also be Asia/Shanghai
+	}
+	t := time.Unix(minuteStart, 0).In(loc)
 	dir := fmt.Sprintf("/media/frigate/recordings/%s/%s/%s",
 		t.Format("2006-01-02"), // YYYY-MM-DD
 		t.Format("15"),         // HH
