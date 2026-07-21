@@ -185,7 +185,32 @@ func (h *WebSocketHandler) Handle(c *gin.Context) {
 
 	// 6. Create client and register with hub.
 	client := ws.NewClient(h.hub, conn, claims.UserID, claims.DeviceID, isAdmin)
+	// v1.6.16: wire WS client lifecycle into device.Manager so that
+	// Android app clients (which connect via WS, not MQTT) are counted
+	// as online devices. Previously only MQTT-publishing devices were
+	// tracked, so the dashboard always showed "0 online" even when the
+	// user was actively using the app.
+	//
+	// onHeartbeat: called every time the client sends a WS heartbeat
+	//   message — refreshes the device's LastSeen so the manager's
+	//   90s sweep loop keeps it marked online.
+	// onDisconnect: intentionally NOT wired to SetOffline. The sweep
+	//   loop will mark the device offline after 90s without a heartbeat,
+	//   which correctly handles the case where the user has multiple
+	//   WS connections (e.g. app in foreground + background briefly).
+	//   Calling SetOffline here would prematurely flip a device that
+	//   still has another live connection.
+	client.SetLifecycleCallbacks(
+		func(deviceID uint) {
+			h.deviceMgr.Heartbeat(deviceID)
+		},
+		nil,
+	)
 	h.hub.Register(client)
+
+	// Immediately mark the device online — the WS connection is the
+	// strongest signal that the user is actively using the app.
+	h.deviceMgr.SetOnline(claims.DeviceID, c.ClientIP())
 
 	// 7. Push initial online device list to the new client.
 	onlineIDs := h.deviceMgr.GetOnlineDevices()
