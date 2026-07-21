@@ -419,6 +419,19 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 	}
 
 	// buckets is already sorted newest-first by ListRecordingMinutesFromDisk.
+	//
+	// v1.8.6: duration_seconds now derived from SegmentCount * 10
+	// instead of (EndUnix - StartUnix). Frigate 0.17 stores ~10s MP4
+	// segments that are NOT aligned to minute boundaries — segments
+	// in a minute can start at offsets like :08, :18, :28, :38, :48,
+	// :58 (8s offset from the minute edge). The bucketing logic in
+	// registry.go floors start to the minute edge (good) but tracks
+	// endUnix as max(segStart + 10), so for an 8s offset the bucket
+	// span becomes 68s instead of 60s. Summed across a 1440-minute
+	// day this inflated the displayed total to 26h-27h (user report
+	// "他一天的录像为什么有26h"). Each Frigate segment is ~10s, so
+	// count*10 gives the true recording time and correctly handles
+	// partial minutes (no segments = 0s, not 60s).
 	views := make([]gin.H, 0, len(buckets))
 	for _, b := range buckets {
 		views = append(views, gin.H{
@@ -426,7 +439,7 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 			"camera_id":        cam.ID,
 			"start_at":         time.Unix(b.StartUnix, 0).UTC().Format(time.RFC3339),
 			"end_at":           time.Unix(b.EndUnix, 0).UTC().Format(time.RFC3339),
-			"duration_seconds": int(b.EndUnix - b.StartUnix),
+			"duration_seconds": b.SegmentCount * 10,
 			"segment_count":    b.SegmentCount,
 			"size_bytes":       0,
 			"size_human":       "--",
