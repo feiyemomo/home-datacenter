@@ -18,7 +18,6 @@ import {
     recordingFileUrl,
     type MotionRange,
 } from "@/api/camera";
-import { authHeaderFor } from "@/api/client";
 import type { CameraRecording } from "@/types";
 
 /**
@@ -139,10 +138,16 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     const [loadingRecs, setLoadingRecs] = useState(false);
     const [recError, setRecError] = useState<string | null>(null);
 
-    // Motion-range cache: dayKey → ranges. Loaded on demand when a
-    // day is selected. The backend has a 60s TTL cache per
-    // <camera>:<after>:<before>, so repeat opens are instant.
-    const [motionCache, setMotionCache] = useState<Record<string, MotionRange[]>>({});
+    // Motion-range cache: dayKey → ranges (or null while fetching /
+    // after a failed fetch). We distinguish "never fetched" (null) from
+    // "fetched but empty" ([]) so that an empty result can be retried
+    // on a later mount — Frigate's motion index can lag behind the
+    // recording index by a few minutes, so a first load that returns
+    // empty may have data on the next attempt. The previous behavior
+    // cached `[]` permanently, which was the root cause of motion
+    // events never appearing on the web dashboard even though the
+    // Android app (which has no client cache) showed them.
+    const [motionCache, setMotionCache] = useState<Record<string, MotionRange[] | null>>({});
     const [loadingMotion, setLoadingMotion] = useState(false);
 
     // Active playback: the recording being played + the <video> state.
@@ -151,7 +156,6 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     const [fetchingId, setFetchingId] = useState<number | null>(null);
     const [playError, setPlayError] = useState<string | null>(null);
     const videoRef = useRef<HTMLVideoElement>(null);
-    const urlRef = useRef<string | null>(null);
 
     // Player state.
     const [isPlaying, setIsPlaying] = useState(false);
@@ -185,15 +189,8 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         void loadRecordings();
     }, [loadRecordings]);
 
-    // Cleanup blob URL on unmount.
-    useEffect(() => {
-        return () => {
-            if (urlRef.current) {
-                URL.revokeObjectURL(urlRef.current);
-                urlRef.current = null;
-            }
-        };
-    }, []);
+    // No blob URL cleanup needed — we use direct URLs now and let
+    // the browser manage the HTTP connection.
 
     // ----- Filter recordings by selected day -----
     const dayStart = dayStartUnix(selectedDay);
@@ -218,7 +215,9 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // ----- Load motion ranges for the selected day -----
     useEffect(() => {
         const key = dayKey(selectedDay);
-        if (motionCache[key]) return; // cached
+        // null = never fetched (or previous fetch failed). Skip only
+        // when we have an actual array (even empty) cached.
+        if (motionCache[key] !== undefined && motionCache[key] !== null) return;
         if (loadingMotion) return;
 
         let cancelled = false;
@@ -229,9 +228,11 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                 if (cancelled) return;
                 setMotionCache((prev) => ({ ...prev, [key]: res.ranges ?? [] }));
             } catch {
-                // Non-fatal: motion overlay just won't render.
+                // Non-fatal: leave motionCache[key] as null so the next
+                // mount / day switch can retry. Previously we cached []
+                // which permanently blocked retries.
                 if (!cancelled) {
-                    setMotionCache((prev) => ({ ...prev, [key]: [] }));
+                    setMotionCache((prev) => ({ ...prev, [key]: null }));
                 }
             } finally {
                 if (!cancelled) setLoadingMotion(false);
@@ -262,32 +263,27 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         }
     }, [targetTime, loadingRecs, dayRecordings, activeRec]); // eslint-disable-line react-hooks/exhaustive-deps
 
-    // ----- Play a recording (fetch MP4 with JWT, build blob URL) -----
+    // ----- Play a recording (stream MP4 via native Range requests) -----
+    // We point the <video> element directly at the file URL and let the
+    // browser issue native HTTP Range requests. The backend
+    // (http.ServeFile) supports Range, so the browser can seek freely
+    // and start playback as soon as the first bytes arrive — no need
+    // to download the whole 30-60MB MP4 first as a blob.
+    //
+    // JWT auth: the home_token cookie (SameSite=Lax, set by /api/v1/auth/bind)
+    // is sent automatically with same-origin requests to /api/..., so
+    // the <video> element can authenticate without us attaching an
+    // Authorization header (which <video> cannot do natively).
     async function playRecording(rec: CameraRecording, seekOffset = 0) {
-        // Stop any current playback.
-        if (urlRef.current) {
-            URL.revokeObjectURL(urlRef.current);
-            urlRef.current = null;
-        }
+        // Stop any current playback. No blob URL to revoke anymore —
+        // we use the raw URL and let the browser manage the connection.
         setVideoUrl(null);
         setActiveRec(null);
         setPlayError(null);
         setFetchingId(rec.id);
 
         try {
-            const h = authHeaderFor();
-            // Try the blob path first (full file). For 60s MP4s this
-            // is ~10-30MB which is fast on LAN; on Tunnel it can take
-            // a few seconds but Range support makes streaming better.
-            const resp = await fetch(recordingFileUrl(cameraId, rec.id), {
-                headers: h ? { [h.name]: h.value } : {},
-            });
-            if (!resp.ok) {
-                throw new Error(`HTTP ${resp.status}${resp.statusText ? ` ${resp.statusText}` : ""}`);
-            }
-            const blob = await resp.blob();
-            const url = URL.createObjectURL(blob);
-            urlRef.current = url;
+            const url = recordingFileUrl(cameraId, rec.id);
             setVideoUrl(url);
             setActiveRec(rec);
             // Seek to the requested offset once metadata loads.
@@ -309,10 +305,6 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     }
 
     function stopPlayback() {
-        if (urlRef.current) {
-            URL.revokeObjectURL(urlRef.current);
-            urlRef.current = null;
-        }
         setVideoUrl(null);
         setActiveRec(null);
         setIsPlaying(false);
@@ -479,11 +471,18 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                         src={videoUrl}
                         autoPlay
                         playsInline
+                        muted
                         className="h-full w-full object-contain cursor-pointer"
                         onClick={onVideoClick}
                         onMouseDown={onVideoMouseDown}
                         onMouseUp={onVideoMouseUp}
                         onMouseLeave={onVideoMouseUp}
+                        onError={() => {
+                            // video element errors (network/decode/src).
+                            // Most common causes: JWT cookie missing,
+                            // backend 404, or HEVC decode failure.
+                            setPlayError("视频加载失败，请检查网络或浏览器解码能力");
+                        }}
                     />
                     {/* Long-press 5x indicator */}
                     {longPressActive && (
@@ -648,10 +647,18 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                 <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
                     <button
                         type="button"
-                        onClick={loadRecordings}
+                        onClick={() => {
+                            // Refresh also clears the motion-range cache so
+                            // events that were empty on first load (Frigate
+                            // lag, transient backend error) get a chance to
+                            // re-fetch. The previous behavior left empty
+                            // motion data permanently stuck.
+                            setMotionCache({});
+                            void loadRecordings();
+                        }}
                         disabled={loadingRecs}
                         className="shrink-0 inline-flex items-center gap-1 rounded-lg glass-subtle px-2 py-1 text-[10px] text-fg-muted hover:text-fg transition-colors disabled:opacity-50"
-                        title="刷新录像列表"
+                        title="刷新录像和活动事件"
                     >
                         <RefreshCw size={10} className={loadingRecs ? "animate-spin" : ""} />
                         刷新

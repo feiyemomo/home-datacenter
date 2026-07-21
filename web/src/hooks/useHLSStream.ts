@@ -142,15 +142,16 @@ export function useHLSStream(
         // on Tunnel links, and we let the watchdog absorb the
         // hls.js frag-load retry stack.
         //
-        // On slow Cloudflare Tunnel links, the first segment
-        // download alone can take 9.97s (a 1.8 MB HEVC .m4s at
-        // ~2.5 Mbps), and hls.js's frag-loading retry backoff
-        // can stack up to 32s before the segment is declared
-        // failed. We give the stall watchdog 60s to absorb the
-        // first 1-2 segment loads before declaring the stream
-        // dead — otherwise a clean cold start falsely surfaces
-        // "HLS stream stalled" on every page load.
-        const stallTimeoutMs = 60_000;
+        // Stall watchdog: if the HLS stream doesn't reach "playing"
+        // state within 15s of starting, declare it dead. The previous
+        // 60s timeout was far too long — on LAN the first segment
+        // loads in <2s, and even on a slow Cloudflare Tunnel link a
+        // 1.8MB HEVC .m4s at 2.5 Mbps arrives in ~10s. 15s covers
+        // the slow-link cold start without leaving the user staring
+        // at a frozen frame for a full minute. If hls.js emits a
+        // fatal error before the timer fires, the error handler
+        // below will surface it immediately.
+        const stallTimeoutMs = 15_000;
         const stallTimer = window.setTimeout(() => {
             if (cancelled) return;
             setState((cur) => {
