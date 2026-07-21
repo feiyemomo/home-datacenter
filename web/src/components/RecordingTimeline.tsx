@@ -89,6 +89,63 @@ function formatDuration(sec: number): string {
     return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
 }
 
+/**
+ * Client-side consolidation of motion ranges — mirrors Android's
+ * AlertRangeOverlay.consolidateRanges. Consecutive same-tier ranges
+ * (both AI or both motion-only) whose gap <= MOTION_MERGE_GAP_S
+ * are merged into a single range spanning the union (min start,
+ * max end). Very-small-gap cross-tier ranges (<=5s) are also merged
+ * and upgraded to the AI (red) tier. This is purely visual — the
+ * underlying data is not modified.
+ *
+ * Without this, ~109 ranges/day render as 109 separate markers that
+ * visually fuse into a blob on the 24h timeline.
+ */
+const MOTION_MERGE_GAP_S = 60; // web: 60s (Android uses 30s)
+const MOTION_CROSS_TIER_MERGE_S = 5;
+
+function consolidateMotionRanges(ranges: MotionRange[]): MotionRange[] {
+    if (ranges.length <= 1) return ranges;
+    const sorted = [...ranges].sort((a, b) => a.start - b.start);
+    const out: MotionRange[] = [];
+    let cur: MotionRange = { ...sorted[0] };
+    for (let i = 1; i < sorted.length; i++) {
+        const r = sorted[i];
+        const curEnd = cur.start + cur.duration;
+        const gap = r.start - curEnd;
+        const curAI = (cur.peak_objects ?? 0) > 0;
+        const rAI = (r.peak_objects ?? 0) > 0;
+        if (curAI === rAI && gap <= MOTION_MERGE_GAP_S) {
+            // Same tier, small gap -> extend.
+            const start = Math.min(cur.start, r.start);
+            const end = Math.max(curEnd, r.start + r.duration);
+            cur = {
+                start,
+                duration: end - start,
+                motion_score: (cur.motion_score ?? 0) + (r.motion_score ?? 0),
+                segment_count: (cur.segment_count ?? 0) + (r.segment_count ?? 0),
+                peak_objects: Math.max(cur.peak_objects ?? 0, r.peak_objects ?? 0),
+            } as MotionRange;
+        } else if (gap <= MOTION_CROSS_TIER_MERGE_S) {
+            // Cross-tier but essentially touching -> merge, upgrade to AI.
+            const start = Math.min(cur.start, r.start);
+            const end = Math.max(curEnd, r.start + r.duration);
+            cur = {
+                start,
+                duration: end - start,
+                motion_score: (cur.motion_score ?? 0) + (r.motion_score ?? 0),
+                segment_count: (cur.segment_count ?? 0) + (r.segment_count ?? 0),
+                peak_objects: Math.max(cur.peak_objects ?? 0, r.peak_objects ?? 0),
+            } as MotionRange;
+        } else {
+            out.push(cur);
+            cur = { ...r };
+        }
+    }
+    out.push(cur);
+    return out;
+}
+
 export interface RecordingTimelineProps {
     cameraId: number;
     /** Unix seconds. When set, auto-selects the matching day + seeks. */
@@ -262,6 +319,16 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     }, [selectedDay, dayStart, dayEnd, cameraId, motionCache]);
 
     const dayMotion = motionCache[dayKey(selectedDay)] ?? [];
+
+    // Client-side merge of same-tier ranges within 60s gap. Mirrors
+    // Android's AlertRangeOverlay.consolidateRanges(consolidateGapMs=30s).
+    // Web uses a larger gap (60s) because the timeline is typically
+    // narrower than Android's SeekBar, so visually-adjacent ranges need
+    // more aggressive consolidation to avoid the "blob" effect.
+    const mergedMotion = useMemo(
+        () => consolidateMotionRanges(dayMotion),
+        [dayMotion],
+    );
 
     // ----- targetTime handling: pick the right day + auto-play -----
     useEffect(() => {
@@ -458,17 +525,14 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // 24-hour timeline: render 1440 minute-buckets as a horizontal bar.
     // Each bucket is 60s/86400s = 0.0694% of the bar width.
     const minuteBuckets = useMemo(() => {
-        const buckets: { startUnix: number; hasRec: boolean; motion?: MotionRange[] }[] = [];
+        const buckets: { startUnix: number; hasRec: boolean }[] = [];
         for (let m = 0; m < 1440; m++) {
             const startUnix = dayStart + m * 60;
             const hasRec = recordingMinuteSet.has(startUnix);
-            const motion = dayMotion.filter(
-                (r) => r.start >= startUnix && r.start < startUnix + 60,
-            );
-            buckets.push({ startUnix, hasRec, motion: motion.length > 0 ? motion : undefined });
+            buckets.push({ startUnix, hasRec });
         }
         return buckets;
-    }, [dayStart, recordingMinuteSet, dayMotion]);
+    }, [dayStart, recordingMinuteSet]);
 
     // Active recording position on the 24h timeline (for the playhead).
     const playheadFraction = activeRec
@@ -476,8 +540,8 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         : null;
 
     // Event counts for the ribbon header.
-    const aiEventCount = dayMotion.filter((r) => r.peak_objects > 0).length;
-    const motionEventCount = dayMotion.length - aiEventCount;
+    const aiEventCount = mergedMotion.filter((r) => r.peak_objects > 0).length;
+    const motionEventCount = mergedMotion.length - aiEventCount;
 
     // ----- Video surface (portaled into LiveVideo's main video area) -----
     // Rendered via createPortal so live and playback share the same
@@ -708,7 +772,7 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                     <div className="flex items-center justify-between text-[10px] tracking-wider text-fg-subtle">
                         <span>24 小时时间轴</span>
                         <span className="text-fg-muted">
-                            {dayRecordings.length} 分钟录像{dayMotion.length > 0 && ` · ${dayMotion.length} 段活动`}
+                            {dayRecordings.length} 分钟录像{mergedMotion.length > 0 && ` · ${mergedMotion.length} 段活动`}
                         </span>
                     </div>
                     {/* Event ribbon — prominent markers for motion/AI events.
@@ -727,14 +791,14 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                      * indicators must pop in both themes. The dark slate
                      * backing (CSS-var based, adapts to theme) amplifies
                      * contrast for both red and amber in light mode. */}
-                    <div className="relative h-6 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
+                    <div className="relative h-4 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
                         {dayMotion.length === 0 ? (
                             <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/40">
                                 无活动事件
                             </div>
                         ) : (
                             <>
-                                {dayMotion.map((r, i) => {
+                                {mergedMotion.map((r, i) => {
                                     const rawStartFrac = (r.start - dayStart) / 86_400;
                                     const rawEndFrac = (r.start + r.duration - dayStart) / 86_400;
                                     const startFrac = Math.max(0, Math.min(1, rawStartFrac));
@@ -745,14 +809,14 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                         <div
                                             key={`${r.start}-${i}`}
                                             className={cn(
-                                                "absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full",
+                                                "absolute top-1/2 h-1 -translate-y-1/2 rounded-full",
                                                 hasAI
-                                                    ? "bg-red-500"
-                                                    : "bg-amber-500",
+                                                    ? "bg-red-500/70"
+                                                    : "bg-amber-500/70",
                                             )}
                                             style={{
                                                 left: `${startFrac * 100}%`,
-                                                width: `${Math.max(0.3, (endFrac - startFrac) * 100)}%`,
+                                                width: `${Math.max(0.15, (endFrac - startFrac) * 100)}%`,
                                                 zIndex: 10,
                                             }}
                                             title={`${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}`}
@@ -798,16 +862,6 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                 >
                                     {b.hasRec && (
                                         <div className="absolute inset-0 bg-[rgb(var(--accent-primary)/0.35)]" />
-                                    )}
-                                    {b.motion && b.motion.length > 0 && (
-                                        <div
-                                            className={cn(
-                                                "absolute inset-0",
-                                                b.motion.some((r) => r.peak_objects > 0)
-                                                    ? "bg-red-500/70"
-                                                    : "bg-amber-500/65",
-                                            )}
-                                        />
                                     )}
                                 </div>
                             ))}
