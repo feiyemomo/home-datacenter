@@ -285,7 +285,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     const onWebRTCFallback = transport === "auto" ? () => setPath("hls") : undefined;
 
     return (
-        <Card className="glass glass-glow glass-hover-lift rounded-2xl overflow-hidden bg-[rgb(var(--glass-bg)/0.92)]">
+        <Card className="glass glass-glow glass-hover-lift rounded-2xl bg-[rgb(var(--glass-bg)/0.92)]">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="flex items-center gap-2 text-base font-semibold text-fg">
                     <span
@@ -378,29 +378,29 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         <Button
                             size="sm"
                             variant="secondary"
-                            className="h-6 w-6 p-0"
+                            className="h-7 w-7 p-0 ring-1 ring-[rgb(var(--border)/0.5)] bg-[rgb(var(--glass-bg)/0.8)]"
                             onClick={() => setMenuOpen((o) => !o)}
                             title="更多操作"
                             aria-label="更多操作"
                             aria-expanded={menuOpen}
                         >
-                            <MoreVertical size={12} />
+                            <MoreVertical size={16} className="text-fg" />
                         </Button>
                         {menuOpen && (
-                            <div className="absolute right-0 top-full mt-1 z-30 min-w-[220px] rounded-lg glass-strong p-2.5 shadow-lg space-y-2.5">
+                            <div className="absolute right-0 top-full mt-1 z-50 min-w-[240px] rounded-xl glass-strong p-3 shadow-xl ring-1 ring-[rgb(var(--border)/0.4)] space-y-2.5">
                                 {/* Vendor + last seen info */}
-                                <div className="space-y-0.5 text-[10px] text-fg-subtle">
-                                    <div>厂商：<span className="text-fg-muted">{camera.vendor || "onvif"}</span></div>
+                                <div className="space-y-1 text-xs text-fg-muted">
+                                    <div>厂商：<span className="text-fg font-medium">{camera.vendor || "onvif"}</span></div>
                                     {lastSeen && (
-                                        <div>最后在线：<span className="text-fg-muted">{new Date(lastSeen).toLocaleString()}</span></div>
+                                        <div>最后在线：<span className="text-fg font-medium">{new Date(lastSeen).toLocaleString()}</span></div>
                                     )}
                                 </div>
                                 {/* Transport selector — live mode only */}
                                 {mode === "live" && (
-                                    <div className="space-y-1 pt-1 border-t border-[rgb(var(--border)/0.2)]">
-                                        <div className="text-[10px] tracking-wider text-fg-subtle">传输方式</div>
+                                    <div className="space-y-1.5 pt-2 border-t border-[rgb(var(--border)/0.2)]">
+                                        <div className="text-xs font-medium text-fg">传输方式</div>
                                         <div
-                                            className="inline-flex h-6 w-full items-center glass-subtle rounded-lg p-0.5 text-[10px]"
+                                            className="inline-flex h-7 w-full items-center glass-subtle rounded-lg p-0.5 text-xs"
                                             role="radiogroup"
                                             aria-label="直播传输方式"
                                         >
@@ -414,7 +414,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                                         aria-checked={active}
                                                         onClick={() => setTransport(t)}
                                                         className={cn(
-                                                            "h-5 flex-1 rounded px-1.5 font-medium tracking-wider transition-all",
+                                                            "h-6 flex-1 rounded px-1.5 font-medium tracking-wider transition-all",
                                                             active
                                                                 ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))]"
                                                                 : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
@@ -432,19 +432,19 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                                 );
                                             })}
                                         </div>
-                                        <div className="text-[9px] text-fg-subtle">
-                                            当前：<span className="text-fg-muted">{effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
+                                        <div className="text-[11px] text-fg-muted">
+                                            当前：<span className="text-fg font-medium">{effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
                                         </div>
                                     </div>
                                 )}
                                 {/* Recording toggle — admin only */}
                                 {isAdmin && (
-                                    <div className="space-y-1 pt-1 border-t border-[rgb(var(--border)/0.2)]">
+                                    <div className="space-y-1.5 pt-2 border-t border-[rgb(var(--border)/0.2)]">
                                         <div className="flex items-center justify-between">
-                                            <div className="text-[10px] tracking-wider text-fg-subtle">录像计划</div>
+                                            <div className="text-xs font-medium text-fg">录像计划</div>
                                             <span
                                                 className={cn(
-                                                    "inline-flex items-center gap-1 text-[10px] font-medium",
+                                                    "inline-flex items-center gap-1 text-xs font-medium",
                                                     recordingEnabled
                                                         ? "text-[rgb(var(--accent-danger))]"
                                                         : "text-fg-muted",
@@ -452,7 +452,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             >
                                                 <span
                                                     className={cn(
-                                                        "inline-block h-1.5 w-1.5 rounded-full",
+                                                        "inline-block h-2 w-2 rounded-full",
                                                         recordingEnabled
                                                             ? "bg-[rgb(var(--accent-danger))] animate-pulse"
                                                             : "bg-[rgb(var(--fg-subtle))]",
@@ -466,14 +466,14 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             variant={recordingEnabled ? "danger" : "primary"}
                                             onClick={onToggleRecording}
                                             disabled={toggling || !onRefresh}
-                                            className="w-full h-6 text-[10px]"
+                                            className="w-full h-7 text-xs"
                                             title={
                                                 recordingEnabled
                                                     ? `录像中 · ${camera.meta.recording?.segment_seconds ?? 600}秒/段 · 保留 ${camera.meta.recording?.retention_days ?? 7} 天`
                                                     : "录像未开启"
                                             }
                                         >
-                                            {toggling && <Loader2 size={10} className="animate-spin mr-1" />}
+                                            {toggling && <Loader2 size={12} className="animate-spin mr-1" />}
                                             {recordingEnabled ? "停止录像" : "开始录像"}
                                         </Button>
                                     </div>
