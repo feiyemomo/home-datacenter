@@ -54,11 +54,12 @@ func NewReleaseHandler(releasesDir string) *ReleaseHandler {
 
 // apkFile is one entry in the releases directory after parsing.
 type apkFile struct {
-	Path        string // absolute path on disk
-	VersionName string // e.g. "1.6.10"
-	VersionCode int    // e.g. 53 (parsed from versionName as 1*10000 + 6*100 + 10)
-	SizeBytes   int64
-	FileName    string // e.g. "app-debug-v1.6.10.apk"
+	Path         string // absolute path on disk
+	VersionName  string // e.g. "1.6.10"
+	VersionCode  int    // e.g. 53 (parsed from versionName as 1*10000 + 6*100 + 10)
+	SizeBytes    int64
+	FileName     string // e.g. "app-debug-v1.6.10.apk"
+	ReleaseNotes string // contents of release-notes-v1.6.10.txt (empty if absent)
 }
 
 // Latest returns metadata about the highest-version APK in the
@@ -99,7 +100,7 @@ func (h *ReleaseHandler) Latest(c *gin.Context) {
 		"download_url":  "/api/v1/release/latest/apk",
 		"file_name":     apk.FileName,
 		"size_bytes":    apk.SizeBytes,
-		"release_notes": "",
+		"release_notes": apk.ReleaseNotes,
 	})
 }
 
@@ -166,12 +167,22 @@ func (h *ReleaseHandler) findLatest() (*apkFile, error) {
 			continue
 		}
 
+		// Read optional release notes from a sibling text file named
+		// release-notes-v{version}.txt. Missing file = empty string.
+		// This lets the publisher attach a changelog per release by
+		// simply dropping a .txt file alongside the APK — no DB, no
+		// config edit. The Android app renders this as the "版本特点"
+		// section in the update dialog.
+		notesPath := filepath.Join(h.releasesDir, "release-notes-v"+verStr+".txt")
+		notes, _ := os.ReadFile(notesPath)
+
 		apks = append(apks, apkFile{
-			Path:        filepath.Join(h.releasesDir, name),
-			VersionName: verStr,
-			VersionCode: code,
-			SizeBytes:   info.Size(),
-			FileName:    name,
+			Path:         filepath.Join(h.releasesDir, name),
+			VersionName:  verStr,
+			VersionCode:  code,
+			SizeBytes:    info.Size(),
+			FileName:     name,
+			ReleaseNotes: string(notes),
 		})
 	}
 
