@@ -186,8 +186,14 @@ export async function getMotionRanges(
     after: number,
     before: number,
 ): Promise<MotionRangesResponse> {
+    // v1.8.2: override the global 15s axios timeout. The backend
+    // chunks a 24h window into 24 hourly Frigate API requests (each
+    // 1-2s), so the total can take 24-48s. The default 15s timeout
+    // was silently aborting the request, causing the frontend to
+    // cache null and the UI to show "0 events".
     const { data } = await client.get<MotionRangesResponse>(
         `/cameras/${id}/motion-ranges?after=${after}&before=${before}`,
+        { timeout: 90000 },
     );
     return data ?? { ranges: [], total: 0 };
 }

@@ -638,10 +638,20 @@ func (c *FrigateClient) ListMotionRanges(ctx context.Context, cameraName string,
 			log.Printf("frigate: ListMotionRanges chunk [%d,%d) failed: %v", start, end, err)
 			continue
 		}
+		// v1.8.2 debug: log per-chunk segment count + sample motion
+		// values so we can see exactly what Frigate returns.
+		motionSegs := 0
+		for _, r := range recs {
+			if r.Motion > 0 {
+				motionSegs++
+			}
+		}
+		log.Printf("[motion-ranges] chunk [%d,%d) cam=%s segs=%d with_motion=%d", start, end, cameraName, len(recs), motionSegs)
 		allSegments = append(allSegments, recs...)
 	}
 
 	if len(allSegments) == 0 {
+		log.Printf("[motion-ranges] no segments from Frigate for cam=%s [%d,%d) — returning nil", cameraName, after, before)
 		c.cacheMotionRanges(cacheKey, nil)
 		return nil, nil
 	}
