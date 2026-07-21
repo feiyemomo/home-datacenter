@@ -88,7 +88,7 @@ list / get 的 scope 过滤）。详见
                                                            │ WebRTC/HLS  │
                                                            │ AI Detection│
                                                            │ 24/7 Record │
-                                                           └────────────┘
+                                                           └─────────────┘
 ```
 
 ---
@@ -581,6 +581,23 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 ---
 
 ## 更新日志
+
+### v1.8.3（2026-07-21）HLS 延迟提示 + Android v1.6.24 同步
+
+- **Web 端 HLS 延迟提示徽标**：
+  - 在 `LiveVideo` 直播模式 + HLS 传输路径下（用户手动选择 `hls`，或 `auto` 模式下 WebRTC 回退到 HLS 时），视频容器左上角（`absolute left-2 top-2 z-20`）显示一个"网络质量差，延迟较大"徽标。
+  - 暖色液态玻璃风格：`--accent-warm` 作为图标/文字颜色、`--glass-bg` 作为半透明背景、`backdrop-blur-md` 实现毛玻璃效果。
+  - 图标使用 `lucide-react` 的 `AlertTriangle`（沿用已有导入）。
+  - 仅在直播模式 + HLS 路径触发，回放与其他模式不显示。
+- **Android v1.6.24 — Tunnel 路径尝试 WebRTC**：
+  - `CameraDetailActivity.startPlayback()` 不再在调用 `startWebRtcStream()` 前检查 `isDirectPath()`，WebRTC 现在会在所有路径（LAN / IPv6 直连 / Cloudflare Tunnel）下被尝试，只要摄像头在线且 WebRTC client 可用。
+  - Tunnel 路径上 WebRTC 通常会失败（Cloudflare Tunnel 无法中继 UDP），但已有的自适应超时（5s ICE 收集、6s 连接）+ TCP candidate 启用让 STUN / P2P / IPv6 直连场景仍有机会成功。
+  - 失败后走原有回退阶梯（MP4 → HLS），最终可用性不受影响。
+- **Android v1.6.24 — HLS 延迟提示**：
+  - 新增 `bg_hls_notice.xml` drawable + `tvHlsNotice` TextView（`activity_camera_detail.xml`），HLS 激活时显示"网络质量差，延迟较大"。
+  - 暖色液态玻璃风格与 `CameraCard.kt` 调色板一致（`#F2FFFFFF` 背景、`#66FFD4B8` 桃色边框）。
+  - `versionCode` 66 → 67，`versionName` "1.6.23" → "1.6.24"，构建验证通过。
+- **跨端 UX 一致性**：本次变更统一了 Web 端与 Android 端的 HLS 延迟提示样式与文案，用户在任一端遇到 HLS 回退时都能得到一致的视觉提示。
 
 ### v1.8.2（2026-07-21）活动事件拉取修复 + kebab 按钮文字遮挡修复
 

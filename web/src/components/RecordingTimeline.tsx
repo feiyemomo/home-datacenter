@@ -148,7 +148,6 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // events never appearing on the web dashboard even though the
     // Android app (which has no client cache) showed them.
     const [motionCache, setMotionCache] = useState<Record<string, MotionRange[] | null>>({});
-    const [loadingMotion, setLoadingMotion] = useState(false);
 
     // Active playback: the recording being played + the <video> state.
     const [activeRec, setActiveRec] = useState<CameraRecording | null>(null);
@@ -213,6 +212,20 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     }, [dayRecordings]);
 
     // ----- Load motion ranges for the selected day -----
+    // v1.8.3: Fix race condition. The previous dependency array included
+    // `loadingMotion`, which caused:
+    //   1. Effect runs, starts fetch, calls setLoadingMotion(true)
+    //   2. Re-render triggered by setLoadingMotion
+    //   3. Cleanup runs → cancelled = true (the in-flight fetch is doomed)
+    //   4. New effect runs but skips because loadingMotion === true
+    //   5. Fetch completes, sees cancelled === true, discards the result
+    // Net: motionCache stays empty ~95% of the time. The "lucky" renders
+    // where React batched the state updates were the only ones that worked.
+    //
+    // Fix: use a ref to track in-flight requests (no re-render on change),
+    // and remove loadingMotion from the dependency array. The ref check
+    // prevents duplicate fetches without triggering a cleanup cycle.
+    const fetchingMotionRef = useRef(false);
     useEffect(() => {
         const key = dayKey(selectedDay);
         // Skip if we've already attempted a fetch for this key
@@ -222,16 +235,17 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         // hammers the backend. The user can click the refresh
         // button to clear the cache and force a retry.
         if (motionCache[key] !== undefined) return;
-        if (loadingMotion) return;
+        if (fetchingMotionRef.current) return;
 
         let cancelled = false;
-        setLoadingMotion(true);
+        fetchingMotionRef.current = true;
         (async () => {
             try {
                 const res = await getMotionRanges(cameraId, dayStart, dayEnd);
                 if (cancelled) return;
                 setMotionCache((prev) => ({ ...prev, [key]: res.ranges ?? [] }));
-            } catch {
+            } catch (e) {
+                console.warn(`[motion] cam=${cameraId} day=${key} FAILED:`, e);
                 // Non-fatal: cache null to mark "attempted but failed"
                 // so the effect doesn't immediately retry. The UI shows
                 // an empty ribbon; the refresh button clears the cache.
@@ -239,11 +253,13 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                     setMotionCache((prev) => ({ ...prev, [key]: null }));
                 }
             } finally {
-                if (!cancelled) setLoadingMotion(false);
+                if (!cancelled) {
+                    fetchingMotionRef.current = false;
+                }
             }
         })();
         return () => { cancelled = true; };
-    }, [selectedDay, dayStart, dayEnd, cameraId, motionCache, loadingMotion]);
+    }, [selectedDay, dayStart, dayEnd, cameraId, motionCache]);
 
     const dayMotion = motionCache[dayKey(selectedDay)] ?? [];
 
@@ -695,60 +711,55 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                             {dayRecordings.length} 分钟录像{dayMotion.length > 0 && ` · ${dayMotion.length} 段活动`}
                         </span>
                     </div>
-
                     {/* Event ribbon — prominent markers for motion/AI events.
-                     * Each MotionRange becomes a tall colored bar so events
+                     * Each MotionRange becomes a thin colored bar so events
                      * are glanceable at a distance. Red = personnel/AI,
                      * amber = motion-only (scene change).
                      *
-                     * We use saturated Tailwind palette colors (red-500 /
-                     * amber-500) instead of the pastel --accent-* variables
-                     * because event markers are semantic status indicators
-                     * that must pop in both light and dark themes — the
-                     * soft accent variables disappear against the warm
-                     * cream background in light mode. The dark backing
-                     * strip further amplifies contrast. */}
-                    {/* Event ribbon — always rendered (even when empty) so the
-                     * dark backing strip is visible as a reference. Event bars
-                     * use saturated Tailwind red/amber (not pastel --accent-*
-                     * variables) because semantic status indicators must pop
-                     * in both themes. The dark backing amplifies contrast. */}
-                    <div className="relative h-8 w-full overflow-hidden rounded-md bg-[rgb(var(--slate-900)/0.9)] ring-1 ring-inset ring-[rgb(var(--border)/0.5)]">
-                        {/* Hour grid lines for reference */}
-                        <div className="absolute inset-0 flex pointer-events-none">
-                            {Array.from({ length: 24 }).map((_, h) => (
-                                <div
-                                    key={h}
-                                    className="flex-1 border-r border-white/5"
-                                />
-                            ))}
-                        </div>
+                     * v1.8.3: Tailwind's default color palette was previously
+                     * wiped out by a top-level theme.colors in tailwind.config.js,
+                     * which is why bg-red-600 / bg-amber-500 silently failed to
+                     * generate any CSS. The config now merges via theme.extend,
+                     * so standard Tailwind colors work again.
+                     *
+                     * We use saturated Tailwind red/amber (not the pastel
+                     * --accent-* CSS variables) because semantic status
+                     * indicators must pop in both themes. The dark slate
+                     * backing (CSS-var based, adapts to theme) amplifies
+                     * contrast for both red and amber in light mode. */}
+                    <div className="relative h-6 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
                         {dayMotion.length === 0 ? (
-                            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/30">
+                            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/40">
                                 无活动事件
                             </div>
                         ) : (
-                            dayMotion.map((r, i) => {
-                                const startFrac = (r.start - dayStart) / 86_400;
-                                const endFrac = Math.min(1, (r.start + r.duration - dayStart) / 86_400);
-                                const hasAI = r.peak_objects > 0;
-                                return (
-                                    <div
-                                        key={`${r.start}-${i}`}
-                                        className={cn(
-                                            "absolute inset-y-1 rounded-sm transition-all",
-                                            hasAI
-                                                ? "bg-red-500 shadow-[0_0_8px_rgb(239_68_68/0.9)] animate-pulse"
-                                                : "bg-amber-400 shadow-[0_0_6px_rgb(245_158_11/0.7)]",
-                                        )}
-                                        style={{
-                                            left: `${startFrac * 100}%`,
-                                            width: `${Math.max(1.5, (endFrac - startFrac) * 100)}%`,
-                                        }}
-                                        title={`${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}`}
-                                    />
-                                );
-                            })
+                            <>
+                                {dayMotion.map((r, i) => {
+                                    const rawStartFrac = (r.start - dayStart) / 86_400;
+                                    const rawEndFrac = (r.start + r.duration - dayStart) / 86_400;
+                                    const startFrac = Math.max(0, Math.min(1, rawStartFrac));
+                                    const endFrac = Math.max(0, Math.min(1, rawEndFrac));
+                                    if (endFrac <= startFrac) return null;
+                                    const hasAI = r.peak_objects > 0;
+                                    return (
+                                        <div
+                                            key={`${r.start}-${i}`}
+                                            className={cn(
+                                                "absolute top-1/2 h-1.5 -translate-y-1/2 rounded-full",
+                                                hasAI
+                                                    ? "bg-red-500"
+                                                    : "bg-amber-500",
+                                            )}
+                                            style={{
+                                                left: `${startFrac * 100}%`,
+                                                width: `${Math.max(0.3, (endFrac - startFrac) * 100)}%`,
+                                                zIndex: 10,
+                                            }}
+                                            title={`${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}`}
+                                        />
+                                    );
+                                })}
+                            </>
                         )}
                     </div>
 

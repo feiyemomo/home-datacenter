@@ -98,8 +98,22 @@ services:
     restart: unless-stopped
     # Port 8088 on the host maps to 80 in the container. Port 80
     # on the host is typically occupied by the NAS web UI.
+    #
+    # v1.6.23: dual-stack binding (IPv4 + IPv6). The previous
+    # "0.0.0.0:8088:80" only bound IPv4, which forced remote mobile
+    # clients (on CGNAT IPv4 with IPv6) to route through the
+    # Cloudflare Tunnel (1.4s TTFB) even when both NAS and phone had
+    # IPv6 connectivity. With IPv6 bound, the Android app's
+    # BaseUrlResolver can now pick http://[NAS_IPV6]:8088/ as a
+    # direct path when the phone has IPv6 — TTFB drops from ~1.4s
+    # to ~50ms. docker-proxy handles the IPv6→IPv4 translation to
+    # the container's internal 0.0.0.0:80, so nginx needs no config
+    # change. We keep 0.0.0.0 explicit (instead of bare "8088:80")
+    # so the IPv4 binding is unchanged on Docker setups where the
+    # default bind address differs.
     ports:
       - "0.0.0.0:8088:80"
+      - "[::]:8088:80"
     depends_on:
       - api
     networks:

@@ -327,6 +327,10 @@ export interface NetworkStatus {
     /** BEST achievable path after probing. Client upgrades from `initial` to this if probe succeeds. */
     strategy: ConnectionStrategy;
     quality: number; // 1-5
+    /** Server's IPv6 direct HTTP URL (empty if IPv6 unreachable). */
+    direct_url?: string;
+    /** Server's UDP endpoint for P2P hole punching (empty if unavailable). */
+    p2p_endpoint?: string;
     checked_at: string;
 }
 
