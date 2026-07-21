@@ -434,14 +434,28 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
 
     // ----- Seekbar click → play the matching 60s bucket -----
     const seekBarRef = useRef<HTMLDivElement>(null);
-    function seekToHour(hourFraction: number) {
-        const targetUnix = dayStart + Math.floor(hourFraction * 86_400);
+
+    // Seek to a specific unix timestamp by finding the matching 60s
+    // recording bucket and playing it from the offset. Shared by the
+    // seekbar click handler and the event-marker click handler so every
+    // "jump to time" path uses identical logic. playRecording swaps the
+    // portaled video surface's source, which effectively puts the player
+    // into recording mode at that timestamp.
+    const seekToUnix = useCallback((targetUnix: number) => {
         const targetMinute = Math.floor(targetUnix / 60) * 60;
         const match = dayRecordings.find((r) => r.id === targetMinute) ??
             dayRecordings.find((r) => Math.abs(r.id - targetMinute) < 600);
         if (match) {
             void playRecording(match, targetUnix - match.id);
         }
+        // playRecording is a component-scope closure whose dependencies
+        // (setState refs, cameraId, videoRef) are all stable; omitting it
+        // from deps avoids re-creating seekToUnix on every render.
+    }, [dayRecordings]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    function seekToHour(hourFraction: number) {
+        const targetUnix = dayStart + Math.floor(hourFraction * 86_400);
+        seekToUnix(targetUnix);
     }
 
     function onSeekBarClick(e: React.MouseEvent<HTMLDivElement>) {
@@ -451,6 +465,14 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         const fraction = x / rect.width;
         seekToHour(fraction);
     }
+
+    // Event-marker click: jump to the marker's start timestamp. Wraps
+    // seekToUnix in a stable callback so the per-marker onClick reference
+    // doesn't change on every render (avoids re-attaching handlers when
+    // unrelated state like currentTime/duration updates fire).
+    const handleMarkerClick = useCallback((timestamp: number) => {
+        seekToUnix(timestamp);
+    }, [seekToUnix]);
 
     // ----- Within-recording seek (drag inside the playing bucket) -----
     function onWithinRecSeek(e: React.MouseEvent<HTMLDivElement>) {
@@ -776,9 +798,14 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                         </span>
                     </div>
                     {/* Event ribbon — prominent markers for motion/AI events.
-                     * Each MotionRange becomes a thin colored bar so events
-                     * are glanceable at a distance. Red = personnel/AI,
-                     * amber = motion-only (scene change).
+                     * Each MotionRange becomes a colored bar so events are
+                     * glanceable at a distance. Red = personnel/AI (taller,
+                     * saturated, glowing, hover-scales), amber = motion-only /
+                     * scene change (shorter, semi-transparent). Both tiers are
+                     * clickable → seekToUnix jumps the player to the marker's
+                     * start timestamp (playRecording replaces the portaled
+                     * video surface's source, putting the player into
+                     * recording mode at that instant).
                      *
                      * v1.8.3: Tailwind's default color palette was previously
                      * wiped out by a top-level theme.colors in tailwind.config.js,
@@ -790,8 +817,17 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                      * --accent-* CSS variables) because semantic status
                      * indicators must pop in both themes. The dark slate
                      * backing (CSS-var based, adapts to theme) amplifies
-                     * contrast for both red and amber in light mode. */}
-                    <div className="relative h-4 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
+                     * contrast for both red and amber in light mode.
+                     *
+                     * Visual hierarchy (per v1.8.5 design feedback):
+                     *   - AI markers:    h-3 (12px), full-opacity bg-red-500,
+                     *                     glow shadow, z-20, hover scale-y-110
+                     *   - Motion-only:   h-1.5 (6px), bg-amber-500/50 (faint),
+                     *                     z-10, no shadow — recedes so AI pops.
+                     *   - Container grew h-4 → h-6 to fit the taller AI bars
+                     *     with vertical breathing room for the glow + hover scale.
+                     */}
+                    <div className="relative h-6 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
                         {dayMotion.length === 0 ? (
                             <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/40">
                                 无活动事件
@@ -806,20 +842,21 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                     if (endFrac <= startFrac) return null;
                                     const hasAI = r.peak_objects > 0;
                                     return (
-                                        <div
+                                        <button
                                             key={`${r.start}-${i}`}
+                                            type="button"
+                                            onClick={() => handleMarkerClick(r.start)}
                                             className={cn(
-                                                "absolute top-1/2 h-1 -translate-y-1/2 rounded-full",
+                                                "absolute top-1/2 -translate-y-1/2 rounded-full transition-all hover:brightness-125 hover:z-30 cursor-pointer",
                                                 hasAI
-                                                    ? "bg-red-500/70"
-                                                    : "bg-amber-500/70",
+                                                    ? "h-3 bg-red-500 shadow-sm shadow-red-500/60 hover:scale-y-110 z-20"
+                                                    : "h-1.5 bg-amber-500/50 hover:bg-amber-500/70 z-10",
                                             )}
                                             style={{
                                                 left: `${startFrac * 100}%`,
                                                 width: `${Math.max(0.15, (endFrac - startFrac) * 100)}%`,
-                                                zIndex: 10,
                                             }}
-                                            title={`${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}`}
+                                            title={`${hasAI ? "人员活动" : "画面变动"} · ${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}（点击跳转）`}
                                         />
                                     );
                                 })}
