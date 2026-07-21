@@ -120,6 +120,7 @@ export function useWebRTCStream(
 
     useEffect(() => {
         let cancelled = false;
+        let iceDisconnectTimer: number | null = null;
         setError(null);
 
         (async () => {
@@ -152,28 +153,50 @@ export function useWebRTCStream(
                 };
                 pc.oniceconnectionstatechange = () => {
                     // We intentionally DO NOT treat iceConnectionState
-                    // 'failed' as a terminal error here. The browser
-                    // briefly reports 'failed' as it cycles through
-                    // candidate pairs (especially over ICE-TCP on slow
-                    // links) before settling on 'connected' or
+                    // 'failed' as an immediate terminal error here. The
+                    // browser briefly reports 'failed' as it cycles
+                    // through candidate pairs (especially over ICE-TCP
+                    // on slow links) before settling on 'connected' or
                     // 'completed'. Surfacing that transient as an
                     // error triggers LiveVideo's onFallback → HLS
                     // remount, which closes the peer connection just
                     // as it was about to stabilise.
                     //
-                    // We log the state for visibility but let
-                    // pc.onconnectionstatechange (below) decide
-                    // whether the whole connection is dead. That
-                    // callback only fires on a stable terminal state
-                    // (failed/closed), not on transient ICE churn.
+                    // However, 'disconnected' must not be ignored
+                    // indefinitely. The browser will only promote
+                    // 'disconnected' to 'failed' after a 30s timeout,
+                    // during which the user sees a frozen frame with
+                    // no error. To keep the perceived latency low we
+                    // start our own 8s timer on 'disconnected'; if
+                    // ICE does not recover to 'connected'/'completed'
+                    // in that window, we fall back to HLS.
                     if (cancelled) return;
-                    if (pc.iceConnectionState === "failed" ||
-                        pc.iceConnectionState === "disconnected") {
-                        // eslint-disable-next-line no-console
-                        console.debug(
-                            `[webrtc] iceConnectionState=${pc.iceConnectionState} ` +
-                            `(transient; not failing over yet)`,
-                        );
+                    const st = pc.iceConnectionState;
+                    // eslint-disable-next-line no-console
+                    console.debug(`[webrtc] iceConnectionState=${st}`);
+                    if (st === "disconnected") {
+                        if (iceDisconnectTimer) {
+                            window.clearTimeout(iceDisconnectTimer);
+                        }
+                        iceDisconnectTimer = window.setTimeout(() => {
+                            if (cancelled) return;
+                            // Re-check state in case ICE recovered
+                            // between the timer being armed and firing.
+                            const cur = pc.iceConnectionState;
+                            if (cur === "disconnected" || cur === "failed") {
+                                // eslint-disable-next-line no-console
+                                console.warn(
+                                    `[webrtc] ICE ${cur} for >8s — falling back to HLS`,
+                                );
+                                setState("error");
+                                setError(`ice ${cur} (8s timeout)`);
+                            }
+                        }, 8_000);
+                    } else if (st === "connected" || st === "completed") {
+                        if (iceDisconnectTimer) {
+                            window.clearTimeout(iceDisconnectTimer);
+                            iceDisconnectTimer = null;
+                        }
                     }
                 };
                 pc.onconnectionstatechange = () => {
@@ -283,6 +306,10 @@ export function useWebRTCStream(
 
         return () => {
             cancelled = true;
+            if (iceDisconnectTimer) {
+                window.clearTimeout(iceDisconnectTimer);
+                iceDisconnectTimer = null;
+            }
             teardown();
         };
     }, [opts.cameraId, opts.streamName, opts.webrtcUrl, opts.sdpUrlOverride, nonce, teardown]);
