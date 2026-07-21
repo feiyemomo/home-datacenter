@@ -61,6 +61,15 @@ services:
       - MQTT_PASSWORD=${MQTT_PASSWORD:-}
       - GO2RTC_BASE_URL=${GO2RTC_BASE_URL:-http://home-frigate:1984}
       - FRIGATE_BASE_URL=${FRIGATE_BASE_URL:-http://home-frigate:5000}
+      # v1.6.22: NAS public IPv6 address. The container cannot probe
+      # IPv6 reachability itself (home-net bridge has no IPv6 subnet),
+      # so we expose the host's public IPv6 address via env var. When
+      # set, CheckIPv6() reports enabled+reachable=true and includes
+      # this address — dashboard's network card and Android's IPv6
+      # direct mode then both work. Update this value if the ISP
+      # rotates the IPv6 prefix (find via: ip -6 addr show enp4s0 |
+      # grep "scope global" | grep -v temporary).
+      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37a0:63f0:62be:b4ff:fe08:bd09}
     networks:
       - home-net
 
