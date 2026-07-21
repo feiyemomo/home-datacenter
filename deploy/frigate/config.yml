@@ -179,17 +179,22 @@ go2rtc:
       - 127.0.0.1:8555
       - 192.168.31.234:8555
   hls:
-    # 1s segment: keeps each .m4s under ~1 MB on a 8 Mbps HEVC
-    # stream, so it can finish downloading inside the 5s upstream
-    # keepalive window on slow Cloudflare Tunnel links. The old
-    # 2s setting produced 1.8 MB segments that took 9.97s to
-    # download, which is well past the session timeout and
-    # triggered the "no new segments arrived in time" stall loop.
-    segment: 1
+    # v1.6.19: ultra-low-latency HLS for remote (Cloudflare Tunnel)
+    # viewing. segment=0.5s is the practical floor — 0.2s segments on
+    # an 8 Mbps HEVC stream are only ~200KB each, and HTTP request
+    # overhead (TLS handshake reuse + Cloudflare Tunnel TTFB ~1.4s)
+    # dominates the per-segment cost. 0.5s yields ~500KB segments
+    # that download in ~500ms over the tunnel, leaving headroom.
+    # Combined with partial=true (LL-HLS) hls.js can begin playback
+    # after the first partial segment (~167ms) instead of waiting
+    # for a full segment, so end-to-end first-frame is ~2-3s on
+    # remote vs the previous ~5-7s.
+    segment: 0.5
     partial: true
-    # 8 segments in the rolling window: hls.js can re-buffer two
-    # or three without falling off the end of the playlist.
-    window: 8
+    # v1.6.19: window 6 (3s of content) — smaller than v1.6.18's 8
+    # because partial mode lets hls.js re-buffer from partials; a
+    # large window just wastes playlist bandwidth on remote.
+    window: 6
 
 # Cameras section is managed by home-api. The empty dict here is
 # a placeholder so Frigate boots without complaining about a

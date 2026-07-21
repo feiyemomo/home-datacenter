@@ -49,13 +49,34 @@ export type TransportMode = "auto" | "webrtc" | "hls";
 
 const TRANSPORT_KEY = "home.transport";
 
+/**
+ * v1.6.19: detect whether the dashboard is being accessed remotely
+ * (via Cloudflare Tunnel) or on the LAN. Used to default the live
+ * transport to HLS on remote networks where WebRTC cannot punch
+ * through double CGNAT (Symmetric NAT on both home and mobile).
+ *
+ * LAN hostnames: localhost, 127.0.0.1, 192.168.x.x, 10.x.x.x,
+ * 172.16-31.x.x. Everything else (e.g. api.feiyemomo.top) is
+ * considered remote.
+ */
+function isRemoteAccess(): boolean {
+    if (typeof window === "undefined") return false;
+    const h = window.location.hostname;
+    if (h === "localhost" || h === "127.0.0.1") return false;
+    if (h.startsWith("192.168.") || h.startsWith("10.")) return false;
+    if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return false;
+    return true;
+}
+
 function readTransport(): TransportMode {
     if (typeof window === "undefined") return "auto";
     try {
         const v = window.localStorage.getItem(TRANSPORT_KEY);
         if (v === "auto" || v === "webrtc" || v === "hls") return v;
     } catch { /* private browsing etc. */ }
-    return "auto";
+    // v1.6.19: no stored preference — default to HLS on remote
+    // (CGNAT blocks WebRTC), "auto" (WebRTC first) on LAN.
+    return isRemoteAccess() ? "hls" : "auto";
 }
 
 /**
