@@ -2,6 +2,7 @@ package network
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -245,18 +246,33 @@ func (s *Service) detect() NetworkStatus {
 		quality = 3
 	}
 
-	log.Printf("network: ipv6=%v/%v nat=%s p2p=%v initial=%s strategy=%s quality=%d/5",
+	// Build the direct URL and P2P endpoint for clients to use.
+	var directURL string
+	var p2pEndpoint string
+	if ipv6Status.Reachable && ipv6Status.Address != "" {
+		// The web container (nginx) is bound to port 8088 for both
+		// IPv4 and IPv6 (compose.yaml dual-stack). Clients connect
+		// to this port which reverse-proxies /api/ to home-api:8080.
+		directURL = fmt.Sprintf("http://[%s]:8088/", ipv6Status.Address)
+	}
+	if p2p.Supported && natStatus.PublicIP != "" && natStatus.PublicPort > 0 {
+		p2pEndpoint = fmt.Sprintf("%s:%d", natStatus.PublicIP, natStatus.PublicPort)
+	}
+
+	log.Printf("network: ipv6=%v/%v nat=%s p2p=%v initial=%s strategy=%s quality=%d/5 direct=%s",
 		ipv6Status.Enabled, ipv6Status.Reachable,
-		natStatus.Type, p2p.Supported, initial, strategy, quality)
+		natStatus.Type, p2p.Supported, initial, strategy, quality, directURL)
 
 	return NetworkStatus{
-		IPv6:      ipv6Status,
-		NAT:       natStatus,
-		P2P:       p2p,
-		Relay:     relay,
-		Initial:   initial,
-		Strategy:  strategy,
-		Quality:   quality,
-		CheckedAt: time.Now(),
+		IPv6:        ipv6Status,
+		NAT:         natStatus,
+		P2P:         p2p,
+		Relay:       relay,
+		Initial:     initial,
+		Strategy:    strategy,
+		Quality:     quality,
+		DirectURL:   directURL,
+		P2PEndpoint: p2pEndpoint,
+		CheckedAt:   time.Now(),
 	}
 }

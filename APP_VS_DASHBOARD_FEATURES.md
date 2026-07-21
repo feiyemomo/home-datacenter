@@ -5,8 +5,7 @@
 > (`d:\Projects\home-datacenter\web\`), with implementation details
 > to help prioritize dashboard补全 work.
 >
-> **Last updated**: 2026-07-20 (Android v1.6.8 vs dashboard at the
-> same commit).
+> **Last updated**: 2026-07-21 (Android v1.6.24 vs dashboard at v1.8.3).
 
 ## TL;DR
 
@@ -349,7 +348,7 @@ navigate to this route on card click.
 
 | | Android | Dashboard |
 |---|---|---|
-| Status | **Has** | **Weak** (no MP4 middle tier) |
+| Status | **Has** (v1.6.24: WebRTC now attempted on Tunnel path too — previously skipped via `isDirectPath()` gate) | **Weak** (no MP4 middle tier) |
 | Severity | Medium | — |
 
 **Description**: WebRTC failure → MP4 direct stream → HLS → give
@@ -361,6 +360,7 @@ up. UI badge updates with each transition.
   - `WebRtcClient.Listener.onError` triggers `startMp4Playback`.
   - ExoPlayer `onPlayerError` triggers `preparePlayback(hlsUrl)`.
   - `updateStreamStrategy` updates the badge text.
+  - **v1.6.24 change**: `startPlayback()` no longer checks `isDirectPath()` before calling `startWebRtcStream()`. WebRTC is now attempted on ALL paths (LAN / IPv6 / Tunnel) when the camera is online and the WebRTC client is available. On Tunnel, WebRTC usually fails (Cloudflare can't relay UDP) but the existing 5s ICE / 6s connect timeouts + TCP candidate fallback give STUN / P2P / IPv6-direct scenarios a chance. On failure, the existing MP4 → HLS ladder takes over.
 
 **Dashboard补全建议**: In `LiveVideo.tsx` add an MP4 fallback tier
 between `useWebRTCStream` and `HLSVideo`. When WebRTC fails, switch
@@ -524,7 +524,7 @@ TTL before re-probing.
 
 | | Android | Dashboard |
 |---|---|---|
-| Status | **Has** | **Missing** |
+| Status | **Has** (v1.6.24: WebRTC now attempted on Tunnel path too — previously skipped via `isDirectPath()` gate; on WebRTC failure MP4 is still tried before HLS) | **Missing** |
 | Severity | Medium | — |
 
 **Description**: When WebRTC fails, MP4 direct stream
@@ -533,6 +533,7 @@ TTL before re-probing.
 **Implementation**:
 - File: `CameraDetailActivity.kt` — `startMp4Playback`
 - Key logic: `ProgressiveMediaSource.Factory` + the camera's MP4 endpoint.
+- **v1.6.24 note**: The WebRTC → MP4 → HLS ladder is unchanged. What changed in v1.6.24 is that WebRTC is now attempted on the Tunnel path too (previously `isDirectPath()` gated it to LAN / IPv6 only). On Tunnel, WebRTC usually fails fast and MP4 is reached sooner; the MP4 tier itself still runs as before.
 
 **Dashboard补全建议**: See 2.2.
 
@@ -670,6 +671,33 @@ button for admin users. No补全 needed.
 
 ---
 
+### 8.1 HLS latency notice
+
+| | Android | Dashboard |
+|---|---|---|
+| Status | **Has** (v1.6.24) | **Has** (v1.8.3) |
+| Severity | — | — |
+
+**Description**: When HLS is the active transport (manual selection
+or WebRTC fallback), a small "网络质量差，延迟较大" notice is
+shown in the video player area. Uses warm liquid-glass styling
+to match across platforms.
+
+**Implementation (Android, v1.6.24)**:
+- New `bg_hls_notice.xml` drawable + `tvHlsNotice` TextView in `activity_camera_detail.xml`.
+- Warm liquid-glass palette matches `CameraCard.kt` (`#F2FFFFFF` background, `#66FFD4B8` peach border).
+- Toggled on when `updateStreamStrategy` reflects HLS active.
+
+**Implementation (Dashboard, v1.8.3)**:
+- `web/src/components/LiveVideo.tsx` — small badge at `absolute left-2 top-2 z-20` of the video container.
+- Warm liquid-glass styling via CSS variables (`--accent-warm` for color, `--glass-bg` for background, `backdrop-blur-md`).
+- `AlertTriangle` icon from `lucide-react`.
+- Shown only in live mode + HLS path (manual `hls` selection or `auto` mode after WebRTC failure).
+
+**Gap**: None — both platforms now ship a matching notice.
+
+---
+
 ## Summary Matrix
 
 | # | Feature | Android | Dashboard | Severity |
@@ -686,20 +714,21 @@ button for admin users. No补全 needed.
 | 1.10 | Custom fullscreen toggle | Has | Weak (native) | Low |
 | 1.11 | Alert click → recording seek | Has | Weak (jumps to live) | High |
 | 2.1 | Standalone camera detail Activity | Has | Missing | Medium |
-| 2.2 | WebRTC/MP4/HLS three-tier fallback | Has | Weak (no MP4) | Medium |
+| 2.2 | WebRTC/MP4/HLS three-tier fallback | Has (v1.6.24: WebRTC attempted on Tunnel too) | Weak (no MP4) | Medium |
 | 2.3 | Large liquid-glass camera card | Has | Weak | Low |
 | 3.1 | Weather card | Has | **Missing** | High |
 | 3.2 | LAN/Remote path chip | Has | Missing | Medium |
 | 4.1 | LAN/Tunnel auto-switching | Has | **Missing** | High |
 | 4.2 | Network-change forced re-probe | Has | Missing | Medium |
 | 4.3 | 5-minute TTL cache | Has | Missing | Low |
-| 5.1 | MP4 fallback middle tier | Has | Missing | Medium |
+| 5.1 | MP4 fallback middle tier | Has (v1.6.24: WebRTC attempted on Tunnel too) | Missing | Medium |
 | 5.2 | WebRTC client pre-warming | Has | Missing | Low |
 | 6.1 | Alert click → recording playback | Has | Weak (jumps to live) | High |
 | 6.2 | Multi-source thumbnail downsampling | Has | Weak | Low |
 | 7.1 | Follow-system theme | Has | Weak (no "system") | Medium |
 | 7.2 | Camera list column adaptation | Has | Already has | — |
 | 7.3 | Admin camera registration FAB | Has | Already has | — |
+| 8.1 | HLS latency notice | Has (v1.6.24) | Has (v1.8.3) | — |
 
 ---
 
@@ -716,6 +745,11 @@ Ordered by user value divided by implementation cost:
 Advanced recording-playback features (fisheye chips, motion-range
 overlay, gestures, custom fullscreen) can be added in later
 iterations once the foundation (1.1 + 1.2) is in place.
+
+The v1.8.3 + Android v1.6.24 release (HLS latency notice + WebRTC
+attempted on Tunnel path) closes no items in this list — those
+changes are about UX consistency and expanding existing coverage,
+not about filling previously-listed dashboard gaps.
 
 ---
 

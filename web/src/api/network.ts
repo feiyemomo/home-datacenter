@@ -36,22 +36,29 @@ export async function getServerEndpoint(): Promise<ServerEndpoint> {
  * handshake.
  *
  * Multiple endpoints are tried in parallel because ipv6.google.com is
- * blocked by the GFW in China — we need a China-accessible fallback
- * (ipv6.test-ipv6.com) for users on Chinese mobile networks.
+ * blocked by the GFW in China — we need China-accessible fallbacks
+ * (ipv6.test-ipv6.com, mirrors6.tuna.tsinghua.edu.cn).
  *
  * Timeout is 3s per endpoint — on networks without IPv6, the failure is
  * usually immediate (DNS NXDOMAIN) rather than a hang.
+ *
+ * v1.8.3: added mirrors6.tuna.tsinghua.edu.cn (Tsinghua TUNA, China),
+ * and ipv6.baidu.com as additional fallbacks. The previous only-two-endpoint
+ * design meant users on Chinese networks behind GFW got false "no IPv6"
+ * results because both endpoints were blocked or slow.
  */
 const IPV6_TEST_ENDPOINTS = [
-    "https://ipv6.google.com/generate_204",
     "https://ipv6.test-ipv6.com/ip/?callback=test",
+    "https://mirrors6.tuna.tsinghua.edu.cn/",
+    "https://ipv6.baidu.com/",
+    "https://ipv6.google.com/generate_204",
 ];
 
 export async function checkClientIPv6(): Promise<boolean> {
     const results = await Promise.allSettled(
         IPV6_TEST_ENDPOINTS.map(async (url) => {
             const controller = new AbortController();
-            const timeout = setTimeout(() => controller.abort(), 3000);
+            const timeout = setTimeout(() => controller.abort(), 4000);
             try {
                 await fetch(url, {
                     signal: controller.signal,

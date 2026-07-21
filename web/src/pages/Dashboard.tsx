@@ -274,21 +274,26 @@ function WeatherCard() {
 }
 
 /**
- * Determine whether the current dashboard origin is the LAN path
- * (192.168.x.x or 10.x or 172.16-31.x) or the remote path
- * (Cloudflare Tunnel via api.feiyemomo.top).
+ * Determine the current dashboard connection path.
  *
- * Used by the LAN/Remote chip on the Network Quality card. The
- * Android app uses BaseUrlResolver to actually probe both paths;
- * on web we're bound to the current origin so we just classify it.
+ * Returns:
+ *  - "lan"       — direct LAN access (192.168.x.x, 10.x, 172.16-31.x)
+ *  - "ipv6"      — IPv6 literal direct connection (bypasses Cloudflare Tunnel)
+ *  - "remote"    — Cloudflare Tunnel or other remote path
+ *
+ * Used by the Network Quality card to show the current path chip.
+ * The Android app uses BaseUrlResolver to actually probe paths;
+ * on web we classify by current origin.
  */
-function detectApiPath(): "lan" | "remote" {
+function detectApiPath(): "lan" | "ipv6" | "remote" {
     if (typeof window === "undefined") return "remote";
     const h = window.location.hostname;
     if (h === "localhost" || h === "127.0.0.1") return "lan";
     if (/^192\.168\./.test(h)) return "lan";
     if (/^10\./.test(h)) return "lan";
     if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return "lan";
+    // Detect IPv6 literal addresses (wrapped in brackets like [::1] or [2001:db8::1])
+    if (/^\[[0-9a-f:]+\]$/i.test(h)) return "ipv6";
     return "remote";
 }
 
@@ -530,53 +535,86 @@ export default function Dashboard() {
                         <Globe size={16} /> 网络质量
                     </CardTitle>
                     <div className="flex items-center gap-2">
-                        {/* LAN/Remote path chip — mirrors Android's
-                         * network-quality card chip. Green dot = LAN
-                         * (low latency, ~10ms TTFB), amber dot = remote
-                         * (Cloudflare Tunnel, ~1.4s+ TTFB). */}
+                        {/* Path chip: LAN (green) / IPv6 直连 (blue) / 远程 (amber) */}
                         <Badge
                             variant="outline"
                             className="text-[10px] gap-1"
                             title={
                                 apiPath === "lan"
-                                    ? "当前从局域网路径加载（低延迟）"
-                                    : "当前通过 Cloudflare 隧道加载（远程）"
+                                    ? "当前从局域网路径加载（低延迟 ~10ms）"
+                                    : apiPath === "ipv6"
+                                        ? "当前通过 IPv6 直连加载（低延迟 ~50ms，绕过 Cloudflare 隧道）"
+                                        : "当前通过 Cloudflare 隧道加载（远程，~1.4s+ TTFB）"
                             }
                         >
                             <NetworkIcon size={10} />
                             <span
                                 className={`inline-block h-1.5 w-1.5 rounded-full ${
-                                    apiPath === "lan" ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-warm))]"
+                                    apiPath === "lan"
+                                        ? "bg-[rgb(var(--accent-success))]"
+                                        : apiPath === "ipv6"
+                                            ? "bg-[rgb(var(--accent-info))]"
+                                            : "bg-[rgb(var(--accent-warm))]"
                                 }`}
                             />
-                            {apiPath === "lan" ? "局域网" : "远程"}
+                            {apiPath === "lan" ? "局域网" : apiPath === "ipv6" ? "IPv6 直连" : "远程"}
                         </Badge>
-                        {netStatus && (
-                            <div className="flex items-center gap-0.5">
-                                {[1, 2, 3, 4, 5].map((n) => (
-                                    <Star
-                                        key={n}
-                                        size={14}
-                                        className={
-                                            n <= netStatus.quality
-                                                ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
-                                                : "fill-none text-fg-subtle"
-                                        }
-                                    />
-                                ))}
-                            </div>
-                        )}
+                        {netStatus && (() => {
+                            // Quality rating reflects the CURRENT connection experience,
+                            // not the best-possible upgrade target. The path chip already
+                            // shows what path you're on; the stars should match that reality.
+                            //
+                            // - LAN / IPv6 direct: always 5 (lowest latency, no intermediary)
+                            // - Relay (remote): at most 3, regardless of what upgrades are available
+                            // - Client lacks IPv6 while server is IPv6-only: downgrade to 3
+                            const currentQuality = (() => {
+                                if (apiPath === "lan" || apiPath === "ipv6") return 5;
+                                // On relay — actual experience is relay quality (3)
+                                if (apiPath === "remote") return Math.min(netStatus.quality, 3);
+                                // Client cannot use IPv6 direct even though server supports it
+                                if (netStatus.strategy === "ipv6_direct" && clientIPv6 === false) return 3;
+                                return netStatus.quality;
+                            })();
+                            // Best possible quality (for upgrade hint)
+                            const bestQuality =
+                                netStatus.strategy === "ipv6_direct" && clientIPv6 === false
+                                    ? 3
+                                    : netStatus.quality;
+                            const hasUpgrade = bestQuality > currentQuality;
+                            return (
+                                <div className="flex items-center gap-0.5" title={hasUpgrade ? `当前体验 ${currentQuality}/5 · 可升级到 ${bestQuality}/5` : `连接质量 ${currentQuality}/5`}>
+                                    {[1, 2, 3, 4, 5].map((n) => (
+                                        <Star
+                                            key={n}
+                                            size={14}
+                                            className={
+                                                n <= currentQuality
+                                                    ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
+                                                    : n <= bestQuality && hasUpgrade
+                                                        ? "fill-none text-[rgb(var(--accent-warm)/0.35)]"
+                                                        : "fill-none text-fg-subtle"
+                                            }
+                                        />
+                                    ))}
+                                </div>
+                            );
+                        })()}
                     </div>
                 </CardHeader>
                 <CardContent>
                     <div className="flex items-center gap-4">
                         <div className="min-w-0 flex-1">
-                            {/* Connection model: Relay → Upgrade */}
+                            {/* Connection path: shows actual path and upgrade options */}
                             <div className="flex items-center gap-2">
                                 <span className="text-lg font-semibold text-fg">
-                                    中继
+                                    {apiPath === "lan"
+                                        ? "局域网"
+                                        : apiPath === "ipv6"
+                                            ? "IPv6 直连"
+                                            : "中继"}
                                 </span>
-                                {netStatus && netStatus.strategy !== netStatus.initial && (
+                                {/* Show upgrade hint only when on relay but better path exists */}
+                                {netStatus && apiPath === "remote" && netStatus.strategy !== netStatus.initial && (
                                     <>
                                         <ArrowUp size={14} className="text-[rgb(var(--accent-info))]" />
                                         <span className="text-sm text-[rgb(var(--accent-info))]">
@@ -589,37 +627,101 @@ export default function Dashboard() {
                                         </span>
                                     </>
                                 )}
+                                {/* Show when already on IPv6 direct */}
+                                {apiPath === "ipv6" && (
+                                    <Badge variant="info" className="text-[10px]">直连</Badge>
+                                )}
+                                {/* Show when already on LAN */}
+                                {apiPath === "lan" && (
+                                    <Badge variant="success" className="text-[10px]">直连</Badge>
+                                )}
                             </div>
+                            {/* Sub-line: contextual message based on current path vs best strategy */}
+                            {netStatus && (() => {
+                                // On LAN or IPv6 direct — already on the best path
+                                if (apiPath === "lan") {
+                                    return (
+                                        <p className="mt-0.5 text-xs text-fg-muted">
+                                            局域网直连 · 延迟 &lt;10ms
+                                        </p>
+                                    );
+                                }
+                                if (apiPath === "ipv6") {
+                                    return (
+                                        <p className="mt-0.5 text-xs text-fg-muted">
+                                            IPv6 直连 · 延迟 ~50ms · 已绕过 Cloudflare 隧道
+                                        </p>
+                                    );
+                                }
+                                // On relay — show what's available
+                                if (netStatus.strategy === "ipv6_direct") {
+                                    return (
+                                        <p className="mt-0.5 text-xs text-fg-muted">
+                                            {clientIPv6 === null
+                                                ? "正在检测本机 IPv6 能力…"
+                                                : clientIPv6
+                                                    ? "本机具备 IPv6，建议使用 IPv6 直连地址访问以获得更低延迟"
+                                                    : "本机无 IPv6 — 仅能通过 Cloudflare 中继访问"}
+                                        </p>
+                                    );
+                                }
+                                if (netStatus.strategy === "p2p") {
+                                    return (
+                                        <p className="mt-0.5 text-xs text-fg-muted">
+                                            P2P UDP 打洞可用 — 可尝试直连以获得更低延迟
+                                        </p>
+                                    );
+                                }
+                                // relay only
+                                return (
+                                    <p className="mt-0.5 text-xs text-fg-muted">
+                                        服务器无 IPv6/P2P 能力 · 中继是唯一路径
+                                    </p>
+                                );
+                            })()}
                             {/* Capability indicators: Server vs Client */}
-                            <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-fg-muted">
+                            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-fg-muted">
                                 <span className="inline-flex items-center gap-1" title="服务器 IPv6">
                                     <Server size={11} />
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.ipv6?.reachable ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
+                                        className={`inline-block h-2 w-2 rounded-full ${
+                                            netStatus?.ipv6?.reachable
+                                                ? "bg-[rgb(var(--accent-success))]"
+                                                : "bg-[rgb(var(--accent-danger))]"
+                                        }`}
                                     />
                                     IPv6
                                 </span>
                                 <span className="inline-flex items-center gap-1" title="本机 IPv6">
                                     <Smartphone size={11} />
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${clientIPv6 === null
+                                        className={`inline-block h-2 w-2 rounded-full ${
+                                            clientIPv6 === null
                                                 ? "bg-[rgb(var(--fg-subtle))]"
                                                 : clientIPv6
                                                     ? "bg-[rgb(var(--accent-success))]"
                                                     : "bg-[rgb(var(--accent-danger))]"
-                                            }`}
+                                        }`}
                                     />
                                     本机
                                 </span>
                                 <span className="inline-flex items-center gap-1" title="服务器 P2P">
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.p2p?.supported ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
+                                        className={`inline-block h-2 w-2 rounded-full ${
+                                            netStatus?.p2p?.supported
+                                                ? "bg-[rgb(var(--accent-success))]"
+                                                : "bg-[rgb(var(--accent-danger))]"
+                                        }`}
                                     />
                                     P2P
                                 </span>
                                 <span className="inline-flex items-center gap-1" title="中继">
                                     <span
-                                        className={`inline-block h-2 w-2 rounded-full ${netStatus?.relay?.available ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
+                                        className={`inline-block h-2 w-2 rounded-full ${
+                                            netStatus?.relay?.available
+                                                ? "bg-[rgb(var(--accent-success))]"
+                                                : "bg-[rgb(var(--accent-danger))]"
+                                        }`}
                                     />
                                     中继
                                 </span>

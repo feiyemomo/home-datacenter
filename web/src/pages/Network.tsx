@@ -249,10 +249,16 @@ export default function Network() {
                                         </span>
                                     </div>
                                     {status.ipv6.address && (
-                                        <div>
+                                        <div className="space-y-1">
                                             <code className="font-mono text-xs text-fg-muted">
                                                 {status.ipv6.address}
                                             </code>
+                                            <div className="rounded-lg bg-[rgb(var(--accent-success)/0.08)] px-2.5 py-1.5">
+                                                <p className="text-[11px] text-fg-muted">IPv6 直连地址：</p>
+                                                <code className="font-mono text-[11px] text-[rgb(var(--accent-success))] break-all">
+                                                    http://[{status.ipv6.address}]:8088/
+                                                </code>
+                                            </div>
                                         </div>
                                     )}
                                 </div>

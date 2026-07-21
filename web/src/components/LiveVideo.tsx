@@ -529,6 +529,18 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             />
                         )
                     )}
+                    {/* HLS latency notice — shown only when the live
+                     * stream is delivered over HLS (forced via the
+                     * transport selector or after a WebRTC auto-
+                     * fallback). Mirrors the Android v1.6.24 notice:
+                     * HLS adds seconds of buffering, so the operator
+                     * sees "网络质量差，延迟较大" near the video. */}
+                    {mode === "live" && effectivePath === "hls" && (
+                        <div className="absolute left-2 top-2 z-20 inline-flex items-center gap-1.5 rounded-md border border-[rgb(var(--accent-warm)/0.5)] bg-[rgb(var(--glass-bg)/0.92)] px-2.5 py-1 text-[11px] font-semibold text-[rgb(var(--accent-warm))] shadow-sm backdrop-blur-md">
+                            <AlertTriangle className="h-3 w-3" />
+                            <span>网络质量差，延迟较大</span>
+                        </div>
+                    )}
                     {/* Playback mode: RecordingTimeline portals its
                      * <video> + custom controls into this same video
                      * area (see videoAreaEl above). No placeholder
