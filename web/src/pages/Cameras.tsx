@@ -78,7 +78,7 @@ export default function Cameras() {
 
     async function remove(id: number) {
         if (!isAdmin) return;
-        if (!confirm(`Delete camera ${id}?`)) return;
+        if (!confirm(`确认删除摄像头 ${id}？`)) return;
         try {
             await deleteCamera(id);
             await refresh();
@@ -92,18 +92,18 @@ export default function Cameras() {
             <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
                     <CameraIcon className="h-5 w-5 text-[rgb(var(--accent-primary))]" />
-                    <h2 className="text-lg font-semibold text-fg">Cameras</h2>
+                    <h2 className="text-lg font-semibold text-fg">摄像头</h2>
                     <Badge variant="outline">{cams.length}</Badge>
                 </div>
                 <div className="flex gap-2">
                     <Button size="sm" variant="outline" onClick={refresh} disabled={loading}>
                         <RefreshCcw size={14} className="mr-1" />
-                        Refresh
+                        刷新
                     </Button>
                     {isAdmin && (
                         <Button size="sm" onClick={() => nav("/cameras/new")}>
                             <Plus size={14} className="mr-1" />
-                            Register
+                            注册
                         </Button>
                     )}
                 </div>
@@ -131,7 +131,7 @@ export default function Cameras() {
                         ))}
                         {cams.length === 0 && !loading && (
                             <div className="col-span-full glass rounded-2xl p-8 text-center text-sm text-fg-muted animate-fade-in">
-                                No cameras registered. {isAdmin ? "Click Register to add one." : "Ask an admin to register one."}
+                                暂无注册的摄像头。{isAdmin ? "点击「注册」添加一个。" : "请联系管理员添加。"}
                             </div>
                         )}
                     </div>
@@ -214,7 +214,7 @@ function CamCard({
                     </p>
                     {codecError && (
                         <p className="mt-0.5 truncate text-[10px] text-[rgb(var(--accent-danger))]" title={codecError}>
-                            codec: {codecError}
+                            编码：{codecError}
                         </p>
                     )}
                 </div>
@@ -225,13 +225,13 @@ function CamCard({
                                 value={currentCodec}
                                 onChange={onCodecChange}
                                 disabled={codecLoading}
-                                aria-label="Output codec"
-                                title="Output codec (H.264 required for WebRTC)"
+                                aria-label="输出编码"
+                                title="输出编码（WebRTC 要求 H.264）"
                                 className="glass-subtle rounded-lg h-7 w-[104px] px-1.5 py-0 text-[11px]"
                             >
                                 {currentCodec !== "h264" && (
                                     <option value={currentCodec} disabled>
-                                        {codecBadgeLabel(cam)} (legacy)
+                                        {codecBadgeLabel(cam)}（旧版）
                                     </option>
                                 )}
                                 <option value="h264">H.264</option>
@@ -241,15 +241,15 @@ function CamCard({
                             )}
                         </div>
                     )}
-                    <Badge variant={statusVariant} className="text-[10px] capitalize">
-                        {cam.status}
+                    <Badge variant={statusVariant} className="text-[10px]">
+                        {cam.status === "online" ? "在线" : cam.status === "offline" ? "离线" : "未知"}
                     </Badge>
                     {isAdmin && (
                         <button
                             className="rounded-md p-1.5 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
                             onClick={onDelete}
-                            aria-label="Delete camera"
-                            title="Delete camera"
+                            aria-label="删除摄像头"
+                            title="删除摄像头"
                         >
                             <Trash2 size={14} />
                         </button>

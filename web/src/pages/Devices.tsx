@@ -50,7 +50,7 @@ export default function Devices() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "failed to load devices",
+                        : "加载设备失败",
             );
         } finally {
             setLoading(false);
@@ -165,7 +165,7 @@ export default function Devices() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "failed to revoke device",
+                        : "吊销设备失败",
             );
         } finally {
             setRevokingId(null);
@@ -176,9 +176,9 @@ export default function Devices() {
         <div className="animate-fade-in space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                    <h2 className="text-lg font-semibold text-fg">Devices</h2>
+                    <h2 className="text-lg font-semibold text-fg">设备</h2>
                     <p className="text-xs text-fg-subtle">
-                        Bound device credentials and live online state.
+                        已绑定的设备凭证与实时在线状态。
                     </p>
                 </div>
                 <Button
@@ -192,7 +192,7 @@ export default function Devices() {
                     ) : (
                         <RefreshCw size={14} />
                     )}
-                    Refresh
+                    刷新
                 </Button>
             </div>
 
@@ -205,11 +205,10 @@ export default function Devices() {
             <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <HardDrive size={16} /> Device registry
+                        <HardDrive size={16} /> 设备注册表
                     </CardTitle>
                     <CardDescription>
-                        {devices.length} device{devices.length === 1 ? "" : "s"} visible to
-                        you. Status reflects the latest WebSocket heartbeat.
+                        当前可见 {devices.length} 个设备。状态反映最新的 WebSocket 心跳。
                     </CardDescription>
                 </CardHeader>
                 <CardContent className="p-0">
@@ -217,12 +216,12 @@ export default function Devices() {
                         <table className="w-full text-left text-sm">
                             <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-fg-subtle">
                                 <tr>
-                                    <th className="px-4 py-3 font-medium">Name</th>
-                                    <th className="px-4 py-3 font-medium">User</th>
-                                    <th className="px-4 py-3 font-medium">Status</th>
-                                    <th className="px-4 py-3 font-medium">Last login</th>
-                                    <th className="px-4 py-3 font-medium">Created</th>
-                                    <th className="px-4 py-3 text-right font-medium">Actions</th>
+                                    <th className="px-4 py-3 font-medium">名称</th>
+                                    <th className="px-4 py-3 font-medium">用户</th>
+                                    <th className="px-4 py-3 font-medium">状态</th>
+                                    <th className="px-4 py-3 font-medium">最后登录</th>
+                                    <th className="px-4 py-3 font-medium">创建于</th>
+                                    <th className="px-4 py-3 text-right font-medium">操作</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-[rgb(var(--border)/0.3)]">
@@ -232,7 +231,7 @@ export default function Devices() {
                                             colSpan={6}
                                             className="px-4 py-10 text-center text-fg-subtle"
                                         >
-                                            No devices found.
+                                            未找到设备。
                                         </td>
                                     </tr>
                                 )}
@@ -275,14 +274,14 @@ export default function Devices() {
                                             </td>
                                             <td className="px-4 py-3">
                                                 {isRevoked ? (
-                                                    <Badge variant="danger">revoked</Badge>
+                                                    <Badge variant="danger">已吊销</Badge>
                                                 ) : isOnline ? (
                                                     <Badge variant="success">
                                                         <span className="mr-1 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-[rgb(var(--accent-success))]" />
-                                                        online
+                                                        在线
                                                     </Badge>
                                                 ) : (
-                                                    <Badge variant="outline">offline</Badge>
+                                                    <Badge variant="outline">离线</Badge>
                                                 )}
                                             </td>
                                             <td className="px-4 py-3 text-fg-muted">
@@ -300,7 +299,7 @@ export default function Devices() {
                                                             onClick={() => setConfirmId(null)}
                                                             disabled={revokingId === d.id}
                                                         >
-                                                            Cancel
+                                                            取消
                                                         </Button>
                                                         <Button
                                                             variant="danger"
@@ -313,7 +312,7 @@ export default function Devices() {
                                                             ) : (
                                                                 <Trash2 size={14} />
                                                             )}
-                                                            Confirm
+                                                            确认
                                                         </Button>
                                                     </div>
                                                 ) : (
@@ -325,7 +324,7 @@ export default function Devices() {
                                                         disabled={isRevoked}
                                                     >
                                                         <Trash2 size={14} />
-                                                        Revoke
+                                                        吊销
                                                     </Button>
                                                 )}
                                             </td>
@@ -340,9 +339,9 @@ export default function Devices() {
 
             <Card>
                 <CardHeader>
-                    <CardTitle>Live events</CardTitle>
+                    <CardTitle>实时事件</CardTitle>
                     <CardDescription>
-                        Recent WebSocket messages on the <code>device.*</code> topic.
+                        <code>device.*</code> 主题上的最近 WebSocket 消息。
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -365,7 +364,7 @@ function EventLog({ lastMessage }: { lastMessage: WsMessage | null }) {
     if (entries.length === 0) {
         return (
             <p className="text-xs text-fg-subtle">
-                Waiting for events… (subscribed to <code>device</code>)
+                等待事件中…（已订阅 <code>device</code>）
             </p>
         );
     }

@@ -84,7 +84,7 @@ function StatCard({ label, value, icon, accent, hint }: StatCardProps) {
                 className={`pointer-events-none absolute inset-0 bg-gradient-to-br ${accentClasses[accent].gradient}`}
             />
             <CardHeader className="relative flex-row items-center justify-between pb-2">
-                <CardTitle className="text-xs uppercase tracking-wider text-fg-muted">
+                <CardTitle className="text-xs tracking-wider text-fg-muted">
                     {label}
                 </CardTitle>
                 <div
@@ -203,7 +203,7 @@ function WeatherCard() {
         <Card className="animate-fade-in relative overflow-hidden">
             <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.15)] via-[rgb(var(--accent-primary)/0.05)] to-transparent" />
             <CardHeader className="relative flex-row items-center justify-between pb-2">
-                <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
+                <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
                     <Icon size={16} className="text-[rgb(var(--accent-warm))]" /> 天气
                 </CardTitle>
                 {areaName && (
@@ -223,7 +223,7 @@ function WeatherCard() {
                     <div className="flex items-center gap-2 text-fg-muted">
                         <Cloud size={20} className="opacity-50" />
                         <span className="text-xs">
-                            {error ? error.message : "weather unavailable"}
+                            {error ? error.message : "天气数据不可用"}
                         </span>
                     </div>
                 ) : (
@@ -394,10 +394,10 @@ export default function Dashboard() {
             <div className="animate-fade-in flex items-center justify-between">
                 <div>
                     <h2 className="text-lg font-semibold text-fg">
-                        Dashboard
+                        仪表盘
                     </h2>
                     <p className="text-xs text-fg-muted">
-                        Live system metrics, refreshed every 5 seconds.
+                        实时系统指标，每 5 秒刷新。
                     </p>
                 </div>
                 {loading ? (
@@ -407,7 +407,7 @@ export default function Dashboard() {
                         <span
                             className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
                         />
-                        {error ? "error" : "live"}
+                        {error ? "异常" : "实时"}
                     </Badge>
                 )}
             </div>
@@ -469,22 +469,21 @@ export default function Dashboard() {
 
             <div className="animate-fade-in grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <StatCard
-                    label="Online Devices"
+                    label="在线设备"
                     value={String(onlineCount)}
                     icon={<Activity size={18} />}
                     accent="emerald"
                     hint={
                         status ? (
                             <span>
-                                {(status.online_device_ids?.length ?? 0)} ID
-                                {(status.online_device_ids?.length ?? 0) === 1 ? "" : "s"} online
+                                {(status.online_device_ids?.length ?? 0)} 个 ID 在线
                             </span>
                         ) : undefined
                     }
                 />
                 <StatCard
-                    label="MQTT Status"
-                    value={status ? (status.mqtt_connected ? "Connected" : "Down") : "—"
+                    label="MQTT 状态"
+                    value={status ? (status.mqtt_connected ? "已连接" : "中断") : "—"
                     }
                     icon={
                         status?.mqtt_connected ? <Wifi size={18} /> : <WifiOff size={18} />
@@ -496,21 +495,21 @@ export default function Dashboard() {
                                 <span
                                     className={`inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                 />
-                                {status.mqtt_connected ? "broker reachable" : "broker offline"}
+                                {status.mqtt_connected ? "代理可达" : "代理离线"}
                             </span>
                         ) : undefined
                     }
                 />
                 <StatCard
-                    label="WS Clients"
+                    label="WS 客户端"
                     value={status ? String(status.ws_clients) : "—"
                     }
                     icon={<Radio size={18} />}
                     accent="sky"
-                    hint="connected app clients"
+                    hint="已连接的应用客户端"
                 />
                 <StatCard
-                    label="Uptime"
+                    label="运行时长"
                     value={uptime}
                     icon={<Clock size={18} />}
                     accent="violet"
@@ -527,8 +526,8 @@ export default function Dashboard() {
             {/* Network quality summary */}
             <Card className="animate-fade-in">
                 <CardHeader className="flex-row items-center justify-between pb-2">
-                    <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
-                        <Globe size={16} /> Network Quality
+                    <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
+                        <Globe size={16} /> 网络质量
                     </CardTitle>
                     <div className="flex items-center gap-2">
                         {/* LAN/Remote path chip — mirrors Android's
@@ -540,8 +539,8 @@ export default function Dashboard() {
                             className="text-[10px] gap-1"
                             title={
                                 apiPath === "lan"
-                                    ? "Dashboard is loaded from the LAN path (low latency)"
-                                    : "Dashboard is loaded via Cloudflare Tunnel (remote)"
+                                    ? "当前从局域网路径加载（低延迟）"
+                                    : "当前通过 Cloudflare 隧道加载（远程）"
                             }
                         >
                             <NetworkIcon size={10} />
@@ -550,7 +549,7 @@ export default function Dashboard() {
                                     apiPath === "lan" ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-warm))]"
                                 }`}
                             />
-                            {apiPath === "lan" ? "LAN" : "Remote"}
+                            {apiPath === "lan" ? "局域网" : "远程"}
                         </Badge>
                         {netStatus && (
                             <div className="flex items-center gap-0.5">
@@ -575,15 +574,15 @@ export default function Dashboard() {
                             {/* Connection model: Relay → Upgrade */}
                             <div className="flex items-center gap-2">
                                 <span className="text-lg font-semibold text-fg">
-                                    Relay
+                                    中继
                                 </span>
                                 {netStatus && netStatus.strategy !== netStatus.initial && (
                                     <>
                                         <ArrowUp size={14} className="text-[rgb(var(--accent-info))]" />
                                         <span className="text-sm text-[rgb(var(--accent-info))]">
-                                            upgradable to{" "}
+                                            可升级到{" "}
                                             {netStatus.strategy === "ipv6_direct"
-                                                ? "IPv6 Direct"
+                                                ? "IPv6 直连"
                                                 : netStatus.strategy === "p2p"
                                                     ? "P2P"
                                                     : ""}
@@ -593,14 +592,14 @@ export default function Dashboard() {
                             </div>
                             {/* Capability indicators: Server vs Client */}
                             <div className="mt-1.5 flex flex-wrap items-center gap-3 text-xs text-fg-muted">
-                                <span className="inline-flex items-center gap-1" title="Server IPv6">
+                                <span className="inline-flex items-center gap-1" title="服务器 IPv6">
                                     <Server size={11} />
                                     <span
                                         className={`inline-block h-2 w-2 rounded-full ${netStatus?.ipv6?.reachable ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                     />
                                     IPv6
                                 </span>
-                                <span className="inline-flex items-center gap-1" title="Your device IPv6">
+                                <span className="inline-flex items-center gap-1" title="本机 IPv6">
                                     <Smartphone size={11} />
                                     <span
                                         className={`inline-block h-2 w-2 rounded-full ${clientIPv6 === null
@@ -610,19 +609,19 @@ export default function Dashboard() {
                                                     : "bg-[rgb(var(--accent-danger))]"
                                             }`}
                                     />
-                                    You
+                                    本机
                                 </span>
-                                <span className="inline-flex items-center gap-1" title="Server P2P">
+                                <span className="inline-flex items-center gap-1" title="服务器 P2P">
                                     <span
                                         className={`inline-block h-2 w-2 rounded-full ${netStatus?.p2p?.supported ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                     />
                                     P2P
                                 </span>
-                                <span className="inline-flex items-center gap-1" title="Relay">
+                                <span className="inline-flex items-center gap-1" title="中继">
                                     <span
                                         className={`inline-block h-2 w-2 rounded-full ${netStatus?.relay?.available ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                     />
-                                    Relay
+                                    中继
                                 </span>
                             </div>
                         </div>
@@ -633,7 +632,7 @@ export default function Dashboard() {
             {/* Detection alerts list */}
             <Card className="animate-fade-in">
                 <CardHeader className="flex-row items-center justify-between pb-2">
-                    <CardTitle className="flex items-center gap-2 text-xs uppercase tracking-wider text-fg-muted">
+                    <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
                         <Eye size={16} /> 检测报警
                     </CardTitle>
                     <div className="flex items-center gap-2">
@@ -808,15 +807,15 @@ export default function Dashboard() {
             <Card className="animate-fade-in">
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <Server size={16} /> System snapshot
+                        <Server size={16} /> 系统快照
                     </CardTitle>
                     <CardDescription>
-                        Raw payload from <code className="font-mono">/api/v1/system/status</code>.
+                        来自 <code className="font-mono">/api/v1/system/status</code> 的原始数据。
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
                     <pre className="glass-subtle overflow-x-auto rounded-2xl p-4 text-xs leading-relaxed text-fg">
-                        {status ? JSON.stringify(status, null, 2) : "// no data yet"}
+                        {status ? JSON.stringify(status, null, 2) : "// 暂无数据"}
                     </pre>
                 </CardContent>
             </Card>

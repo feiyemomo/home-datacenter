@@ -39,7 +39,7 @@ const VENDOR_PRESETS: Record<
         onvifPort: 80,
         channelId: 101,
         ptz: true,
-        notes: "Channels 101/201 = main/sub stream of camera 1. RTSP path is fixed.",
+        notes: "通道 101/201 = 摄像头 1 的主/子码流。RTSP 路径固定。",
     },
     dahua: {
         label: "Dahua / Uniview",
@@ -47,15 +47,15 @@ const VENDOR_PRESETS: Record<
         onvifPort: 80,
         channelId: 1,
         ptz: true,
-        notes: "Channels 1/2 = main/sub. Some firmware still uses 101/201 — verify with VLC.",
+        notes: "通道 1/2 = 主/子码流。部分固件仍使用 101/201 — 请用 VLC 验证。",
     },
     ezviz: {
-        label: "Ezviz (cloud-relay LAN mode)",
+        label: "Ezviz（云中继局域网模式）",
         rtspPort: 554,
         onvifPort: 80,
         channelId: 1,
         ptz: false,
-        notes: "Cloud-only devices do not expose LAN RTSP. Disable if testing shows no video.",
+        notes: "纯云设备不暴露局域网 RTSP。若测试无画面，请禁用。",
     },
     reolink: {
         label: "Reolink",
@@ -63,15 +63,15 @@ const VENDOR_PRESETS: Record<
         onvifPort: 8000,
         channelId: 0,
         ptz: true,
-        notes: "Channel 0 is main, 1 is sub. ONVIF port often 8000, not the usual 80.",
+        notes: "通道 0 为主码流，1 为子码流。ONVIF 端口通常为 8000，非一般默认的 80。",
     },
     onvif_generic: {
-        label: "Generic ONVIF",
+        label: "通用 ONVIF",
         rtspPort: 554,
         onvifPort: 80,
         channelId: 1,
         ptz: false,
-        notes: "Unknown vendor. ONVIF auto-discovery may fill the profile token on register.",
+        notes: "未知厂商。ONVIF 自动发现可能会在注册时填充 profile token。",
     },
 };
 
@@ -177,8 +177,7 @@ export default function DeviceCreate() {
                 <Card>
                     <CardContent className="p-8 text-center text-sm text-fg-muted">
                         <Info className="mx-auto mb-2 h-6 w-6 text-fg-subtle" />
-                        Only administrators can register new devices. Ask an admin
-                        to add this camera, or sign in as admin.
+                        只有管理员可以注册新设备。请联系管理员添加此摄像头，或以管理员身份登录。
                     </CardContent>
                 </Card>
             </div>
@@ -230,18 +229,18 @@ export default function DeviceCreate() {
                         <CheckCircle2 className="mx-auto h-10 w-10 text-[rgb(var(--accent-success))]" />
                         <div>
                             <p className="text-base font-semibold text-fg">
-                                "{submit.name}" registered
+                                “{submit.name}” 已注册
                             </p>
                             <p className="mt-1 text-xs text-fg-muted">
-                                Camera #{submit.id} is now in go2rtc and the cameras list.
+                                摄像头 #{submit.id} 已添加到 go2rtc 和摄像头列表。
                             </p>
                         </div>
                         <div className="flex justify-center gap-2">
                             <Button onClick={() => nav("/cameras")}>
-                                Open cameras list
+                                打开摄像头列表
                             </Button>
                             <Button variant="outline" onClick={reset}>
-                                Register another
+                                继续注册
                             </Button>
                         </div>
                     </CardContent>
@@ -259,25 +258,23 @@ export default function DeviceCreate() {
                         <CardHeader>
                             <CardTitle className="flex items-center gap-2 text-base">
                                 <CameraIcon size={16} className="text-[rgb(var(--accent-info))]" />
-                                Identity
+                                标识
                             </CardTitle>
                             <CardDescription>
-                                The dashboard name doubles as the go2rtc stream
-                                key, so two cameras cannot share it. Pick a
-                                name you can recognise at a glance.
+                                面板名称同时作为 go2rtc 的流密钥，因此两个摄像头不能重名。请选择一个一眼能识别的名称。
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                            <Field label="Display name" required>
+                            <Field label="显示名称" required>
                                 <Input
-                                    placeholder="e.g. 前门 / garage-north"
+                                    placeholder="例如：前门 / garage-north"
                                     value={draft.name}
                                     onChange={(e) => setDraft({ ...draft, name: e.target.value })}
                                     required
                                     autoFocus
                                 />
                             </Field>
-                            <Field label="Vendor">
+                            <Field label="厂商">
                                 <Select
                                     value={draft.vendor}
                                     onChange={(e) => applyVendor(e.target.value)}
@@ -292,7 +289,7 @@ export default function DeviceCreate() {
                             <div className="sm:col-span-2">
                                 <p className="text-xs text-fg-subtle">
                                     {VENDOR_PRESETS[draft.vendor]?.notes ??
-                                        "Pick a vendor to autofill ports and channel id."}
+                                        "选择厂商以自动填充端口和通道 ID。"}
                                 </p>
                             </div>
                         </CardContent>
@@ -303,16 +300,14 @@ export default function DeviceCreate() {
                         <CardHeader>
                             <CardTitle className="flex items-center gap-2 text-base">
                                 <Plug size={16} className="text-[rgb(var(--accent-info))]" />
-                                Network
+                                网络
                             </CardTitle>
                             <CardDescription>
-                                Where the camera listens. Host can be an IP or
-                                a hostname that resolves on the same LAN as
-                                home-api (the registry talks to it directly).
+                                摄像头监听地址。主机可以是 IP，也可以是 home-api 所在局域网内可解析的主机名（注册中心会直接与之通信）。
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                            <Field label="Host" required className="sm:col-span-3">
+                            <Field label="主机" required className="sm:col-span-3">
                                 <Input
                                     placeholder="192.168.31.100"
                                     value={draft.host}
@@ -320,7 +315,7 @@ export default function DeviceCreate() {
                                     required
                                 />
                             </Field>
-                            <Field label="ONVIF port">
+                            <Field label="ONVIF 端口">
                                 <Input
                                     type="number"
                                     min={1}
@@ -329,7 +324,7 @@ export default function DeviceCreate() {
                                     onChange={(e) => setDraft({ ...draft, onvif_port: +e.target.value || 0 })}
                                 />
                             </Field>
-                            <Field label="RTSP port">
+                            <Field label="RTSP 端口">
                                 <Input
                                     type="number"
                                     min={1}
@@ -338,7 +333,7 @@ export default function DeviceCreate() {
                                     onChange={(e) => setDraft({ ...draft, rtsp_port: +e.target.value || 0 })}
                                 />
                             </Field>
-                            <Field label="Channel id">
+                            <Field label="通道 ID">
                                 <Input
                                     type="number"
                                     min={0}
@@ -352,23 +347,20 @@ export default function DeviceCreate() {
                     {/* 3. Credentials */}
                     <Card>
                         <CardHeader>
-                            <CardTitle className="text-base">Credentials</CardTitle>
+                            <CardTitle className="text-base">凭证</CardTitle>
                             <CardDescription>
-                                Stored encrypted at rest (AES-256-GCM via
-                                SecretBox) and never returned by any GET
-                                endpoint. The registry only sends them to the
-                                camera's RTSP / ONVIF ports.
+                                静态加密存储（通过 SecretBox 使用 AES-256-GCM），任何 GET 接口都不会返回。注册中心只会将其发送到摄像头的 RTSP / ONVIF 端口。
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                            <Field label="Username">
+                            <Field label="用户名">
                                 <Input
                                     value={draft.username}
                                     onChange={(e) => setDraft({ ...draft, username: e.target.value })}
                                     autoComplete="off"
                                 />
                             </Field>
-                            <Field label="Password" required>
+                            <Field label="密码" required>
                                 <div className="relative">
                                     <Input
                                         type={showPassword ? "text" : "password"}
@@ -382,7 +374,7 @@ export default function DeviceCreate() {
                                         type="button"
                                         onClick={() => setShowPassword((s) => !s)}
                                         className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-1 text-fg-subtle hover:text-fg"
-                                        aria-label={showPassword ? "Hide password" : "Show password"}
+                                        aria-label={showPassword ? "隐藏密码" : "显示密码"}
                                     >
                                         {showPassword ? <EyeOff size={14} /> : <Eye size={14} />}
                                     </button>
@@ -394,15 +386,9 @@ export default function DeviceCreate() {
                     {/* 4. Capabilities + RTSP preview */}
                     <Card>
                         <CardHeader>
-                            <CardTitle className="text-base">Capabilities &amp; preview</CardTitle>
+                            <CardTitle className="text-base">能力与预览</CardTitle>
                             <CardDescription>
-                                PTZ / audio / motion flags surface in the
-                                dashboard for icon gating. "Transcode to
-                                H.264" routes the camera through go2rtc's
-                                ffmpeg pipeline — use it for HEVC cameras
-                                you want to view over WebRTC on Chrome,
-                                Edge, or Android (those browsers cannot
-                                decode H.265 in the WebRTC RTP path).
+                                PTZ / 音频 / 动检 标志位会在面板中用于图标门控。“转码为 H.264”会让摄像头经过 go2rtc 的 ffmpeg 管道处理 — 适用于希望通过 WebRTC 在 Chrome、Edge 或 Android 上观看的 HEVC 摄像头（这些浏览器无法在 WebRTC RTP 通道中解码 H.265）。
                             </CardDescription>
                         </CardHeader>
                         <CardContent className="space-y-4">
@@ -413,17 +399,17 @@ export default function DeviceCreate() {
                                     on={(ptz) => setDraft({ ...draft, ptz })}
                                 />
                                 <Toggle
-                                    label="Audio"
+                                    label="音频"
                                     v={draft.audio}
                                     on={(audio) => setDraft({ ...draft, audio })}
                                 />
                                 <Toggle
-                                    label="Motion"
+                                    label="动检"
                                     v={draft.motion}
                                     on={(motion) => setDraft({ ...draft, motion })}
                                 />
                                 <Toggle
-                                    label="Transcode to H.264 (ffmpeg)"
+                                    label="转码为 H.264 (ffmpeg)"
                                     v={draft.transcode}
                                     on={(transcode) => setDraft({ ...draft, transcode })}
                                 />
@@ -431,7 +417,7 @@ export default function DeviceCreate() {
                             <div className="glass-subtle rounded-xl p-4">
                                 <div className="mb-1 flex items-center gap-2 text-[10px] uppercase tracking-widest text-fg-subtle">
                                     <Badge variant="info" className="text-[9px]">RTSP</Badge>
-                                    <span>will be sent to go2rtc as</span>
+                                    <span>将以下 URL 发送给 go2rtc</span>
                                 </div>
                                 <code className="block break-all font-mono text-xs text-fg">
                                     {rtspPreview}
@@ -447,13 +433,13 @@ export default function DeviceCreate() {
                             onClick={() => nav("/cameras")}
                             disabled={submit.kind === "submitting"}
                         >
-                            Cancel
+                            取消
                         </Button>
                         <Button type="submit" disabled={submit.kind === "submitting"}>
                             {submit.kind === "submitting" ? (
                                 <Loader2 size={14} className="animate-spin" />
                             ) : null}
-                            {submit.kind === "submitting" ? "Registering…" : "Register camera"}
+                            {submit.kind === "submitting" ? "注册中…" : "注册摄像头"}
                         </Button>
                     </div>
                 </form>
@@ -465,14 +451,13 @@ export default function DeviceCreate() {
 function PageHeader({ onBack }: { onBack: () => void }) {
     return (
         <div className="flex items-center gap-3">
-            <Button variant="ghost" size="icon" onClick={onBack} aria-label="Back to cameras">
+            <Button variant="ghost" size="icon" onClick={onBack} aria-label="返回摄像头列表">
                 <ChevronLeft size={18} />
             </Button>
             <div>
-                <h2 className="text-lg font-semibold text-fg">Register a new device</h2>
+                <h2 className="text-lg font-semibold text-fg">注册新设备</h2>
                 <p className="text-xs text-fg-subtle">
-                    Add a camera to the platform. ONVIF profile token and stream
-                    are auto-discovered if blank.
+                    向平台添加一个摄像头。若 ONVIF profile token 与流地址为空，将自动发现。
                 </p>
             </div>
         </div>

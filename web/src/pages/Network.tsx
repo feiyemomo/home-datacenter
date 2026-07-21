@@ -59,7 +59,7 @@ export default function Network() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "failed to load network status",
+                        : "加载网络状态失败",
             );
         } finally {
             setRefreshing(false);
@@ -71,9 +71,9 @@ export default function Network() {
     }, [fetchAll]);
 
     const strategyLabel: Record<ConnectionStrategy, string> = {
-        ipv6_direct: "IPv6 Direct",
+        ipv6_direct: "IPv6 直连",
         p2p: "P2P UDP",
-        relay: "Relay (Tunnel)",
+        relay: "中继（隧道）",
     };
 
     // Whether an upgrade from relay is available.
@@ -88,9 +88,9 @@ export default function Network() {
             {/* Header */}
             <div className="flex items-center justify-between">
                 <div>
-                    <h2 className="text-lg font-semibold text-fg">Network</h2>
+                    <h2 className="text-lg font-semibold text-fg">网络</h2>
                     <p className="text-xs text-fg-muted">
-                        Server network capability and connection strategy.
+                        服务器网络能力与连接策略。
                     </p>
                 </div>
                 <Button
@@ -100,7 +100,7 @@ export default function Network() {
                     disabled={refreshing}
                 >
                     <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} />
-                    Refresh
+                    刷新
                 </Button>
             </div>
 
@@ -115,10 +115,10 @@ export default function Network() {
                 <CardHeader className="flex-row items-center justify-between">
                     <div>
                         <CardTitle className="flex items-center gap-2">
-                            <Wifi size={16} /> Connection Model
+                            <Wifi size={16} /> 连接模型
                         </CardTitle>
                         <CardDescription>
-                            Relay-first: connect immediately, then probe and upgrade.
+                            中继优先：立即连接，然后探测并升级。
                         </CardDescription>
                     </div>
                     {status && (
@@ -147,13 +147,13 @@ export default function Network() {
                                 </div>
                                 <div className="min-w-0 flex-1">
                                     <p className="text-sm font-medium text-fg">
-                                        Connect via Relay
+                                        通过中继连接
                                     </p>
                                     <p className="text-xs text-fg-muted">
-                                        Cloudflare Tunnel — zero delay, always works
+                                        Cloudflare 隧道 — 零延迟，始终可用
                                     </p>
                                 </div>
-                                <Badge variant="success">Active</Badge>
+                                <Badge variant="success">使用中</Badge>
                             </div>
 
                             {/* Arrow down */}
@@ -181,33 +181,33 @@ export default function Network() {
                                 <div className="min-w-0 flex-1">
                                     <p className="text-sm font-medium text-fg">
                                         {hasUpgrade
-                                            ? `Probe & Upgrade to ${strategyLabel[status.strategy]}`
-                                            : "No upgrade available"}
+                                            ? `探测并升级到 ${strategyLabel[status.strategy]}`
+                                            : "无可用升级"}
                                     </p>
                                     <p className="text-xs text-fg-muted">
                                         {hasUpgrade
                                             ? status.strategy === "ipv6_direct"
-                                                ? "Background probe to server's public IPv6 — switch if reachable"
-                                                : "Background UDP hole-punching via STUN — switch if established"
-                                            : "Server has no IPv6 or P2P capability — relay is the only path"}
+                                                ? "后台探测服务器公网 IPv6 — 可达则切换"
+                                                : "通过 STUN 后台 UDP 打洞 — 建立则切换"
+                                            : "服务器无 IPv6 或 P2P 能力 — 中继是唯一路径"}
                                     </p>
                                 </div>
                                 {hasUpgrade ? (
                                     <Badge variant="info">
                                         <ArrowUp size={12} className="mr-1" />
-                                        Upgrade
+                                        升级
                                     </Badge>
                                 ) : (
-                                    <Badge variant="outline">N/A</Badge>
+                                    <Badge variant="outline">不适用</Badge>
                                 )}
                             </div>
 
                             <div className="text-xs text-fg-subtle">
-                                Last checked: {new Date(status.checked_at).toLocaleString()}
+                                最后检查：{new Date(status.checked_at).toLocaleString()}
                             </div>
                         </div>
                     ) : (
-                        <div className="text-sm text-fg-muted">Loading...</div>
+                        <div className="text-sm text-fg-muted">加载中...</div>
                     )}
                 </CardContent>
             </Card>
@@ -216,10 +216,10 @@ export default function Network() {
             <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <Globe size={16} /> IPv6 Connectivity
+                        <Globe size={16} /> IPv6 连通性
                     </CardTitle>
                     <CardDescription>
-                        IPv6 direct requires BOTH server and client to have public IPv6.
+                        IPv6 直连要求服务器和客户端都具备公网 IPv6。
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -229,7 +229,7 @@ export default function Network() {
                             <div className="mb-2 flex items-center gap-2">
                                 <Server size={14} className="text-fg-muted" />
                                 <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
-                                    Server
+                                    服务器
                                 </span>
                             </div>
                             {status?.ipv6 ? (
@@ -242,10 +242,10 @@ export default function Network() {
                                         )}
                                         <span className="text-sm text-fg">
                                             {status.ipv6.reachable
-                                                ? "Public IPv6 reachable"
+                                                ? "公网 IPv6 可达"
                                                 : status.ipv6.enabled
-                                                    ? "IPv6 enabled but not publicly reachable"
-                                                    : "IPv6 unavailable"}
+                                                    ? "IPv6 已启用但公网不可达"
+                                                    : "IPv6 不可用"}
                                         </span>
                                     </div>
                                     {status.ipv6.address && (
@@ -257,7 +257,7 @@ export default function Network() {
                                     )}
                                 </div>
                             ) : (
-                                <div className="text-sm text-fg-muted">Loading...</div>
+                                <div className="text-sm text-fg-muted">加载中...</div>
                             )}
                         </div>
 
@@ -266,7 +266,7 @@ export default function Network() {
                             <div className="mb-2 flex items-center gap-2">
                                 <Smartphone size={14} className="text-fg-muted" />
                                 <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
-                                    Your Device
+                                    您的设备
                                 </span>
                             </div>
                             <div className="space-y-2">
@@ -280,19 +280,19 @@ export default function Network() {
                                     )}
                                     <span className="text-sm text-fg">
                                         {clientIPv6 === null
-                                            ? "Checking..."
+                                            ? "检查中..."
                                             : clientIPv6
-                                                ? "IPv6 available"
-                                                : "IPv6 unavailable"}
+                                                ? "IPv6 可用"
+                                                : "IPv6 不可用"}
                                     </span>
                                 </div>
                                 <p className="text-xs text-fg-muted">
                                     {clientIPv6 === false
-                                        ? "Your network lacks IPv6 — relay is the only option"
+                                        ? "您的网络无 IPv6 — 只能使用中继"
                                         : clientIPv6 === true && !status?.ipv6?.reachable
-                                            ? "You have IPv6, but the server doesn't — IPv6 direct blocked by server"
+                                            ? "您具备 IPv6，但服务器没有 — IPv6 直连被服务器阻挡"
                                             : ipv6DirectPossible
-                                                ? "Both sides have IPv6 — direct connection possible"
+                                                ? "双方都具备 IPv6 — 可以直连"
                                                 : ""}
                                 </p>
                             </div>
@@ -328,7 +328,7 @@ export default function Network() {
                             <div className="space-y-1.5">
                                 {status.nat.public_ip && (
                                     <div>
-                                        <span className="text-xs text-fg-muted">Public IP: </span>
+                                        <span className="text-xs text-fg-muted">公网 IP： </span>
                                         <code className="font-mono text-xs text-fg">
                                             {status.nat.public_ip}
                                         </code>
@@ -336,7 +336,7 @@ export default function Network() {
                                 )}
                                 {status.nat.public_port != null && status.nat.public_port > 0 && (
                                     <div>
-                                        <span className="text-xs text-fg-muted">Public port: </span>
+                                        <span className="text-xs text-fg-muted">公网端口： </span>
                                         <code className="font-mono text-xs text-fg">
                                             {status.nat.public_port}
                                         </code>
@@ -344,12 +344,12 @@ export default function Network() {
                                 )}
                                 {!status.nat.public_ip && (
                                     <span className="text-xs text-fg-muted">
-                                        STUN unreachable — NAT type unknown.
+                                        STUN 不可达 — NAT 类型未知。
                                     </span>
                                 )}
                             </div>
                         ) : (
-                            <div className="text-sm text-fg-muted">Loading...</div>
+                            <div className="text-sm text-fg-muted">加载中...</div>
                         )}
                     </CardContent>
                 </Card>
@@ -362,7 +362,7 @@ export default function Network() {
                         </CardTitle>
                         {status?.p2p && (
                             <Badge variant={status.p2p.supported ? "success" : "danger"}>
-                                {status.p2p.supported ? "Supported" : "Unsupported"}
+                                {status.p2p.supported ? "支持" : "不支持"}
                             </Badge>
                         )}
                     </CardHeader>
@@ -370,7 +370,7 @@ export default function Network() {
                         {status?.p2p ? (
                             <p className="text-xs text-fg-muted">{status.p2p.reason}</p>
                         ) : (
-                            <div className="text-sm text-fg-muted">Loading...</div>
+                            <div className="text-sm text-fg-muted">加载中...</div>
                         )}
                     </CardContent>
                 </Card>
@@ -380,15 +380,15 @@ export default function Network() {
             <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <NetworkIcon size={16} /> Raw payload
+                        <NetworkIcon size={16} /> 原始负载
                     </CardTitle>
                     <CardDescription>
-                        Raw JSON from <code className="font-mono">/api/v1/network/status</code>.
+                        来自 <code className="font-mono">/api/v1/network/status</code> 的原始 JSON。
                     </CardDescription>
                 </CardHeader>
                 <CardContent>
                     <pre className="glass-subtle rounded-xl overflow-x-auto p-4 text-xs leading-relaxed text-fg">
-                        {status ? JSON.stringify(status, null, 2) : "// no data yet"}
+                        {status ? JSON.stringify(status, null, 2) : "// 暂无数据"}
                     </pre>
                 </CardContent>
             </Card>

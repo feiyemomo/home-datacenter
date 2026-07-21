@@ -598,17 +598,22 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                     </div>
                 </>
             ) : fetchingId !== null ? (
-                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-300">
-                    <Loader2 className="mb-2 h-6 w-6 animate-spin" />
-                    <span className="text-xs">加载录像中…</span>
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-fg-muted">
+                    <Loader2 className="mb-2 h-6 w-6 animate-spin text-[rgb(var(--accent-info))]" />
+                    <span className="text-xs">正在加载录像…</span>
+                </div>
+            ) : loadingRecs ? (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-fg-muted">
+                    <Loader2 className="mb-2 h-6 w-6 animate-spin text-[rgb(var(--accent-info))]" />
+                    <span className="text-xs">正在读取录像列表…</span>
                 </div>
             ) : dayRecordings.length === 0 ? (
-                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
-                    <AlertTriangle className="mb-2 h-6 w-6 text-slate-500" />
-                    <span className="text-xs">{loadingRecs ? "加载中…" : "当日无录像"}</span>
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-fg-muted">
+                    <AlertTriangle className="mb-2 h-6 w-6 text-fg-subtle" />
+                    <span className="text-xs">当日无录像</span>
                 </div>
             ) : (
-                <div className="absolute inset-0 flex flex-col items-center justify-center text-slate-400">
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-fg-muted">
                     <Play className="mb-2 h-6 w-6 opacity-50" />
                     <span className="text-xs">点击下方时间轴开始播放</span>
                 </div>
@@ -673,20 +678,36 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
 
                 {/* 24-hour timeline SeekBar with event ribbon + motion overlay */}
                 <div className="space-y-1">
-                    <div className="flex items-center justify-between text-[10px] uppercase tracking-wider text-fg-subtle">
+                    <div className="flex items-center justify-between text-[10px] tracking-wider text-fg-subtle">
                         <span>24 小时时间轴</span>
                         <span className="text-fg-muted">
-                            {dayRecordings.length} 分钟录像 · {dayMotion.length} 段活动
-                            {loadingMotion && <Loader2 size={10} className="ml-1 inline animate-spin" />}
+                            {dayRecordings.length} 分钟录像{dayMotion.length > 0 && ` · ${dayMotion.length} 段活动`}
                         </span>
                     </div>
 
                     {/* Event ribbon — prominent markers for motion/AI events.
                      * Each MotionRange becomes a tall colored bar so events
                      * are glanceable at a distance. Red = personnel/AI,
-                     * amber = motion-only (scene change). */}
+                     * amber = motion-only (scene change).
+                     *
+                     * We use saturated Tailwind palette colors (red-500 /
+                     * amber-500) instead of the pastel --accent-* variables
+                     * because event markers are semantic status indicators
+                     * that must pop in both light and dark themes — the
+                     * soft accent variables disappear against the warm
+                     * cream background in light mode. The dark backing
+                     * strip further amplifies contrast. */}
                     {dayMotion.length > 0 && (
-                        <div className="relative h-3.5 w-full overflow-hidden rounded-md glass-subtle">
+                        <div className="relative h-6 w-full overflow-hidden rounded-md bg-[rgb(var(--slate-900)/0.85)] ring-1 ring-inset ring-[rgb(var(--border)/0.4)]">
+                            {/* Hour grid lines for reference */}
+                            <div className="absolute inset-0 flex pointer-events-none">
+                                {Array.from({ length: 24 }).map((_, h) => (
+                                    <div
+                                        key={h}
+                                        className="flex-1 border-r border-white/5"
+                                    />
+                                ))}
+                            </div>
                             {dayMotion.map((r, i) => {
                                 const startFrac = (r.start - dayStart) / 86_400;
                                 const endFrac = Math.min(1, (r.start + r.duration - dayStart) / 86_400);
@@ -695,16 +716,16 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                     <div
                                         key={`${r.start}-${i}`}
                                         className={cn(
-                                            "absolute inset-y-0.5 rounded-sm transition-all",
+                                            "absolute inset-y-1 rounded-sm transition-all",
                                             hasAI
-                                                ? "bg-[rgb(var(--accent-danger))]"
-                                                : "bg-[rgb(var(--accent-warm))]",
+                                                ? "bg-red-500 shadow-[0_0_6px_rgb(239_68_68/0.8)] animate-pulse"
+                                                : "bg-amber-500 shadow-[0_0_4px_rgb(245_158_11/0.6)]",
                                         )}
                                         style={{
                                             left: `${startFrac * 100}%`,
-                                            width: `${Math.max(0.8, (endFrac - startFrac) * 100)}%`,
+                                            width: `${Math.max(1.2, (endFrac - startFrac) * 100)}%`,
                                         }}
-                                        title={`${formatHMS(r.start)} · ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · score ${r.motion_score} · ${r.segment_count} segments${hasAI ? ` · ${r.peak_objects} objects` : ""}`}
+                                        title={`${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}`}
                                     />
                                 );
                             })}
@@ -743,8 +764,8 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                             className={cn(
                                                 "absolute inset-0",
                                                 b.motion.some((r) => r.peak_objects > 0)
-                                                    ? "bg-[rgb(var(--accent-danger)/0.6)]"
-                                                    : "bg-[rgb(var(--accent-warm)/0.55)]",
+                                                    ? "bg-red-500/70"
+                                                    : "bg-amber-500/65",
                                             )}
                                         />
                                     )}
@@ -768,15 +789,15 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                         </div>
                     </div>
 
-                    {/* Legend */}
+                    {/* Legend — color swatches match the event ribbon above. */}
                     <div className="flex items-center gap-3 text-[9px] text-fg-subtle">
                         <span className="inline-flex items-center gap-1">
-                            <span className="inline-block h-2 w-2 rounded-sm bg-[rgb(var(--accent-danger))]" />
+                            <span className="inline-block h-2 w-2 rounded-sm bg-red-500 shadow-[0_0_4px_rgb(239_68_68/0.6)]" />
                             人员活动
                             {aiEventCount > 0 && <span className="text-fg-muted">({aiEventCount})</span>}
                         </span>
                         <span className="inline-flex items-center gap-1">
-                            <span className="inline-block h-2 w-2 rounded-sm bg-[rgb(var(--accent-warm))]" />
+                            <span className="inline-block h-2 w-2 rounded-sm bg-amber-500 shadow-[0_0_3px_rgb(245_158_11/0.5)]" />
                             画面变动
                             {motionEventCount > 0 && <span className="text-fg-muted">({motionEventCount})</span>}
                         </span>

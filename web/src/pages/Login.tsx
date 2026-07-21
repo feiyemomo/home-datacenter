@@ -33,12 +33,12 @@ export default function Login() {
         const trimmedId = userId.trim();
         const trimmedKey = accessKey.trim();
         if (!trimmedId || !trimmedKey) {
-            setError("user_id and access_key are required");
+            setError("用户 ID 和 Access Key 不能为空");
             return;
         }
         const idNum = Number(trimmedId);
         if (!Number.isInteger(idNum) || idNum <= 0) {
-            setError("user_id must be a positive integer");
+            setError("用户 ID 必须为正整数");
             return;
         }
 
@@ -52,7 +52,7 @@ export default function Login() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "login failed";
+                        : "登录失败";
             setError(msg);
         } finally {
             setSubmitting(false);
@@ -71,16 +71,16 @@ export default function Login() {
                     <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-primary)/0.6)] to-[rgb(var(--accent-warm)/0.4)] text-white glass-glow">
                         <Server size={26} />
                     </div>
-                    <CardTitle className="text-base">Sign in to Home Datacenter</CardTitle>
+                    <CardTitle className="text-base">登录到家庭数据中心</CardTitle>
                     <p className="text-xs text-fg-muted">
-                        Bind this browser to an existing device credential.
+                        将此浏览器绑定到已存在的设备凭据。
                     </p>
                 </CardHeader>
 
                 <CardContent>
                     <form onSubmit={handleSubmit} className="space-y-4">
                         <div className="space-y-2">
-                            <Label htmlFor="user_id">User ID</Label>
+                            <Label htmlFor="user_id">用户 ID</Label>
                             <div className="relative">
                                 <UserIcon
                                     size={16}
@@ -112,7 +112,7 @@ export default function Login() {
                                 <Input
                                     id="access_key"
                                     type="password"
-                                    placeholder="hex access key"
+                                    placeholder="十六进制 Access Key"
                                     className="pl-9 font-mono"
                                     value={accessKey}
                                     onChange={(e) => setAccessKey(e.target.value)}
@@ -136,16 +136,16 @@ export default function Login() {
                             {submitting ? (
                                 <>
                                     <Loader2 size={16} className="animate-spin" />
-                                    Binding…
+                                    绑定中…
                                 </>
                             ) : (
-                                "Sign in"
+                                "登录"
                             )}
                         </Button>
                     </form>
 
                     <p className="mt-4 text-center text-[11px] text-fg-subtle">
-                        Tokens are valid for 365 days. Stored locally on this device.
+                        令牌有效期 365 天，存储在本设备本地。
                     </p>
                 </CardContent>
             </Card>
