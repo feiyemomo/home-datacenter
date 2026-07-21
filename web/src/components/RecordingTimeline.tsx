@@ -697,18 +697,27 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                      * soft accent variables disappear against the warm
                      * cream background in light mode. The dark backing
                      * strip further amplifies contrast. */}
-                    {dayMotion.length > 0 && (
-                        <div className="relative h-6 w-full overflow-hidden rounded-md bg-[rgb(var(--slate-900)/0.85)] ring-1 ring-inset ring-[rgb(var(--border)/0.4)]">
-                            {/* Hour grid lines for reference */}
-                            <div className="absolute inset-0 flex pointer-events-none">
-                                {Array.from({ length: 24 }).map((_, h) => (
-                                    <div
-                                        key={h}
-                                        className="flex-1 border-r border-white/5"
-                                    />
-                                ))}
+                    {/* Event ribbon — always rendered (even when empty) so the
+                     * dark backing strip is visible as a reference. Event bars
+                     * use saturated Tailwind red/amber (not pastel --accent-*
+                     * variables) because semantic status indicators must pop
+                     * in both themes. The dark backing amplifies contrast. */}
+                    <div className="relative h-8 w-full overflow-hidden rounded-md bg-[rgb(var(--slate-900)/0.9)] ring-1 ring-inset ring-[rgb(var(--border)/0.5)]">
+                        {/* Hour grid lines for reference */}
+                        <div className="absolute inset-0 flex pointer-events-none">
+                            {Array.from({ length: 24 }).map((_, h) => (
+                                <div
+                                    key={h}
+                                    className="flex-1 border-r border-white/5"
+                                />
+                            ))}
+                        </div>
+                        {dayMotion.length === 0 ? (
+                            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/30">
+                                无活动事件
                             </div>
-                            {dayMotion.map((r, i) => {
+                        ) : (
+                            dayMotion.map((r, i) => {
                                 const startFrac = (r.start - dayStart) / 86_400;
                                 const endFrac = Math.min(1, (r.start + r.duration - dayStart) / 86_400);
                                 const hasAI = r.peak_objects > 0;
@@ -718,19 +727,19 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                         className={cn(
                                             "absolute inset-y-1 rounded-sm transition-all",
                                             hasAI
-                                                ? "bg-red-500 shadow-[0_0_6px_rgb(239_68_68/0.8)] animate-pulse"
-                                                : "bg-amber-500 shadow-[0_0_4px_rgb(245_158_11/0.6)]",
+                                                ? "bg-red-500 shadow-[0_0_8px_rgb(239_68_68/0.9)] animate-pulse"
+                                                : "bg-amber-400 shadow-[0_0_6px_rgb(245_158_11/0.7)]",
                                         )}
                                         style={{
                                             left: `${startFrac * 100}%`,
-                                            width: `${Math.max(1.2, (endFrac - startFrac) * 100)}%`,
+                                            width: `${Math.max(1.5, (endFrac - startFrac) * 100)}%`,
                                         }}
                                         title={`${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · ${hasAI ? "人员活动" : "画面变动"} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}`}
                                     />
                                 );
-                            })}
-                        </div>
-                    )}
+                            })
+                        )}
+                    </div>
 
                     {/* SeekBar */}
                     <div
@@ -748,13 +757,22 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                                 />
                             ))}
                         </div>
-                        {/* Recording buckets (highlighted) */}
-                        <div className="absolute inset-0 flex">
-                            {minuteBuckets.map((b) => (
+                        {/* Recording buckets (highlighted) — absolute percentage
+                         * positioning. Each bucket is 1/1440 of the bar width.
+                         * We avoid flex + min-width because sub-pixel rounding
+                         * (0.5px → 1px on non-Retina screens) caused 1440
+                         * buckets to overflow the container, making 591 minutes
+                         * of recordings visually fill ~100% of the 24h bar
+                         * instead of the correct ~41%. */}
+                        <div className="absolute inset-0">
+                            {minuteBuckets.map((b, i) => (
                                 <div
                                     key={b.startUnix}
-                                    className="flex-1 relative"
-                                    style={{ minWidth: "0.5px" }}
+                                    className="absolute top-0 bottom-0"
+                                    style={{
+                                        left: `${(i / 1440) * 100}%`,
+                                        width: `${(1 / 1440) * 100}%`,
+                                    }}
                                 >
                                     {b.hasRec && (
                                         <div className="absolute inset-0 bg-[rgb(var(--accent-primary)/0.35)]" />
