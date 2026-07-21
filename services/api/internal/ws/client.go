@@ -36,6 +36,14 @@ type Client struct {
 
 	closeOnce sync.Once
 	closed    bool
+
+	// v1.6.16: optional callbacks invoked by the client lifecycle.
+	// Used by ws_handler to wire WebSocket connect/disconnect into
+	// the device.Manager so that Android app clients (which connect
+	// via WS, not MQTT) are counted as "online devices" on the
+	// dashboard. Both may be nil.
+	onHeartbeat  func(deviceID uint)
+	onDisconnect func(deviceID uint)
 }
 
 // NewClient creates a Client for the given WebSocket connection.
@@ -50,6 +58,16 @@ func NewClient(hub *Hub, conn *websocket.Conn, userID, deviceID uint, isAdmin bo
 		subscriptions: make(map[string]struct{}),
 		send:          make(chan []byte, 64), // buffered to absorb bursts
 	}
+}
+
+// SetLifecycleCallbacks wires optional heartbeat/disconnect callbacks.
+// v1.6.16: used by ws_handler to bridge WS client lifecycle into
+// device.Manager so Android app clients (HTTP+WS only, no MQTT) are
+// counted as online devices. Both callbacks receive the client's
+// deviceID. Either may be nil.
+func (c *Client) SetLifecycleCallbacks(onHeartbeat, onDisconnect func(uint)) {
+	c.onHeartbeat = onHeartbeat
+	c.onDisconnect = onDisconnect
 }
 
 // ReadPump pumps messages from the WebSocket connection to the hub.
@@ -101,6 +119,11 @@ func (c *Client) handleClientMessage(msg Message) {
 			"status": "ok",
 		})
 		c.sendMsg(ack)
+		// v1.6.16: forward to device.Manager so Android app clients
+		// (which send WS heartbeats, not MQTT) stay marked online.
+		if c.onHeartbeat != nil {
+			c.onHeartbeat(c.deviceID)
+		}
 
 	case MsgSubscribe:
 		if msg.Topic == "" {
@@ -209,5 +232,12 @@ func (c *Client) close() {
 		c.closed = true
 		close(c.send)
 		c.conn.Close()
+		// v1.6.16: notify device.Manager that this WS client
+		// disconnected, so the device's online state can be
+		// reconciled (the manager's sweep loop will finalize
+		// the offline transition after heartbeatTimeout).
+		if c.onDisconnect != nil {
+			c.onDisconnect(c.deviceID)
+		}
 	})
 }
