@@ -59,7 +59,7 @@ export default function MqttDebug() {
         } catch (e) {
             return {
                 valid: false,
-                parseError: e instanceof Error ? e.message : "invalid JSON",
+                parseError: e instanceof Error ? e.message : "无效的 JSON",
             };
         }
     }, [payload]);
@@ -93,11 +93,11 @@ export default function MqttDebug() {
         setResult(null);
 
         if (!topic.trim()) {
-            setError("topic is required");
+            setError("主题为必填项");
             return;
         }
         if (!valid) {
-            setError(`payload is not valid JSON: ${parseError}`);
+            setError(`负载不是有效的 JSON：${parseError}`);
             return;
         }
 
@@ -117,7 +117,7 @@ export default function MqttDebug() {
                         topic: res.topic,
                         payload: res.payload,
                         ok: true,
-                        text: `published (qos=${res.qos})`,
+                        text: `已发布 (qos=${res.qos})`,
                     },
                     ...prev,
                 ].slice(0, 100),
@@ -128,7 +128,7 @@ export default function MqttDebug() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "publish failed";
+                        : "发布失败";
             setError(msg);
         } finally {
             setSubmitting(false);
@@ -140,10 +140,10 @@ export default function MqttDebug() {
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
                     <h2 className="flex items-center gap-2 text-lg font-semibold text-fg">
-                        <Radio size={18} /> MQTT Debug
+                        <Radio size={18} /> MQTT 调试
                     </h2>
                     <p className="text-xs text-fg-subtle">
-                        Publish raw messages and watch live events. Admin only.
+                        发布原始消息并查看实时事件。仅限管理员。
                     </p>
                 </div>
                 <Badge variant={isConnected ? "success" : "outline"}>
@@ -153,7 +153,7 @@ export default function MqttDebug() {
                             isConnected ? "bg-[rgb(var(--accent-success))] animate-pulse" : "bg-[rgb(var(--fg-subtle))]",
                         )}
                     />
-                    {isConnected ? "ws connected" : "ws offline"}
+                    {isConnected ? "ws 已连接" : "ws 离线"}
                 </Badge>
             </div>
 
@@ -161,15 +161,15 @@ export default function MqttDebug() {
                 {/* Publish form */}
                 <Card>
                     <CardHeader>
-                        <CardTitle>Publish</CardTitle>
+                        <CardTitle>发布</CardTitle>
                         <CardDescription>
-                            Send a message to an MQTT topic via the broker.
+                            通过 broker 向 MQTT 主题发送消息。
                         </CardDescription>
                     </CardHeader>
                     <CardContent>
                         <form onSubmit={handlePublish} className="space-y-4">
                             <div className="space-y-2">
-                                <Label htmlFor="topic">Topic</Label>
+                                <Label htmlFor="topic">主题</Label>
                                 <Input
                                     id="topic"
                                     value={topic}
@@ -199,7 +199,7 @@ export default function MqttDebug() {
 
                             <div className="space-y-2">
                                 <Label htmlFor="payload">
-                                    Payload{" "}
+                                    负载{" "}
                                     <span
                                         className={cn(
                                             "ml-2 inline-flex items-center gap-1 normal-case tracking-normal",
@@ -208,11 +208,11 @@ export default function MqttDebug() {
                                     >
                                         {valid ? (
                                             <>
-                                                <CheckCircle2 size={11} /> valid JSON
+                                                <CheckCircle2 size={11} /> JSON 有效
                                             </>
                                         ) : (
                                             <>
-                                                <AlertTriangle size={11} /> invalid
+                                                <AlertTriangle size={11} /> 无效
                                             </>
                                         )}
                                     </span>
@@ -259,12 +259,12 @@ export default function MqttDebug() {
                                     {submitting ? (
                                         <>
                                             <Loader2 size={16} className="animate-spin" />
-                                            Publishing…
+                                            发布中…
                                         </>
                                     ) : (
                                         <>
                                             <Send size={16} />
-                                            Publish
+                                            发布
                                         </>
                                     )}
                                 </Button>
@@ -277,8 +277,8 @@ export default function MqttDebug() {
                             )}
                             {result && (
                                 <div className="rounded-xl glass bg-[rgb(var(--accent-success)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-success))]">
-                                    Published to <code className="font-mono">{result.topic}</code>{" "}
-                                    (qos {result.qos}).
+                                    已发布到 <code className="font-mono">{result.topic}</code>{" "}
+                                    (qos {result.qos})。
                                 </div>
                             )}
                         </form>
@@ -289,9 +289,9 @@ export default function MqttDebug() {
                 <Card className="flex flex-col">
                     <CardHeader className="flex-row items-center justify-between">
                         <div>
-                            <CardTitle>Event log</CardTitle>
+                            <CardTitle>事件日志</CardTitle>
                             <CardDescription>
-                                Live WebSocket messages (newest first).
+                                实时 WebSocket 消息（最新在前）。
                             </CardDescription>
                         </div>
                         <Button
@@ -301,15 +301,15 @@ export default function MqttDebug() {
                             disabled={log.length === 0}
                         >
                             <Trash2 size={14} />
-                            Clear
+                            清空
                         </Button>
                     </CardHeader>
                     <CardContent className="flex-1">
                         <div className="glass-subtle rounded-xl h-[420px] overflow-y-auto p-2">
                             {log.length === 0 ? (
                                 <p className="p-4 text-xs text-fg-subtle">
-                                    No events yet. The server pushes heartbeat, online_list, and
-                                    device.* events here automatically.
+                                    暂无事件。服务器会自动将 heartbeat、online_list 和
+                                    device.* 事件推送至此。
                                 </p>
                             ) : (
                                 <ul className="space-y-1">

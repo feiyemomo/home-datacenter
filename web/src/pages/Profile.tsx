@@ -53,7 +53,7 @@ export default function Profile() {
                         ? err.message
                         : err instanceof Error
                             ? err.message
-                            : "failed to load profile",
+                            : "加载个人中心失败",
                 );
             }
         })();
@@ -78,9 +78,9 @@ export default function Profile() {
     return (
         <div className="animate-fade-in space-y-6">
             <div>
-                <h2 className="text-lg font-semibold text-fg">Profile</h2>
+                <h2 className="text-lg font-semibold text-fg">个人中心</h2>
                 <p className="text-xs text-fg-subtle">
-                    Your account, token claims, and bound devices.
+                    您的账户、令牌声明与绑定的设备。
                 </p>
             </div>
 
@@ -95,22 +95,22 @@ export default function Profile() {
                 <Card>
                     <CardHeader>
                         <CardTitle className="flex items-center gap-2">
-                            <UserIcon size={16} /> Account
+                            <UserIcon size={16} /> 账户
                         </CardTitle>
-                        <CardDescription>From GET /api/v1/user/me</CardDescription>
+                        <CardDescription>来自 GET /api/v1/user/me</CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                        <Row label="User ID" value={`#${user?.id ?? "—"}`} />
-                        <Row label="Name" value={user?.name ?? "—"} />
+                        <Row label="用户 ID" value={`#${user?.id ?? "—"}`} />
+                        <Row label="名称" value={user?.name ?? "—"} />
                         <Row
-                            label="Role"
+                            label="角色"
                             value={
                                 user?.is_admin ? (
                                     <Badge variant="success">
-                                        <ShieldCheck size={11} /> administrator
+                                        <ShieldCheck size={11} /> 管理员
                                     </Badge>
                                 ) : (
-                                    <Badge variant="outline">user</Badge>
+                                    <Badge variant="outline">用户</Badge>
                                 )
                             }
                         />
@@ -121,17 +121,17 @@ export default function Profile() {
                 <Card>
                     <CardHeader>
                         <CardTitle className="flex items-center gap-2">
-                            <KeyRound size={16} /> Token
+                            <KeyRound size={16} /> 令牌
                         </CardTitle>
                         <CardDescription>
-                            Decoded locally from the HS256 JWT payload.
+                            从 HS256 JWT 负载在本地解码。
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                        <Row label="User ID" value={`#${claims?.user_id ?? "—"}`} />
-                        <Row label="Device ID" value={`#${claims?.device_id ?? "—"}`} />
+                        <Row label="用户 ID" value={`#${claims?.user_id ?? "—"}`} />
+                        <Row label="设备 ID" value={`#${claims?.device_id ?? "—"}`} />
                         <Row
-                            label="Issued at"
+                            label="签发于"
                             value={
                                 claims?.iat
                                     ? formatDateTime(new Date(claims.iat * 1000).toISOString())
@@ -139,7 +139,7 @@ export default function Profile() {
                             }
                         />
                         <Row
-                            label="Expires at"
+                            label="过期于"
                             value={
                                 claims?.exp
                                     ? formatDateTime(new Date(claims.exp * 1000).toISOString())
@@ -147,7 +147,7 @@ export default function Profile() {
                             }
                         />
                         <Row
-                            label="Countdown"
+                            label="倒计时"
                             value={
                                 <span
                                     className={cn(
@@ -158,7 +158,7 @@ export default function Profile() {
                                     <Clock size={12} />
                                     {claims?.exp
                                         ? expiry.expired
-                                            ? "expired"
+                                            ? "已过期"
                                             : formatCountdown(expiry.ms)
                                         : "—"}
                                 </span>
@@ -167,7 +167,7 @@ export default function Profile() {
                         {token && (
                             <div className="pt-1">
                                 <div className="mb-1 text-xs uppercase tracking-wider text-fg-subtle">
-                                    Raw token
+                                    原始令牌
                                 </div>
                                 <div className="glass-subtle rounded-xl max-h-24 overflow-y-auto p-2 font-mono text-[11px] break-all text-fg-subtle">
                                     {token}
@@ -182,22 +182,22 @@ export default function Profile() {
             <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <HardDrive size={16} /> Bound devices
-                    </CardTitle>
-                    <CardDescription>
-                        Devices owned by you ({devices.length}).
-                    </CardDescription>
+                            <HardDrive size={16} /> 绑定的设备
+                        </CardTitle>
+                        <CardDescription>
+                            您名下的设备（共 {devices.length} 台）。
+                        </CardDescription>
                 </CardHeader>
                 <CardContent className="p-0">
                     <div className="overflow-x-auto">
                         <table className="w-full text-left text-sm">
                             <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-fg-subtle">
                                 <tr>
-                                    <th className="px-4 py-3 font-medium">Name</th>
+                                    <th className="px-4 py-3 font-medium">名称</th>
                                     <th className="px-4 py-3 font-medium">ID</th>
-                                    <th className="px-4 py-3 font-medium">Last login</th>
-                                    <th className="px-4 py-3 font-medium">Created</th>
-                                    <th className="px-4 py-3 font-medium">State</th>
+                                    <th className="px-4 py-3 font-medium">最后登录</th>
+                                    <th className="px-4 py-3 font-medium">创建于</th>
+                                    <th className="px-4 py-3 font-medium">状态</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-[rgb(var(--border)/0.3)]">
@@ -207,7 +207,7 @@ export default function Profile() {
                                             colSpan={5}
                                             className="px-4 py-10 text-center text-fg-subtle"
                                         >
-                                            No devices bound to your account.
+                                            您的账户尚未绑定任何设备。
                                         </td>
                                     </tr>
                                 )}
@@ -225,9 +225,9 @@ export default function Profile() {
                                         </td>
                                         <td className="px-4 py-3">
                                             {d.revoked_at ? (
-                                                <Badge variant="danger">revoked</Badge>
+                                                <Badge variant="danger">已撤销</Badge>
                                             ) : (
-                                                <Badge variant="success">active</Badge>
+                                                <Badge variant="success">活跃</Badge>
                                             )}
                                         </td>
                                     </tr>

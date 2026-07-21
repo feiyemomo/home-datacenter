@@ -70,7 +70,7 @@ export default function Users() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "failed to load users",
+                        : "加载用户失败",
             );
         } finally {
             setLoading(false);
@@ -84,7 +84,7 @@ export default function Users() {
     async function handleCreate() {
         const name = newName.trim();
         if (!name) {
-            setError("name is required");
+            setError("请输入名称");
             return;
         }
         const deviceName = newDeviceName.trim();
@@ -108,7 +108,7 @@ export default function Users() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "create failed",
+                        : "创建失败",
             );
         } finally {
             setCreating(false);
@@ -166,11 +166,11 @@ export default function Users() {
         // operator sees the error inline instead of having to
         // round-trip.
         if (u.is_admin && !nextIsAdmin && adminCount <= 1) {
-            setError("cannot demote the only remaining admin");
+            setError("无法降级最后一位管理员");
             return;
         }
         if (u.id === me?.id && u.is_admin && !nextIsAdmin) {
-            setError("cannot demote the currently authenticated user");
+            setError("无法降级当前登录用户");
             return;
         }
         setSavingId(u.id);
@@ -184,7 +184,7 @@ export default function Users() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "update failed",
+                        : "更新失败",
             );
         } finally {
             setSavingId(null);
@@ -204,7 +204,7 @@ export default function Users() {
                     ? err.message
                     : err instanceof Error
                         ? err.message
-                        : "delete failed",
+                        : "删除失败",
             );
         } finally {
             setDeletingId(null);
@@ -215,11 +215,9 @@ export default function Users() {
         <div className="animate-fade-in space-y-6">
             <div className="flex flex-wrap items-center justify-between gap-3">
                 <div>
-                    <h2 className="text-lg font-semibold text-fg">Users</h2>
+                    <h2 className="text-lg font-semibold text-fg">用户</h2>
                     <p className="text-xs text-fg-muted">
-                        Admin-only. {users.length} user
-                        {users.length === 1 ? "" : "s"} · {adminCount} admin
-                        {adminCount === 1 ? "" : "s"}.
+                        仅管理员可见。共 {users.length} 位用户 · {adminCount} 位管理员。
                     </p>
                 </div>
                 <div className="flex items-center gap-2">
@@ -234,11 +232,11 @@ export default function Users() {
                         ) : (
                             <RefreshCw size={14} />
                         )}
-                        Refresh
+                        刷新
                     </Button>
                     <Button size="sm" onClick={() => setShowCreate((s) => !s)}>
                         <Plus size={14} />
-                        {showCreate ? "Cancel" : "New user"}
+                        {showCreate ? "取消" : "新建用户"}
                     </Button>
                 </div>
             </div>
@@ -253,11 +251,9 @@ export default function Users() {
             {showCreate && (
                 <Card>
                     <CardHeader>
-                        <CardTitle className="text-base">Create user</CardTitle>
+                        <CardTitle className="text-base">创建用户</CardTitle>
                         <CardDescription>
-                            Names are 1-32 characters of letters, digits, _ or -.
-                            Optionally create a first device — its AccessKey
-                            will be shown once after creation.
+                            名称为 1-32 个字符，可包含字母、数字、_ 或 -。可选择同时创建首个设备 —— 其访问密钥将在创建后仅显示一次。
                         </CardDescription>
                     </CardHeader>
                     <CardContent>
@@ -269,14 +265,14 @@ export default function Users() {
                             }}
                         >
                             <Input
-                                placeholder="name (e.g. alice)"
+                                placeholder="名称（例如 alice）"
                                 value={newName}
                                 onChange={(e) => setNewName(e.target.value)}
                                 maxLength={32}
                                 autoFocus
                             />
                             <Input
-                                placeholder="device name (optional, e.g. alice-laptop)"
+                                placeholder="设备名称（可选，例如 alice-laptop）"
                                 value={newDeviceName}
                                 onChange={(e) => setNewDeviceName(e.target.value)}
                                 maxLength={64}
@@ -288,7 +284,7 @@ export default function Users() {
                                     onChange={(e) => setNewIsAdmin(e.target.checked)}
                                     className="h-4 w-4 rounded border-[rgb(var(--border))] bg-[rgb(var(--glass-base))] text-[rgb(var(--accent-info))] focus:ring-[rgb(var(--accent-info))]"
                                 />
-                                admin
+                                管理员
                             </label>
                             <Button type="submit" disabled={creating || !newName.trim()}>
                                 {creating ? (
@@ -296,7 +292,7 @@ export default function Users() {
                                 ) : (
                                     <Plus size={14} />
                                 )}
-                                Create
+                                创建
                             </Button>
                         </form>
                     </CardContent>
@@ -310,13 +306,11 @@ export default function Users() {
                     <CardHeader>
                         <CardTitle className="flex items-center gap-2 text-base text-[rgb(var(--accent-warm))]">
                             <Key size={16} />
-                            User created — save the AccessKey
+                            用户已创建 —— 请保存访问密钥
                         </CardTitle>
                         <CardDescription>
-                            This is the only time the AccessKey is shown.
-                            Copy it and send it to <strong>{createResult.name}</strong>
-                            {createResult.device ? ` (device: ${createResult.device.device_name})` : ""}.
-                            It cannot be recovered later.
+                            访问密钥仅此一次显示。请复制并发送给 <strong>{createResult.name}</strong>
+                            {createResult.device ? `（设备：${createResult.device.device_name}）` : ""}。之后无法再次恢复。
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-3">
@@ -333,12 +327,12 @@ export default function Users() {
                                 {copied ? (
                                     <>
                                         <Check size={14} className="mr-1 text-[rgb(var(--accent-success))]" />
-                                        Copied
+                                        已复制
                                     </>
                                 ) : (
                                     <>
                                         <Copy size={14} className="mr-1" />
-                                        Copy
+                                        复制
                                     </>
                                 )}
                             </Button>
@@ -349,7 +343,7 @@ export default function Users() {
                                 variant="ghost"
                                 onClick={() => setCreateResult(null)}
                             >
-                                Dismiss
+                                关闭
                             </Button>
                         </div>
                     </CardContent>
@@ -359,11 +353,10 @@ export default function Users() {
             <Card>
                 <CardHeader>
                     <CardTitle className="flex items-center gap-2">
-                        <UserCog size={16} /> User registry
+                        <UserCog size={16} /> 用户列表
                     </CardTitle>
                     <CardDescription>
-                        Deleting a user cascades to all of their devices —
-                        JWTs issued to those devices are immediately rejected.
+                        删除用户将级联删除其所有设备 —— 那些设备的 JWT 令牌将立即失效。
                     </CardDescription>
                 </CardHeader>
                 <CardContent className="p-0">
@@ -371,11 +364,11 @@ export default function Users() {
                         <table className="w-full text-left text-sm">
                             <thead className="glass-subtle border-b border-[rgb(var(--border)/0.3)] text-xs uppercase tracking-wider text-fg-muted">
                                 <tr>
-                                    <th className="px-4 py-3 font-medium">Name</th>
-                                    <th className="px-4 py-3 font-medium">Role</th>
-                                    <th className="px-4 py-3 font-medium">Devices</th>
-                                    <th className="px-4 py-3 font-medium">Created</th>
-                                    <th className="px-4 py-3 text-right font-medium">Actions</th>
+                                    <th className="px-4 py-3 font-medium">名称</th>
+                                    <th className="px-4 py-3 font-medium">角色</th>
+                                    <th className="px-4 py-3 font-medium">设备</th>
+                                    <th className="px-4 py-3 font-medium">创建于</th>
+                                    <th className="px-4 py-3 text-right font-medium">操作</th>
                                 </tr>
                             </thead>
                             <tbody className="divide-[rgb(var(--border)/0.3)]">
@@ -385,7 +378,7 @@ export default function Users() {
                                             colSpan={5}
                                             className="px-4 py-10 text-center text-fg-muted"
                                         >
-                                            No users found.
+                                            未找到用户。
                                         </td>
                                     </tr>
                                 )}
@@ -451,7 +444,7 @@ export default function Users() {
                                                                     variant="info"
                                                                     className="ml-2 text-[9px]"
                                                                 >
-                                                                    you
+                                                                    你
                                                                 </Badge>
                                                             )}
                                                         </div>
@@ -468,12 +461,12 @@ export default function Users() {
                                                     )}
                                                     title={
                                                         isOnlyAdmin
-                                                            ? "cannot demote the only admin"
+                                                            ? "无法降级唯一管理员"
                                                             : isMe
-                                                                ? "cannot demote yourself"
+                                                                ? "无法降级自己"
                                                                 : u.is_admin
-                                                                    ? "demote to non-admin"
-                                                                    : "promote to admin"
+                                                                    ? "降级为普通用户"
+                                                                    : "提升为管理员"
                                                     }
                                                 >
                                                     <input
@@ -485,10 +478,10 @@ export default function Users() {
                                                             isMe
                                                         }
                                                         onChange={() => handleToggleAdmin(u)}
-                                                        className="h-3.5 w-3.5 rounded border-[rgb(var(--border))] bg-white text-[rgb(var(--accent-info))] focus:ring-[rgb(var(--accent-info))] disabled:cursor-not-allowed dark:border-[rgb(var(--border))] dark:bg-[rgb(var(--glass-base))]"
+                                                        className="h-3.5 w-3.5 rounded border-[rgb(var(--border))] bg-[rgb(var(--glass-base))] text-[rgb(var(--accent-info))] focus:ring-[rgb(var(--accent-info))] disabled:cursor-not-allowed"
                                                     />
                                                     <span className="text-fg-muted">
-                                                        {u.is_admin ? "admin" : "user"}
+                                                        {u.is_admin ? "管理员" : "用户"}
                                                     </span>
                                                 </label>
                                             </td>
@@ -512,7 +505,7 @@ export default function Users() {
                                                             }
                                                             disabled={isBusy}
                                                         >
-                                                            Cancel
+                                                            取消
                                                         </Button>
                                                         <Button
                                                             variant="primary"
@@ -526,7 +519,7 @@ export default function Users() {
                                                                     className="animate-spin"
                                                                 />
                                                             ) : null}
-                                                            Save
+                                                            保存
                                                         </Button>
                                                     </div>
                                                 ) : confirmDeleteId === u.id ? (
@@ -537,7 +530,7 @@ export default function Users() {
                                                             onClick={() => setConfirmDeleteId(null)}
                                                             disabled={isBusy}
                                                         >
-                                                            Cancel
+                                                            取消
                                                         </Button>
                                                         <Button
                                                             variant="danger"
@@ -546,10 +539,10 @@ export default function Users() {
                                                             disabled={isBusy || isMe}
                                                             title={
                                                                 isMe
-                                                                    ? "cannot delete yourself"
+                                                                    ? "无法删除自己"
                                                                     : isOnlyAdmin
-                                                                        ? "cannot delete the only admin"
-                                                                        : "delete user + cascade devices"
+                                                                        ? "无法删除唯一管理员"
+                                                                        : "删除用户并级联删除设备"
                                                             }
                                                         >
                                                             {deletingId === u.id ? (
@@ -560,7 +553,7 @@ export default function Users() {
                                                             ) : (
                                                                 <Trash2 size={14} />
                                                             )}
-                                                            Confirm
+                                                            确认
                                                         </Button>
                                                     </div>
                                                 ) : (
@@ -576,7 +569,7 @@ export default function Users() {
                                                             }
                                                             disabled={isBusy}
                                                         >
-                                                            Rename
+                                                            重命名
                                                         </Button>
                                                         <Button
                                                             variant="ghost"
@@ -586,14 +579,14 @@ export default function Users() {
                                                             disabled={isMe || isOnlyAdmin}
                                                             title={
                                                                 isMe
-                                                                    ? "cannot delete yourself"
+                                                                    ? "无法删除自己"
                                                                     : isOnlyAdmin
-                                                                        ? "cannot delete the only admin"
-                                                                        : "delete user + cascade devices"
+                                                                        ? "无法删除唯一管理员"
+                                                                        : "删除用户并级联删除设备"
                                                             }
                                                         >
                                                             <Trash2 size={14} />
-                                                            Delete
+                                                            删除
                                                         </Button>
                                                     </div>
                                                 )}

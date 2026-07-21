@@ -285,7 +285,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     const onWebRTCFallback = transport === "auto" ? () => setPath("hls") : undefined;
 
     return (
-        <Card className="glass glass-glow glass-hover-lift rounded-2xl overflow-hidden">
+        <Card className="glass glass-glow glass-hover-lift rounded-2xl overflow-hidden bg-[rgb(var(--glass-bg)/0.92)]">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="flex items-center gap-2 text-base font-semibold text-fg">
                     <span
@@ -297,14 +297,14 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                     ? "bg-[rgb(var(--accent-danger))]"
                                     : "bg-[rgb(var(--fg-subtle))]",
                         )}
-                        title={`status: ${status}`}
+                        title={`状态：${status}`}
                     />
                     {camera.name}
                     {camera.transcode && (
                         <Badge
                             variant="info"
                             className="text-[9px]"
-                            title="Server-side H.264 transcoding via ffmpeg (HEVC → H.264). Costs CPU on the home-api host."
+                            title="服务端 ffmpeg 转码（HEVC → H.264），会占用 home-api 主机 CPU"
                         >
                             x264
                         </Badge>
@@ -313,7 +313,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                 <div className="flex items-center gap-1.5">
                     {/* Status badge — always visible, compact. */}
                     <Badge variant="outline" className={cn("ring-1 ring-inset text-[10px]", statusColor)}>
-                        {status}
+                        {status === "online" ? "在线" : status === "offline" ? "离线" : "未知"}
                     </Badge>
                     {/* Mode tabs — only visible once we've left
                      * preview. Switching to live tears down the
@@ -323,35 +323,35 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         <div
                             className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
                             role="radiogroup"
-                            aria-label="View mode"
+                            aria-label="查看模式"
                         >
                             <button
                                 role="radio"
                                 aria-checked={mode === "live"}
                                 onClick={() => setMode("live")}
                                 className={cn(
-                                    "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                    "h-5 rounded px-1.5 font-medium tracking-wider transition-all",
                                     mode === "live"
-                                        ? "bg-white/15 text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
-                                        : "text-fg-muted hover:text-fg hover:bg-white/5",
+                                        ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgb(var(--accent-info)/0.25)]"
+                                        : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
                                 )}
-                                title="Live stream"
+                                title="直播"
                             >
-                                Live
+                                直播
                             </button>
                             <button
                                 role="radio"
                                 aria-checked={mode === "playback"}
                                 onClick={() => setMode("playback")}
                                 className={cn(
-                                    "h-5 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                    "h-5 rounded px-1.5 font-medium tracking-wider transition-all",
                                     mode === "playback"
-                                        ? "bg-white/15 text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgba(56,189,248,0.25)]"
-                                        : "text-fg-muted hover:text-fg hover:bg-white/5",
+                                        ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgb(var(--accent-info)/0.25)]"
+                                        : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
                                 )}
-                                title="Recording playback"
+                                title="录像回放"
                             >
-                                Playback
+                                回放
                             </button>
                         </div>
                     )}
@@ -361,12 +361,12 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 px-2 text-[10px] glass-subtle hover:bg-white/10"
+                            className="h-6 px-2 text-[10px] hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             onClick={() => setMode("preview")}
-                            title="Return to preview"
+                            title="返回预览"
                         >
                             <Square size={10} className="mr-1" />
-                            Stop
+                            停止
                         </Button>
                     )}
                     {/* Kebab menu (⋮) — overflow controls.
@@ -377,35 +377,36 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                     <div className="relative" ref={menuRef}>
                         <Button
                             size="sm"
-                            variant="outline"
-                            className="h-6 w-6 p-0 glass-subtle hover:bg-white/10"
+                            variant="secondary"
+                            className="h-6 w-6 p-0"
                             onClick={() => setMenuOpen((o) => !o)}
-                            title="More controls"
-                            aria-label="More controls"
+                            title="更多操作"
+                            aria-label="更多操作"
                             aria-expanded={menuOpen}
                         >
                             <MoreVertical size={12} />
                         </Button>
                         {menuOpen && (
-                            <div className="absolute right-0 top-full mt-1 z-20 min-w-[200px] rounded-lg glass-strong p-2.5 shadow-lg space-y-2.5">
+                            <div className="absolute right-0 top-full mt-1 z-30 min-w-[220px] rounded-lg glass-strong p-2.5 shadow-lg space-y-2.5">
                                 {/* Vendor + last seen info */}
                                 <div className="space-y-0.5 text-[10px] text-fg-subtle">
-                                    <div>vendor: <span className="text-fg-muted">{camera.vendor || "onvif"}</span></div>
+                                    <div>厂商：<span className="text-fg-muted">{camera.vendor || "onvif"}</span></div>
                                     {lastSeen && (
-                                        <div>last seen: <span className="text-fg-muted">{new Date(lastSeen).toLocaleString()}</span></div>
+                                        <div>最后在线：<span className="text-fg-muted">{new Date(lastSeen).toLocaleString()}</span></div>
                                     )}
                                 </div>
                                 {/* Transport selector — live mode only */}
                                 {mode === "live" && (
                                     <div className="space-y-1 pt-1 border-t border-[rgb(var(--border)/0.2)]">
-                                        <div className="text-[10px] uppercase tracking-wider text-fg-subtle">Transport</div>
+                                        <div className="text-[10px] tracking-wider text-fg-subtle">传输方式</div>
                                         <div
                                             className="inline-flex h-6 w-full items-center glass-subtle rounded-lg p-0.5 text-[10px]"
                                             role="radiogroup"
-                                            aria-label="Live stream transport"
+                                            aria-label="直播传输方式"
                                         >
                                             {(["auto", "webrtc", "hls"] as TransportMode[]).map((t) => {
                                                 const active = transport === t;
+                                                const label = t === "auto" ? "自动" : t === "webrtc" ? "WebRTC" : "HLS";
                                                 return (
                                                     <button
                                                         key={t}
@@ -413,26 +414,26 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                                         aria-checked={active}
                                                         onClick={() => setTransport(t)}
                                                         className={cn(
-                                                            "h-5 flex-1 rounded px-1.5 font-medium uppercase tracking-wider transition-all",
+                                                            "h-5 flex-1 rounded px-1.5 font-medium tracking-wider transition-all",
                                                             active
-                                                                ? "bg-white/15 text-[rgb(var(--accent-info))]"
-                                                                : "text-fg-muted hover:text-fg hover:bg-white/5",
+                                                                ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))]"
+                                                                : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
                                                         )}
                                                         title={
                                                             t === "auto"
-                                                                ? "Try WebRTC; fall back to HLS on failure"
+                                                                ? "优先 WebRTC，失败自动回退到 HLS"
                                                                 : t === "webrtc"
-                                                                    ? "Force WebRTC; show error on failure (no auto-fallback)"
-                                                                    : "Force HLS; never try WebRTC"
+                                                                    ? "强制 WebRTC，失败显示错误（不自动回退）"
+                                                                    : "强制 HLS，不尝试 WebRTC"
                                                         }
                                                     >
-                                                        {t}
+                                                        {label}
                                                     </button>
                                                 );
                                             })}
                                         </div>
                                         <div className="text-[9px] text-fg-subtle">
-                                            effective: <span className="text-fg-muted">{effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
+                                            当前：<span className="text-fg-muted">{effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
                                         </div>
                                     </div>
                                 )}
@@ -440,7 +441,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 {isAdmin && (
                                     <div className="space-y-1 pt-1 border-t border-[rgb(var(--border)/0.2)]">
                                         <div className="flex items-center justify-between">
-                                            <div className="text-[10px] uppercase tracking-wider text-fg-subtle">Recording</div>
+                                            <div className="text-[10px] tracking-wider text-fg-subtle">录像计划</div>
                                             <span
                                                 className={cn(
                                                     "inline-flex items-center gap-1 text-[10px] font-medium",
@@ -457,7 +458,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                                             : "bg-[rgb(var(--fg-subtle))]",
                                                     )}
                                                 />
-                                                {recordingEnabled ? "ON" : "OFF"}
+                                                {recordingEnabled ? "开启" : "关闭"}
                                             </span>
                                         </div>
                                         <Button
@@ -468,12 +469,12 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             className="w-full h-6 text-[10px]"
                                             title={
                                                 recordingEnabled
-                                                    ? `Recording ON · ${camera.meta.recording?.segment_seconds ?? 600}s · ${camera.meta.recording?.retention_days ?? 7}d retention`
-                                                    : "Recording OFF"
+                                                    ? `录像中 · ${camera.meta.recording?.segment_seconds ?? 600}秒/段 · 保留 ${camera.meta.recording?.retention_days ?? 7} 天`
+                                                    : "录像未开启"
                                             }
                                         >
                                             {toggling && <Loader2 size={10} className="animate-spin mr-1" />}
-                                            {recordingEnabled ? "Stop recording" : "Start recording"}
+                                            {recordingEnabled ? "停止录像" : "开始录像"}
                                         </Button>
                                     </div>
                                 )}
@@ -547,8 +548,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 variant="outline"
                                 disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("up")}
-                                aria-label="PTZ up"
-                                className="glass-subtle hover:bg-white/10"
+                                aria-label="上转"
+                                className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             >
                                 <ChevronUp size={16} />
                             </Button>
@@ -558,8 +559,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 variant="outline"
                                 disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("left")}
-                                aria-label="PTZ left"
-                                className="glass-subtle hover:bg-white/10"
+                                aria-label="左转"
+                                className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             >
                                 <ChevronLeft size={16} />
                             </Button>
@@ -568,8 +569,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 variant="outline"
                                 disabled={!isAdmin || busy}
                                 onClick={() => sendPTZ("stop")}
-                                aria-label="PTZ stop"
-                                className="glass-subtle hover:bg-white/10"
+                                aria-label="停止转动"
+                                className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             >
                                 <Square size={14} />
                             </Button>
@@ -578,8 +579,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 variant="outline"
                                 disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("right")}
-                                aria-label="PTZ right"
-                                className="glass-subtle hover:bg-white/10"
+                                aria-label="右转"
+                                className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             >
                                 <ChevronRight size={16} />
                             </Button>
@@ -589,8 +590,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 variant="outline"
                                 disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("down")}
-                                aria-label="PTZ down"
-                                className="glass-subtle hover:bg-white/10"
+                                aria-label="下转"
+                                className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             >
                                 <ChevronDown size={16} />
                             </Button>
@@ -605,25 +606,25 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                     variant="outline"
                                     disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                     onClick={() => sendPTZ("zoom_in")}
-                                    className="glass-subtle hover:bg-white/10"
+                                    className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                                 >
                                     <ZoomIn size={14} className="mr-1" />
-                                    Zoom+
+                                    拉近
                                 </Button>
                                 <Button
                                     size="sm"
                                     variant="outline"
                                     disabled={!isAdmin || busy || !camera.capabilities.ptz}
                                     onClick={() => sendPTZ("zoom_out")}
-                                    className="glass-subtle hover:bg-white/10"
+                                    className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                                 >
                                     <ZoomOut size={14} className="mr-1" />
-                                    Zoom-
+                                    拉远
                                 </Button>
                                 {!isAdmin && (
                                     <Badge variant="outline" className="text-[10px]">
                                         <Power size={10} className="mr-1" />
-                                        view-only
+                                        仅观看
                                     </Badge>
                                 )}
                             </div>
@@ -636,7 +637,6 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             variant="secondary"
                                             disabled={!isAdmin || busy}
                                             onClick={() => sendPreset(alias)}
-                                            className="glass-subtle hover:bg-white/10"
                                         >
                                             {alias}
                                         </Button>
@@ -648,7 +648,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             )}
                             {lastSeen && (
                                 <p className="text-[10px] text-fg-subtle">
-                                    last seen {new Date(lastSeen).toLocaleString()}
+                                    最后在线 {new Date(lastSeen).toLocaleString()}
                                 </p>
                             )}
                         </div>
@@ -678,15 +678,15 @@ function PreviewFrame({
     return (
         <div className="absolute inset-0 flex items-center justify-center bg-black">
             {error ? (
-                <div className="flex flex-col items-center text-slate-400">
-                    <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
-                    <span className="text-xs">preview unavailable</span>
+                <div className="flex flex-col items-center text-fg-muted">
+                    <AlertTriangle className="mb-2 h-6 w-6 text-[rgb(var(--accent-danger))]" />
+                    <span className="text-xs">预览不可用</span>
                 </div>
             ) : (
                 <>
                     <img
                         src={cameraFrameUrl(cameraId)}
-                        alt="camera preview"
+                        alt="摄像头预览"
                         onError={() => setError(true)}
                         className="h-full w-full object-contain"
                     />
@@ -694,8 +694,8 @@ function PreviewFrame({
                         type="button"
                         onClick={onPlay}
                         className="absolute inset-0 flex items-center justify-center bg-black/30 hover:bg-black/40 transition-colors group"
-                        aria-label="Play live stream"
-                        title="Play live stream"
+                        aria-label="开始直播"
+                        title="开始直播"
                     >
                         <span className="flex h-14 w-14 items-center justify-center rounded-full bg-white/20 backdrop-blur-md ring-2 ring-white/40 group-hover:scale-110 transition-transform">
                             <Play className="ml-1 h-6 w-6 text-white" fill="currentColor" />
@@ -802,24 +802,24 @@ function VideoSurface({
             {viewState === "loading" && (
                 <Overlay>
                     <Loader2 className="mr-2 h-5 w-5 animate-spin" />
-                    loading live stream
+                    正在加载直播
                 </Overlay>
             )}
             {viewState === "error" && (
                 <Overlay>
-                    <AlertTriangle className="mb-2 h-6 w-6 text-rose-400" />
-                    <p className="px-4 text-center text-sm text-slate-200">
-                        {error ?? "playback failed"}
+                    <AlertTriangle className="mb-2 h-6 w-6 text-[rgb(var(--accent-danger))]" />
+                    <p className="px-4 text-center text-sm text-fg">
+                        {error ?? "播放失败"}
                     </p>
                     {onRetry && (
                         <Button
                             size="sm"
                             variant="outline"
-                            className="mt-2 glass-subtle hover:bg-white/10"
+                            className="mt-2 hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             onClick={onRetry}
                         >
                             <RefreshCw className="mr-1 h-3 w-3" />
-                            Retry
+                            重试
                         </Button>
                     )}
                 </Overlay>
@@ -830,7 +830,7 @@ function VideoSurface({
 
 function Overlay({ children }: { children: React.ReactNode }) {
     return (
-        <div className="absolute inset-0 flex flex-col items-center justify-center backdrop-blur-xl bg-black/50 text-slate-300">
+        <div className="absolute inset-0 flex flex-col items-center justify-center backdrop-blur-xl bg-black/60 text-fg">
             {children}
         </div>
     );

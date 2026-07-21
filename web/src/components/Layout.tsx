@@ -32,23 +32,23 @@ interface NavItem {
 }
 
 const NAV_ITEMS: NavItem[] = [
-    { to: "/dashboard", label: "Dashboard", icon: <LayoutDashboard size={18} /> },
-    { to: "/cameras", label: "Cameras", icon: <CameraIcon size={18} /> },
-    { to: "/network", label: "Network", icon: <NetworkIcon size={18} /> },
-    { to: "/devices", label: "Devices", icon: <HardDrive size={18} /> },
+    { to: "/dashboard", label: "仪表盘", icon: <LayoutDashboard size={18} /> },
+    { to: "/cameras", label: "摄像头", icon: <CameraIcon size={18} /> },
+    { to: "/network", label: "网络", icon: <NetworkIcon size={18} /> },
+    { to: "/devices", label: "设备", icon: <HardDrive size={18} /> },
     {
         to: "/users",
-        label: "Users",
+        label: "用户",
         icon: <UserCog size={18} />,
         adminOnly: true,
     },
     {
         to: "/mqtt",
-        label: "MQTT Debug",
+        label: "MQTT 调试",
         icon: <Radio size={18} />,
         adminOnly: true,
     },
-    { to: "/profile", label: "Profile", icon: <UserIcon size={18} /> },
+    { to: "/profile", label: "个人中心", icon: <UserIcon size={18} /> },
 ];
 
 interface SidebarProps {
@@ -86,16 +86,16 @@ export function Sidebar({ open, onClose }: SidebarProps) {
                     </div>
                     <div className="flex flex-col leading-tight">
                         <span className="text-sm font-semibold text-fg">
-                            Home Datacenter
+                            家庭数据中心
                         </span>
-                        <span className="text-[10px] uppercase tracking-widest text-fg-subtle">
-                            Control Panel
+                        <span className="text-[10px] tracking-widest text-fg-subtle">
+                            控制面板
                         </span>
                     </div>
                     <button
                         className="ml-auto text-fg-subtle hover:text-fg transition-colors md:hidden"
                         onClick={onClose}
-                        aria-label="Close navigation"
+                        aria-label="关闭导航"
                     >
                         <X size={20} />
                     </button>
@@ -126,7 +126,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
                             <span>{item.label}</span>
                             {item.adminOnly && (
                                 <Badge variant="info" className="ml-auto text-[10px]">
-                                    ADMIN
+                                    管理员
                                 </Badge>
                             )}
                         </NavLink>
@@ -141,15 +141,15 @@ export function Sidebar({ open, onClose }: SidebarProps) {
                         </div>
                         <div className="min-w-0 flex-1">
                             <p className="truncate text-xs font-medium text-fg">
-                                {user?.name ?? "unknown"}
+                                {user?.name ?? "未知"}
                             </p>
                             <p className="text-[10px] text-fg-muted">
-                                {isAdmin ? "administrator" : "user"}
+                                {isAdmin ? "管理员" : "普通用户"}
                             </p>
                         </div>
                         {isAdmin && (
                             <Badge variant="success" className="text-[10px]">
-                                <Activity size={10} /> admin
+                                <Activity size={10} /> 管理员
                             </Badge>
                         )}
                     </div>
@@ -160,7 +160,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
                         onClick={logout}
                     >
                         <LogOut size={16} />
-                        Sign out
+                        退出登录
                     </Button>
                 </div>
             </aside>
@@ -207,21 +207,23 @@ function ThemeMenu() {
     }, [open]);
 
     const options: { value: Theme; label: string; icon: typeof Sun }[] = [
-        { value: "light", label: "Light", icon: Sun },
-        { value: "dark", label: "Dark", icon: Moon },
-        { value: "system", label: "System", icon: Monitor },
+        { value: "light", label: "亮色", icon: Sun },
+        { value: "dark", label: "暗色", icon: Moon },
+        { value: "system", label: "跟随系统", icon: Monitor },
     ];
 
     const ActiveIcon = resolved === "dark" ? Moon : Sun;
+    const themeLabel = theme === "light" ? "亮色" : theme === "dark" ? "暗色" : "跟随系统";
+    const resolvedLabel = resolved === "dark" ? "暗色" : "亮色";
 
     return (
-        <div ref={ref} className="relative">
+        <div ref={ref} className="relative z-50">
             <Button
                 size="icon"
                 variant="ghost"
                 onClick={() => setOpen((v) => !v)}
-                aria-label={`Theme: ${theme}`}
-                title={`Theme: ${theme} (resolved: ${resolved})`}
+                aria-label={`主题：${themeLabel}`}
+                title={`主题：${themeLabel}（当前生效：${resolvedLabel}）`}
                 aria-expanded={open}
                 aria-haspopup="menu"
             >
@@ -230,7 +232,7 @@ function ThemeMenu() {
             {open && (
                 <div
                     role="menu"
-                    className="absolute right-0 top-full mt-1 min-w-[140px] overflow-hidden rounded-xl glass-strong p-1 shadow-lg z-50 animate-fade-in"
+                    className="absolute right-0 top-full mt-1 min-w-[150px] overflow-hidden rounded-xl glass-strong p-1 shadow-xl z-[100] animate-fade-in ring-1 ring-[rgb(var(--border)/0.4)]"
                 >
                     {options.map((opt) => {
                         const Icon = opt.icon;
@@ -278,23 +280,27 @@ export function Layout({ children }: LayoutProps) {
             <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
             <div className="relative flex flex-1 flex-col overflow-hidden">
-                {/* Top header */}
-                <header className="flex h-16 shrink-0 items-center gap-3 glass-strong px-4 md:px-6 transition-all duration-500 ease-out">
+                {/* Top header — z-40 so dropdowns inside (ThemeMenu)
+                 * can stack above main content but below the mobile
+                 * sidebar backdrop (z-30 is mobile backdrop; we use
+                 * z-40 on the header so the theme dropdown's z-[100]
+                 * cleanly rises above any card content below). */}
+                <header className="relative z-40 flex h-16 shrink-0 items-center gap-3 glass-strong px-4 md:px-6 transition-all duration-500 ease-out">
                     <button
                         className="text-fg-subtle hover:text-fg transition-colors md:hidden"
                         onClick={() => setSidebarOpen(true)}
-                        aria-label="Open navigation"
+                        aria-label="打开导航"
                     >
                         <Menu size={22} />
                     </button>
 
                     <div className="flex items-center gap-2">
                         <h1 className="text-sm font-semibold text-fg">
-                            Home Datacenter
+                            家庭数据中心
                         </h1>
                         <Badge variant="outline" className="hidden sm:inline-flex">
                             <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-fg-subtle" />
-                            {resolved}
+                            {resolved === "dark" ? "暗色" : "亮色"}
                         </Badge>
                     </div>
 
@@ -304,8 +310,9 @@ export function Layout({ children }: LayoutProps) {
                             target="_blank"
                             rel="noreferrer"
                             className="hidden text-xs text-fg-subtle hover:text-fg transition-colors sm:inline"
+                            title="后端健康检查"
                         >
-                            /health
+                            健康检查
                         </a>
                         <ThemeMenu />
                     </div>
