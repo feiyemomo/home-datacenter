@@ -321,7 +321,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                      * down the WebRTC/HLS pipeline. */}
                     {mode !== "preview" && (
                         <div
-                            className="inline-flex h-6 items-center glass-subtle rounded-lg p-0.5 text-[10px]"
+                            className="inline-flex h-7 items-center glass-subtle rounded-lg p-0.5 text-[11px]"
                             role="radiogroup"
                             aria-label="查看模式"
                         >
@@ -330,7 +330,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 aria-checked={mode === "live"}
                                 onClick={() => setMode("live")}
                                 className={cn(
-                                    "h-5 rounded px-1.5 font-medium tracking-wider transition-all",
+                                    "inline-flex h-6 items-center justify-center rounded px-2 font-medium transition-all",
                                     mode === "live"
                                         ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgb(var(--accent-info)/0.25)]"
                                         : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
@@ -344,7 +344,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 aria-checked={mode === "playback"}
                                 onClick={() => setMode("playback")}
                                 className={cn(
-                                    "h-5 rounded px-1.5 font-medium tracking-wider transition-all",
+                                    "inline-flex h-6 items-center justify-center rounded px-2 font-medium transition-all",
                                     mode === "playback"
                                         ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))] shadow-[0_1px_8px_rgb(var(--accent-info)/0.25)]"
                                         : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
@@ -361,11 +361,11 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         <Button
                             size="sm"
                             variant="outline"
-                            className="h-6 px-2 text-[10px] hover:bg-[rgb(var(--bg-subtle)/0.6)]"
+                            className="h-7 px-2.5 text-[11px] hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                             onClick={() => setMode("preview")}
                             title="返回预览"
                         >
-                            <Square size={10} className="mr-1" />
+                            <Square size={11} className="mr-1" />
                             停止
                         </Button>
                     )}
@@ -376,15 +376,15 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                      * toggle recording without entering playback. */}
                     <div className="relative" ref={menuRef}>
                         <Button
-                            size="sm"
-                            variant="secondary"
-                            className="h-7 w-7 p-0 ring-1 ring-[rgb(var(--border)/0.5)] bg-[rgb(var(--glass-bg)/0.8)]"
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8 text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]"
                             onClick={() => setMenuOpen((o) => !o)}
                             title="更多操作"
                             aria-label="更多操作"
                             aria-expanded={menuOpen}
                         >
-                            <MoreVertical size={16} className="text-fg" />
+                            <MoreVertical size={18} className="text-fg" />
                         </Button>
                         {menuOpen && (
                             <div className="absolute right-0 top-full mt-1 z-50 min-w-[240px] rounded-xl glass-strong p-3 shadow-xl ring-1 ring-[rgb(var(--border)/0.4)] space-y-2.5">
@@ -400,7 +400,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                     <div className="space-y-1.5 pt-2 border-t border-[rgb(var(--border)/0.2)]">
                                         <div className="text-xs font-medium text-fg">传输方式</div>
                                         <div
-                                            className="inline-flex h-7 w-full items-center glass-subtle rounded-lg p-0.5 text-xs"
+                                            className="inline-flex h-8 w-full items-center glass-subtle rounded-lg p-0.5 text-xs"
                                             role="radiogroup"
                                             aria-label="直播传输方式"
                                         >
@@ -414,7 +414,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                                         aria-checked={active}
                                                         onClick={() => setTransport(t)}
                                                         className={cn(
-                                                            "h-6 flex-1 rounded px-1.5 font-medium tracking-wider transition-all",
+                                                            "inline-flex h-7 flex-1 items-center justify-center rounded px-2 font-medium transition-all",
                                                             active
                                                                 ? "bg-[rgb(var(--accent-info)/0.25)] text-[rgb(var(--accent-info))]"
                                                                 : "text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)]",
@@ -466,7 +466,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             variant={recordingEnabled ? "danger" : "primary"}
                                             onClick={onToggleRecording}
                                             disabled={toggling || !onRefresh}
-                                            className="w-full h-7 text-xs"
+                                            className="w-full h-8 text-xs"
                                             title={
                                                 recordingEnabled
                                                     ? `录像中 · ${camera.meta.recording?.segment_seconds ?? 600}秒/段 · 保留 ${camera.meta.recording?.retention_days ?? 7} 天`

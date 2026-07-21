@@ -562,7 +562,14 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 		return
 	}
 
+	// v1.8.2 debug: log every motion-ranges request so we can see
+	// exactly what the backend receives from the dashboard. This is
+	// temporary — remove once the "0 events" issue is resolved.
+	log.Printf("[motion-ranges] cam_id=%d stream_name=%q slug=%q after=%d before=%d frigate_nil=%v",
+		cam.ID, cam.StreamName, h.Reg.FrigateSlug(cam), after, before, h.Reg.Frigate == nil)
+
 	if h.Reg.Frigate == nil {
+		log.Printf("[motion-ranges] RETURNING EMPTY: Frigate client is nil (config issue)")
 		utils.Success(c, gin.H{"ranges": []any{}, "total": 0})
 		return
 	}
@@ -570,6 +577,7 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 	slug := h.Reg.FrigateSlug(cam)
 	ranges, err := h.Reg.Frigate.ListMotionRanges(c.Request.Context(), slug, after, before)
 	if err != nil {
+		log.Printf("[motion-ranges] RETURNING ERROR: %v", err)
 		utils.Fail(c, http.StatusBadGateway, "failed to fetch motion ranges: "+err.Error())
 		return
 	}
@@ -579,6 +587,7 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 		// to handle null separately.
 		ranges = []camera.MotionRange{}
 	}
+	log.Printf("[motion-ranges] RETURNING %d ranges for slug=%q", len(ranges), slug)
 	utils.Success(c, gin.H{"ranges": ranges, "total": len(ranges)})
 }
 

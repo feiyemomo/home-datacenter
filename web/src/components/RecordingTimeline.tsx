@@ -215,9 +215,13 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // ----- Load motion ranges for the selected day -----
     useEffect(() => {
         const key = dayKey(selectedDay);
-        // null = never fetched (or previous fetch failed). Skip only
-        // when we have an actual array (even empty) cached.
-        if (motionCache[key] !== undefined && motionCache[key] !== null) return;
+        // Skip if we've already attempted a fetch for this key
+        // (success → array, failure → null). Without this guard,
+        // a failed fetch would set null, which triggers the effect
+        // to re-run and retry immediately — an infinite loop that
+        // hammers the backend. The user can click the refresh
+        // button to clear the cache and force a retry.
+        if (motionCache[key] !== undefined) return;
         if (loadingMotion) return;
 
         let cancelled = false;
@@ -228,9 +232,9 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                 if (cancelled) return;
                 setMotionCache((prev) => ({ ...prev, [key]: res.ranges ?? [] }));
             } catch {
-                // Non-fatal: leave motionCache[key] as null so the next
-                // mount / day switch can retry. Previously we cached []
-                // which permanently blocked retries.
+                // Non-fatal: cache null to mark "attempted but failed"
+                // so the effect doesn't immediately retry. The UI shows
+                // an empty ribbon; the refresh button clears the cache.
                 if (!cancelled) {
                     setMotionCache((prev) => ({ ...prev, [key]: null }));
                 }
