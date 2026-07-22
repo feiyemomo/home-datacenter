@@ -614,6 +614,56 @@ the stale prefix.
 
 ---
 
+## Phase 11 (v1.8.5): IPv6 Direct Connection Latency Optimization
+
+### Problem
+After the v1.8.4 prefix-rotation fix, the IPv6 direct-connection path
+dropped from ~1000ms to ~500ms on cellular. The residual 500ms ≈
+2 × ~250ms (cellular RTT) — one RTT for the TCP handshake, one for
+the HTTP roundtrip. NAS-side processing (nginx + Go, ~1ms) and the
+docker-proxy IPv6→IPv4 translation (~0ms) are negligible; the NAS is
+NOT the bottleneck. The effective lever is connection reuse: skip the
+TCP handshake on every call after the first.
+
+### Solution
+- **nginx upstream keepalive** (`web/nginx.conf`): added
+  `upstream api_backend { server api:8080; keepalive 32; }` and
+  switched the `/api/` location to `proxy_pass http://api_backend`
+  with `proxy_set_header Connection ""`. nginx now reuses connections
+  to the Go backend instead of opening a new one per request. The
+  WebSocket location `/api/v1/ws` is left unchanged (still uses
+  `http://api:8080` with `Connection "upgrade"`).
+- **OkHttp ConnectionPool + warmup** (Android v1.6.28): `NetworkFactory.kt`
+  explicitly sets `.connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))`
+  (HTTP/1.1 retained, h2c NOT enabled for stability).
+  `BaseUrlResolver.kt` adds `warmupConnection(url)` — a best-effort
+  `HEAD /api/v1/system/status` with 3s timeouts via
+  `client.newBuilder()`, invoked from `probeSync()` on URL change to
+  pre-establish the TCP connection before the first real API call.
+- **docker IPv6 direct (skipped)**: diagnosis showed docker-proxy
+  translation overhead is ~0ms, not a bottleneck. Enabling native
+  docker IPv6 would require daemon + bridge + compose network
+  reconfiguration and a firewall re-audit, for zero measurable gain.
+  Documented as explicitly skipped.
+
+### Files Changed
+- `web/nginx.conf` — `upstream api_backend` block + `keepalive 32` + `Connection ""` header
+- `Android/.../data/api/NetworkFactory.kt` — explicit `ConnectionPool(5, 5, TimeUnit.MINUTES)`
+- `Android/.../util/BaseUrlResolver.kt` — `warmupConnection(url)` method + invocation in `probeSync()`
+- `Android/app/build.gradle.kts` — versionCode 70 → 71, versionName "1.6.27" → "1.6.28"
+- `docs/ipv6-latency-optimization.md` — new detailed design doc
+- `docs/ai-context.md` — Phase 11 section (this section)
+- `README.md` — v1.8.5 changelog entry
+
+### Expected Effect
+On cellular IPv6 (~250ms RTT): first API call after probe drops from
+~500ms to ~250ms (warmup pre-establishes TCP); subsequent calls within
+the 5-min pool TTL drop from ~500ms to ~250ms each (one RTT saved per
+reused connection). LAN path (~7ms) sees <1ms change — sub-millisecond
+and not user-perceptible.
+
+---
+
 ## Developer Workflow
 
 **Run locally:**
@@ -853,4 +903,4 @@ app (see `APP_VS_DASHBOARD_FEATURES.md`). Key additions:
 
 ---
 
-**Last Updated:** 2026-07-22 (v1.8.4 IPv6 prefix rotation auto-adaptation: OutboundIPv6Address + PrefixWatcher + /api/v1/network/ipv6 endpoint + Android fetchDynamicIpv6Url. See Phase 10 above and `docs/ipv6-prefix-rotation.md`.)
+**Last Updated:** 2026-07-22 (v1.8.5 IPv6 direct latency optimization: nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection, docker IPv6 skipped. See Phase 11 above and `docs/ipv6-latency-optimization.md`. Earlier: v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
