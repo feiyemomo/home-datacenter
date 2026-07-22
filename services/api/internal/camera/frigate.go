@@ -282,6 +282,66 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 	return nil
 }
 
+// SetWebRTCCandidates pushes an updated go2rtc webrtc.candidates list
+// to Frigate via PUT /api/config/set. Used by the PrefixWatcher when
+// the ISP rotates the IPv6 prefix — the new outbound address becomes
+// the new IPv6 host candidate, replacing the old (now unreachable) one.
+//
+// The push is a partial config update: only go2rtc.webrtc.candidates
+// is sent, so Frigate's deep-merge preserves all other config (cameras,
+// mqtt, detectors, etc.). Frigate applies the new candidates to the
+// running go2rtc subsystem without a restart.
+//
+// Returns an error if the Frigate API call fails. The caller
+// (PrefixWatcher) logs the error but doesn't block subsequent checks.
+func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string) error {
+	// Build the candidate list: loopback + LAN IPv4 + IPv6 (if provided).
+	// We deliberately include 127.0.0.1 and the LAN IPv4 to keep the
+	// local/LAN paths working — sending only the IPv6 candidate would
+	// break LAN WebRTC.
+	candidates := []string{
+		"127.0.0.1:8555",
+		"192.168.31.234:8555",
+	}
+	if ipv6Addr != "" {
+		candidates = append(candidates, fmt.Sprintf("[%s]:8555", ipv6Addr))
+	}
+
+	partial := map[string]any{
+		"go2rtc": map[string]any{
+			"webrtc": map[string]any{
+				"candidates": candidates,
+			},
+		},
+	}
+
+	body, err := json.Marshal(partial)
+	if err != nil {
+		return fmt.Errorf("marshal candidates config: %w", err)
+	}
+
+	// Reuse the existing PUT /api/config/set endpoint.
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.FrigateBase+"/api/config/set", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return fmt.Errorf("frigate config set: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("frigate returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
+}
+
 // fetchConfig retrieves the current Frigate config as a generic map.
 // Currently unused — we send partial configs instead. Kept for
 // future use (e.g. reading back the merged config to verify).

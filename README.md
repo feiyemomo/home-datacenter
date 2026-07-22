@@ -582,6 +582,24 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.4 — IPv6 前缀轮换自动适配 (2026-07-22)
+
+### 新增
+- `GET /api/v1/network/ipv6` 端点（JWT 保护）：返回 NAS 当前出站 IPv6 地址、配置地址、前缀是否轮换、最后检查时间
+- `PrefixWatcher` 后台 goroutine：每 5 分钟检测 ISP 前缀轮换，自动更新 go2rtc webrtc.candidates 并发布 EventBus 事件 `network.ipv6.prefix_rotated`
+- `FrigateClient.SetWebRTCCandidates()` 方法：通过 Frigate PUT /api/config/set 推送更新后的 WebRTC candidates
+- `network.OutboundIPv6Address()` + `IPv6PrefixMatches()` + `OutboundIPv6Status` 工具函数
+- Android `BaseUrlResolver.fetchDynamicIpv6Url()`：从后端动态获取 NAS IPv6 地址，避免硬编码失效
+
+### 修复
+- 移动设备 IPv6 直连延迟从 ~1000ms 降至 ~50ms（根因：ISP 前缀轮换后三处硬编码地址未同步更新导致非对称路由）
+- 更新硬编码 IPv6 地址从旧前缀 `2409:8a70:37a0:63f0::/64` 到新前缀 `2409:8a70:37a3:99d0::/64`
+- NAS 添加稳定 SLAAC EUI-64 地址 `2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09` 并通过 systemd service 持久化
+
+### 文档
+- 新增 `docs/ipv6-prefix-rotation.md`：诊断步骤、即时修复流程、长期方案架构
+- 更新 `docs/ai-context.md`：新增 Phase 10 (v1.8.4) 章节
+
 ### v1.8.3（2026-07-21）HLS 延迟提示 + Android v1.6.24 同步
 
 - **Web 端 HLS 延迟提示徽标**：
