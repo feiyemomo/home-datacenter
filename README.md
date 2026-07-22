@@ -582,6 +582,23 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.5 — IPv6 直连延迟优化 (2026-07-22)
+
+### 优化
+- **nginx upstream keepalive**（`web/nginx.conf`）：新增 `upstream api_backend` 块（`keepalive 32`），`/api/` location 切换到 `proxy_pass http://api_backend` 并设置 `proxy_set_header Connection ""`，nginx 与 Go backend 复用连接；WebSocket `/api/v1/ws` location 保持不变（仍使用 `http://api:8080` + `Connection "upgrade"`）。
+- **OkHttp ConnectionPool**（Android v1.6.28，`NetworkFactory.kt`）：显式配置 `.connectionPool(ConnectionPool(5, 5, TimeUnit.MINUTES))`；保留 `protocols(listOf(HTTP_1_1))`（未启用 h2c，稳定性优先）；所有超时配置不变。
+- **OkHttp warmupConnection**（Android v1.6.28，`BaseUrlResolver.kt`）：新增 `warmupConnection(url)` 方法，在 `probeSync()` 检测到 URL 变化时通过 `client.newBuilder()` 发送 `HEAD /api/v1/system/status`（3s 超时，best-effort）预建 TCP 连接，首次真实 API 调用复用该连接，省去一次 TCP 握手。
+- **Android 版本号**：`versionCode` 70 → 71，`versionName` "1.6.27" → "1.6.28"。
+- **docker IPv6 直连（跳过）**：诊断显示 docker-proxy 的 IPv6→IPv4 转换开销约 0ms，非瓶颈；启用原生 docker IPv6 需重配 daemon / bridge / compose network 并重新审计 ip6tables 防火墙，收益为零而风险较高，明确跳过。
+
+### 文档
+- 新增 `docs/ipv6-latency-optimization.md`：500ms 延迟根因诊断（cellular RTT × 2 = TCP 握手 + HTTP 往返）、三项优化方案（nginx keepalive / OkHttp pool + warmup / docker IPv6 跳过）、文件变更清单、预期效果。
+- 更新 `docs/ai-context.md`：新增 Phase 11 (v1.8.5) 章节，更新 Last Updated 行。
+
+### 预期效果
+- 蜂窝 IPv6 直连路径（~250ms RTT）：首次 API 调用从 ~500ms 降至 ~250ms（warmup 预建 TCP）；连接池 TTL（5min）内的后续调用每次省一个 RTT（~250ms）。
+- LAN 路径（~7ms）：<1ms 变化，无感知。
+
 ### v1.8.4 — IPv6 前缀轮换自动适配 (2026-07-22)
 
 ### 新增
