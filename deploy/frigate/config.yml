@@ -192,7 +192,7 @@ go2rtc:
     candidates:
       - 127.0.0.1:8555
       - 192.168.31.234:8555
-      - "[2409:8a70:37a0:63f0:62be:b4ff:fe08:bd09]:8555"
+      - "[2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09]:8555"
   hls:
     # v1.6.19: ultra-low-latency HLS for remote (Cloudflare Tunnel)
     # viewing. segment=0.5s is the practical floor — 0.2s segments on

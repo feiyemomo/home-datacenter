@@ -69,7 +69,7 @@ services:
       # direct mode then both work. Update this value if the ISP
       # rotates the IPv6 prefix (find via: ip -6 addr show enp4s0 |
       # grep "scope global" | grep -v temporary).
-      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37a0:63f0:62be:b4ff:fe08:bd09}
+      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09}
     networks:
       - home-net
 

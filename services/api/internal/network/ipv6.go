@@ -2,8 +2,11 @@ package network
 
 import (
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -151,4 +154,80 @@ func IPv6ReachableURL(port int) string {
 		return ""
 	}
 	return fmt.Sprintf("http://[%s]:%d", ip, port)
+}
+
+// OutboundIPv6Address returns the current outbound IPv6 address of the
+// host by querying an external echo service (ident.me, with api64.ipify.org
+// as fallback). ident.me responds with the raw IP as plain text.
+//
+// If the NAS_IPV6_ADDRESS environment variable is set, it is returned
+// directly without any network probe. This short-circuit mirrors
+// CheckIPv6(): the home-api container runs on a docker bridge without
+// an IPv6 subnet, so an in-container HTTP probe to ident.me would
+// always time out. The env var is the authoritative source in the
+// deployment and is the path that actually takes effect.
+//
+// 3s timeout per request. Returns "" on failure — never panics, never
+// blocks the caller.
+func OutboundIPv6Address() string {
+	if envAddr := os.Getenv("NAS_IPV6_ADDRESS"); envAddr != "" {
+		if ip := net.ParseIP(envAddr); ip != nil && ip.To4() == nil {
+			return envAddr
+		}
+	}
+
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, url := range []string{"https://ident.me", "https://api64.ipify.org"} {
+		resp, err := client.Get(url)
+		if err != nil {
+			continue
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+		resp.Body.Close()
+		if err != nil {
+			continue
+		}
+		addr := strings.TrimSpace(string(body))
+		if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
+			return addr
+		}
+	}
+	return ""
+}
+
+// IPv6PrefixMatches reports whether two IPv6 addresses share the same
+// /64 prefix. This is used by the PrefixWatcher to detect ISP DHCPv6-PD
+// prefix rotations: the host's interface ID (lower 64 bits) stays
+// stable across rotations, but the network prefix (upper 64 bits)
+// changes.
+//
+// Returns false if either address fails to parse as IPv6.
+func IPv6PrefixMatches(addr1, addr2 string) bool {
+	ip1 := net.ParseIP(addr1)
+	ip2 := net.ParseIP(addr2)
+	if ip1 == nil || ip2 == nil {
+		return false
+	}
+	b1 := ip1.To16()
+	b2 := ip2.To16()
+	if b1 == nil || b2 == nil {
+		return false
+	}
+	// Compare the first 8 bytes (64 bits) — the /64 network prefix.
+	for i := 0; i < 8; i++ {
+		if b1[i] != b2[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// OutboundIPv6Status is the cached result of the outbound IPv6 address
+// probe. The PrefixWatcher populates this on each check cycle and the
+// /api/v1/network/ipv6 endpoint serves it to the mobile app.
+type OutboundIPv6Status struct {
+	OutboundAddress   string    `json:"outbound_address"`
+	ConfiguredAddress string    `json:"configured_address"`
+	PrefixRotated     bool      `json:"prefix_rotated"`
+	LastChecked       time.Time `json:"last_checked"`
 }

@@ -89,6 +89,15 @@ func main() {
 	}
 	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
 	frigate := camera.NewFrigateClient(cfg.Frigate.BaseURL, cfg.Go2RTC.BaseURL)
+
+	// PrefixWatcher probes the outbound IPv6 address every 5 minutes and
+	// auto-detects ISP DHCPv6-PD prefix rotations. On rotation it publishes
+	// an event and pushes updated go2rtc webrtc.candidates to Frigate so
+	// IPv6 direct-mode WebRTC keeps working without manual intervention.
+	prefixWatcher := network.NewPrefixWatcher(bus, frigate)
+	prefixWatcher.Start()
+	defer prefixWatcher.Stop()
+
 	camONVIF := camera.NewONVIFController()
 	camReg := camera.NewRegistry(database.DB, go2, frigate, box, camONVIF, cfg.Camera.WebRTCPublicBase)
 
@@ -215,7 +224,7 @@ func main() {
 		time.Duration(cfg.Network.CheckIntervalSeconds)*time.Second)
 	netService.StartBackground(context.Background())
 	peerRegistry := network.NewPeerRegistry()
-	netHandler := handler.NewNetworkHandler(netService, peerRegistry)
+	netHandler := handler.NewNetworkHandler(netService, peerRegistry, prefixWatcher)
 
 	api := r.Group("/api/v1")
 	{
@@ -397,6 +406,7 @@ func main() {
 		netGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
 			netGroup.GET("/status", netHandler.Status)
+			netGroup.GET("/ipv6", netHandler.GetIPv6Status)
 			// P2P signaling endpoints.
 			netGroup.POST("/p2p/register", netHandler.RegisterP2P)
 			netGroup.DELETE("/p2p/register", netHandler.UnregisterP2P)

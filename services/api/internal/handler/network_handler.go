@@ -2,7 +2,9 @@ package handler
 
 import (
 	"net"
+	"os"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -12,13 +14,16 @@ import (
 
 // NetworkHandler exposes the network capability detection API.
 type NetworkHandler struct {
-	svc    *network.Service
-	peers  *network.PeerRegistry
+	svc     *network.Service
+	peers   *network.PeerRegistry
+	watcher *network.PrefixWatcher
 }
 
 // NewNetworkHandler creates a handler for network status and P2P signaling.
-func NewNetworkHandler(svc *network.Service, peers *network.PeerRegistry) *NetworkHandler {
-	return &NetworkHandler{svc: svc, peers: peers}
+// The watcher may be nil — in that case GetIPv6Status falls back to an
+// on-the-fly probe instead of using the cached watcher state.
+func NewNetworkHandler(svc *network.Service, peers *network.PeerRegistry, watcher *network.PrefixWatcher) *NetworkHandler {
+	return &NetworkHandler{svc: svc, peers: peers, watcher: watcher}
 }
 
 // Status returns the network capability report.
@@ -37,6 +42,38 @@ func (h *NetworkHandler) Status(c *gin.Context) {
 		status = h.svc.Refresh()
 	} else {
 		status = h.svc.Status()
+	}
+	utils.Success(c, status)
+}
+
+// GetIPv6Status returns the outbound IPv6 address and whether the ISP
+// has rotated the /64 prefix since the configured address was set.
+//
+//	Route: GET /api/v1/network/ipv6
+//
+// Pass ?refresh=true to force a fresh probe (skips the watcher's cache).
+// This is useful when the operator has just updated NAS_IPV6_ADDRESS
+// and wants to verify the new value takes effect immediately.
+func (h *NetworkHandler) GetIPv6Status(c *gin.Context) {
+	if h.watcher != nil {
+		var status network.OutboundIPv6Status
+		if c.Query("refresh") == "true" {
+			status = h.watcher.Refresh()
+		} else {
+			status = h.watcher.Status()
+		}
+		utils.Success(c, status)
+		return
+	}
+
+	// Watcher not wired up — compute on the fly.
+	outbound := network.OutboundIPv6Address()
+	configured := os.Getenv("NAS_IPV6_ADDRESS")
+	status := network.OutboundIPv6Status{
+		OutboundAddress:   outbound,
+		ConfiguredAddress: configured,
+		PrefixRotated:     !network.IPv6PrefixMatches(outbound, configured),
+		LastChecked:       time.Now(),
 	}
 	utils.Success(c, status)
 }

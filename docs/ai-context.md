@@ -573,6 +573,36 @@ Chrome/Edge/Firefox. This is a protocol-level limitation, not a bug.
   `docker compose up -d --force-recreate frigate` — the API
   restart flag is only reliable for adding/removing cameras.
 
+## Phase 10 (v1.8.4): IPv6 Prefix Rotation Auto-Adaptation
+
+### Problem
+ISP (China Mobile) rotates the IPv6 prefix via DHCPv6-PD, breaking
+the hardcoded IPv6 direct-connection address. Mobile devices experience
+~1000ms latency (expected ~50ms) due to asymmetric routing through
+the stale prefix.
+
+### Solution
+- **Backend**: `OutboundIPv6Address()` function + `PrefixWatcher`
+  goroutine + `GET /api/v1/network/ipv6` endpoint. Detects prefix
+  rotation every 5 minutes, auto-updates go2rtc webrtc.candidates,
+  publishes EventBus event.
+- **Android**: `BaseUrlResolver.fetchDynamicIpv6Url()` fetches the
+  current NAS outbound IPv6 address from the backend, falls back to
+  the hardcoded default on failure.
+- **NAS**: Stable SLAAC EUI-64 address persisted via systemd service
+  (with `accept_dad=0` to avoid kernel DAD removing the address).
+
+### Files Changed
+- `services/api/internal/network/ipv6.go` — outbound probe + prefix comparison
+- `services/api/internal/network/watcher.go` — periodic prefix rotation watcher
+- `services/api/internal/handler/network_handler.go` — /api/v1/network/ipv6 endpoint
+- `services/api/internal/camera/frigate.go` — SetWebRTCCandidates method
+- `services/api/cmd/main.go` — wire up watcher + new route
+- `deploy/frigate/config.yml` — updated IPv6 candidate to new prefix
+- `compose.yaml` — updated NAS_IPV6_ADDRESS default to new prefix
+- `Android/.../BaseUrlResolver.kt` — dynamic IPv6 URL fetch
+- `Android/.../AppContainer.kt` — wire up tokenProvider for fetchDynamicIpv6Url
+
 **Next Items (Optional):**
 
 - PostgreSQL migration
@@ -823,4 +853,4 @@ app (see `APP_VS_DASHBOARD_FEATURES.md`). Key additions:
 
 ---
 
-**Last Updated:** 2026-07-21 (v1.8.0 UI refinements: theme-aware color migration across 9 files, LiveVideo header kebab menu, live/playback player merge via React Portal, RecordingTimeline fisheye removal + event ribbon, useCachedFetch hook for dashboard widgets)
+**Last Updated:** 2026-07-22 (v1.8.4 IPv6 prefix rotation auto-adaptation: OutboundIPv6Address + PrefixWatcher + /api/v1/network/ipv6 endpoint + Android fetchDynamicIpv6Url. See Phase 10 above and `docs/ipv6-prefix-rotation.md`.)
