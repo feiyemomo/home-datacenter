@@ -289,4 +289,74 @@ After deployment (Task 5 of the spec):
 
 ---
 
-**Version:** v1.8.5 / v1.6.28 (2026-07-22)
+## 7. v1.6.29 Fix: Latency Display Not Reflecting Warmup
+
+### Problem
+
+After v1.6.28, the Dashboard network quality card still displayed
+~500ms even though the warmup connection was being established.
+The card reads `lastRttMs`, which is written by `probeSync()`'s
+probe call. Because `warmupConnection()` was invoked **after** the
+probe in `probeSync()`, the probe still measured the full
+handshake + HTTP roundtrip (~500ms) and stored that value to
+`lastRttMs` before the warmup had a chance to pre-establish the
+TCP connection. The warmup did help subsequent API calls (they
+reused the warm connection and paid only ~250ms), but the value
+on the card was already locked to the probe's ~500ms reading and
+was never refreshed by those faster calls.
+
+### Root Cause
+
+Two compounding issues:
+
+1. **Warmup call order** — In `probeSync()`, the sequence was
+   `probe → write lastRttMs → warmupConnection()`. The probe
+   therefore always measured the cold path (handshake + HTTP)
+   and wrote ~500ms to the display. The warmup that followed
+   only benefited calls issued after the probe.
+2. **ConnectionPool keep-alive == probe TTL** — Both the OkHttp
+   `ConnectionPool` keep-alive and the probe interval were
+   5 minutes. By the time the next probe ran, the warm
+   connection in the pool had just expired, so the probe again
+   hit the cold path and re-wrote ~500ms to the card.
+
+### Fix
+
+Three coordinated changes (Android v1.6.29):
+
+1. **`updateRttFromApiCall(rtt)`** — New method on
+   `BaseUrlResolver` that lets real API calls write back their
+   measured RTT to `lastRttMs`. The update is **monotonic**:
+   `lastRttMs` is only replaced when the new RTT is **lower**
+   than the current value, so transient jitter or a slow call
+   cannot degrade the displayed number. `loadSystemStatus()`
+   (polled every 5 seconds by `DashboardFragment`) measures the
+   API call duration and calls `updateRttFromApiCall()`, so the
+   card reflects the steady-state RTT of a reused connection
+   rather than the probe's one-shot cold measurement.
+2. **Warmup before probe** — `probeSync()` now calls
+   `warmupConnection(resolved)` at the **start**, before
+   probing. The probe then reuses the warmed connection and
+   itself measures ~250ms instead of ~500ms, so even the
+   probe's own `lastRttMs` write reflects the warm path.
+3. **keep-alive 5 min → 10 min** — `ConnectionPool` keep-alive
+   in `NetworkFactory.kt` extended from 5 minutes to
+   10 minutes (`ConnectionPool(5, 10, TimeUnit.MINUTES)`). This
+   exceeds the 5-minute probe TTL, so the next probe still
+   finds a warm connection in the pool and does not fall back
+   to the cold handshake path.
+
+### Expected Effect
+
+The Dashboard network quality card drops from ~500ms to ~250ms
+**within 5 seconds of app launch**: the first `loadSystemStatus()`
+poll (5 s interval) reuses the warm connection established during
+`probeSync()` and writes the ~250ms steady-state RTT back to
+`lastRttMs` via `updateRttFromApiCall()`. Subsequent polls
+reinforce the same value. The probe itself also reports ~250ms
+after the warmup-before-probe reorder, so there is no longer a
+~500ms "stale" reading on the card at any point.
+
+---
+
+**Version:** v1.8.5 / v1.6.28 (2026-07-22); v1.8.6 / v1.6.29 fix (2026-07-22)

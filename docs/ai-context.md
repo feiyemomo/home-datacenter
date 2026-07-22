@@ -662,6 +662,45 @@ the 5-min pool TTL drop from ~500ms to ~250ms each (one RTT saved per
 reused connection). LAN path (~7ms) sees <1ms change — sub-millisecond
 and not user-perceptible.
 
+### v1.6.29 Fix: Latency Display
+
+The v1.8.5 / v1.6.28 optimization cut the actual API RTT to ~250ms,
+but the Dashboard network quality card still showed ~500ms because
+`lastRttMs` was written by the probe in `probeSync()` and the probe
+ran **before** `warmupConnection()` — so the probe measured the full
+cold handshake + HTTP roundtrip and locked the display to that value.
+The warmup only helped later API calls, which never wrote their RTT
+back to the display. A second contributing factor was that the
+`ConnectionPool` keep-alive (5 min) equaled the probe TTL (5 min),
+so the next probe always found an expired connection and re-measured
+the cold path.
+
+Three coordinated fixes ship in Android v1.6.29:
+
+1. **`updateRttFromApiCall(rtt)`** — New `BaseUrlResolver` method
+   that lets real API calls write their measured RTT back to
+   `lastRttMs`. Monotonic: only updates when the new RTT is lower,
+   so jitter cannot degrade the displayed value. `loadSystemStatus()`
+   (polled every 5 s by `DashboardFragment`) calls it, so the card
+   reflects steady-state reused-connection RTT instead of the
+   probe's one-shot cold measurement.
+2. **Warmup before probe** — `probeSync()` now calls
+   `warmupConnection(resolved)` at the start, before probing. The
+   probe reuses the warm connection and itself measures ~250ms.
+3. **keep-alive 5 min → 10 min** — `ConnectionPool(5, 10, TimeUnit.MINUTES)`
+   in `NetworkFactory.kt` now exceeds the 5-min probe TTL, so the
+   next probe still finds a warm connection in the pool.
+
+**Expected effect**: the card drops from ~500ms to ~250ms within
+5 seconds of app launch (first `loadSystemStatus()` poll reuses the
+warm connection and writes back ~250ms via `updateRttFromApiCall()`).
+
+Files changed (Android only):
+- `app/build.gradle.kts` — versionCode 71 → 72, versionName "1.6.28" → "1.6.29"
+- `app/src/main/java/com/homedatacenter/app/data/api/NetworkFactory.kt` — `ConnectionPool(5, 10, TimeUnit.MINUTES)`
+- `app/src/main/java/com/homedatacenter/app/util/BaseUrlResolver.kt` — `updateRttFromApiCall()` + warmup-before-probe reorder in `probeSync()`
+- `app/src/main/java/com/homedatacenter/app/ui/dashboard/DashboardFragment.kt` — `loadSystemStatus()` measures RTT and calls `updateRttFromApiCall()`
+
 ---
 
 ## Developer Workflow
@@ -903,4 +942,4 @@ app (see `APP_VS_DASHBOARD_FEATURES.md`). Key additions:
 
 ---
 
-**Last Updated:** 2026-07-22 (v1.8.5 IPv6 direct latency optimization: nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection, docker IPv6 skipped. See Phase 11 above and `docs/ipv6-latency-optimization.md`. Earlier: v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
+**Last Updated:** 2026-07-22 (v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse — added `updateRttFromApiCall()` for real-API RTT writeback, moved warmup before probe in `probeSync()`, extended ConnectionPool keep-alive 5→10 min. See the "v1.6.29 Fix: Latency Display" subsection under Phase 11 and `docs/ipv6-latency-optimization.md` §7. Earlier: v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection, docker IPv6 skipped. See Phase 11 above and `docs/ipv6-latency-optimization.md`. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
