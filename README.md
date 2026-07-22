@@ -582,6 +582,14 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.6 — IPv6 直连延迟显示修复 (2026-07-22)
+
+### 修复
+- Dashboard 网络质量卡片显示值从 ~500ms（含 TCP 握手）降到 ~250ms（稳态连接复用）
+- 根因：v1.6.28 的 `warmupConnection()` 在 probe 之后调用，probe RTT 含握手但被直接显示；warmup 只让后续 API 调用变快但未反映到卡片
+- 修复：新增 `updateRttFromApiCall()` 让真实 API 调用 RTT 写回显示值；`probeSync()` 在 probe 前先 warmup 当前 resolved URL；ConnectionPool keep-alive 从 5 分钟延长到 10 分钟（超过 5 分钟 probe TTL）
+- Android v1.6.29（versionCode 72）
+
 ### v1.8.5 — IPv6 直连延迟优化 (2026-07-22)
 
 ### 优化
