@@ -1,0 +1,21 @@
+- [ ] `PROMPT.md` exists at project root and contains: production SSH credentials (fnos-momo@192.168.31.234, password @Fnos324), deploy script path (`D:\Projects\home-datacenter\deploy-nas.ps1`), dashboard test credentials (user id=1, access-key ebc94f7fe99b497a9bdec7bd45add929360e4386be3cad96a8b3922d1d680a05), and the standard workflow steps
+- [ ] `PROMPT.md` references `README.md`, `docs/ai-context.md`, and `docs/api-documentation.md` as the first files to read
+- [ ] `LiveVideo.tsx` `isRemoteAccess()` returns `false` for IPv6-literal hostnames (e.g. `[2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09]`)
+- [ ] `LiveVideo.tsx` `readTransport()` returns `"auto"` (not `"hls"`) when accessed via IPv6 literal
+- [ ] `Dashboard.tsx` quality rating evaluates `clientIPv6 === false` BEFORE the generic `apiPath === "remote"` clamp
+- [ ] `Dashboard.tsx` shows `currentQuality = 3` and `bestQuality = 3` when on relay + server has IPv6 + client lacks IPv6
+- [ ] `Dashboard.tsx` shows `currentQuality = 3` and `bestQuality = 5` when on relay + server has IPv6 + client has IPv6
+- [ ] `Network.tsx` renders a "切换到 IPv6 直连" link when user is on relay + server IPv6 reachable + client IPv6 available
+- [ ] `Network.tsx` link opens `http://[<ipv6>]:8088/` in a new tab with `rel="noopener noreferrer"`
+- [ ] `Network.tsx` preserves "不适用" badge when upgrade conditions not met
+- [ ] `Dashboard.tsx` first network status fetch includes `?refresh=true`
+- [ ] `Dashboard.tsx` subsequent polling refreshes do NOT include `?refresh=true`
+- [ ] `docs/ai-context.md` has a new Phase entry documenting the four fixes
+- [ ] `README.md` has a new changelog entry (v1.8.7) describing the fixes
+- [ ] Production deployment via `deploy-nas.ps1 -Password '@Fnos324'` completes successfully
+- [ ] chrome-devtools verification on LAN path (http://192.168.31.234/) shows Dashboard network card with "局域网" + 5 stars
+- [ ] chrome-devtools verification on relay path (http://dashboard.feiyemomo.top/) shows "远程" + upgrade hint
+- [ ] chrome-devtools verification of LiveVideo transport selector switches without console errors
+- [ ] Browser console shows no errors during all verification steps
+- [ ] Git commit includes all changed files with a descriptive conventional commit message
+- [ ] Git push to remote completes successfully

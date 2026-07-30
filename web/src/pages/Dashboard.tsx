@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
     Activity,
@@ -310,6 +310,13 @@ export default function Dashboard() {
     // WebSocket for real-time alerts
     const ws = useWebSocket(true);
 
+    // Force a fresh backend network detection on the first load only.
+    // The backend caches network status for 60s; without this, the
+    // displayed quality rating may be up to 60s stale on initial load.
+    // Subsequent polling refreshes use the cached backend response to
+    // avoid hammering STUN servers.
+    const forceRefreshRef = useRef(true);
+
     // System + network status: cached fetch with 5s silent background
     // refresh. The cache lets us paint the last-known values instantly
     // when the dashboard remounts (e.g. navigating back from another
@@ -320,7 +327,11 @@ export default function Dashboard() {
         error: statusError,
     } = useCachedFetch<[SystemStatus, NetworkStatus]>(
         "home.dashboard.status",
-        () => Promise.all([getSystemStatus(), getNetworkStatus()]),
+        () => {
+            const refresh = forceRefreshRef.current;
+            forceRefreshRef.current = false;
+            return Promise.all([getSystemStatus(), getNetworkStatus(refresh)]);
+        },
         { refetchMs: 5000 },
     );
     const status = statusData?.[0] ?? null;
@@ -569,10 +580,13 @@ export default function Dashboard() {
                             // - Client lacks IPv6 while server is IPv6-only: downgrade to 3
                             const currentQuality = (() => {
                                 if (apiPath === "lan" || apiPath === "ipv6") return 5;
+                                // Client cannot use IPv6 direct even though server supports it —
+                                // cap at 3 (relay quality) regardless of apiPath. This must be
+                                // evaluated BEFORE the generic remote clamp so the downgrade is
+                                // explicit and survives future refactors.
+                                if (netStatus.strategy === "ipv6_direct" && clientIPv6 === false) return 3;
                                 // On relay — actual experience is relay quality (3)
                                 if (apiPath === "remote") return Math.min(netStatus.quality, 3);
-                                // Client cannot use IPv6 direct even though server supports it
-                                if (netStatus.strategy === "ipv6_direct" && clientIPv6 === false) return 3;
                                 return netStatus.quality;
                             })();
                             // Best possible quality (for upgrade hint)

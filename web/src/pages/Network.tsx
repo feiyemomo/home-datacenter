@@ -27,6 +27,22 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 
 /**
+ * Detect whether the current page was loaded via the relay path
+ * (Cloudflare Tunnel) rather than a direct LAN or IPv6 connection.
+ * Mirrors Dashboard.tsx's detectApiPath() logic.
+ */
+function isOnRelay(): boolean {
+    if (typeof window === "undefined") return false;
+    const h = window.location.hostname;
+    if (h === "localhost" || h === "127.0.0.1") return false;
+    if (h.startsWith("192.168.") || h.startsWith("10.")) return false;
+    if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return false;
+    // IPv6 literal — direct connection, not relay
+    if (/^\[[0-9a-f:]+\]$/i.test(h)) return false;
+    return true;
+}
+
+/**
  * Network page: displays the server's network capability report.
  *
  * Shows IPv6 availability, NAT type, P2P feasibility, relay status,
@@ -82,6 +98,11 @@ export default function Network() {
     // IPv6 direct is possible only if BOTH server and client have IPv6.
     const ipv6DirectPossible =
         status?.ipv6?.reachable === true && clientIPv6 === true;
+
+    // Whether to show the clickable "switch to IPv6 direct" link.
+    // Requires: user is on relay, server has IPv6, client has IPv6.
+    const canSwitchToIPv6Direct =
+        isOnRelay() && ipv6DirectPossible && status?.ipv6?.address != null;
 
     return (
         <div className="animate-fade-in space-y-6">
@@ -191,6 +212,16 @@ export default function Network() {
                                                 : "通过 STUN 后台 UDP 打洞 — 建立则切换"
                                             : "服务器无 IPv6 或 P2P 能力 — 中继是唯一路径"}
                                     </p>
+                                    {canSwitchToIPv6Direct && (
+                                        <a
+                                            href={`http://[${status.ipv6?.address}]:8088/`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="mt-1.5 inline-flex items-center gap-1 text-xs font-medium text-[rgb(var(--accent-info))] hover:underline"
+                                        >
+                                            切换到 IPv6 直连 →
+                                        </a>
+                                    )}
                                 </div>
                                 {hasUpgrade ? (
                                     <Badge variant="info">
