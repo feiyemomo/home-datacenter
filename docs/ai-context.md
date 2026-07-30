@@ -942,4 +942,76 @@ app (see `APP_VS_DASHBOARD_FEATURES.md`). Key additions:
 
 ---
 
-**Last Updated:** 2026-07-22 (v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse — added `updateRttFromApiCall()` for real-API RTT writeback, moved warmup before probe in `probeSync()`, extended ConnectionPool keep-alive 5→10 min. See the "v1.6.29 Fix: Latency Display" subsection under Phase 11 and `docs/ipv6-latency-optimization.md` §7. Earlier: v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection, docker IPv6 skipped. See Phase 11 above and `docs/ipv6-latency-optimization.md`. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
+## Phase 12 (v1.8.7): Network Policy Review & Frontend IPv6/UX Fixes
+
+### Problem
+Code review of the dashboard's network scheduling policy ("Relay First,
+Then Upgrade") surfaced four issues that degrade the IPv6-direct and
+WebRTC experience on the web frontend:
+
+1. **`LiveVideo.tsx` `isRemoteAccess()` did not detect IPv6 literals** —
+   accessing the dashboard via `http://[2409:8a70:...]:8088/` was
+   classified as "remote", defaulting the live transport to HLS. This
+   blocked WebRTC on the highest-quality direct path, contradicting
+   `Dashboard.tsx`'s `detectApiPath()` which already classified IPv6
+   literals as a direct path.
+2. **`Dashboard.tsx` quality rating had an unreachable branch** — the
+   `clientIPv6 === false` downgrade was evaluated AFTER `apiPath ===
+   "remote"` had already returned, so the "server has IPv6 but client
+   doesn't → cap at 3 stars" intent was dead code.
+3. **`Network.tsx` described an upgrade action but offered no way to
+   trigger it** — the "Relay First, Then Upgrade" card showed an "升级"
+   badge but no clickable control to actually switch to the IPv6 direct
+   URL. The web frontend had no equivalent of Android's `BaseUrlResolver`
+   path-switching mechanism.
+4. **Dashboard initial load showed stale network status** — the backend
+   caches network detection for 60s, but the Dashboard's first fetch
+   did not pass `?refresh=true`, so the displayed quality rating could
+   be up to 60s stale on initial page load.
+
+### Solution
+- **`LiveVideo.tsx`**: Added IPv6-literal regex (`/^\[[0-9a-f:]+\]$/i`)
+  to `isRemoteAccess()`, returning `false` for bracketed IPv6 hostnames.
+  Now `readTransport()` defaults to `"auto"` (WebRTC first) on IPv6
+  direct access, matching LAN behavior.
+- **`Dashboard.tsx`**: Reordered the `currentQuality` IIFE so the
+  `clientIPv6 === false` check is evaluated BEFORE the generic
+  `apiPath === "remote"` clamp. The downgrade is now explicit and
+  survives future refactors.
+- **`Network.tsx`**: Added `isOnRelay()` helper and `canSwitchToIPv6Direct`
+  computed variable. When the user is on relay AND both server and client
+  have IPv6, a "切换到 IPv6 直连 →" link renders below the Step 2
+  description, opening `http://[<ipv6>]:8088/` in a new tab.
+- **`Dashboard.tsx`**: Added `forceRefreshRef = useRef(true)` flag. The
+  first `useCachedFetch` fetcher call passes `refresh=true` to
+  `getNetworkStatus()`, bypassing the backend cache. Subsequent 5s
+  polling refreshes use the cached backend response (no `?refresh=true`)
+  to avoid hammering STUN servers.
+
+### Files Changed
+- `PROMPT.md` (new) — reusable project prompt with production env access,
+  deploy script, test credentials, and standard workflow
+- `web/src/components/LiveVideo.tsx` — `isRemoteAccess()` IPv6 detection
+- `web/src/pages/Dashboard.tsx` — quality rating reorder + initial-load
+  freshness fix (`useRef` flag + `getNetworkStatus(refresh)`)
+- `web/src/pages/Network.tsx` — `isOnRelay()` helper + `canSwitchToIPv6Direct`
+  + clickable "切换到 IPv6 直连" link
+- `docs/ai-context.md` — Phase 12 section (this section)
+- `README.md` — v1.8.7 changelog entry
+
+### Expected Effect
+- IPv6 direct access now attempts WebRTC first (was HLS), matching the
+  behavior on LAN. WebRTC's lower latency (~200ms vs HLS's ~5-10s
+  buffering) is now achievable on the IPv6 direct path.
+- Dashboard quality rating correctly caps at 3 stars when the client
+  lacks IPv6 but the server has it, making the "no upgrade available"
+  state visually clear.
+- Network page's "Relay First, Then Upgrade" model is now actionable —
+  users on relay with IPv6 capability can click to switch to the direct
+  path, instead of having to manually construct the IPv6 URL.
+- Dashboard's initial network quality display reflects current state
+  instead of up to 60s of backend cache staleness.
+
+---
+
+**Last Updated:** 2026-07-30 (v1.8.7: Network policy review — fixed LiveVideo IPv6-literal classification, Dashboard quality rating unreachable branch, Network page upgrade action, and initial-load freshness. See Phase 12 above. Earlier: v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse. v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)

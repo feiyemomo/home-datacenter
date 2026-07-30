@@ -582,6 +582,21 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.7 — 网络策略审查与前端 IPv6/UX 修复 (2026-07-30)
+
+### 修复
+- **LiveVideo IPv6 直连分类**：`isRemoteAccess()` 新增 IPv6 字面量检测（`/^\[[0-9a-f:]+\]$/i`），IPv6 直连地址不再被分类为"远程"，默认传输方式从 HLS 改为 auto（WebRTC 优先）。根因：`Dashboard.tsx` 的 `detectApiPath()` 已识别 IPv6 字面量为直连路径，但 `LiveVideo.tsx` 的 `isRemoteAccess()` 未同步，导致 IPv6 直连时 WebRTC 被阻塞。
+- **Dashboard 质量评分不可达分支**：`currentQuality` IIFE 中 `clientIPv6 === false` 检查原位于 `apiPath === "remote"` 返回之后，永远不会执行。重排序使客户端无 IPv6 的降级逻辑在通用远程钳制之前评估。
+- **Network 页面升级动作缺失**："中继优先，然后升级"卡片描述了升级动作但无实际触发方式。新增 `isOnRelay()` 辅助函数和 `canSwitchToIPv6Direct` 计算变量，当用户在中继路径且双方均有 IPv6 时，渲染"切换到 IPv6 直连 →"链接，点击在新标签页打开 `http://[<ipv6>]:8088/`。
+- **Dashboard 初始加载网络状态陈旧**：后端缓存网络检测结果 60s，但 Dashboard 首次获取未传 `?refresh=true`，导致初始显示可能滞后 60s。新增 `forceRefreshRef = useRef(true)` 标志，首次调用传 `refresh=true` 强制后端刷新，后续 5s 轮询使用缓存避免 STUN 服务器压力。
+
+### 新增
+- `PROMPT.md`（项目根目录）— 可复用提示词，编码生产环境 SSH 凭证、部署脚本路径、Dashboard 测试账号、标准工作流，新会话无需重复收集
+
+### 文档
+- 新增 `docs/ai-context.md` Phase 12 章节
+- 更新 `README.md` 更新日志
+
 ### v1.8.6 — IPv6 直连延迟显示修复 (2026-07-22)
 
 ### 修复
