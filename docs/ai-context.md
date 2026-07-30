@@ -1063,4 +1063,59 @@ script would be the long-term fix.
 
 ---
 
-**Last Updated:** 2026-07-30 (v1.8.7: Network policy review — fixed LiveVideo IPv6-literal classification, Dashboard quality rating unreachable branch, Network page upgrade action, and initial-load freshness. See Phase 12 above. Earlier: v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse. v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
+## Phase 14 (v1.8.9): Android Network Policy Sync
+
+### Problem
+v1.8.7 fixed the web dashboard's network policy issues (LiveVideo IPv6-literal
+classification, Dashboard quality rating unreachable branch, Network page
+upgrade action, and initial-load freshness), and v1.8.8 verified the IPv6
+direct path end-to-end. The Android client (`D:\Projects\Android`) had the
+same two issues but was not yet synced:
+
+1. **`BaseUrlResolver.kt` `IPV6_DIRECT_URL` stale fallback constant** — the
+   hardcoded IPv6 address used as a fallback when dynamic fetch fails
+   (pre-login or backend unreachable) still pointed to the old ISP prefix
+   `2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09`. After the ISP rotated the
+   /64 prefix to `2409:8a70:37a4:9141::/64` (the same rotation that
+   v1.8.8 fixed in `compose.yaml`), the Android fallback pointed to a dead
+   endpoint. Dynamic fetch normally masks this, but when the backend is
+   unreachable the resolver falls back to the constant, causing probe
+   failures that force fallback to the slow Cloudflare Tunnel.
+
+2. **`DashboardFragment.loadNetworkStatus()` first-fetch cache staleness** —
+   the first network status fetch after fragment creation did not pass
+   `refresh=true`, so the Dashboard displayed up to 60s of stale backend
+   cache on initial load. The web dashboard was fixed in v1.8.7
+   (`forceRefreshRef`), but the Android client still used the cached path.
+
+### Solution
+- **`BaseUrlResolver.kt`**: Updated `IPV6_DIRECT_URL` constant from
+  `2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09` to
+  `2409:8a70:37a4:9141:62be:b4ff:fe08:bd09`, matching `compose.yaml`'s
+  `NAS_IPV6_ADDRESS` default.
+- **`DashboardFragment.kt`**: Added `@Volatile private var firstNetworkFetchDone = false`
+  flag. `loadNetworkStatus()` now passes `refresh = !firstNetworkFetchDone`
+  and sets the flag to `true` after the first call. Subsequent `onResume`
+  calls use the backend cache (60s TTL is fresh enough for page re-entry).
+  `onDestroyView()` resets the flag so fragment recreation re-forces the
+  refresh.
+- **`app/build.gradle.kts`**: versionCode 72 → 73, versionName "1.6.29" → "1.6.30".
+- **`release-notes-v1.6.30.txt`** (new): Documents both fixes for users.
+
+### Files Changed (Android repo)
+- `app/build.gradle.kts` — version bump
+- `app/src/main/java/com/homedatacenter/app/util/BaseUrlResolver.kt` — `IPV6_DIRECT_URL` constant
+- `app/src/main/java/com/homedatacenter/app/ui/dashboard/DashboardFragment.kt` — `firstNetworkFetchDone` flag
+- `release-notes-v1.6.30.txt` — new release notes
+
+### Parity Check
+This phase brings the Android client to feature parity with the web
+dashboard's v1.8.7 network-policy fixes. Both clients now:
+- Use the current ISP prefix for the IPv6 fallback (web: `compose.yaml`
+  env var; Android: `IPV6_DIRECT_URL` constant)
+- Force `refresh=true` on the first network status fetch after view
+  creation, then use cache for subsequent re-entries
+
+---
+
+**Last Updated:** 2026-07-30 (v1.8.9: Android network policy sync — updated `BaseUrlResolver.IPV6_DIRECT_URL` to current ISP prefix and added `firstNetworkFetchDone` flag to `DashboardFragment` to force refresh on first fetch. See Phase 14 above. Earlier: v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review — fixed LiveVideo IPv6-literal classification, Dashboard quality rating unreachable branch, Network page upgrade action, and initial-load freshness. See Phase 12 above. v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse. v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
