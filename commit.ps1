@@ -106,12 +106,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # --- Step 6: Push ---
+# Try with default config (may include a proxy). If it fails, retry without
+# proxy in case the configured proxy cannot reach the remote (e.g. GitHub).
 
 Write-Step "==> Step 6/6: Pushing (git push)"
 & git push
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "ERROR: 'git push' failed."
-    exit 1
+$pushExitCode = $LASTEXITCODE
+if ($pushExitCode -ne 0) {
+    Write-Warn "WARNING: 'git push' failed (exit code $pushExitCode), possibly due to an unreachable proxy. Retrying without proxy..."
+    & git -c http.proxy= -c https.proxy= push
+    $retryExitCode = $LASTEXITCODE
+    if ($retryExitCode -ne 0) {
+        Write-Err "ERROR: 'git push' failed even without proxy (exit code $retryExitCode)."
+        exit 1
+    }
+    Write-Ok "Pushed via direct connection (no proxy)."
 }
 
 # --- Confirmation ---
