@@ -56,8 +56,9 @@ const TRANSPORT_KEY = "home.transport";
  * through double CGNAT (Symmetric NAT on both home and mobile).
  *
  * LAN hostnames: localhost, 127.0.0.1, 192.168.x.x, 10.x.x.x,
- * 172.16-31.x.x, and IPv6 literals ([2001:db8::1]). Everything else
- * (e.g. api.feiyemomo.top) is considered remote.
+ * 172.16-31.x.x, IPv6 literals ([2001:db8::1]), and the NAS DDNS
+ * domain (nas.feiyemomo.top — pure-AAAA, IPv6 direct). Everything
+ * else (e.g. api.feiyemomo.top) is considered remote.
  */
 function isRemoteAccess(): boolean {
     if (typeof window === "undefined") return false;
@@ -65,6 +66,9 @@ function isRemoteAccess(): boolean {
     if (h === "localhost" || h === "127.0.0.1") return false;
     if (h.startsWith("192.168.") || h.startsWith("10.")) return false;
     if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return false;
+    // DDNS domain (nas.feiyemomo.top) — pure-AAAA record, so access
+    // via this hostname is an IPv6 direct connection, not a relay.
+    if (h === "nas.feiyemomo.top") return false;
     // IPv6 literal (e.g. [2001:db8::1] or [::1]) — direct connection,
     // not relay. Aligns with Dashboard.tsx detectApiPath() which
     // classifies IPv6 literals as a direct path. Without this, IPv6

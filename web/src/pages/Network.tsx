@@ -214,7 +214,7 @@ export default function Network() {
                                     </p>
                                     {canSwitchToIPv6Direct && (
                                         <a
-                                            href={`http://[${status.ipv6?.address}]:8088/`}
+                                            href="http://nas.feiyemomo.top:8088/"
                                             target="_blank"
                                             rel="noopener noreferrer"
                                             className="mt-1.5 inline-flex items-center gap-1 text-xs font-medium text-[rgb(var(--accent-info))] hover:underline"
