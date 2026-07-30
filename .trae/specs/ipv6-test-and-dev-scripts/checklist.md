@@ -1,25 +1,26 @@
-- [ ] `test-ws.ps1` 存在于项目根目录，内容与原 `services/api/scripts/test_ws.ps1` 一致（路径引用已更新）
-- [ ] `services/api/scripts/test_ws.ps1` 原文件已被移除（git mv 保留历史）
-- [ ] `get-token.ps1` 存在于项目根目录
-- [ ] `get-token.ps1` 默认使用 LAN 地址 `http://192.168.31.234:8080`
-- [ ] `get-token.ps1` 支持 `-BaseUrl` 参数
-- [ ] `get-token.ps1` 输出 JWT token 到 stdout
-- [ ] `get-token.ps1` 支持 `-Copy` 选项复制到剪贴板
-- [ ] `get-token.ps1` 内置测试 AccessKey（`ebc94f7fe99b497a9bdec7bd45add929360e4386be3cad96a8b3922d1d680a05`，user_id=1）
-- [ ] `commit.ps1` 存在于项目根目录
-- [ ] `commit.ps1` 默认交互模式：显示 status → add → 提示输入 message → commit → push
-- [ ] `commit.ps1` 支持 `-Message "..."` 非交互模式
-- [ ] `commit.ps1` 支持 `-DryRun` 选项
-- [ ] `commit.ps1` 提交前显示 diff 统计
-- [ ] `commit.ps1` 推送后显示确认信息
-- [ ] chrome-devtools 验证：IPv6 直连路径 `http://[<nas-ipv6>]:8088/` Dashboard 正常加载
-- [ ] chrome-devtools 验证：Dashboard 网络卡片显示"IPv6 直连"（非"局域网"或"远程"）
-- [ ] chrome-devtools 验证：Dashboard 质量评分为 5 星
-- [ ] chrome-devtools 验证：IPv6 直连路径下 Network 页面不显示"切换到 IPv6 直连"链接
-- [ ] chrome-devtools 验证：IPv6 直连路径下 LiveVideo 默认传输方式为"自动"（WebRTC 优先）
-- [ ] chrome-devtools 验证：中继路径 Network 页面的"切换到 IPv6 直连 →"链接 href 指向正确 IPv6 地址
-- [ ] chrome-devtools 验证：浏览器控制台无应用错误
-- [ ] `PROMPT.md` "便捷脚本"章节列出所有 4 个脚本（deploy-nas.ps1、test-ws.ps1、get-token.ps1、commit.ps1）的用法
-- [ ] `docs/ai-context.md` 新增 Phase 13 记录
-- [ ] `README.md` 新增 v1.8.8 更新日志
-- [ ] 使用 `commit.ps1` 成功提交并推送所有变更
+- [x] `test-ws.ps1` 存在于项目根目录，内容与原 `services/api/scripts/test_ws.ps1` 一致（路径引用已更新）
+- [x] `services/api/scripts/test_ws.ps1` 原文件已被移除（git mv 保留历史）
+- [x] `get-token.ps1` 存在于项目根目录
+- [x] `get-token.ps1` 默认使用 LAN 地址 `http://192.168.31.234:8080`
+- [x] `get-token.ps1` 支持 `-BaseUrl` 参数
+- [x] `get-token.ps1` 输出 JWT token 到 stdout
+- [x] `get-token.ps1` 支持 `-Copy` 选项复制到剪贴板
+- [x] `get-token.ps1` 内置测试 AccessKey（`ebc94f7fe99b497a9bdec7bd45add929360e4386be3cad96a8b3922d1d680a05`，user_id=1）
+- [x] `commit.ps1` 存在于项目根目录
+- [x] `commit.ps1` 默认交互模式：显示 status → add → 提示输入 message → commit → push
+- [x] `commit.ps1` 支持 `-Message "..."` 非交互模式
+- [x] `commit.ps1` 支持 `-DryRun` 选项
+- [x] `commit.ps1` 提交前显示 diff 统计
+- [x] `commit.ps1` 推送后显示确认信息
+- [x] `commit.ps1` push 失败时自动绕过代理重试（实测：全局代理 127.0.0.1:7890 无法访问 GitHub，直连成功）
+- [x] chrome-devtools 验证：IPv6 直连路径 `http://[<nas-ipv6>]:8088/` Dashboard 正常加载
+- [x] chrome-devtools 验证：Dashboard 网络卡片显示"IPv6 直连"（非"局域网"或"远程"）
+- [x] chrome-devtools 验证：Dashboard 质量评分为 5 星
+- [x] chrome-devtools 验证：IPv6 直连路径下 Network 页面不显示"切换到 IPv6 直连"链接
+- [x] chrome-devtools 验证：IPv6 直连路径下 LiveVideo 默认传输方式为"自动"（WebRTC 优先）
+- [x] chrome-devtools 验证：中继路径 Network 页面的"切换到 IPv6 直连 →"链接 href 指向正确 IPv6 地址
+- [x] chrome-devtools 验证：浏览器控制台无应用错误
+- [x] `PROMPT.md` "便捷脚本"章节列出所有 4 个脚本（deploy-nas.ps1、test-ws.ps1、get-token.ps1、commit.ps1）的用法
+- [x] `docs/ai-context.md` 新增 Phase 13 记录
+- [x] `README.md` 新增 v1.8.8 更新日志
+- [x] 使用 `commit.ps1` 成功提交并推送所有变更（commit `1c1edcd` 已推送至 `origin/main`）

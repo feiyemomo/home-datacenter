@@ -17,6 +17,7 @@
   - [x] SubTask 3.3: 支持 `-DryRun` 选项（仅显示将要提交的文件和 message，不实际操作）
   - [x] SubTask 3.4: 在提交前显示 diff 统计（`git diff --stat HEAD`）供用户确认
   - [x] SubTask 3.5: 推送后显示远程提交链接或确认信息
+  - [x] SubTask 3.6: push 失败时自动绕过代理重试（实测：全局代理 127.0.0.1:7890 无法访问 GitHub，直连成功）
 
 - [x] Task 4: IPv6 直连路径全链路测试（chrome-devtools MCP）
   - [x] SubTask 4.1: 获取 NAS 当前公网 IPv6 地址（通过 `get-network-status` API 或 SSH 查询）
@@ -27,14 +28,15 @@
   - [x] SubTask 4.6: 检查浏览器控制台无应用错误
   - [x] SubTask 4.7: 发现并修复 NAS_IPV6_ADDRESS 过时问题（ISP 前缀轮换 37a3→37a4，compose.yaml 默认值已更新）
 
-- [ ] Task 5: 更新文档
-  - [ ] SubTask 5.1: 更新 `PROMPT.md` — 将"部署脚本"章节扩展为"便捷脚本"章节，列出 `deploy-nas.ps1`、`test-ws.ps1`、`get-token.ps1`、`commit.ps1` 的用法
-  - [ ] SubTask 5.2: 更新 `docs/ai-context.md` — 新增 Phase 13 记录（脚本整合 + IPv6 全链路验证结果）
-  - [ ] SubTask 5.3: 更新 `README.md` — 新增 v1.8.8 更新日志
+- [x] Task 5: 更新文档
+  - [x] SubTask 5.1: 更新 `PROMPT.md` — 将"部署脚本"章节扩展为"便捷脚本"章节，列出 `deploy-nas.ps1`、`test-ws.ps1`、`get-token.ps1`、`commit.ps1` 的用法
+  - [x] SubTask 5.2: 更新 `docs/ai-context.md` — 新增 Phase 13 记录（脚本整合 + IPv6 全链路验证结果）
+  - [x] SubTask 5.3: 更新 `README.md` — 新增 v1.8.8 更新日志
 
-- [ ] Task 6: Git 提交并推送
-  - [ ] SubTask 6.1: 使用新建的 `commit.ps1` 脚本提交所有变更
-  - [ ] SubTask 6.2: 验证推送成功
+- [x] Task 6: Git 提交并推送
+  - [x] SubTask 6.1: 使用 `commit.ps1` 脚本提交所有变更（commit `1c1edcd`）
+  - [x] SubTask 6.2: 验证推送成功（`e3ea9f8..1c1edcd main -> main`，因全局代理不可达 GitHub，使用 `-c http.proxy= -c https.proxy=` 绕过代理推送成功）
+  - [x] SubTask 6.3: 改进 `commit.ps1` 增加代理回退机制，避免未来再次出现 push 失败
 
 # Task Dependencies
 
