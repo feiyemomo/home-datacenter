@@ -582,6 +582,19 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.9 — Android 网络策略同步修正 (2026-07-30)
+
+#### 修复
+- **Android `BaseUrlResolver` IPv6 回退地址陈旧**：`IPV6_DIRECT_URL` 常量从旧前缀 `2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09` 更新为新前缀 `2409:8a70:37a4:9141:62be:b4ff:fe08:bd09`，与 `compose.yaml` 的 `NAS_IPV6_ADDRESS` 默认值保持一致。当动态获取失败（pre-login 或后端不可达）时，回退常量现在指向有效地址，避免探测失败强制降级到慢速 Cloudflare Tunnel。
+- **Android Dashboard 首次网络状态缓存陈旧**：`DashboardFragment.loadNetworkStatus()` 首次调用未传 `refresh=true`，使用后端 60s 缓存数据。新增 `@Volatile private var firstNetworkFetchDone` 标志位，首次调用传 `refresh=true` 强制后端刷新，后续 `onResume` 使用缓存（60s TTL 足够新鲜）。`onDestroyView` 重置标志位，Fragment 重建时重新强制刷新。同步 Web Dashboard v1.8.7 修复。
+
+#### 版本
+- Android v1.6.30（versionCode 72 → 73）
+
+#### 文档
+- 新增 `docs/ai-context.md` Phase 14 章节
+- 新增 `D:\Projects\Android\release-notes-v1.6.30.txt`
+
 ### v1.8.8 — IPv6 全链路测试与开发脚本整合 (2026-07-30)
 
 #### 修复

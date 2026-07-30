@@ -1,0 +1,13 @@
+- [ ] `BaseUrlResolver.kt` `IPV6_DIRECT_URL` 常量值为 `http://[2409:8a70:37a4:9141:62be:b4ff:fe08:bd09]:8088/`
+- [ ] `IPV6_DIRECT_URL` 值与 `compose.yaml` 的 `NAS_IPV6_ADDRESS` 默认值一致
+- [ ] `DashboardFragment` 包含 `firstNetworkFetchDone` 标志位（`@Volatile private var`）
+- [ ] `loadNetworkStatus()` 首次调用传 `refresh = true`（通过 `!firstNetworkFetchDone` 实现）
+- [ ] 首次调用成功后 `firstNetworkFetchDone` 被置为 `true`
+- [ ] 后续 `onResume` 触发的 `loadNetworkStatus()` 传 `refresh = false`（使用后端缓存）
+- [ ] `onDestroyView()` 重置 `firstNetworkFetchDone = false`
+- [ ] `app/build.gradle.kts` versionCode = 73，versionName = "1.6.30"
+- [ ] `release-notes-v1.6.30.txt` 存在并描述两个修复点
+- [ ] `docs/ai-context.md` 新增 Phase 14 记录
+- [ ] `README.md` 新增 v1.8.9 更新日志
+- [ ] Android 仓库提交并推送成功
+- [ ] home-datacenter 仓库提交并推送成功
