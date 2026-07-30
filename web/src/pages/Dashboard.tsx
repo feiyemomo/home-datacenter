@@ -274,11 +274,20 @@ function WeatherCard() {
 }
 
 /**
+ * The NAS's DDNS domain — pure-AAAA record (no A record), so any
+ * access via this hostname is an IPv6 direct connection. The ISP
+ * DHCPv6-PD prefix rotations are tracked by the DDNS provider, so
+ * this constant never needs updating.
+ */
+const NAS_DDNS_DOMAIN = "nas.feiyemomo.top";
+
+/**
  * Determine the current dashboard connection path.
  *
  * Returns:
  *  - "lan"       — direct LAN access (192.168.x.x, 10.x, 172.16-31.x)
- *  - "ipv6"      — IPv6 literal direct connection (bypasses Cloudflare Tunnel)
+ *  - "ipv6"      — IPv6 direct connection (DDNS domain or IPv6 literal,
+ *                  bypasses Cloudflare Tunnel)
  *  - "remote"    — Cloudflare Tunnel or other remote path
  *
  * Used by the Network Quality card to show the current path chip.
@@ -292,6 +301,9 @@ function detectApiPath(): "lan" | "ipv6" | "remote" {
     if (/^192\.168\./.test(h)) return "lan";
     if (/^10\./.test(h)) return "lan";
     if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return "lan";
+    // DDNS domain (nas.feiyemomo.top) — pure-AAAA record, so access
+    // via this hostname is an IPv6 direct connection.
+    if (h === NAS_DDNS_DOMAIN) return "ipv6";
     // Detect IPv6 literal addresses (wrapped in brackets like [::1] or [2001:db8::1])
     if (/^\[[0-9a-f:]+\]$/i.test(h)) return "ipv6";
     return "remote";

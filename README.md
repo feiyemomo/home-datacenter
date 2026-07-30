@@ -582,6 +582,25 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.10 — DDNS 域名统一识别 (2026-07-30)
+
+#### 修复
+- **Web Dashboard 通过 DDNS 域名访问时误判为中继**：`detectApiPath()` 和 `LiveVideo.isRemoteAccess()` 只能识别 IPv6 **字面量**（如 `[2001:db8::1]`），无法识别 DDNS **域名**（`nas.feiyemomo.top`）。当用户通过 `http://nas.feiyemomo.top:8088/` 访问时，系统误判为"Cloudflare Tunnel 中继"，网络质量卡片显示"可升级到 IPv6 直连"——但实际上用户已经在走 IPv6 直连了。
+  - `Dashboard.tsx` `detectApiPath()` 新增 `nas.feiyemomo.top` 域名识别，返回 `"ipv6"` 路径。
+  - `LiveVideo.tsx` `isRemoteAccess()` 同步识别 `nas.feiyemomo.top` 为直连路径，WebRTC 不再被错误降级为 HLS。
+  - `Network.tsx` "切换到 IPv6 直连"链接从 `http://[${status.ipv6?.address}]:8088/`（硬编码 IPv6 字面量）改为 `http://nas.feiyemomo.top:8088/`（DDNS 域名），前缀轮换时无需更新代码。
+- **Android `fetchDynamicIpv6Url()` 返回字面量 URL**：该函数从后端 `/api/v1/network/ipv6` 获取 IPv6 地址后构造 `http://[<addr>]:8088/`，但 `IPV6_DIRECT_URL` 已经是 DDNS 域名。改为返回 `IPV6_DIRECT_URL`（域名），仍调用后端验证 IPv6 可达性。DDNS 提供商自动跟踪前缀轮换，无需重建字面量 URL。
+
+#### 设计决策
+- `compose.yaml` 的 `NAS_IPV6_ADDRESS` 和 `deploy/frigate/config.yml` 的 `go2rtc.webrtc.candidates` **保留** IPv6 字面量，因为：
+  - 后端 `CheckIPv6()` 用 `net.ParseIP` 验证环境变量值，只接受 IP 字面量。
+  - WebRTC ICE candidate 的 `address` 字段按 RFC 8445 要求必须是 IP，不能用域名。
+  - 这些是**基础设施层配置**，不是**应用层 URL**。应用层（Web 前端 + Android）已统一使用 DDNS 域名。
+
+#### 版本
+- Web: v1.8.10
+- Android: v1.6.33（versionCode 75 → 76）
+
 ### v1.8.9 — Android 网络策略同步修正 (2026-07-30)
 
 #### 修复
