@@ -582,6 +582,27 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.8 — IPv6 全链路测试与开发脚本整合 (2026-07-30)
+
+#### 修复
+- **NAS_IPV6_ADDRESS 前缀轮换**：`compose.yaml` 默认值从
+  `2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09`（旧前缀）更新为
+  `2409:8a70:37a4:9141:62be:b4ff:fe08:bd09`（当前前缀）。ISP 轮换了
+  /64 前缀但 env var 未更新，导致"切换到 IPv6 直连"链接指向不可达地址。
+
+#### 新增
+- `test-ws.ps1`（项目根目录）— 从 `services/api/scripts/test_ws.ps1` 移动，
+  WebSocket 连接测试一键脚本。
+- `get-token.ps1`（项目根目录）— 使用内置测试 AccessKey 获取 JWT，
+  支持 `-BaseUrl`（LAN/中继/IPv6）和 `-Copy`（复制到剪贴板）。
+- `commit.ps1`（项目根目录）— 交互式 git add → commit → push 一键脚本，
+  支持 `-Message`（非交互）和 `-DryRun`（预览）。
+
+#### 验证
+- IPv6 直连路径（`http://[<ipv6>]:8088/`）：Dashboard 显示"IPv6 直连" + 5 星，
+  LiveVideo 默认使用 WebRTC（v1.8.7 修复确认有效）。
+- 中继路径：Network 页面"切换到 IPv6 直连"链接指向正确的当前 IPv6 地址。
+
 ### v1.8.7 — 网络策略审查与前端 IPv6/UX 修复 (2026-07-30)
 
 ### 修复

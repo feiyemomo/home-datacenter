@@ -1014,4 +1014,53 @@ WebRTC experience on the web frontend:
 
 ---
 
+## Phase 13 (v1.8.8): IPv6 Full-Path Test & Dev Scripts Consolidation
+
+### Problem
+1. v1.8.7 fixed the IPv6 direct path classification in `LiveVideo.tsx`, but the
+   dev machine had no IPv6 at the time — the fix was verified only on LAN and
+   relay paths, never on the actual IPv6 direct path (`http://[<ipv6>]:8088/`).
+2. The `NAS_IPV6_ADDRESS` env var in `compose.yaml` was stale: ISP had rotated
+   the prefix from `2409:8a70:37a3:99d0::/64` to `2409:8a70:37a4:9141::/64`,
+   but the default value still pointed to the old prefix. The API reported
+   `reachable=true` with the unreachable old address, so the "切换到 IPv6 直连"
+   link on the relay path pointed to a dead endpoint.
+3. Convenient PowerShell scripts were scattered in subdirectories
+   (`services/api/scripts/test_ws.ps1`), and frequent operations like git
+   commit/push had no one-click script.
+
+### Solution
+- **compose.yaml**: Updated `NAS_IPV6_ADDRESS` default from
+  `2409:8a70:37a3:99d0:62be:b4ff:fe08:bd09` to
+  `2409:8a70:37a4:9141:62be:b4ff:fe08:bd09` (current ISP prefix).
+- **test-ws.ps1**: Moved from `services/api/scripts/test_ws.ps1` to project
+  root via `git mv` (preserves history). Updated header comments.
+- **get-token.ps1** (new): One-click JWT retrieval using built-in test
+  AccessKey. Supports `-BaseUrl` (LAN/relay/IPv6) and `-Copy` (clipboard).
+  Sets `$env:HC_TOKEN` for downstream API calls.
+- **commit.ps1** (new): Interactive git add → commit message → push.
+  Supports `-Message` (non-interactive) and `-DryRun` (preview).
+
+### Verification (chrome-devtools MCP)
+- IPv6 direct path (`http://[2409:8a70:37a4:9141:62be:b4ff:fe08:bd09]:8088/`):
+  - Dashboard network card shows "IPv6 直连" + 5 stars ✓
+  - Network page does NOT show "切换到 IPv6 直连" link (already on direct) ✓
+  - LiveVideo defaults to "自动" (WebRTC), not HLS ✓ (v1.8.7 fix confirmed)
+  - Console: no errors ✓
+- Relay path (`https://dashboard.feiyemomo.top/network`):
+  - "切换到 IPv6 直连 →" link href points to correct current IPv6 address ✓
+  - `direct_url` in JSON payload matches actual NAS IPv6 ✓
+
+### Known Limitation
+The PrefixWatcher (`internal/network/watcher.go`) cannot auto-detect prefix
+rotations because the `home-api` container runs on a docker bridge without
+IPv6 outbound connectivity (confirmed: `docker exec home-api wget -qO- https://ident.me`
+returns IPv4). Both `CheckIPv6()` and `OutboundIPv6Address()` short-circuit
+with the `NAS_IPV6_ADDRESS` env var. When the ISP rotates the prefix, the
+operator must manually update the default in `compose.yaml` (or set
+`NAS_IPV6_ADDRESS` in `.env`) and redeploy. A host-level prefix watcher
+script would be the long-term fix.
+
+---
+
 **Last Updated:** 2026-07-30 (v1.8.7: Network policy review — fixed LiveVideo IPv6-literal classification, Dashboard quality rating unreachable branch, Network page upgrade action, and initial-load freshness. See Phase 12 above. Earlier: v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse. v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
