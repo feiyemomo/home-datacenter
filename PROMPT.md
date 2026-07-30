@@ -28,14 +28,23 @@ ssh -p 22 fnos-momo@192.168.31.234
 # 密码：@Fnos324
 ```
 
-## 部署脚本
+## 便捷脚本
 
-本项目使用 `D:\Projects\home-datacenter\deploy-nas.ps1` 一键部署到 NAS。
+项目根目录提供以下一键脚本，覆盖开发与运维高频操作：
+
+| 脚本 | 用途 | 说明 |
+|---|---|---|
+| `deploy-nas.ps1` | 部署到 NAS | 构建并打包项目，scp 推送至 NAS 并 `docker compose up -d --build` |
+| `test-ws.ps1` | WebSocket 连接测试 | 从 `services/api/scripts/` 迁移至根目录，验证 WS 通道是否畅通 |
+| `get-token.ps1` | 获取测试 JWT | 调用 `/api/v1/auth/bind` 拿到 token 并写入 `$env:HC_TOKEN`，便于下游 API 调用 |
+| `commit.ps1` | 一键 git 提交推送 | 交互式展示 `git status`、提示输入提交信息，提交后自动 `git push` |
+
+### deploy-nas.ps1 — 部署到 NAS
 
 ```powershell
 # 从项目根目录运行（密码模式，无需 SSH 密钥）
 cd D:\Projects\home-datacenter
-.\deploy-nas.ps1 -Password '@Fnos324'
+.\deploy-nas.ps1 -Password '@Fnos324'         # 构建并部署
 
 # 仅更新 compose.yaml/.env（不重新构建镜像）
 .\deploy-nas.ps1 -Password '@Fnos324' -NoBuild
@@ -48,6 +57,47 @@ cd D:\Projects\home-datacenter
 ```
 
 脚本流程：tar 打包（排除 data/.git/node_modules/.env）→ scp 到 NAS → 远程 tar 解压 → 验证 .env 存在 → `docker compose up -d --build` → 打印服务状态。
+
+### test-ws.ps1 — WebSocket 连接测试
+
+```powershell
+# 默认测试本地 (localhost:8080)
+.\test-ws.ps1 -AccessKey "<key>"
+
+# 测试 NAS 上的 WebSocket
+.\test-ws.ps1 -AccessKey "<key>" -BaseUrl "http://192.168.31.234:8080"
+```
+
+### get-token.ps1 — 获取测试 JWT
+
+```powershell
+# 默认从 LAN 获取
+.\get-token.ps1
+
+# 从 Cloudflare 中继域名获取
+.\get-token.ps1 -BaseUrl "https://dashboard.feiyemomo.top"
+
+# 获取并复制到剪贴板
+.\get-token.ps1 -Copy
+
+# 设置 $env:HC_TOKEN 供后续 API 调用使用（需 dot-source 运行）
+. .\get-token.ps1
+```
+
+> 注意：脚本会设置 `$env:HC_TOKEN`，但因 PowerShell 作用域限制，需 dot-source（`. .\get-token.ps1`）执行方可在当前 shell 中保留该环境变量。
+
+### commit.ps1 — 一键 git 提交推送
+
+```powershell
+# 交互模式：显示 git status，提示输入提交信息，提交后自动 push
+.\commit.ps1
+
+# 非交互模式：直接传入提交信息
+.\commit.ps1 -Message "fix: ..."
+
+# 预览将要提交的内容（不实际提交）
+.\commit.ps1 -DryRun
+```
 
 ## Dashboard 测试用户
 

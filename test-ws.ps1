@@ -1,7 +1,7 @@
 # Home Datacenter WebSocket test script
-# Usage:
-#   $key = "<your-access-key>"
-#   .\scripts\test_ws.ps1
+# Usage (from project root):
+#   .\test-ws.ps1 -AccessKey "<your-access-key>"
+#   .\test-ws.ps1 -AccessKey "<key>" -BaseUrl "http://192.168.31.234:8080"
 
 param(
     [Parameter(Mandatory=$true)]
