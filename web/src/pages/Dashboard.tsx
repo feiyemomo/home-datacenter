@@ -28,6 +28,8 @@ import {
     Wind,
     MapPin,
     Network as NetworkIcon,
+    ChevronDown,
+    Code2,
 } from "lucide-react";
 import { getSystemStatus } from "@/api/system";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
@@ -318,6 +320,9 @@ export default function Dashboard() {
     const [liveAlert, setLiveAlert] = useState<CameraAlert | null>(null);
     // Alert selected for full-resolution snapshot viewing (modal).
     const [selectedAlert, setSelectedAlert] = useState<CameraAlert | null>(null);
+    // Raw JSON snapshot collapsed by default — routine operators don't
+    // need it, and it was pushing the alert list below the fold.
+    const [snapshotOpen, setSnapshotOpen] = useState(false);
 
     // WebSocket for real-time alerts
     const ws = useWebSocket(true);
@@ -419,25 +424,32 @@ export default function Dashboard() {
 
     return (
         <div className="space-y-6">
-            <div className="animate-fade-in flex items-center justify-between">
-                <div>
-                    <h2 className="text-lg font-semibold text-fg">
-                        仪表盘
-                    </h2>
-                    <p className="text-xs text-fg-muted">
-                        实时系统指标，每 5 秒刷新。
-                    </p>
+            {/* Page header — liquid glass banner with warm accent glow.
+             * The gradient strip on the left anchors the title
+             * visually and ties into the ambient orb background. */}
+            <div className="animate-fade-in glass-subtle relative overflow-hidden rounded-2xl px-5 py-4">
+                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-warm)/0.8)] via-[rgb(var(--accent-primary)/0.5)] to-transparent" />
+                <div className="pointer-events-none absolute -right-8 -top-8 h-24 w-24 rounded-full bg-[rgb(var(--accent-warm)/0.08)] blur-2xl" />
+                <div className="relative flex items-center justify-between">
+                    <div>
+                        <h2 className="text-lg font-semibold tracking-tight text-fg">
+                            仪表盘
+                        </h2>
+                        <p className="mt-0.5 text-xs text-fg-muted">
+                            实时系统指标，每 5 秒刷新。
+                        </p>
+                    </div>
+                    {loading ? (
+                        <RefreshCw size={16} className="animate-spin text-fg-subtle" />
+                    ) : (
+                        <Badge variant={error ? "danger" : "success"}>
+                            <span
+                                className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
+                            />
+                            {error ? "异常" : "实时"}
+                        </Badge>
+                    )}
                 </div>
-                {loading ? (
-                    <RefreshCw size={16} className="animate-spin text-fg-subtle" />
-                ) : (
-                    <Badge variant={error ? "danger" : "success"}>
-                        <span
-                            className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
-                        />
-                        {error ? "异常" : "实时"}
-                    </Badge>
-                )}
             </div>
 
             {error && (
@@ -932,20 +944,38 @@ export default function Dashboard() {
                 </div>
             )}
 
+            {/* Raw JSON snapshot — collapsed by default. Routine
+             * operators rarely need the wire payload; keeping it
+             * behind a click keeps the dashboard focused on the
+             * alert list and stat cards above. */}
             <Card className="animate-fade-in">
-                <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                        <Server size={16} /> 系统快照
-                    </CardTitle>
-                    <CardDescription>
-                        来自 <code className="font-mono">/api/v1/system/status</code> 的原始数据。
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>
-                    <pre className="glass-subtle overflow-x-auto rounded-2xl p-4 text-xs leading-relaxed text-fg">
-                        {status ? JSON.stringify(status, null, 2) : "// 暂无数据"}
-                    </pre>
-                </CardContent>
+                <button
+                    type="button"
+                    onClick={() => setSnapshotOpen((v) => !v)}
+                    className="flex w-full items-center justify-between gap-3 p-5 text-left transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
+                    aria-expanded={snapshotOpen}
+                >
+                    <div className="flex items-center gap-2">
+                        <Code2 size={16} className="text-fg-muted" />
+                        <div>
+                            <CardTitle className="text-sm">系统快照</CardTitle>
+                            <CardDescription className="mt-0.5">
+                                来自 <code className="font-mono">/api/v1/system/status</code> 的原始数据。
+                            </CardDescription>
+                        </div>
+                    </div>
+                    <ChevronDown
+                        size={16}
+                        className={`shrink-0 text-fg-subtle transition-transform duration-300 ${snapshotOpen ? "rotate-180" : ""}`}
+                    />
+                </button>
+                {snapshotOpen && (
+                    <CardContent className="animate-fade-in">
+                        <pre className="glass-subtle overflow-x-auto rounded-2xl p-4 text-xs leading-relaxed text-fg">
+                            {status ? JSON.stringify(status, null, 2) : "// 暂无数据"}
+                        </pre>
+                    </CardContent>
+                )}
             </Card>
         </div>
     );
