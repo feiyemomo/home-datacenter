@@ -18,7 +18,7 @@ import type { IceConfig } from "@/types";
  * the default 3000ms timeout is generous enough to cover slow STUN
  * servers but short enough to keep the fallback path responsive.
  */
-function waitForIceGathering(
+export function waitForIceGathering(
     pc: RTCPeerConnection,
     timeoutMs: number,
 ): Promise<void> {
@@ -82,6 +82,10 @@ export interface UseWebRTCStreamOptions {
     sdpUrlOverride?: string;
     /** Disable the auto-reconnect on connection-state changes. */
     autoReconnect?: boolean;
+    /** A pre-negotiated PC + offer (created during preview mode)
+     *  to skip the ICE gather phase on the critical path. Consumed
+     *  once on mount; the hook takes ownership of the PC. */
+    prefetched?: { pc: RTCPeerConnection; offer: RTCSessionDescriptionInit } | null;
 }
 
 export interface UseWebRTCStreamResult {
@@ -125,25 +129,39 @@ export function useWebRTCStream(
 
         (async () => {
             try {
-                setState("fetching-ice");
-                let ice: IceConfig | null = null;
-                try {
-                    ice = await getIceConfig();
-                } catch {
-                    // ICE config is optional — proceed with browser defaults.
+                let pc: RTCPeerConnection;
+                let offerSdp = "";
+
+                // If a pre-negotiated PC + offer was provided (from
+                // preview-mode prefetch), take ownership and skip the
+                // ICE config fetch + createOffer + ICE gathering phase
+                // (200-500ms saved on the user-visible critical path).
+                const prefetched = opts.prefetched;
+                if (prefetched) {
+                    setState("connecting");
+                    pc = prefetched.pc;
+                    offerSdp = prefetched.offer.sdp ?? "";
+                } else {
+                    setState("fetching-ice");
+                    let ice: IceConfig | null = null;
+                    try {
+                        ice = await getIceConfig();
+                    } catch {
+                        // ICE config is optional — proceed with browser defaults.
+                    }
+                    if (cancelled) return;
+
+                    setState("connecting");
+                    const iceServers = (ice?.ice_servers ?? []) as RTCIceServer[];
+                    pc = new RTCPeerConnection({ iceServers });
+
+                    // Video only — camera audio codecs (G726/PCMU/MPEG4-
+                    // GENERIC) are not browser-decodable via WebRTC. The
+                    // API also appends #audio=0 to the go2rtc source URL
+                    // so go2rtc won't even try to negotiate audio.
+                    pc.addTransceiver("video", { direction: "recvonly" });
                 }
-                if (cancelled) return;
-
-                setState("connecting");
-                const iceServers = (ice?.ice_servers ?? []) as RTCIceServer[];
-                const pc = new RTCPeerConnection({ iceServers });
                 pcRef.current = pc;
-
-                // Video only — camera audio codecs (G726/PCMU/MPEG4-
-                // GENERIC) are not browser-decodable via WebRTC. The
-                // API also appends #audio=0 to the go2rtc source URL
-                // so go2rtc won't even try to negotiate audio.
-                pc.addTransceiver("video", { direction: "recvonly" });
 
                 pc.ontrack = (ev) => {
                     if (videoRef.current && ev.streams[0]) {
@@ -212,22 +230,25 @@ export function useWebRTCStream(
                     }
                 };
 
-                const offer = await pc.createOffer();
-                await pc.setLocalDescription(offer);
+                if (!prefetched) {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
 
-                // Wait for ICE gathering to complete BEFORE POSTing the
-                // SDP offer. If we send the offer while candidates are
-                // still being gathered, the SDP we hand to go2rtc
-                // contains only the first host candidate — and if that
-                // one is wrong (e.g. Docker bridge IP 172.x.x.x that
-                // the browser can't reach), the connection dies even
-                // though a perfectly fine 127.0.0.1:8555 candidate
-                // would have arrived 200ms later. iceGatheringState
-                // transitions to 'complete' once the browser has
-                // finished enumerating host + STUN-reflected
-                // candidates, or our hard timeout fires.
-                await waitForIceGathering(pc, 3000);
-                if (cancelled) return;
+                    // Wait for ICE gathering to complete BEFORE POSTing the
+                    // SDP offer. If we send the offer while candidates are
+                    // still being gathered, the SDP we hand to go2rtc
+                    // contains only the first host candidate — and if that
+                    // one is wrong (e.g. Docker bridge IP 172.x.x.x that
+                    // the browser can't reach), the connection dies even
+                    // though a perfectly fine 127.0.0.1:8555 candidate
+                    // would have arrived 200ms later. iceGatheringState
+                    // transitions to 'complete' once the browser has
+                    // finished enumerating host + STUN-reflected
+                    // candidates, or our hard timeout fires.
+                    await waitForIceGathering(pc, 3000);
+                    if (cancelled) return;
+                    offerSdp = offer.sdp ?? "";
+                }
 
                 // Same-origin POST to home-api. The SDP body is read
                 // exactly once in the Go handler and forwarded
@@ -261,7 +282,7 @@ export function useWebRTCStream(
                 const resp = await authedFetch(sdpUrl, {
                     method: "POST",
                     headers: { "Content-Type": "application/sdp" },
-                    body: offer.sdp ?? "",
+                    body: offerSdp,
                 });
                 if (!resp.ok) {
                     // The body of the error response is the most
@@ -312,6 +333,9 @@ export function useWebRTCStream(
             }
             teardown();
         };
+        // opts.prefetched is intentionally excluded — it's consumed once
+        // on mount and should not re-trigger the effect.
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [opts.cameraId, opts.streamName, opts.webrtcUrl, opts.sdpUrlOverride, nonce, teardown]);
 
     const retry = useCallback(() => setNonce((n) => n + 1), []);

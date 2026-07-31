@@ -44,6 +44,12 @@ func NewHub(bus *eventbus.Bus) *Hub {
 		eventbus.TopicUserNotification,
 		eventbus.TopicSystemBroadcast,
 		eventbus.TopicAutomationFired,
+		// Persisted audit log: emitted by internal/log/subscriber.go
+		// after each SystemLog row write. Subscribed explicitly
+		// (rather than via the "system" prefix) to mirror the
+		// existing TopicSystemBroadcast pattern — the Hub only
+		// fans out what the dashboard actually renders.
+		eventbus.TopicSystemLog,
 	}
 	for _, t := range topics {
 		bus.Subscribe(t, h.onEvent)
@@ -149,7 +155,12 @@ func (h *Hub) onEvent(e eventbus.Event) {
 			return
 		}
 		// fallthrough to broadcast on parse error
-	case eventbus.TopicSystemBroadcast:
+	case eventbus.TopicSystemBroadcast,
+		eventbus.TopicSystemLog:
+		// System-wide: the audit log is shown on every dashboard,
+		// so fan it out to every connected client (admins +
+		// non-admins alike). The Hub is already behind JWTAuth on
+		// the WS endpoint, so every listener is authenticated.
 		h.Broadcast(msg)
 		return
 	}

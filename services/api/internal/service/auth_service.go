@@ -29,14 +29,18 @@ func NewAuthService(
 // Bind exchanges an access_key for a long-lived JWT.
 // Flow: user lookup -> hash key -> find device -> revoke check ->
 // update last login -> sign JWT.
+//
+// Returns the bound device alongside the token so callers (the auth
+// handler) can emit a user.login EventBus event with device_id and
+// device_name without re-querying.
 func (s *AuthService) Bind(
 	userID uint,
 	accessKey string,
-) (string, error) {
+) (string, *model.Device, error) {
 
 	// Verify user exists
 	if _, err := s.userRepo.GetByID(userID); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Hash the access key (DB stores only the hash)
@@ -46,14 +50,14 @@ func (s *AuthService) Bind(
 	device, err := s.deviceRepo.GetByUserIDAndHash(userID, hash)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", errors.New("invalid access key")
+			return "", nil, errors.New("invalid access key")
 		}
-		return "", err
+		return "", nil, err
 	}
 
 	// Reject revoked devices
 	if device.RevokedAt.Valid {
-		return "", errors.New("device revoked")
+		return "", nil, errors.New("device revoked")
 	}
 
 	// Update last login timestamp
@@ -61,16 +65,16 @@ func (s *AuthService) Bind(
 	device.LastLoginAt = utils.NullTime{Time: now, Valid: true}
 
 	if err := s.deviceRepo.Update(device); err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	// Issue a long-lived JWT (365d, see utils.TokenExpireDays)
 	token, err := utils.GenerateToken(userID, device.ID)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
-	return token, nil
+	return token, device, nil
 }
 
 // GetDeviceForAuth is the lightweight lookup the /api/v1/auth/verify

@@ -19,9 +19,9 @@
   - [x] SubTask 5.1: `docs/ai-context.md` 新增 Phase 14 记录（Android 网络策略修正）
   - [x] SubTask 5.2: `README.md` 新增 v1.8.9 更新日志
 
-- [ ] Task 6: Git 提交并推送
-  - [ ] SubTask 6.1: Android 仓库提交并推送（commit.ps1 或直接 git 命令）
-  - [ ] SubTask 6.2: home-datacenter 仓库提交文档更新并推送
+- [x] Task 6: Git 提交并推送
+  - [x] SubTask 6.1: Android 仓库提交并推送（commit 1f242ce，push 成功）
+  - [x] SubTask 6.2: home-datacenter 仓库提交文档更新并推送（commit 52f42f0，push 成功）
 
 # Task Dependencies
 

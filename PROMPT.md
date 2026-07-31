@@ -14,17 +14,18 @@
 
 | 项 | 值 |
 |---|---|
-| NAS IP | `192.168.31.234` |
+| NAS IP | `192.168.1.3` |
+| NAS DDNS | `nas.feiyemomo.top` (AAAA → NAS 稳定 IPv6，纯 IPv6 DDNS，无 A 记录) |
 | SSH 用户 | `fnos-momo` |
 | SSH 密码 | `@Fnos324` |
 | SSH 端口 | `22` |
 | 远程路径 | `/vol1/docker/home-datacenter` |
-| Web UI | `http://192.168.31.234/` (LAN) 或 `https://dashboard.feiyemomo.top/` (Cloudflare Tunnel) |
-| API | `http://192.168.31.234:8080/health` |
+| Web UI | `http://192.168.1.3/` (LAN) 或 `http://nas.feiyemomo.top:8088/` (IPv6 DDNS) 或 `https://dashboard.feiyemomo.top/` (Cloudflare Tunnel) |
+| API | `http://192.168.1.3:8080/health` |
 
 SSH 连接示例：
 ```powershell
-ssh -p 22 fnos-momo@192.168.31.234
+ssh -p 22 fnos-momo@192.168.1.3
 # 密码：@Fnos324
 ```
 
@@ -65,7 +66,7 @@ cd D:\Projects\home-datacenter
 .\test-ws.ps1 -AccessKey "<key>"
 
 # 测试 NAS 上的 WebSocket
-.\test-ws.ps1 -AccessKey "<key>" -BaseUrl "http://192.168.31.234:8080"
+.\test-ws.ps1 -AccessKey "<key>" -BaseUrl "http://192.168.1.3:8080"
 ```
 
 ### get-token.ps1 — 获取测试 JWT
@@ -109,18 +110,18 @@ cd D:\Projects\home-datacenter
 获取 JWT：
 ```powershell
 $body = @{ user_id = 1; access_key = "ebc94f7fe99b497a9bdec7bd45add929360e4386be3cad96a8b3922d1d680a05" } | ConvertTo-Json
-$resp = Invoke-RestMethod -Uri "http://192.168.31.234:8080/api/v1/auth/bind" -Method POST -Body $body -ContentType "application/json"
+$resp = Invoke-RestMethod -Uri "http://192.168.1.3:8080/api/v1/auth/bind" -Method POST -Body $body -ContentType "application/json"
 $token = $resp.data.token
 ```
 
-登录 Dashboard：访问 `http://192.168.31.234/`，在登录页输入 user_id=1 和 access-key。
+登录 Dashboard：访问 `http://192.168.1.3/`，在登录页输入 user_id=1 和 access-key。
 
 ## 标准工作流
 
 1. **了解项目** — 先读 `README.md` + `docs/ai-context.md`
 2. **修改代码** — 在本地编辑，遵循项目已有风格（Go: gofmt；TS: 2-space 缩进，双引号）
 3. **部署到 NAS** — `.\deploy-nas.ps1 -Password '@Fnos324'`
-4. **验证** — 使用 chrome-devtools MCP 浏览 `http://192.168.31.234/` 或 `https://dashboard.feiyemomo.top/`，检查页面行为和 console
+4. **验证** — 使用 chrome-devtools MCP 浏览 `http://192.168.1.3/` 或 `https://dashboard.feiyemomo.top/`，检查页面行为和 console
 5. **更新文档** — 更新 `docs/ai-context.md` 的 Phase 记录和 `README.md` 的更新日志
 6. **Git 提交** — `git add <files>` + `git commit -m "..."` + `git push`
 
@@ -128,16 +129,16 @@ $token = $resp.data.token
 
 ```powershell
 # 容器状态
-ssh -p 22 fnos-momo@192.168.31.234 "cd /vol1/docker/home-datacenter && docker compose ps"
+ssh -p 22 fnos-momo@192.168.1.3 "cd /vol1/docker/home-datacenter && docker compose ps"
 
 # API 健康检查
-curl -s http://192.168.31.234:8080/health
+curl -s http://192.168.1.3:8080/health
 
 # 查看 api 日志
-ssh -p 22 fnos-momo@192.168.31.234 "cd /vol1/docker/home-datacenter && docker compose logs --tail=50 api"
+ssh -p 22 fnos-momo@192.168.1.3 "cd /vol1/docker/home-datacenter && docker compose logs --tail=50 api"
 
 # 查看 frigate 日志
-ssh -p 22 fnos-momo@192.168.31.234 "cd /vol1/docker/home-datacenter && docker compose logs --tail=50 frigate"
+ssh -p 22 fnos-momo@192.168.1.3 "cd /vol1/docker/home-datacenter && docker compose logs --tail=50 frigate"
 ```
 
 ## 注意事项

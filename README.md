@@ -582,6 +582,37 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.11 — App Experience Optimizations (2026-07-31)
+
+#### 新增
+- **设备管理作用域**：`GET /api/v1/device/list` 新增 `scope` 查询参数（`mine` | `all`）。默认 `mine` 只返回调用者自己的设备；管理员可传 `all` 查看全部设备。非管理员传 `all` 时也只返回自己的设备（服务端强制）。
+- **设备创建端点**：`POST /api/v1/device` 为当前用户创建新设备，响应中一次性返回明文 `access_key`（后续 GET 不再包含）。
+- **服务日志系统**：新增 `SystemLog` 模型 + `system_log_handler.go` + `internal/log/` 日志中间件，记录用户登录/登出、设备上下线等事件。通过 WebSocket `system.log` 主题实时推送。
+- **摄像头预热端点**：`POST /api/v1/cameras/:id/preheat` 触发 go2rtc 提前连接 RTSP 源，避免首次播放的 1-10s 冷启动。
+- **ICE 配置 HTTP 缓存**：`GET /api/v1/cameras/ice` 响应添加 `ETag` + `If-None-Match` 304 处理。
+
+#### 优化
+- **Web 直播预加载**：`useWebRTCStream.ts` 预创建 RTCPeerConnection + ICE 收集；`useHLSStream.ts` 启用 `lowLatencyMode`；`LiveVideo.tsx` 预览模式每 10s 刷新 JPEG 保持 RTSP 源热；`camera.ts` 模块级缓存 `getIceConfig`。
+- **Android SDP 预协商**：`WebRtcClient.prepareOffer()` 在 `CameraDetailActivity.onCreate` 中预创建 PeerConnection + 完成 ICE 收集，`startStream` 直接复用预协商结果，跳过 800ms LAN / 5s remote 的 ICE 收集阶段。
+- **Android 网络并行探测**：`BaseUrlResolver.probeSync()` 改用协程 `async/awaitAll` 并行探测 LAN → IPv6 → Tunnel，最坏耗时从 7.5s 降至 4s。
+- **Android 直播缓冲调优**：ExoPlayer `DefaultLoadControl` minBuffer=1s, maxBuffer=3s, bufferForPlayback=500ms；`hls.js` 从 CDN 改为本地 asset 加载。
+- **Android Dashboard 日志卡片**：Dashboard 新增"最近日志"卡片显示最近 5 条服务日志，支持 WebSocket 实时更新。
+
+#### 修复
+- **Android 服务日志不可见**：`SystemLog.kt` 字段名与后端 PascalCase JSON 不匹配（`ignoreUnknownKeys=true` 导致静默反序列化为空对象）。为所有字段添加 `@SerialName` 注解映射后端字段名（`ID`, `Ts`, `EventType`, `Source`, `Message`, `Payload`）。
+- **心跳误判为设备上线**（v1.6.36）：两处根因。
+  (1) `device/manager.go` `SetOnline()` 缺少 `wasOffline` 转换守卫——每次 WebSocket 重连（用户打开 App / 切换标签页）都会调用 `SetOnline`，即使设备从未离线也会发布 `device.status=online` 事件，导致 `system_logs` 被重复"设备上线"日志淹没。`SetOffline()` 同样缺少 `wasOnline` 守卫。两者现已对齐 `Heartbeat()` 的转换检查逻辑：只有真实的 offline→online / online→offline 转换才发布事件。
+  (2) `mqtt/handler.go` `handleStatus()` 尾部无条件重发 `device.status` 事件——每次 MQTT 心跳（`status=heartbeat`）都额外写一条 `设备 #N heartbeat` 日志，且真实 online/offline 转换会被发布两次（Manager 内部一次 + 这里一次）。已移除冗余重发，由 Manager 内部的 `publishStatus` 统一负责。
+
+#### 优化（v1.6.36 增量）
+- **日志分级**：`SystemLog` 模型新增 `Level` 字段（`critical` / `normal` / `info`），后端 `subscriber.buildEntry` 按事件类型赋级——摄像头/设备掉线 = `critical`，用户上线/登出/设备上线 = `normal`，摄像头状态变更 = `info`。REST `GET /api/v1/system/logs` 支持 `level` 过滤参数。SQLite 启动时自动 backfill 历史行的 level（按 event_type + payload 推断）。Android `SystemLog` 模型同步加 `level` 字段，`ServiceLogAdapter` / `RecentLogAdapter` 按 level 着色 icon（critical=红 / normal=橙 / info=灰）。
+- **ICE 配置预取提前**：`prefetchIceConfig()` 从 `DashboardFragment.onResume` 提前到 `HomeCenterApp.onCreate` 已登录分支 + `LoginActivity` 登录成功回调。App 启动即开始预热 ICE 配置（远程 1.4s 往返），用户进入摄像头详情页时配置已在内存中。
+
+#### 版本
+- Backend: v1.8.11
+- Web: v1.8.11
+- Android: v1.6.36 (versionCode 79)
+
 ### v1.8.10 — DDNS 域名统一识别 (2026-07-30)
 
 #### 修复

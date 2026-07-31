@@ -4,16 +4,17 @@ import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
-import { useWebRTCStream } from "@/hooks/useWebRTCStream";
+import { useWebRTCStream, waitForIceGathering } from "@/hooks/useWebRTCStream";
 import { useHLSStream } from "@/hooks/useHLSStream";
 import {
     ptzMove,
     gotoPreset,
     cameraFrameUrl,
     setRecordingPlan,
+    getIceConfig,
 } from "@/api/camera";
 import { RecordingTimeline } from "@/components/RecordingTimeline";
-import type { Camera, CameraEventMessage, CameraStatusEvent, WsMessage } from "@/types";
+import type { Camera, CameraEventMessage, CameraStatusEvent, IceConfig, WsMessage } from "@/types";
 
 interface LiveVideoProps {
     camera: Camera;
@@ -291,6 +292,76 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
         setMode("playback");
     }, [targetTime]); // eslint-disable-line react-hooks/exhaustive-deps
 
+    // Prefetched WebRTC offer (PC + SDP) created during preview
+    // mode. When the user clicks Play, this is passed to
+    // useWebRTCStream to skip the 200-500ms ICE gather phase on
+    // the user-visible critical path.
+    const prefetchedWebrtcRef = useRef<{
+        pc: RTCPeerConnection;
+        offer: RTCSessionDescriptionInit;
+    } | null>(null);
+
+    // Pre-negotiate WebRTC offer during preview mode (when transport
+    // would use WebRTC). The PC + gathered offer is stored in
+    // prefetchedWebrtcRef for useWebRTCStream to consume on Play.
+    useEffect(() => {
+        if (mode !== "preview" || transport === "hls") return;
+
+        let cancelled = false;
+
+        (async () => {
+            try {
+                let ice: IceConfig | null = null;
+                try {
+                    ice = await getIceConfig();
+                } catch {
+                    // ICE config is optional — proceed with browser defaults.
+                }
+                if (cancelled) return;
+
+                const iceServers = (ice?.ice_servers ?? []) as RTCIceServer[];
+                const pc = new RTCPeerConnection({ iceServers });
+                pc.addTransceiver("video", { direction: "recvonly" });
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                await waitForIceGathering(pc, 3000);
+                if (cancelled) {
+                    try { pc.close(); } catch { /* */ }
+                    return;
+                }
+                prefetchedWebrtcRef.current = { pc, offer };
+            } catch {
+                // Prefetch failure is non-fatal — the normal flow will retry.
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [mode, transport, camera.id]);
+
+    // When entering live mode, the prefetched PC (if any) has been
+    // passed to WebRTCVideo as a prop. Clear the ref so the stale-PC
+    // cleanup below doesn't close a PC the hook now owns.
+    useEffect(() => {
+        if (mode === "live") {
+            prefetchedWebrtcRef.current = null;
+        }
+    }, [mode]);
+
+    // Clean up unconsumed prefetched PCs on camera change, transport
+    // switch, or unmount. This catches the case where the user changes
+    // camera or switches to HLS while in preview mode (the prefetch
+    // effect's cleanup only sets `cancelled`, it doesn't close the PC).
+    useEffect(() => {
+        return () => {
+            if (prefetchedWebrtcRef.current) {
+                try { prefetchedWebrtcRef.current.pc.close(); } catch { /* */ }
+                prefetchedWebrtcRef.current = null;
+            }
+        };
+    }, [camera.id, transport]);
+
     const statusColor =
         status === "online"
             ? "bg-[rgb(var(--accent-success)/0.2)] text-[rgb(var(--accent-success))] ring-[rgb(var(--accent-success)/0.3)]"
@@ -530,6 +601,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 streamName={camera.stream.stream_name}
                                 webrtcUrl={camera.stream.webrtc_url}
                                 onFallback={onWebRTCFallback}
+                                prefetched={prefetchedWebrtcRef.current}
                             />
                         ) : (
                             <HLSVideo
@@ -718,6 +790,20 @@ function PreviewFrame({
     onPlay: () => void;
 }) {
     const [error, setError] = useState(false);
+    const [refreshCounter, setRefreshCounter] = useState(0);
+
+    // Refresh the preview JPEG every 10s while mounted (i.e. while
+    // mode is still preview). The counter is appended as a cache-
+    // buster so the browser fetches a fresh frame instead of serving
+    // a stale one from the HTTP cache. Cleared on unmount (which
+    // happens when the parent switches to live/playback mode).
+    useEffect(() => {
+        const interval = window.setInterval(() => {
+            setRefreshCounter((c) => c + 1);
+        }, 10_000);
+        return () => window.clearInterval(interval);
+    }, []);
+
     return (
         <div className="absolute inset-0 flex items-center justify-center bg-black">
             {error ? (
@@ -728,7 +814,7 @@ function PreviewFrame({
             ) : (
                 <>
                     <img
-                        src={cameraFrameUrl(cameraId)}
+                        src={cameraFrameUrl(cameraId) + '?t=' + refreshCounter}
                         alt="摄像头预览"
                         onError={() => setError(true)}
                         className="h-full w-full object-contain"
@@ -761,16 +847,19 @@ function WebRTCVideo({
     streamName,
     webrtcUrl,
     onFallback,
+    prefetched,
 }: {
     cameraId: number;
     streamName: string;
     webrtcUrl: string;
     onFallback?: () => void;
+    prefetched?: { pc: RTCPeerConnection; offer: RTCSessionDescriptionInit } | null;
 }) {
     const { videoRef, state, error } = useWebRTCStream({
         cameraId,
         streamName,
         webrtcUrl,
+        prefetched,
     });
     useEffect(() => {
         if (state === "error") onFallback?.();
