@@ -20,10 +20,12 @@ import (
 // Subscriber bridges EventBus events into the SystemLog table.
 //
 // On Start it subscribes to a fixed set of topics (device.status,
-// camera.online / offline / status_changed, user.login / logout).
-// Each event is decoded, turned into a Chinese human-readable
-// message, persisted as a SystemLog row, and re-published on the
-// "system.log" topic so the WS Hub can fan it out to dashboards.
+// camera.online / offline / status_changed). user.login / logout are
+// intentionally NOT recorded — routine auth events don't carry audit
+// value and only crowd out meaningful device/camera logs. Each event
+// is decoded, turned into a Chinese human-readable message, persisted
+// as a SystemLog row, and re-published on the "system.log" topic so
+// the WS Hub can fan it out to dashboards.
 type Subscriber struct {
 	db  *gorm.DB
 	bus *eventbus.Bus
@@ -44,8 +46,10 @@ func (s *Subscriber) Start() {
 		eventbus.TopicCameraOnline,
 		eventbus.TopicCameraOffline,
 		eventbus.TopicCameraStatusChanged,
-		eventbus.TopicUserLogin,
-		eventbus.TopicUserLogout,
+		// user.login / user.logout are deliberately omitted: routine
+		// auth events would crowd out meaningful device/camera logs
+		// without adding audit value. WS Hub and automation engine
+		// still receive these events directly from the EventBus.
 	}
 	for _, t := range topics {
 		// Capture the topic in a local variable so the closure
@@ -152,7 +156,10 @@ func (s *Subscriber) pruneSystemLogs() {
 //
 // v1.6.36: each branch now assigns a Level (critical / normal / info)
 // so the dashboard can surface urgent events (camera offline) above
-// routine ones (user login). See model.Level* constants.
+// routine ones. See model.Level* constants.
+//
+// v1.8.13: user.login / user.logout branches removed — routine auth
+// events no longer persisted to system_logs.
 func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog {
 	var (
 		message string
@@ -202,29 +209,6 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 			level = model.LevelInfo
 		}
 
-	case eventbus.TopicUserLogin:
-		var p eventbus.UserLoginPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
-		ts = p.Ts
-		// The auth handler doesn't include the username in the
-		// payload (it has user_id only). Look it up so the log
-		// reads "用户 admin 登录"; fall back to the ID.
-		username := s.username(p.UserID)
-		message = fmt.Sprintf("用户 %s 登录 (设备 %s)", username, deviceLabel(p.DeviceID, p.DeviceName))
-		level = model.LevelNormal
-
-	case eventbus.TopicUserLogout:
-		var p eventbus.UserLogoutPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
-		ts = p.Ts
-		username := s.username(p.UserID)
-		message = fmt.Sprintf("用户 %s 登出 (设备 %s)", username, deviceLabel(p.DeviceID, p.DeviceName))
-		level = model.LevelNormal
-
 	default:
 		return nil
 	}
@@ -253,24 +237,6 @@ func (s *Subscriber) cameraLabel(id uint, host string) string {
 	}
 	if host != "" {
 		return host
-	}
-	return fmt.Sprintf("#%d", id)
-}
-
-// username returns the user's Name, falling back to "#<id>".
-func (s *Subscriber) username(id uint) string {
-	var u model.User
-	if err := s.db.Select("name").First(&u, id).Error; err == nil && u.Name != "" {
-		return u.Name
-	}
-	return fmt.Sprintf("#%d", id)
-}
-
-// deviceLabel prefers the device_name from the payload (no DB hit)
-// and falls back to "#<id>".
-func deviceLabel(id uint, name string) string {
-	if name != "" {
-		return name
 	}
 	return fmt.Sprintf("#%d", id)
 }
