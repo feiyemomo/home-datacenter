@@ -229,6 +229,38 @@ func (r *Registry) Get(id uint) (*model.Camera, error) {
 	return &c, nil
 }
 
+// PreheatStream triggers a best-effort go2rtc preheat for the given
+// camera: forces go2rtc to connect to the RTSP source (and start any
+// transcoder) before the first real client request arrives, so the
+// first WebRTC SDP or HLS request doesn't pay the 1-10s cold-start
+// latency.
+//
+// Non-blocking — the preheat runs in a detached goroutine (with a
+// 15s timeout context, matching Register/BootReplay) so the caller
+// returns immediately. The goroutine's errors are logged but not
+// propagated: preheat is an optimization, so a failure just means
+// the first user request warms the source instead.
+//
+// A lookup failure (camera not found / no stream name) is returned
+// as an error so the handler can decide what to do — but the Preheat
+// handler ignores it (best-effort, 200 either way).
+func (r *Registry) PreheatStream(cameraID uint) error {
+	cam, err := r.Get(cameraID)
+	if err != nil {
+		return err
+	}
+	if cam.StreamName == "" {
+		return fmt.Errorf("camera %d has no stream name", cameraID)
+	}
+	streamName := cam.StreamName
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		r.Go2.Preheat(ctx, streamName)
+	}()
+	return nil
+}
+
 // LookupByFrigateSlug resolves a Frigate camera slug (e.g.
 // "front_door") back to a home-api camera ID. It scans all cameras
 // and computes each one's Frigate slug until it finds a match.

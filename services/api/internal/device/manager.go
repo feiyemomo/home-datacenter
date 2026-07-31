@@ -76,6 +76,13 @@ func (m *Manager) Stop() {
 
 // SetOnline marks a device as online and emits a status event.
 // Also updates LastSeen in the database.
+//
+// v1.6.36: guard with wasOffline transition check, mirroring
+// Heartbeat()'s logic. Without this, every WS reconnect (user
+// opens the app, re-opening a tab) calls SetOnline and emits a
+// spurious "device online" event even though the device never
+// went offline — flooding system_logs with duplicate "设备上线"
+// entries. Now only a real offline→online transition publishes.
 func (m *Manager) SetOnline(deviceID uint, ip string) {
 	m.mu.Lock()
 	st, ok := m.devices[deviceID]
@@ -83,26 +90,46 @@ func (m *Manager) SetOnline(deviceID uint, ip string) {
 		st = &deviceState{}
 		m.devices[deviceID] = st
 	}
+	wasOffline := !st.Online
 	st.Online = true
 	st.LastSeen = time.Now()
-	st.LastIP = ip
-	m.mu.Unlock()
-
-	// Persist LastSeen asynchronously so the hot path is not blocked.
-	go m.repo.UpdateLastSeen(deviceID, ip)
-
-	m.publishStatus(deviceID, "online")
-}
-
-// SetOffline marks a device as offline and emits a status event.
-func (m *Manager) SetOffline(deviceID uint) {
-	m.mu.Lock()
-	if st, ok := m.devices[deviceID]; ok {
-		st.Online = false
+	if ip != "" {
+		st.LastIP = ip
 	}
 	m.mu.Unlock()
 
-	m.publishStatus(deviceID, "offline")
+	// Persist LastSeen asynchronously so the hot path is not blocked.
+	go m.repo.UpdateLastSeen(deviceID, st.LastIP)
+
+	// Only emit on a real offline→online transition.
+	if wasOffline {
+		m.publishStatus(deviceID, "online")
+	}
+}
+
+// SetOffline marks a device as offline and emits a status event.
+//
+// v1.6.36: guard with wasOnline transition check, mirroring
+// SetOnline's logic. Without this, repeated SetOffline calls
+// (e.g. MQTT broker firing multiple disconnect events, or the
+// background sweeper racing with an explicit offline signal)
+// each emit a "device offline" event — flooding system_logs
+// with duplicate "设备离线" entries. Now only a real
+// online→offline transition publishes.
+func (m *Manager) SetOffline(deviceID uint) {
+	m.mu.Lock()
+	st, ok := m.devices[deviceID]
+	if !ok {
+		st = &deviceState{}
+		m.devices[deviceID] = st
+	}
+	wasOnline := st.Online
+	st.Online = false
+	m.mu.Unlock()
+
+	if wasOnline {
+		m.publishStatus(deviceID, "offline")
+	}
 }
 
 // Heartbeat refreshes a device's LastSeen timestamp. Called whenever

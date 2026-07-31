@@ -214,8 +214,22 @@ export function recordingFileUrl(cameraId: number, recId: number): string {
     return `/api/v1/cameras/${cameraId}/recordings/${recId}/file`;
 }
 
-export async function getIceConfig(): Promise<IceConfig> {
+/**
+ * Module-level cache for the ICE config. The STUN/TURN server list
+ * rarely changes, and every camera card on the dashboard calls this
+ * on mount — without a cache, N cameras = N round-trips to /cameras/ice.
+ * TTL is 5 minutes; forceRefresh bypasses for the rare case where the
+ * operator rotated TURN credentials.
+ */
+let iceConfigCache: { data: IceConfig; ts: number } | null = null;
+const ICE_CONFIG_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+export async function getIceConfig(forceRefresh = false): Promise<IceConfig> {
+    if (!forceRefresh && iceConfigCache && Date.now() - iceConfigCache.ts < ICE_CONFIG_TTL_MS) {
+        return iceConfigCache.data;
+    }
     const { data } = await client.get<IceConfig>("/cameras/ice");
+    iceConfigCache = { data, ts: Date.now() };
     return data;
 }
 

@@ -43,7 +43,7 @@ func main() {
 	deviceName := "MacBook-Pro"
 
 	// 创建设备
-	accessKey, err := deviceService.CreateDevice(
+	_, accessKey, err := deviceService.CreateDevice(
 		userID,
 		deviceName,
 	)

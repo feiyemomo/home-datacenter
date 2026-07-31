@@ -279,20 +279,22 @@ func (h *Handler) handleStatus(deviceID uint, payload []byte) {
 		return
 	}
 
-	// Re-publish on the EventBus so WebSocket subscribers see the update.
-	// Re-serialise as canonical JSON (the original may be loosely formatted)
-	// so downstream consumers always get valid JSON.
-	canonical, _ := json.Marshal(struct {
-		DeviceID uint   `json:"device_id"`
-		Status   string `json:"status"`
-		TS       int64  `json:"ts"`
-	}{deviceID, status, ts})
-
-	h.bus.Publish(eventbus.Event{
-		Topic:   eventbus.TopicDeviceStatus,
-		Payload: canonical,
-		Source:  eventbus.SourceMQTT,
-	})
+	// v1.6.36: do NOT re-publish device.status here. The Manager's
+	// SetOnline / SetOffline / Heartbeat methods already publish
+	// device.status on the EventBus (with the correct SourceSystem
+	// and a wasOffline / wasOnline transition guard). Re-publishing
+	// here caused two bugs:
+	//   1. Every MQTT heartbeat (status="heartbeat") wrote a
+	//      spurious "设备 #N heartbeat" SystemLog row — the
+	//      Subscriber's translateStatus() didn't recognise
+	//      "heartbeat" and surfaced the raw string.
+	//   2. Every real online/offline transition was published
+	//      twice (once by the Manager with SourceSystem, once
+	//      here with SourceMQTT), doubling every SystemLog entry.
+	// The ts value is still consumed by parseStatusPayload above
+	// and forwarded into the Manager via the heartbeat/online
+	// path (LastSeen), so dropping the re-publish loses nothing.
+	_ = ts
 }
 
 // parseStatusPayload extracts (status, ts) from a status message.

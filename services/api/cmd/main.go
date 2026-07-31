@@ -16,6 +16,7 @@ import (
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/handler"
+	logpkg "home-datacenter-api/internal/log"
 	"home-datacenter-api/internal/middleware"
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
@@ -127,14 +128,22 @@ func main() {
 	hub := ws.NewHub(bus)
 	defer hub.Close()
 
+	// SystemLog subscriber: persists a human-readable audit entry
+	// for every device / camera / user event and re-publishes on
+	// the "system.log" topic so the WS Hub fans it out to
+	// dashboards. Started before the auth handler is wired so
+	// the very first /auth/bind produces a log row.
+	logSub := logpkg.NewSubscriber(database.DB, bus)
+	logSub.Start()
+
 	// ---- Services & Handlers ----
 	authService := service.NewAuthService(userRepo, deviceRepo)
 	userService := service.NewUserService(userRepo, deviceRepo)
 	deviceService := service.NewDeviceService(deviceRepo)
 
-	authHandler := handler.NewAuthHandler(authService)
+	authHandler := handler.NewAuthHandler(authService, bus)
 	userHandler := handler.NewUserHandler(userService)
-	deviceHandler := handler.NewDeviceHandler(deviceService, userService)
+	deviceHandler := handler.NewDeviceHandler(deviceService, userService, bus)
 
 	// WebSocket handler. If server.allowed_origins is configured, use
 	// the origin-allowlisting constructor to block cross-site WebSocket
@@ -152,6 +161,7 @@ func main() {
 		)
 	}
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
+	systemLogHandler := handler.NewSystemLogHandler(database.DB)
 
 	// ---- Phase 4: Camera platformization (continued) ----
 	//
@@ -286,6 +296,7 @@ func main() {
 		device.Use(middleware.JWTAuth(deviceRepo))
 		{
 			device.GET("/list", deviceHandler.List)
+			device.POST("", deviceHandler.Create)
 			device.DELETE("/:id", deviceHandler.Delete)
 		}
 
@@ -293,6 +304,11 @@ func main() {
 		system.Use(middleware.JWTAuth(deviceRepo))
 		{
 			system.GET("/status", systemHandler.Status)
+			// Persisted audit log: device / camera / user events
+			// turned into human-readable rows by the log
+			// subscriber. Newest first; supports limit/offset/
+			// event_type filters (see SystemLogHandler.List).
+			system.GET("/logs", systemLogHandler.List)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so
@@ -355,6 +371,13 @@ func main() {
 			// nginx auth_request + body-discard interaction that
 			// used to make /go2rtc/api/webrtc hang for 60s.
 			camGroup.POST(":id/webrtc", camHandler.WebRTC)
+			// Preheat: triggers go2rtc to connect to the RTSP source
+			// before the first real video request, so the first
+			// WebRTC/HLS/MP4 request doesn't pay the 1-10s cold-start.
+			// Best-effort, non-blocking — available to any authenticated
+			// user (like WebRTC) since it's a read-ish "prepare to view"
+			// operation, not a config mutation.
+			camGroup.POST(":id/preheat", camHandler.Preheat)
 			// Mutating endpoints are admin-only.
 			adminCam := camGroup.Group("")
 			adminCam.Use(middleware.RequireAdmin(database.DB))

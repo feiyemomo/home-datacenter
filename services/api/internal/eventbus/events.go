@@ -28,6 +28,17 @@ const (
 	TopicSystemAlert      = "system.alert"
 	TopicUserNotification = "user.notification"
 	TopicSystemBroadcast  = "system.broadcast"
+	// TopicSystemLog is published by the log subscriber after a
+	// SystemLog row is persisted. The WS Hub subscribes to it so
+	// connected dashboards see new log entries in real time.
+	TopicSystemLog = "system.log"
+
+	// --- User auth events ---
+	// Emitted by the auth handler on /auth/bind success and by the
+	// device handler on device revoke. Persisted by the log
+	// subscriber as a human-readable audit entry.
+	TopicUserLogin  = "user.login"
+	TopicUserLogout = "user.logout"
 
 	// --- Automation events (Phase 5) ---
 	TopicAutomationFired = "automation.fired"
@@ -94,4 +105,23 @@ type CameraStatusPayload struct {
 	Status   string `json:"status"`
 	Host     string `json:"host"`
 	TS       int64  `json:"ts"`
+}
+
+// UserLoginPayload is the JSON shape for TopicUserLogin events,
+// emitted by /auth/bind on successful credential exchange.
+type UserLoginPayload struct {
+	UserID     uint   `json:"user_id"`
+	DeviceID   uint   `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	Ts         int64  `json:"ts"`
+}
+
+// UserLogoutPayload is the JSON shape for TopicUserLogout events,
+// emitted when an admin revokes a device (the closest equivalent
+// to an explicit logout in this codebase).
+type UserLogoutPayload struct {
+	UserID     uint   `json:"user_id"`
+	DeviceID   uint   `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	Ts         int64  `json:"ts"`
 }

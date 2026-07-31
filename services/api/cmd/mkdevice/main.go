@@ -13,7 +13,7 @@ func main() {
   ds := service.NewDeviceService(dr)
   name := "debug-device"
   if len(os.Args) > 1 { name = os.Args[1] }
-  ak, err := ds.CreateDevice(1, name)
+  _, ak, err := ds.CreateDevice(1, name)
   if err != nil { log.Fatal(err) }
   fmt.Println("ACCESS_KEY=" + ak)
 }

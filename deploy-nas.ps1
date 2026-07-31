@@ -19,13 +19,13 @@
 #      Until you do this, every ssh/scp call below will prompt for the
 #      NAS password interactively.
 #   2. docker compose plugin (v2) on the NAS. fnos ships Docker; verify:
-#        ssh -p 22 fnos-momo@192.168.31.234 'docker compose version'
+#        ssh -p 22 fnos-momo@192.168.1.3 'docker compose version'
 #
 # First-time deploy only:
 #   The script refuses to overwrite the NAS's .env (each environment
 #   must have its own JWT_SECRET + MQTT_PASSWORD). Create it manually
 #   on the NAS before the first deploy:
-#        ssh -p 22 fnos-momo@192.168.31.234
+#        ssh -p 22 fnos-momo@192.168.1.3
 #        cd /vol1/docker/home-datacenter
 #        cp .env.example .env
 #        # edit .env: JWT_SECRET=$(openssl rand -hex 32), MQTT_PASSWORD=...
@@ -57,7 +57,7 @@ param(
 )
 
 # ============== CONFIG (edit to match your NAS) ==============
-$NAS_HOST   = "192.168.31.234"
+$NAS_HOST   = "192.168.1.3"
 $NAS_USER   = "fnos-momo"
 $NAS_PORT   = 22
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
@@ -90,7 +90,7 @@ $script:AskpassFile = ""
 if ($Password) {
     $script:AskpassFile = [System.IO.Path]::GetTempFileName() + "-askpass.bat"
     # Batch file that echoes the password. The %1 argument is the
-    # prompt string ssh passes (e.g. "fnos-momo@192.168.31.234's password:").
+    # prompt string ssh passes (e.g. "fnos-momo@192.168.1.3's password:").
     "@echo $Password" | Set-Content $script:AskpassFile -Encoding ASCII
     $env:SSH_ASKPASS = $script:AskpassFile
     $env:SSH_ASKPASS_REQUIRE = "force"

@@ -1,9 +1,21 @@
 package service
 
 import (
+	"errors"
+	"strings"
+	"unicode/utf8"
+
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/utils"
+)
+
+// Domain-level errors returned by the device API. Handlers translate
+// these into HTTP status codes.
+var (
+	// ErrInvalidDeviceName — device name was empty or longer than 64
+	// runes after trimming.
+	ErrInvalidDeviceName = errors.New("device name must be 1-64 chars")
 )
 
 type DeviceService struct {
@@ -18,27 +30,43 @@ func NewDeviceService(
 	}
 }
 
+// CreateDevice creates a new device for the given user and returns
+// the device plus the plaintext access_key (shown to the user once).
+// The access_key is hashed before persistence — only the hash is
+// stored, so callers must surface the plaintext key to the user
+// immediately because it can never be recovered.
+//
+// The device name is trimmed and must be 1-64 runes; otherwise
+// ErrInvalidDeviceName is returned. revoked_at is left NULL so the
+// device is immediately usable for /auth/bind.
 func (s *DeviceService) CreateDevice(
 	userID uint,
-	deviceName string,
-) (string, error) {
+	name string,
+) (*model.Device, string, error) {
+	// 1. Validate name (1-64 runes after trim).
+	n := strings.TrimSpace(name)
+	if c := utf8.RuneCountInString(n); c < 1 || c > 64 {
+		return nil, "", ErrInvalidDeviceName
+	}
 
+	// 2. Generate the plaintext access_key (64 hex chars, same
+	//    generator the user-create path uses).
 	accessKey, err := utils.GenerateAccessKey()
 	if err != nil {
-		return "", err
+		return nil, "", err
 	}
 
+	// 3. Persist only the SHA256 hash; revoked_at stays NULL.
 	device := &model.Device{
 		UserID:        userID,
-		DeviceName:    deviceName,
+		DeviceName:    n,
 		AccessKeyHash: utils.HashAccessKey(accessKey),
 	}
-
 	if err := s.deviceRepo.Create(device); err != nil {
-		return "", err
+		return nil, "", err
 	}
 
-	return accessKey, nil
+	return device, accessKey, nil
 }
 
 func (s *DeviceService) RevokeDevice(

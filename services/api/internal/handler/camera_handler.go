@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -868,6 +871,33 @@ func humanSize(n int64) string {
 func (h *CameraHandler) ICE(c *gin.Context) {
 	lanBase := h.Reg.Go2.Base
 	cfg := camera.BuildIceConfig(h.RawIce, h.PublicBase, lanBase)
+
+	// Derive a stable ETag from the config payload so clients can
+	// short-circuit with a 304 when nothing changed. SHA256 over the
+	// canonical JSON serialization; 16 hex chars (8 bytes) is far
+	// more collision resistance than needed for a handful of ICE
+	// configs. The ETag is wrapped in quotes per RFC 7232.
+	payload, err := json.Marshal(cfg)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "marshal ice config: "+err.Error())
+		return
+	}
+	sum := sha256.Sum256(payload)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+
+	c.Header("Cache-Control", "private, max-age=300")
+	c.Header("ETag", etag)
+
+	// If-None-Match: return 304 with no body when the client's cached
+	// representation is still current. The ICE config changes rarely
+	// (only when the operator reconfigures STUN/TURN or the public
+	// base URL), so most repeat requests from the dashboard collapse
+	// into a cheap 304.
+	if inm := c.GetHeader("If-None-Match"); inm == etag {
+		c.Status(http.StatusNotModified)
+		return
+	}
+
 	utils.Success(c, cfg)
 }
 
@@ -938,6 +968,31 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 	c.Header("Cache-Control", "no-store")
 	c.Status(http.StatusOK)
 	_, _ = c.Writer.Write(answer)
+}
+
+// Preheat — POST /api/v1/cameras/:id/preheat
+//
+// Triggers go2rtc to connect to the RTSP source proactively so the
+// first real video request (WebRTC SDP or HLS) doesn't pay the
+// 1-10s cold-start. Best-effort, non-blocking — returns 200
+// immediately.
+//
+// If the camera doesn't exist or preheat fails, the response is
+// still 200 (the client shouldn't fail just because preheat failed
+// — the next real request will warm the source anyway). The actual
+// preheat runs in a detached goroutine inside PreheatStream, so the
+// handler returns as soon as the camera lookup completes.
+func (h *CameraHandler) Preheat(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	// Best-effort: ignore the error. A missing camera or a down
+	// go2rtc is not a client-visible failure — preheat is purely an
+	// optimization.
+	_ = h.Reg.PreheatStream(uint(id))
+	utils.Success(c, gin.H{"status": "preheating"})
 }
 
 // List — GET /api/v1/cameras

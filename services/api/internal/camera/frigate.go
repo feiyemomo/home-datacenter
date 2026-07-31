@@ -301,7 +301,7 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 	// break LAN WebRTC.
 	candidates := []string{
 		"127.0.0.1:8555",
-		"192.168.31.234:8555",
+		"192.168.1.3:8555",
 	}
 	if ipv6Addr != "" {
 		candidates = append(candidates, fmt.Sprintf("[%s]:8555", ipv6Addr))

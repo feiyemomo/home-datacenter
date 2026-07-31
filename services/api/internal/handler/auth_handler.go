@@ -1,24 +1,30 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
 )
 
 type AuthHandler struct {
 	authService *service.AuthService
+	bus         *eventbus.Bus
 }
 
 func NewAuthHandler(
 	authService *service.AuthService,
+	bus *eventbus.Bus,
 ) *AuthHandler {
 	return &AuthHandler{
 		authService: authService,
+		bus:         bus,
 	}
 }
 
@@ -65,10 +71,27 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 		return
 	}
 
-	token, err := h.authService.Bind(req.UserID, req.AccessKey)
+	token, device, err := h.authService.Bind(req.UserID, req.AccessKey)
 	if err != nil {
 		utils.Fail(c, http.StatusUnauthorized, "invalid credentials")
 		return
+	}
+
+	// Publish user.login so the log subscriber can persist a
+	// human-readable "用户 admin 登录" entry and the WS Hub can
+	// push it to connected dashboards.
+	if h.bus != nil && device != nil {
+		payload, _ := json.Marshal(eventbus.UserLoginPayload{
+			UserID:     req.UserID,
+			DeviceID:   device.ID,
+			DeviceName: device.DeviceName,
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicUserLogin,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
 	}
 
 	// 365 days, matching the JWT's exp claim. SameSite=Lax is

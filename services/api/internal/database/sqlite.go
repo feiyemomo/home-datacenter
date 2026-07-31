@@ -44,6 +44,7 @@ func InitDB(dbPath string) {
 		&model.Camera{},
 		&model.Recording{},
 		&model.Rule{},
+		&model.SystemLog{},
 	)
 	if err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
@@ -68,6 +69,16 @@ func InitDB(dbPath string) {
 	// true for any NULL row so the migration is non-breaking.
 	if err := backfillTranscodeUseSubstream(db); err != nil {
 		log.Printf("camera: transcode_use_substream backfill: %v", err)
+	}
+
+	// v1.6.36: backfill Level for SystemLog rows written before the
+	// Level column existed. GORM AutoMigrate adds the column as NULL;
+	// without this backfill, pre-v1.6.36 rows would all read as ""
+	// and the dashboard's level filter would miss them. We infer the
+	// level from event_type / payload so historical camera-offline
+	// events get the critical badge they deserve.
+	if err := backfillSystemLogLevel(db); err != nil {
+		log.Printf("systemlog: level backfill: %v", err)
 	}
 
 	DB = db
@@ -147,5 +158,63 @@ func backfillTranscodeUseSubstream(db *gorm.DB) error {
 		return res.Error
 	}
 	log.Printf("camera: transcode_use_substream backfill: %d row(s) updated", res.RowsAffected)
+	return nil
+}
+
+// backfillSystemLogLevel populates the Level column for SystemLog
+// rows written before v1.6.36 (when the column was added). GORM
+// AutoMigrate adds the column as NULL/"" — without this backfill
+// the dashboard's level filter would miss every historical row.
+//
+// Inference rules (mirrors subscriber.go buildEntry):
+//   - event_type = "camera.offline"                  -> critical
+//   - event_type = "device.status" + payload offline -> critical
+//   - event_type = "camera.status_changed"           -> info
+//   - everything else                                -> normal
+//
+// Uses SQLite json_extract on the Payload column to inspect the
+// status field of device.status events. Rows that already have a
+// non-empty Level are left untouched (idempotent).
+func backfillSystemLogLevel(db *gorm.DB) error {
+	// camera.offline -> critical
+	if res := db.Exec(`
+		UPDATE system_logs
+		SET level = ?
+		WHERE (level IS NULL OR level = '')
+		  AND event_type = 'camera.offline'
+	`, model.LevelCritical); res.Error != nil {
+		return res.Error
+	}
+
+	// device.status with status=offline in payload -> critical
+	if res := db.Exec(`
+		UPDATE system_logs
+		SET level = ?
+		WHERE (level IS NULL OR level = '')
+		  AND event_type = 'device.status'
+		  AND json_extract(payload, '$.status') = 'offline'
+	`, model.LevelCritical); res.Error != nil {
+		return res.Error
+	}
+
+	// camera.status_changed -> info
+	if res := db.Exec(`
+		UPDATE system_logs
+		SET level = ?
+		WHERE (level IS NULL OR level = '')
+		  AND event_type = 'camera.status_changed'
+	`, model.LevelInfo); res.Error != nil {
+		return res.Error
+	}
+
+	// Everything else still empty -> normal
+	if res := db.Exec(`
+		UPDATE system_logs
+		SET level = ?
+		WHERE level IS NULL OR level = ''
+	`, model.LevelNormal); res.Error != nil {
+		return res.Error
+	}
+
 	return nil
 }

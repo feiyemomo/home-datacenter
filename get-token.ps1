@@ -18,7 +18,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$BaseUrl = "http://192.168.31.234:8080",
+    [string]$BaseUrl = "http://192.168.1.3:8080",
     [switch]$Copy
 )
 
