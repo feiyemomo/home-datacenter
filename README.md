@@ -582,6 +582,27 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.12 — 日志保留 + IPv6 前缀修复 + 摄像头状态显示 (2026-07-31)
+
+#### 修复
+- **IPv6 直连失败（前缀旋转）**：ISP DHCPv6-PD 续约导致 /64 前缀从 `37a4:9140` 旋转到 `37a8:80c0`，但 `compose.yaml` 的 `NAS_IPV6_ADDRESS` 仍为旧值。后端 `/api/v1/network/ipv6` 报告 `PrefixRotated=true` 且 `configured_address` 过时，导致 Android `fetchDynamicIpv6Url` 误判 IPv6 不可用。已更新默认值为 `2409:8a70:37a8:80c0:62be:b4ff:fe08:bd09`（当前 NAS SLAAC EUI-64 mngtmpaddr）。注意：DDNS 记录（`nas.feiyemomo.top` AAAA）已由 DDNS 提供商自动更新到新前缀，无需手动干预。
+
+#### 优化
+- **日志保留分级**：`SystemLog` 表按 `level` 分级保留，避免普通事件淹没紧急日志。`subscriber.go` 在每次写入后调用 `pruneSystemLogs`：
+  - `critical`（摄像头/设备掉线）：**无限保留**（审计追踪）
+  - `normal`（用户登录/登出、设备上线）：保留最新 **500** 条
+  - `info`（摄像头状态变更）：保留最新 **200** 条
+  - 清理使用单条 `DELETE ... WHERE id IN (subquery)` 语句，配合 `level` 列索引，开销极低。
+- **Android 摄像头当前状态显示**：服务日志 Tab 的 `camera.*` 日志项新增"当前状态：在线/离线"副标题。
+  - `ServiceLogsFragment` 拉取 `/api/v1/cameras` 构建摄像头快照 `Map<cameraId, Camera>`，传给 `ServiceLogAdapter`。
+  - `ServiceLogAdapter.bindCameraStatus` 解析日志 payload 中的 `camera_id`，从快照查找当前状态，绿色显示"在线"、红色显示"离线"。
+  - WebSocket 收到 `camera.*` 事件时自动刷新快照，确保副标题实时反映最新状态（例如摄像头恢复后，之前的"离线"日志副标题立即变为"当前状态：在线"）。
+
+#### 版本
+- Backend: v1.8.12
+- Web: v1.8.11（无改动）
+- Android: v1.6.37 (versionCode 80)
+
 ### v1.8.11 — App Experience Optimizations (2026-07-31)
 
 #### 新增
