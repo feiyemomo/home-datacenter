@@ -74,6 +74,12 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 		return
 	}
 
+	// v1.6.37: prune per-level backlog so routine events don't
+	// drown out urgent ones in SQLite. Critical events are kept
+	// indefinitely (audit trail); normal/info are capped. See
+	// pruneSystemLogs for the retention table.
+	s.pruneSystemLogs()
+
 	// Re-publish the freshly persisted row (now with its ID) on
 	// the system.log topic so the WS Hub can broadcast it.
 	payload, err := json.Marshal(entry)
@@ -86,6 +92,58 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 		Source:  eventbus.SourceSystem,
 		Payload: payload,
 	})
+}
+
+// pruneSystemLogs enforces per-level retention so routine events
+// (user login, camera status_changed) don't grow system_logs
+// unbounded and crowd out critical events in queries.
+//
+// Retention table (v1.6.37):
+//   - critical: unlimited (audit trail — camera/device offline)
+//   - normal:   keep newest 500 rows (user login/logout, online)
+//   - info:     keep newest 200 rows (camera status_changed)
+//
+// Runs on every insert. Cheap because:
+//   1. Count is on the indexed `level` column.
+//   2. Delete only fires when count exceeds the cap (common case
+//      is a no-op).
+//   3. Uses a subquery to find the cutoff id, so it's a single
+//      DELETE statement instead of a row-by-row loop.
+//
+// Empty/unknown level rows (pre-v1.6.36 backfilled to "normal")
+// are treated as normal for pruning.
+func (s *Subscriber) pruneSystemLogs() {
+	caps := map[string]int64{
+		model.LevelNormal: 500,
+		model.LevelInfo:   200,
+	}
+	for level, keep := range caps {
+		var count int64
+		if err := s.db.Model(&model.SystemLog{}).
+			Where("level = ?", level).
+			Count(&count).Error; err != nil {
+			log.Printf("systemlog: prune count failed level=%s: %v", level, err)
+			continue
+		}
+		if count <= keep {
+			continue
+		}
+		// Delete the oldest (count - keep) rows for this level.
+		// "Oldest" = lowest (ts, id) — matches the ORDER BY used by
+		// the REST endpoint's "newest first" listing, so the rows
+		// dropped are exactly the ones no longer shown.
+		excess := count - keep
+		res := s.db.Where(
+			"id IN (SELECT id FROM system_logs WHERE level = ? ORDER BY ts ASC, id ASC LIMIT ?)",
+			level, excess,
+		).Delete(&model.SystemLog{})
+		if res.Error != nil {
+			log.Printf("systemlog: prune delete failed level=%s: %v", level, res.Error)
+			continue
+		}
+		log.Printf("systemlog: pruned %d row(s) level=%s (was %d, cap=%d)",
+			res.RowsAffected, level, count, keep)
+	}
 }
 
 // buildEntry maps an EventBus event to a SystemLog row, including
