@@ -17,7 +17,22 @@ func NewUserRepository(db *gorm.DB) *UserRepository {
 }
 
 // Create 创建用户
+// 自动查找最小可用 ID 以复用已删除用户释放的 ID（SQLite 默认 max(id)+1 不会复用）
 func (r *UserRepository) Create(user *model.User) error {
+	var minID uint
+	r.db.Raw(`
+		SELECT COALESCE(MIN(t.id) + 1, 1) FROM (
+			SELECT 0 AS id
+			UNION ALL
+			SELECT id FROM users
+		) t
+		WHERE NOT EXISTS (
+			SELECT 1 FROM users u WHERE u.id = t.id + 1
+		)
+	`).Scan(&minID)
+	if minID > 0 {
+		user.ID = minID
+	}
 	return r.db.Create(user).Error
 }
 

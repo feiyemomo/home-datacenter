@@ -12,15 +12,15 @@
   - 在 `Dashboard.tsx` 中读取当前用户权限（通过 `useAuth` 或类似机制）
   - 非 admin 用户不显示系统日志卡片（`Card` 组件从 `系统日志` 开始到 `系统快照` 之前）
 
-- [ ] Task 4: 排查并修复已删除用户 ID 复用问题
+- [x] Task 4: 排查并修复已删除用户 ID 复用问题
   - 检查 `user_service.go` 的 `Delete` 方法确保级联删除设备时使用物理删除
   - 检查 `device_repository.go` 的 `DeleteByUser` 方法确认是物理删除
   - 验证 User 和 Device 模型无 `DeletedAt` 字段
   - 验证 SQLite 自增 ID 机制在新记录插入时是否确实复用已删除的 ID
-  - 如果存在 `gorm.DeletedAt` 软删除，改为物理删除
+  - 修复：在 `user_repository.go` 和 `device_repository.go` 的 `Create` 方法中查找最小可用 ID 以复用已删除的 ID
   - 部署后通过测试验证 ID 复用
 
-- [ ] Task 5: 排查 Dashboard 日志显示问题
+- [x] Task 5: 排查 Dashboard 日志显示问题
   - 检查 `listSystemLogs` API 调用是否正确返回数据
   - 检查 `SystemLog` 类型定义与后端返回字段是否匹配
   - 检查渲染逻辑中是否有字段名不匹配或其他 bug
