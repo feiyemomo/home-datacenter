@@ -3,7 +3,6 @@ import { NavLink } from "react-router-dom";
 import {
     Activity,
     LayoutDashboard,
-    HardDrive,
     Radio,
     User as UserIcon,
     UserCog,
@@ -35,7 +34,6 @@ const NAV_ITEMS: NavItem[] = [
     { to: "/dashboard", label: "仪表盘", icon: <LayoutDashboard size={18} /> },
     { to: "/cameras", label: "摄像头", icon: <CameraIcon size={18} /> },
     { to: "/network", label: "网络", icon: <NetworkIcon size={18} /> },
-    { to: "/devices", label: "设备", icon: <HardDrive size={18} /> },
     {
         to: "/users",
         label: "用户",

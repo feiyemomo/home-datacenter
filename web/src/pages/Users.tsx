@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Plus, RefreshCw, Trash2, Loader2, UserCog, ShieldAlert, Copy, Check, Key } from "lucide-react";
+import { Plus, RefreshCw, Trash2, Loader2, UserCog, ShieldAlert } from "lucide-react";
 import { createUser, deleteUser, listUsers, updateUser } from "@/api/user";
 import { ApiError } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
@@ -44,10 +44,10 @@ export default function Users() {
     const [showCreate, setShowCreate] = useState(false);
     const [newName, setNewName] = useState("");
     const [newIsAdmin, setNewIsAdmin] = useState(false);
-    const [newDeviceName, setNewDeviceName] = useState("");
+    
     const [creating, setCreating] = useState(false);
     const [createResult, setCreateResult] = useState<CreateUserResponse | null>(null);
-    const [copied, setCopied] = useState(false);
+    
 
     // Per-row edit state. The map key is the user id; the value
     // is the staged name input. is_admin flips immediately on
@@ -87,18 +87,15 @@ export default function Users() {
             setError("请输入名称");
             return;
         }
-        const deviceName = newDeviceName.trim();
         setCreating(true);
         setError(null);
         try {
             const result = await createUser({
                 name,
                 is_admin: newIsAdmin,
-                initial_device_name: deviceName || undefined,
             });
             setNewName("");
             setNewIsAdmin(false);
-            setNewDeviceName("");
             setShowCreate(false);
             setCreateResult(result);
             await refresh();
@@ -113,14 +110,6 @@ export default function Users() {
         } finally {
             setCreating(false);
         }
-    }
-
-    function handleCopyAccessKey() {
-        if (!createResult?.access_key) return;
-        navigator.clipboard.writeText(createResult.access_key).then(() => {
-            setCopied(true);
-            window.setTimeout(() => setCopied(false), 2000);
-        });
     }
 
     async function handleSave(u: UserListEntry) {
@@ -253,12 +242,12 @@ export default function Users() {
                     <CardHeader>
                         <CardTitle className="text-base">创建用户</CardTitle>
                         <CardDescription>
-                            名称为 1-32 个字符，可包含字母、数字、_ 或 -。可选择同时创建首个设备 —— 其访问密钥将在创建后仅显示一次。
+                            名称为 1-32 个字符，可包含字母、数字、_ 或 -。
                         </CardDescription>
                     </CardHeader>
                     <CardContent>
                         <form
-                            className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_1fr_auto_auto]"
+                            className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_auto_auto]"
                             onSubmit={(e) => {
                                 e.preventDefault();
                                 handleCreate();
@@ -270,12 +259,6 @@ export default function Users() {
                                 onChange={(e) => setNewName(e.target.value)}
                                 maxLength={32}
                                 autoFocus
-                            />
-                            <Input
-                                placeholder="设备名称（可选，例如 alice-laptop）"
-                                value={newDeviceName}
-                                onChange={(e) => setNewDeviceName(e.target.value)}
-                                maxLength={64}
                             />
                             <label className="flex items-center gap-2 text-sm text-fg-muted">
                                 <input
@@ -299,53 +282,24 @@ export default function Users() {
                 </Card>
             )}
 
-            {/* Access Key reveal modal — shown once after successful
-                user creation when initial_device_name was provided. */}
-            {createResult && createResult.access_key && (
-                <Card className="border-[rgb(var(--accent-warm)/0.4)] bg-[rgb(var(--accent-warm)/0.08)]">
+            {createResult && (
+                <Card className="border-[rgb(var(--accent-success)/0.4)] bg-[rgb(var(--accent-success)/0.08)]">
                     <CardHeader>
-                        <CardTitle className="flex items-center gap-2 text-base text-[rgb(var(--accent-warm))]">
-                            <Key size={16} />
-                            用户已创建 —— 请保存访问密钥
+                        <CardTitle className="flex items-center gap-2 text-base text-[rgb(var(--accent-success))]">
+                            用户已创建
                         </CardTitle>
                         <CardDescription>
-                            访问密钥仅此一次显示。请复制并发送给 <strong>{createResult.name}</strong>
-                            {createResult.device ? `（设备：${createResult.device.device_name}）` : ""}。之后无法再次恢复。
+                            用户 <strong>{createResult.name}</strong> 创建成功。
                         </CardDescription>
                     </CardHeader>
-                    <CardContent className="space-y-3">
-                        <div className="flex items-center gap-2">
-                            <code className="flex-1 truncate rounded-lg glass-subtle px-3 py-2 font-mono text-sm text-fg">
-                                {createResult.access_key}
-                            </code>
-                            <Button
-                                size="sm"
-                                variant="outline"
-                                onClick={handleCopyAccessKey}
-                                className="shrink-0"
-                            >
-                                {copied ? (
-                                    <>
-                                        <Check size={14} className="mr-1 text-[rgb(var(--accent-success))]" />
-                                        已复制
-                                    </>
-                                ) : (
-                                    <>
-                                        <Copy size={14} className="mr-1" />
-                                        复制
-                                    </>
-                                )}
-                            </Button>
-                        </div>
-                        <div className="flex justify-end">
-                            <Button
-                                size="sm"
-                                variant="ghost"
-                                onClick={() => setCreateResult(null)}
-                            >
-                                关闭
-                            </Button>
-                        </div>
+                    <CardContent className="flex justify-end">
+                        <Button
+                            size="sm"
+                            variant="ghost"
+                            onClick={() => setCreateResult(null)}
+                        >
+                            关闭
+                        </Button>
                     </CardContent>
                 </Card>
             )}

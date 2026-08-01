@@ -7,19 +7,27 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/device"
+	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
 )
 
 type UserHandler struct {
 	userService *service.UserService
+	deviceMgr   *device.Manager
+	deviceRepo  *repository.DeviceRepository
 }
 
 func NewUserHandler(
 	userService *service.UserService,
+	deviceMgr *device.Manager,
+	deviceRepo *repository.DeviceRepository,
 ) *UserHandler {
 	return &UserHandler{
 		userService: userService,
+		deviceMgr:   deviceMgr,
+		deviceRepo:  deviceRepo,
 	}
 }
 
@@ -67,7 +75,7 @@ func (h *UserHandler) Me(c *gin.Context) {
 	})
 }
 
-// List returns every user along with each user's device_count.
+// List returns every user along with each user's device_count and online status.
 // Admin-only (route-level RequireAdmin guard).
 //
 //	Route: GET /api/v1/user
@@ -77,9 +85,29 @@ func (h *UserHandler) List(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, "failed to list users")
 		return
 	}
+
+	// Build a set of online device IDs for O(1) lookup.
+	onlineIDs := make(map[uint]bool)
+	for _, id := range h.deviceMgr.GetOnlineDevices() {
+		onlineIDs[id] = true
+	}
+
 	resps := make([]gin.H, 0, len(rows))
 	for _, r := range rows {
 		uc := toUserWithCount(r)
+
+		// Check if the user has any online device.
+		online := false
+		devices, err := h.deviceRepo.GetByUserID(uc.ID)
+		if err == nil {
+			for _, d := range devices {
+				if onlineIDs[d.ID] {
+					online = true
+					break
+				}
+			}
+		}
+
 		resps = append(resps, gin.H{
 			"id":           uc.ID,
 			"name":         uc.Name,
@@ -87,21 +115,16 @@ func (h *UserHandler) List(c *gin.Context) {
 			"created_at":   uc.CreatedAt,
 			"updated_at":   uc.UpdatedAt,
 			"device_count": uc.DeviceCount,
+			"online":       online,
 		})
 	}
 	utils.Success(c, gin.H{"users": resps})
 }
 
 // createUserRequest is the JSON body for POST /api/v1/user.
-//
-// initial_device_name is optional. When provided, a first auth
-// device is created alongside the user and the plaintext
-// AccessKey is returned in the response so the admin can hand
-// it to the new user immediately.
 type createUserRequest struct {
-	Name              string `json:"name"`
-	IsAdmin           bool   `json:"is_admin"`
-	InitialDeviceName string `json:"initial_device_name"`
+	Name    string `json:"name"`
+	IsAdmin bool   `json:"is_admin"`
 }
 
 // Create inserts a new user. Admin-only.
@@ -110,38 +133,25 @@ type createUserRequest struct {
 //	Status: 200 + user payload on success
 //	Status: 400 on invalid name
 //	Status: 409 on duplicate name
-//
-// When initial_device_name is provided in the request body, the
-// response includes a `device` object and an `access_key` field
-// with the plaintext AccessKey. The AccessKey is only available
-// at creation time — only its SHA256 hash is stored in the DB.
 func (h *UserHandler) Create(c *gin.Context) {
 	var req createUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	result, err := h.userService.Create(req.Name, req.IsAdmin, req.InitialDeviceName)
+	result, err := h.userService.Create(req.Name, req.IsAdmin)
 	if err != nil {
 		writeUserServiceError(c, err)
 		return
 	}
 	u := result.User
-	resp := gin.H{
+	utils.Success(c, gin.H{
 		"id":         u.ID,
 		"name":       u.Name,
 		"is_admin":   u.IsAdmin,
 		"created_at": u.CreatedAt.Format("2006-01-02 15:04:05"),
 		"updated_at": u.UpdatedAt.Format("2006-01-02 15:04:05"),
-	}
-	if result.Device != nil {
-		resp["device"] = gin.H{
-			"id":          result.Device.ID,
-			"device_name": result.Device.DeviceName,
-		}
-		resp["access_key"] = result.AccessKey
-	}
-	utils.Success(c, resp)
+	})
 }
 
 // getUser fetches one user. Admin-only.

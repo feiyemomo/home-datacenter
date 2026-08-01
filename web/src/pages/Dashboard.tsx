@@ -34,11 +34,12 @@ import {
 import { getSystemStatus } from "@/api/system";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
 import { listAlerts, alertSnapshotUrl, alertThumbnailUrl, type CameraAlert } from "@/api/camera";
+import { listSystemLogs } from "@/api/system";
 import { getWeather, wmoToIcon, type WeatherResponse } from "@/api/weather";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { formatUptime } from "@/lib/utils";
-import type { SystemStatus, NetworkStatus } from "@/types";
+import type { SystemStatus, NetworkStatus, SystemLog } from "@/types";
 import {
     Card,
     CardContent,
@@ -323,6 +324,10 @@ export default function Dashboard() {
     // Raw JSON snapshot collapsed by default — routine operators don't
     // need it, and it was pushing the alert list below the fold.
     const [snapshotOpen, setSnapshotOpen] = useState(false);
+    // System logs for the dashboard log card.
+    const [systemLogs, setSystemLogs] = useState<SystemLog[]>([]);
+    const [logsLoading, setLogsLoading] = useState(false);
+    const [logsOpen, setLogsOpen] = useState(false);
 
     // WebSocket for real-time alerts
     const ws = useWebSocket(true);
@@ -417,6 +422,16 @@ export default function Dashboard() {
         window.addEventListener("keydown", onKey);
         return () => window.removeEventListener("keydown", onKey);
     }, [selectedAlert]);
+
+    // Fetch system logs on mount and when logs section is expanded.
+    useEffect(() => {
+        if (!logsOpen || systemLogs.length > 0) return;
+        setLogsLoading(true);
+        listSystemLogs(10, 0)
+            .then((res) => setSystemLogs(res.logs ?? []))
+            .catch(() => {})
+            .finally(() => setLogsLoading(false));
+    }, [logsOpen]);
 
     const onlineCount = status?.online_device_count ?? 0;
     const uptime = status ? formatUptime(status.uptime_seconds) : "—";
@@ -943,6 +958,72 @@ export default function Dashboard() {
                     </div>
                 </div>
             )}
+
+            {/* System logs — collapsed by default. Shows latest 10 entries. */}
+            <Card className="animate-fade-in">
+                <button
+                    type="button"
+                    onClick={() => setLogsOpen((v) => !v)}
+                    className="flex w-full items-center justify-between gap-3 p-5 text-left transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
+                    aria-expanded={logsOpen}
+                >
+                    <div className="flex items-center gap-2">
+                        <Activity size={16} className="text-fg-muted" />
+                        <div>
+                            <CardTitle className="text-sm">系统日志</CardTitle>
+                            <CardDescription className="mt-0.5">
+                                最近 {systemLogs.length} 条系统日志。
+                            </CardDescription>
+                        </div>
+                    </div>
+                    <ChevronDown
+                        size={16}
+                        className={`shrink-0 text-fg-subtle transition-transform duration-300 ${logsOpen ? "rotate-180" : ""}`}
+                    />
+                </button>
+                {logsOpen && (
+                    <CardContent className="animate-fade-in">
+                        {logsLoading ? (
+                            <div className="flex items-center justify-center py-6 text-xs text-fg-muted">
+                                <RefreshCw size={12} className="mr-1.5 animate-spin" />
+                                加载中…
+                            </div>
+                        ) : systemLogs.length === 0 ? (
+                            <div className="py-6 text-center text-xs text-fg-subtle">
+                                暂无日志
+                            </div>
+                        ) : (
+                            <ul className="space-y-1.5">
+                                {systemLogs.map((log) => (
+                                    <li
+                                        key={log.id}
+                                        className="glass-subtle flex items-start gap-2 rounded-xl px-3 py-2 text-xs"
+                                    >
+                                        <span className="shrink-0 text-fg-subtle" title={new Date(log.ts * 1000).toLocaleString()}>
+                                            {new Date(log.ts * 1000).toLocaleTimeString()}
+                                        </span>
+                                        <Badge
+                                            variant={
+                                                log.level === "critical" ? "danger"
+                                                    : log.level === "normal" ? "info"
+                                                        : "outline"
+                                            }
+                                            className="text-[9px] shrink-0"
+                                        >
+                                            {log.level === "critical" ? "严重"
+                                                : log.level === "normal" ? "普通"
+                                                    : "信息"}
+                                        </Badge>
+                                        <span className="min-w-0 flex-1 truncate text-fg-muted">
+                                            {log.message || log.event_type}
+                                        </span>
+                                    </li>
+                                ))}
+                            </ul>
+                        )}
+                    </CardContent>
+                )}
+            </Card>
 
             {/* Raw JSON snapshot — collapsed by default. Routine
              * operators rarely need the wire payload; keeping it
