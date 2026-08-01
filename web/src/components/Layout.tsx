@@ -11,6 +11,7 @@ import {
     LogOut,
     Server,
     Camera as CameraIcon,
+    History,
     Sun,
     Moon,
     Monitor,
@@ -34,6 +35,12 @@ const NAV_ITEMS: NavItem[] = [
     { to: "/dashboard", label: "仪表盘", icon: <LayoutDashboard size={18} /> },
     { to: "/cameras", label: "摄像头", icon: <CameraIcon size={18} /> },
     { to: "/network", label: "网络", icon: <NetworkIcon size={18} /> },
+    {
+        to: "/logs",
+        label: "日志",
+        icon: <History size={18} />,
+        adminOnly: true,
+    },
     {
         to: "/users",
         label: "用户",
