@@ -825,6 +825,18 @@ function PreviewFrame({
                 <div className="flex flex-col items-center text-fg-muted">
                     <AlertTriangle className="mb-2 h-6 w-6 text-[rgb(var(--accent-danger))]" />
                     <span className="text-xs">预览不可用</span>
+                    {isOffline && (
+                        <button
+                            type="button"
+                            onClick={onPlay}
+                            className="mt-3 inline-flex items-center gap-1.5 rounded-lg bg-white/10 px-3 py-1.5 text-xs text-fg-muted hover:bg-white/20 hover:text-fg transition-colors"
+                            aria-label="查看录像回放"
+                            title="摄像头已离线，点击查看录像回放"
+                        >
+                            <Play size={12} />
+                            查看录像回放
+                        </button>
+                    )}
                 </div>
             ) : (
                 <>
