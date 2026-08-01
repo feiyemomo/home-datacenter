@@ -8,5 +8,5 @@
 - [x] 使用 Chrome DevTools 验证 Dashboard 日志显示正常
 - [x] 后端镜像构建并部署到 NAS 成功
 - [x] Web 前端构建并部署成功
-- [x] Android APK 构建并推送到 NAS 成功
+- [ ] Android APK 构建并推送到 NAS 成功
 - [ ] Git 已提交推送
