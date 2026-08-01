@@ -142,7 +142,7 @@ func main() {
 	deviceService := service.NewDeviceService(deviceRepo)
 
 	authHandler := handler.NewAuthHandler(authService, bus)
-	userHandler := handler.NewUserHandler(userService, deviceMgr, deviceRepo)
+	userHandler := handler.NewUserHandler(userService, deviceService, deviceMgr, deviceRepo)
 	deviceHandler := handler.NewDeviceHandler(deviceService, userService, bus)
 
 	// WebSocket handler. If server.allowed_origins is configured, use
