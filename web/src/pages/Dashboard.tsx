@@ -4,14 +4,11 @@ import {
     Activity,
     Clock,
     Radio,
-    Server,
     Wifi,
     WifiOff,
     RefreshCw,
     Globe,
     Star,
-    Smartphone,
-    ArrowUp,
     AlertTriangle,
     Eye,
     X,
@@ -327,8 +324,7 @@ export default function Dashboard() {
     const [snapshotOpen, setSnapshotOpen] = useState(false);
     // System logs for the dashboard log card.
     const [systemLogs, setSystemLogs] = useState<SystemLog[]>([]);
-    const [logsLoading, setLogsLoading] = useState(false);
-    const [logsOpen, setLogsOpen] = useState(false);
+    const [_logsLoading, setLogsLoading] = useState(false);
 
     // WebSocket for real-time alerts
     const ws = useWebSocket(true);
@@ -424,15 +420,14 @@ export default function Dashboard() {
         return () => window.removeEventListener("keydown", onKey);
     }, [selectedAlert]);
 
-    // Fetch system logs each time the logs section is expanded.
+    // Fetch system logs on mount
     useEffect(() => {
-        if (!logsOpen) return;
         setLogsLoading(true);
-        listSystemLogs(10, 0)
+        listSystemLogs(3, 0)
             .then((res) => setSystemLogs(res.logs ?? []))
             .catch(() => {})
             .finally(() => setLogsLoading(false));
-    }, [logsOpen]);
+    }, []);
 
     const onlineCount = status?.online_device_count ?? 0;
     const uptime = status ? formatUptime(status.uptime_seconds) : "—";
@@ -579,211 +574,102 @@ export default function Dashboard() {
                 />
             </div>
 
-            {/* Network quality summary */}
-            <Card className="animate-fade-in">
-                <CardHeader className="flex-row items-center justify-between pb-2">
-                    <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
-                        <Globe size={16} /> 网络质量
-                    </CardTitle>
-                    <div className="flex items-center gap-2">
-                        {/* Path chip: LAN (green) / IPv6 直连 (blue) / 远程 (amber) */}
-                        <Badge
-                            variant="outline"
-                            className="text-[10px] gap-1"
-                            title={
-                                apiPath === "lan"
-                                    ? "当前从局域网路径加载（低延迟 ~10ms）"
-                                    : apiPath === "ipv6"
-                                        ? "当前通过 IPv6 直连加载（低延迟 ~50ms，绕过 Cloudflare 隧道）"
-                                        : "当前通过 Cloudflare 隧道加载（远程，~1.4s+ TTFB）"
-                            }
-                        >
-                            <NetworkIcon size={10} />
-                            <span
-                                className={`inline-block h-1.5 w-1.5 rounded-full ${
-                                    apiPath === "lan"
-                                        ? "bg-[rgb(var(--accent-success))]"
-                                        : apiPath === "ipv6"
-                                            ? "bg-[rgb(var(--accent-info))]"
-                                            : "bg-[rgb(var(--accent-warm))]"
-                                }`}
-                            />
-                            {apiPath === "lan" ? "局域网" : apiPath === "ipv6" ? "IPv6 直连" : "远程"}
-                        </Badge>
-                        {netStatus && (() => {
-                            // Quality rating reflects the CURRENT connection experience,
-                            // not the best-possible upgrade target. The path chip already
-                            // shows what path you're on; the stars should match that reality.
-                            //
-                            // - LAN / IPv6 direct: always 5 (lowest latency, no intermediary)
-                            // - Relay (remote): at most 3, regardless of what upgrades are available
-                            // - Client lacks IPv6 while server is IPv6-only: downgrade to 3
-                            const currentQuality = (() => {
-                                if (apiPath === "lan" || apiPath === "ipv6") return 5;
-                                // Client cannot use IPv6 direct even though server supports it —
-                                // cap at 3 (relay quality) regardless of apiPath. This must be
-                                // evaluated BEFORE the generic remote clamp so the downgrade is
-                                // explicit and survives future refactors.
-                                if (netStatus.strategy === "ipv6_direct" && clientIPv6 === false) return 3;
-                                // On relay — actual experience is relay quality (3)
-                                if (apiPath === "remote") return Math.min(netStatus.quality, 3);
-                                return netStatus.quality;
-                            })();
-                            // Best possible quality (for upgrade hint)
-                            const bestQuality =
-                                netStatus.strategy === "ipv6_direct" && clientIPv6 === false
-                                    ? 3
-                                    : netStatus.quality;
-                            const hasUpgrade = bestQuality > currentQuality;
-                            return (
-                                <div className="flex items-center gap-0.5" title={hasUpgrade ? `当前体验 ${currentQuality}/5 · 可升级到 ${bestQuality}/5` : `连接质量 ${currentQuality}/5`}>
-                                    {[1, 2, 3, 4, 5].map((n) => (
-                                        <Star
-                                            key={n}
-                                            size={14}
-                                            className={
-                                                n <= currentQuality
-                                                    ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
-                                                    : n <= bestQuality && hasUpgrade
-                                                        ? "fill-none text-[rgb(var(--accent-warm)/0.35)]"
-                                                        : "fill-none text-fg-subtle"
-                                            }
-                                        />
-                                    ))}
-                                </div>
-                            );
-                        })()}
-                    </div>
-                </CardHeader>
-                <CardContent>
-                    <div className="flex items-center gap-4">
-                        <div className="min-w-0 flex-1">
-                            {/* Connection path: shows actual path and upgrade options */}
-                            <div className="flex items-center gap-2">
-                                <span className="text-lg font-semibold text-fg">
-                                    {apiPath === "lan"
-                                        ? "局域网"
-                                        : apiPath === "ipv6"
-                                            ? "IPv6 直连"
-                                            : "中继"}
-                                </span>
-                                {/* Show upgrade hint only when on relay but better path exists */}
-                                {netStatus && apiPath === "remote" && netStatus.strategy !== netStatus.initial && (
-                                    <>
-                                        <ArrowUp size={14} className="text-[rgb(var(--accent-info))]" />
-                                        <span className="text-sm text-[rgb(var(--accent-info))]">
-                                            可升级到{" "}
-                                            {netStatus.strategy === "ipv6_direct"
-                                                ? "IPv6 直连"
-                                                : netStatus.strategy === "p2p"
-                                                    ? "P2P"
-                                                    : ""}
-                                        </span>
-                                    </>
-                                )}
-                                {/* Show when already on IPv6 direct */}
-                                {apiPath === "ipv6" && (
-                                    <Badge variant="info" className="text-[10px]">直连</Badge>
-                                )}
-                                {/* Show when already on LAN */}
-                                {apiPath === "lan" && (
-                                    <Badge variant="success" className="text-[10px]">直连</Badge>
-                                )}
-                            </div>
-                            {/* Sub-line: contextual message based on current path vs best strategy */}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                {/* Network quality summary - compact */}
+                <Card
+                    className="animate-fade-in cursor-pointer transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
+                    onClick={() => navigate("/network")}
+                >
+                    <CardHeader className="flex-row items-center justify-between pb-2">
+                        <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
+                            <Globe size={16} /> 网络质量
+                        </CardTitle>
+                        <div className="flex items-center gap-2">
+                            {/* Path chip */}
+                            <Badge variant="outline" className="text-[10px] gap-1">
+                                <NetworkIcon size={10} />
+                                <span
+                                    className={`inline-block h-1.5 w-1.5 rounded-full ${
+                                        apiPath === "lan"
+                                            ? "bg-[rgb(var(--accent-success))]"
+                                            : apiPath === "ipv6"
+                                                ? "bg-[rgb(var(--accent-info))]"
+                                                : "bg-[rgb(var(--accent-warm))]"
+                                    }`}
+                                />
+                                {apiPath === "lan" ? "局域网" : apiPath === "ipv6" ? "IPv6 直连" : "远程"}
+                            </Badge>
+                            {/* Stars */}
                             {netStatus && (() => {
-                                // On LAN or IPv6 direct — already on the best path
-                                if (apiPath === "lan") {
-                                    return (
-                                        <p className="mt-0.5 text-xs text-fg-muted">
-                                            局域网直连 · 延迟 &lt;10ms
-                                        </p>
-                                    );
-                                }
-                                if (apiPath === "ipv6") {
-                                    return (
-                                        <p className="mt-0.5 text-xs text-fg-muted">
-                                            IPv6 直连 · 延迟 ~50ms · 已绕过 Cloudflare 隧道
-                                        </p>
-                                    );
-                                }
-                                // On relay — show what's available
-                                if (netStatus.strategy === "ipv6_direct") {
-                                    return (
-                                        <p className="mt-0.5 text-xs text-fg-muted">
-                                            {clientIPv6 === null
-                                                ? "正在检测本机 IPv6 能力…"
-                                                : clientIPv6
-                                                    ? "本机具备 IPv6，建议使用 IPv6 直连地址访问以获得更低延迟"
-                                                    : "本机无 IPv6 — 仅能通过 Cloudflare 中继访问"}
-                                        </p>
-                                    );
-                                }
-                                if (netStatus.strategy === "p2p") {
-                                    return (
-                                        <p className="mt-0.5 text-xs text-fg-muted">
-                                            P2P UDP 打洞可用 — 可尝试直连以获得更低延迟
-                                        </p>
-                                    );
-                                }
-                                // relay only
+                                const currentQuality = (() => {
+                                    if (apiPath === "lan" || apiPath === "ipv6") return 5;
+                                    if (netStatus.strategy === "ipv6_direct" && clientIPv6 === false) return 3;
+                                    if (apiPath === "remote") return Math.min(netStatus.quality, 3);
+                                    return netStatus.quality;
+                                })();
                                 return (
-                                    <p className="mt-0.5 text-xs text-fg-muted">
-                                        服务器无 IPv6/P2P 能力 · 中继是唯一路径
-                                    </p>
+                                    <div className="flex items-center gap-0.5">
+                                        {[1, 2, 3, 4, 5].map((n) => (
+                                            <Star
+                                                key={n}
+                                                size={14}
+                                                className={
+                                                    n <= currentQuality
+                                                        ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
+                                                        : "fill-none text-fg-subtle"
+                                                }
+                                            />
+                                        ))}
+                                    </div>
                                 );
                             })()}
-                            {/* Capability indicators: Server vs Client */}
-                            <div className="mt-2 flex flex-wrap items-center gap-3 text-xs text-fg-muted">
-                                <span className="inline-flex items-center gap-1" title="服务器 IPv6">
-                                    <Server size={11} />
-                                    <span
-                                        className={`inline-block h-2 w-2 rounded-full ${
-                                            netStatus?.ipv6?.reachable
-                                                ? "bg-[rgb(var(--accent-success))]"
-                                                : "bg-[rgb(var(--accent-danger))]"
-                                        }`}
-                                    />
-                                    IPv6
-                                </span>
-                                <span className="inline-flex items-center gap-1" title="本机 IPv6">
-                                    <Smartphone size={11} />
-                                    <span
-                                        className={`inline-block h-2 w-2 rounded-full ${
-                                            clientIPv6 === null
-                                                ? "bg-[rgb(var(--fg-subtle))]"
-                                                : clientIPv6
-                                                    ? "bg-[rgb(var(--accent-success))]"
-                                                    : "bg-[rgb(var(--accent-danger))]"
-                                        }`}
-                                    />
-                                    本机
-                                </span>
-                                <span className="inline-flex items-center gap-1" title="服务器 P2P">
-                                    <span
-                                        className={`inline-block h-2 w-2 rounded-full ${
-                                            netStatus?.p2p?.supported
-                                                ? "bg-[rgb(var(--accent-success))]"
-                                                : "bg-[rgb(var(--accent-danger))]"
-                                        }`}
-                                    />
-                                    P2P
-                                </span>
-                                <span className="inline-flex items-center gap-1" title="中继">
-                                    <span
-                                        className={`inline-block h-2 w-2 rounded-full ${
-                                            netStatus?.relay?.available
-                                                ? "bg-[rgb(var(--accent-success))]"
-                                                : "bg-[rgb(var(--accent-danger))]"
-                                        }`}
-                                    />
-                                    中继
-                                </span>
-                            </div>
                         </div>
-                    </div>
-                </CardContent>
-            </Card>
+                    </CardHeader>
+                </Card>
+
+                {isAdmin && (
+                    <Card
+                        className="animate-fade-in cursor-pointer transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
+                        onClick={() => navigate("/logs")}
+                    >
+                        <CardHeader className="flex-row items-center justify-between pb-2">
+                            <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
+                                <Activity size={16} /> 系统日志
+                            </CardTitle>
+                            <Badge variant="outline" className="text-[10px]">
+                                {systemLogs.length} 条
+                            </Badge>
+                        </CardHeader>
+                        <CardContent>
+                            {systemLogs.length === 0 ? (
+                                <div className="text-xs text-fg-subtle">暂无日志</div>
+                            ) : (
+                                <ul className="space-y-1">
+                                    {systemLogs.slice(0, 3).map((log) => (
+                                        <li key={log.id} className="flex items-center gap-2 text-xs">
+                                            <Badge
+                                                variant={
+                                                    log.level === "critical" ? "danger"
+                                                        : log.level === "normal" ? "info"
+                                                            : "outline"
+                                                }
+                                                className="text-[9px] shrink-0"
+                                            >
+                                                {log.level === "critical" ? "严重"
+                                                    : log.level === "normal" ? "普通"
+                                                        : "信息"}
+                                            </Badge>
+                                            <span className="min-w-0 flex-1 truncate text-fg-muted">
+                                                {log.message || log.event_type}
+                                            </span>
+                                        </li>
+                                    ))}
+                                </ul>
+                            )}
+                        </CardContent>
+                    </Card>
+                )}
+            </div>
 
             {/* Detection alerts list */}
             <Card className="animate-fade-in">
@@ -958,73 +844,6 @@ export default function Dashboard() {
                         </div>
                     </div>
                 </div>
-            )}
-
-            {isAdmin && (
-                <Card className="animate-fade-in">
-                    <button
-                        type="button"
-                        onClick={() => setLogsOpen((v) => !v)}
-                        className="flex w-full items-center justify-between gap-3 p-5 text-left transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
-                        aria-expanded={logsOpen}
-                    >
-                        <div className="flex items-center gap-2">
-                            <Activity size={16} className="text-fg-muted" />
-                            <div>
-                                <CardTitle className="text-sm">系统日志</CardTitle>
-                                <CardDescription className="mt-0.5">
-                                    最近 {systemLogs.length} 条系统日志。
-                                </CardDescription>
-                            </div>
-                        </div>
-                        <ChevronDown
-                            size={16}
-                            className={`shrink-0 text-fg-subtle transition-transform duration-300 ${logsOpen ? "rotate-180" : ""}`}
-                        />
-                    </button>
-                    {logsOpen && (
-                        <CardContent className="animate-fade-in">
-                            {logsLoading ? (
-                                <div className="flex items-center justify-center py-6 text-xs text-fg-muted">
-                                    <RefreshCw size={12} className="mr-1.5 animate-spin" />
-                                    加载中…
-                                </div>
-                            ) : systemLogs.length === 0 ? (
-                                <div className="py-6 text-center text-xs text-fg-subtle">
-                                    暂无日志
-                                </div>
-                            ) : (
-                                <ul className="space-y-1.5">
-                                    {systemLogs.map((log) => (
-                                        <li
-                                            key={log.id}
-                                            className="glass-subtle flex items-start gap-2 rounded-xl px-3 py-2 text-xs"
-                                        >
-                                            <span className="shrink-0 text-fg-subtle" title={new Date(log.ts * 1000).toLocaleString()}>
-                                                {new Date(log.ts * 1000).toLocaleTimeString()}
-                                            </span>
-                                            <Badge
-                                                variant={
-                                                    log.level === "critical" ? "danger"
-                                                        : log.level === "normal" ? "info"
-                                                            : "outline"
-                                                }
-                                                className="text-[9px] shrink-0"
-                                            >
-                                                {log.level === "critical" ? "严重"
-                                                    : log.level === "normal" ? "普通"
-                                                        : "信息"}
-                                            </Badge>
-                                            <span className="min-w-0 flex-1 truncate text-fg-muted">
-                                                {log.message || log.event_type}
-                                            </span>
-                                        </li>
-                                    ))}
-                                </ul>
-                            )}
-                        </CardContent>
-                    )}
-                </Card>
             )}
 
             {/* Raw JSON snapshot — collapsed by default. Routine
