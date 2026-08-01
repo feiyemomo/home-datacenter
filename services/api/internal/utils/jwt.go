@@ -20,6 +20,10 @@ type Claims struct {
 	UserID   uint `json:"user_id"`
 	DeviceID uint `json:"device_id"`
 
+	// TokenVersion embeds the device's current token_version so the
+	// middleware can reject outdated tokens after an admin rotates them.
+	TokenVersion int `json:"token_version"`
+
 	jwt.RegisteredClaims
 }
 
@@ -28,13 +32,15 @@ type Claims struct {
 func GenerateToken(
 	userID uint,
 	deviceID uint,
+	tokenVersion int,
 ) (string, error) {
 
 	now := time.Now()
 
 	claims := Claims{
-		UserID:   userID,
-		DeviceID: deviceID,
+		UserID:       userID,
+		DeviceID:     deviceID,
+		TokenVersion: tokenVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt: jwt.NewNumericDate(now),
 

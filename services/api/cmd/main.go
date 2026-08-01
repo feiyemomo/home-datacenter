@@ -174,6 +174,16 @@ func main() {
 	}
 	camHandler := handler.NewCameraHandler(camReg, camONVIF, camRecorder, cfg.Camera.WebRTCPublicBase, cfg.Camera.ICEServers, userService)
 
+	// Purge any soft-deleted camera rows left over from older
+	// deployments where Unregister performed a soft delete. Those
+	// rows still occupy the stream_name UNIQUE index and would
+	// block re-registration of the same friendly name (409 Conflict).
+	// Must run BEFORE BootReplay/pushFrigateConfig so the Frigate
+	// config push sees a clean DB.
+	if err := camReg.CleanupSoftDeleted(); err != nil {
+		log.Printf("camera: cleanup soft-deleted: %v (non-fatal)", err)
+	}
+
 	// Replay every persisted camera to go2rtc so a container restart
 	// doesn't drop the streams. Best-effort: log and continue.
 	if err := camReg.BootReplay(context.Background()); err != nil {
@@ -298,6 +308,16 @@ func main() {
 			device.GET("/list", deviceHandler.List)
 			device.POST("", deviceHandler.Create)
 			device.DELETE("/:id", deviceHandler.Delete)
+			// Hard delete: permanently removes the row. Only callable on
+			// already-revoked devices (see HardDelete handler). Kept on a
+			// distinct path so the original DELETE /:id (revoke) stays
+			// unchanged.
+			device.DELETE("/:id/hard", deviceHandler.HardDelete)
+			// v1.8.15: admin-only token rotation. Increments the device's
+			// token_version, invalidating all existing JWT tokens. The
+			// client detects "token version mismatch" on the next request
+			// and re-binds silently with its access_key.
+			device.POST("/:id/rotate-token", middleware.RequireAdmin(database.DB), deviceHandler.RotateToken)
 		}
 
 		system := api.Group("/system")
@@ -309,6 +329,11 @@ func main() {
 			// subscriber. Newest first; supports limit/offset/
 			// event_type filters (see SystemLogHandler.List).
 			system.GET("/logs", systemLogHandler.List)
+			// v1.8.14: delete a single log entry after manual
+			// verification. Used by the "核查并删除" workflow
+			// where the user reviews a critical offline log and
+			// removes it once the issue is resolved.
+			system.DELETE("/logs/:id", systemLogHandler.Delete)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so
@@ -378,13 +403,27 @@ func main() {
 			// user (like WebRTC) since it's a read-ish "prepare to view"
 			// operation, not a config mutation.
 			camGroup.POST(":id/preheat", camHandler.Preheat)
+			// PTZ control (v1.7.1). Lives in camGroup (not adminCam)
+			// so non-admin users with shared read access can also
+			// control PTZ. The handler enforces visibility via
+			// requireCanRead — same as WebRTC/preheat.
+			camGroup.POST(":id/ptz", camHandler.PTZ)
+			// Camera sharing (v1.7.0). Lives in camGroup (not
+			// adminCam) because non-admin owners can share their
+			// own cameras. ShareCamera/UnshareCamera enforce
+			// owner-or-admin inside the handler via
+			// requireCanManageShares; ListShares only requires
+			// read access (so a shared viewer can see who else
+			// has access).
+			camGroup.POST(":id/shares", camHandler.ShareCamera)
+			camGroup.DELETE(":id/shares/:user_id", camHandler.UnshareCamera)
+			camGroup.GET(":id/shares", camHandler.ListShares)
 			// Mutating endpoints are admin-only.
 			adminCam := camGroup.Group("")
 			adminCam.Use(middleware.RequireAdmin(database.DB))
 			{
 				adminCam.POST("", camHandler.Register)
 				adminCam.DELETE(":id", camHandler.Delete)
-				adminCam.POST(":id/ptz", camHandler.PTZ)
 				adminCam.PUT(":id/presets/:alias", camHandler.SetPreset)
 				adminCam.DELETE(":id/presets/:alias", camHandler.DeletePreset)
 				adminCam.POST(":id/preset/:alias", camHandler.GotoPreset)

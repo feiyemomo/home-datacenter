@@ -91,7 +91,17 @@ func JWTAuth(
 			return
 		}
 
-		// 6. Expose identity to downstream handlers
+		// 6. Token version check: if the admin has rotated the token
+		// (incremented device.TokenVersion), reject tokens issued
+		// against the old version. The client detects "token version
+		// mismatch" in the response and re-binds with its access_key.
+		if claims.TokenVersion < device.TokenVersion {
+			utils.Fail(c, http.StatusUnauthorized, "token version mismatch")
+			c.Abort()
+			return
+		}
+
+		// 7. Expose identity to downstream handlers
 		c.Set("user_id", claims.UserID)
 		c.Set("device_id", claims.DeviceID)
 

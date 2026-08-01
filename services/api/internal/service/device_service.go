@@ -78,6 +78,21 @@ func (s *DeviceService) RevokeDevice(
 	)
 }
 
+// HardDeleteDevice permanently removes the device row from the
+// database. The caller (handler) is responsible for ensuring the
+// device has already been revoked — this method does not check
+// revoked_at itself, it just deletes the row.
+//
+// model.Device has no gorm.DeletedAt field, so deviceRepo.Delete
+// already performs a real (physical) DELETE rather than a soft
+// delete; no Unscoped() is needed.
+func (s *DeviceService) HardDeleteDevice(
+	deviceID uint,
+) error {
+
+	return s.deviceRepo.Delete(deviceID)
+}
+
 // ListDevices returns all devices. Intended for admin views.
 func (s *DeviceService) ListDevices() ([]model.Device, error) {
 	return s.deviceRepo.GetAll()
@@ -97,4 +112,11 @@ func (s *DeviceService) GetDeviceByID(
 	deviceID uint,
 ) (*model.Device, error) {
 	return s.deviceRepo.GetByID(deviceID)
+}
+
+// RotateToken increments the device's token_version, invalidating
+// all existing JWT tokens issued for this device. The client must
+// re-bind with its access_key to obtain a fresh token.
+func (s *DeviceService) RotateToken(deviceID uint) error {
+	return s.deviceRepo.IncrementTokenVersion(deviceID)
 }

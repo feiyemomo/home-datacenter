@@ -209,6 +209,13 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 		return
 	}
 
+	// Token version check: if the admin has rotated the token, reject
+	// old tokens here too (mirrors the JWTAuth middleware check).
+	if claims.TokenVersion < device.TokenVersion {
+		utils.Fail(c, http.StatusUnauthorized, "token version mismatch")
+		return
+	}
+
 	utils.Success(c, gin.H{
 		"user_id":   claims.UserID,
 		"device_id": claims.DeviceID,
