@@ -2,6 +2,7 @@ package handler
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 
@@ -14,20 +15,23 @@ import (
 )
 
 type UserHandler struct {
-	userService *service.UserService
-	deviceMgr   *device.Manager
-	deviceRepo  *repository.DeviceRepository
+	userService   *service.UserService
+	deviceService *service.DeviceService
+	deviceMgr     *device.Manager
+	deviceRepo    *repository.DeviceRepository
 }
 
 func NewUserHandler(
 	userService *service.UserService,
+	deviceService *service.DeviceService,
 	deviceMgr *device.Manager,
 	deviceRepo *repository.DeviceRepository,
 ) *UserHandler {
 	return &UserHandler{
-		userService: userService,
-		deviceMgr:   deviceMgr,
-		deviceRepo:  deviceRepo,
+		userService:   userService,
+		deviceService: deviceService,
+		deviceMgr:     deviceMgr,
+		deviceRepo:    deviceRepo,
 	}
 }
 
@@ -145,12 +149,35 @@ func (h *UserHandler) Create(c *gin.Context) {
 		return
 	}
 	u := result.User
+
+	// Create a default device for the new user so they can
+	// immediately bind with the returned access_key.
+	deviceName := fmt.Sprintf("%s-device", u.Name)
+	device, accessKey, err := h.deviceService.CreateDevice(u.ID, deviceName)
+	if err != nil {
+		// Device creation failed but user was created — log and
+		// still return the user without access_key.
+		utils.Success(c, gin.H{
+			"id":         u.ID,
+			"name":       u.Name,
+			"is_admin":   u.IsAdmin,
+			"created_at": u.CreatedAt.Format("2006-01-02 15:04:05"),
+			"updated_at": u.UpdatedAt.Format("2006-01-02 15:04:05"),
+		})
+		return
+	}
+
 	utils.Success(c, gin.H{
 		"id":         u.ID,
 		"name":       u.Name,
 		"is_admin":   u.IsAdmin,
 		"created_at": u.CreatedAt.Format("2006-01-02 15:04:05"),
 		"updated_at": u.UpdatedAt.Format("2006-01-02 15:04:05"),
+		"access_key": accessKey,
+		"device": gin.H{
+			"id":          device.ID,
+			"device_name": device.DeviceName,
+		},
 	})
 }
 

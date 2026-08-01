@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Plus, RefreshCw, Trash2, Loader2, UserCog, ShieldAlert } from "lucide-react";
+import { Plus, RefreshCw, Trash2, Loader2, UserCog, ShieldAlert, Copy, Check } from "lucide-react";
 import { createUser, deleteUser, listUsers, updateUser } from "@/api/user";
 import { ApiError } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
@@ -47,6 +47,7 @@ export default function Users() {
     
     const [creating, setCreating] = useState(false);
     const [createResult, setCreateResult] = useState<CreateUserResponse | null>(null);
+    const [copied, setCopied] = useState(false);
     
 
     // Per-row edit state. The map key is the user id; the value
@@ -109,6 +110,23 @@ export default function Users() {
             );
         } finally {
             setCreating(false);
+        }
+    }
+
+    useEffect(() => {
+        if (copied) {
+            const timer = setTimeout(() => setCopied(false), 2000);
+            return () => clearTimeout(timer);
+        }
+    }, [copied]);
+
+    async function handleCopyAccessKey() {
+        if (!createResult?.access_key) return;
+        try {
+            await navigator.clipboard.writeText(createResult.access_key);
+            setCopied(true);
+        } catch {
+            // 剪贴板写入失败，静默忽略
         }
     }
 
@@ -292,14 +310,41 @@ export default function Users() {
                             用户 <strong>{createResult.name}</strong> 创建成功。
                         </CardDescription>
                     </CardHeader>
-                    <CardContent className="flex justify-end">
-                        <Button
-                            size="sm"
-                            variant="ghost"
-                            onClick={() => setCreateResult(null)}
-                        >
-                            关闭
-                        </Button>
+                    <CardContent className="space-y-3">
+                        {createResult.access_key && (
+                            <div className="flex items-center gap-2 rounded-lg border border-[rgb(var(--accent-success)/0.3)] bg-[rgb(var(--accent-success)/0.05)] px-3 py-2">
+                                <code className="flex-1 select-all text-sm font-mono text-fg break-all">
+                                    {createResult.access_key}
+                                </code>
+                                <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="shrink-0"
+                                    onClick={handleCopyAccessKey}
+                                >
+                                    {copied ? (
+                                        <>
+                                            <Check size={14} className="text-[rgb(var(--accent-success))]" />
+                                            已复制
+                                        </>
+                                    ) : (
+                                        <>
+                                            <Copy size={14} />
+                                            复制
+                                        </>
+                                    )}
+                                </Button>
+                            </div>
+                        )}
+                        <div className="flex justify-end">
+                            <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => setCreateResult(null)}
+                            >
+                                关闭
+                            </Button>
+                        </div>
                     </CardContent>
                 </Card>
             )}

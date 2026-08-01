@@ -21,33 +21,33 @@ const (
 // which turns device / camera / user events into a uniform "what
 // happened" stream for the dashboard's system log pane.
 type SystemLog struct {
-	ID uint `gorm:"primaryKey"`
+	ID uint `gorm:"primaryKey" json:"id"`
 
 	// Ts is the Unix timestamp the log entry refers to. Indexed so
 	// the REST list endpoint can ORDER BY ts DESC without a sort.
-	Ts int64 `gorm:"index"`
+	Ts int64 `gorm:"index" json:"ts"`
 
 	// EventType is the originating EventBus topic
 	// (e.g. "device.status", "user.login", "camera.online").
-	EventType string `gorm:"index"`
+	EventType string `gorm:"index" json:"event_type"`
 
 	// Level is the severity bucket (v1.6.36). See the Level*
 	// constants above. Indexed so the REST endpoint can filter by
 	// level without a full scan.
-	Level string `gorm:"index"`
+	Level string `gorm:"index" json:"level"`
 
 	// Source is the EventBus source identifier of the originating
 	// event ("mqtt" | "ws" | "system" | "camera" | "automation").
-	Source string
+	Source string `json:"source"`
 
 	// Message is a human-readable summary in Chinese, e.g.
 	// "设备 #3 上线" / "用户 admin 登录" / "摄像头 前门 上线".
-	Message string
+	Message string `json:"message"`
 
 	// Payload is the raw JSON payload of the originating EventBus
 	// event, stored as TEXT so callers can replay the original
 	// fields (device_id, status, host, ...) without a second query.
-	Payload string `gorm:"type:text"`
+	Payload string `gorm:"type:text" json:"payload"`
 }
 
 // TableName overrides GORM's default pluralized "system_logs" ->
