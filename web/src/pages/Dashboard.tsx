@@ -31,10 +31,9 @@ import {
     ChevronDown,
     Code2,
 } from "lucide-react";
-import { getSystemStatus } from "@/api/system";
+import { getSystemStatus, listSystemLogs } from "@/api/system";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
 import { listAlerts, alertSnapshotUrl, alertThumbnailUrl, type CameraAlert } from "@/api/camera";
-import { listSystemLogs } from "@/api/system";
 import { getWeather, wmoToIcon, type WeatherResponse } from "@/api/weather";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
@@ -423,9 +422,9 @@ export default function Dashboard() {
         return () => window.removeEventListener("keydown", onKey);
     }, [selectedAlert]);
 
-    // Fetch system logs on mount and when logs section is expanded.
+    // Fetch system logs each time the logs section is expanded.
     useEffect(() => {
-        if (!logsOpen || systemLogs.length > 0) return;
+        if (!logsOpen) return;
         setLogsLoading(true);
         listSystemLogs(10, 0)
             .then((res) => setSystemLogs(res.logs ?? []))
