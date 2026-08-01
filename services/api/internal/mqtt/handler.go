@@ -13,6 +13,19 @@ import (
 	"home-datacenter-api/internal/eventbus"
 )
 
+// minAlertConfidence is the minimum detection confidence (0–1)
+// required for a camera motion event to be forwarded to the EventBus.
+// Detections below this threshold are logged but not published,
+// preventing low-score false alerts from reaching the app and
+// automation engine.
+// v1.6.39: introduced at 0.80.
+// v1.7.2: lowered to 0.78 per operator tuning. Also tightened the
+// guard so that confidence==0 (Frigate "new" events where neither
+// top_score nor score has been populated yet) is rejected rather
+// than silently passed through — previously the `confidence > 0`
+// pre-condition let zero-confidence events bypass the filter.
+const minAlertConfidence = 0.78
+
 // Handler dispatches incoming MQTT messages to the EventBus and
 // DeviceManager. It is stateless beyond the references it holds.
 //
@@ -110,6 +123,16 @@ func (h *Handler) handleCameraEvent(cameraID uint, payload []byte) {
 		log.Printf("mqtt: invalid camera event payload from %d: %q", cameraID, payload)
 		return
 	}
+	// v1.6.39: apply the confidence threshold. v1.7.2: reject
+	// confidence==0 too (previously passed through due to the
+	// `> 0` guard). A zero-confidence event carries no real
+	// detection signal and should not wake the app.
+	if ev.Confidence < minAlertConfidence {
+		log.Printf("mqtt: camera event below confidence threshold: camera=%d confidence=%.2f",
+			cameraID, ev.Confidence)
+		return
+	}
+
 	if ev.TS == 0 {
 		ev.TS = time.Now().Unix()
 	}
@@ -196,6 +219,20 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 	confidence := frigEv.After.TopScore
 	if confidence == 0 {
 		confidence = frigEv.After.Score
+	}
+
+	// v1.6.39: only forward detections above the confidence
+	// threshold to avoid flooding the app and automation engine
+	// with low-score false alerts (shadows, insects, motion blur).
+	// v1.7.2: also reject confidence==0 (Frigate "new" events
+	// where top_score/score are not yet populated). Previously
+	// the `> 0` guard let these through, producing spurious
+	// low-confidence pushes — the exact "73% alerts still push"
+	// symptom.
+	if confidence < minAlertConfidence {
+		log.Printf("mqtt: frigate detection below confidence threshold: camera=%s label=%s confidence=%.2f",
+			slug, frigEv.After.Label, confidence)
+		return
 	}
 
 	ts := int64(frigEv.After.StartTime)

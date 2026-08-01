@@ -279,6 +279,30 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 	}
 
 	log.Printf("frigate: config pushed (%d cameras, requires_restart=%d)", len(cameras), restartVal)
+
+	// v1.7.1: explicitly call /api/restart when requiresRestart is
+	// true. The requires_restart field in the config/set body is a
+	// hint that Frigate MAY honor, but in practice Frigate 0.17 only
+	// hot-merges the config via ZMQ without spinning up the recording
+	// ffmpeg pipeline for newly added cameras. A dedicated restart
+	// call guarantees the camera processor and ffmpeg processes start
+	// — without it, new cameras show up in the config but never
+	// produce recordings (the exact symptom seen with camera "小路").
+	// Best-effort: log failures but don't fail the PushConfig call,
+	// since the config itself was already saved successfully.
+	if requiresRestart {
+		restartReq, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			c.FrigateBase+"/api/restart", nil)
+		if err == nil {
+			restartResp, err := c.HC.Do(restartReq)
+			if err == nil {
+				_ = restartResp.Body.Close()
+				log.Printf("frigate: restart triggered (status %d)", restartResp.StatusCode)
+			} else {
+				log.Printf("frigate: restart call failed (non-fatal): %v", err)
+			}
+		}
+	}
 	return nil
 }
 

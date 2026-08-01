@@ -2,6 +2,7 @@ package camera
 
 import (
 	"context"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -85,18 +86,24 @@ func (h *HealthChecker) probe(ctx context.Context, c model.Camera) {
 	if h.Bus != nil {
 		ts := now.Unix()
 
-		// Always emit device.status for backward compatibility.
-		h.Bus.Publish(eventbus.Event{
-			Topic:    eventbus.TopicDeviceStatus,
-			Source:   eventbus.SourceCamera,
-			Severity: eventbus.SeverityInfo,
-			Payload: mustJSON(map[string]any{
-				"device_id": c.ID,
-				"type":      "camera",
-				"status":    status,
-				"ts":        ts,
-			}),
-		})
+		// v1.6.39: only emit device.status on state transitions.
+		// Previously this fired every 15s tick unconditionally,
+		// flooding system_logs with repetitive "设备 #N 上线/离线"
+		// entries. The WS Hub and device manager already receive
+		// status updates via the camera-specific topics below.
+		if transitioned || prev == "" {
+			h.Bus.Publish(eventbus.Event{
+				Topic:    eventbus.TopicDeviceStatus,
+				Source:   eventbus.SourceCamera,
+				Severity: eventbus.SeverityInfo,
+				Payload: mustJSON(map[string]any{
+					"device_id": c.ID,
+					"type":      "camera",
+					"status":    status,
+					"ts":        ts,
+				}),
+			})
+		}
 
 		// Emit camera-specific events on transitions.
 		if transitioned {
@@ -117,6 +124,21 @@ func (h *HealthChecker) probe(ctx context.Context, c model.Camera) {
 					"ts":        ts,
 				}),
 			})
+
+			// Re-push Frigate config on online<->offline transitions
+			// so that offline cameras are disabled (Enabled: false) in
+			// Frigate, stopping endless ffmpeg reconnect attempts, and
+			// recovered cameras are re-enabled. Runs asynchronously to
+			// avoid blocking the health-check loop.
+			if h.Registry.Frigate != nil {
+				go func() {
+					pushCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					if err := h.Registry.pushFrigateConfig(pushCtx); err != nil {
+						log.Printf("health: frigate config push on %s transition: %v", status, err)
+					}
+				}()
+			}
 		}
 	}
 }

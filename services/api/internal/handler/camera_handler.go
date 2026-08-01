@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -41,6 +42,24 @@ type CameraHandler struct {
 	PublicBase string // mirrors camera.webrtc_public_base (LAN if blank)
 	RawIce     string // JSON string from camera.ice_servers
 	UserSvc    UserResolver
+	// frameCache holds the most recent JPEG frame per stream name
+	// for up to 2 seconds. The dashboard's camera card polls
+	// /frame on every page mount and sometimes rapid-refreshes;
+	// serving a cached frame cuts go2rtc round-trips (and the
+	// 1-2s cold-stream cost) dramatically for burst traffic while
+	// still being "fresh enough" for a live preview. Keyed by
+	// stream name only — quality/width variations share the same
+	// slot, which is intentional: the dashboard always uses the
+	// same defaults, and a stale-but-correct-dimension frame is
+	// preferable to multiplying upstream calls.
+	frameCache sync.Map
+}
+
+// frameCacheEntry is the value type stored in CameraHandler.frameCache.
+type frameCacheEntry struct {
+	data        []byte
+	contentType string
+	ts          time.Time
 }
 
 // UserResolver is the subset of the user service CameraHandler
@@ -678,10 +697,20 @@ func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
 // fresh keyframe from the live RTSP source, so it always
 // reflects the camera's current view.
 //
-// No caching: the frame is a live snapshot and should be fresh
-// on every request. The browser's default inline image cache is
-// acceptable because the dashboard refreshes the preview on
-// each page mount.
+// Query parameters:
+//
+//	quality (1-100, default 30)  — JPEG encoder quality forwarded to go2rtc
+//	width   (80-1920, default 640) — optional resize width forwarded to go2rtc
+//
+// Out-of-range or unparseable values silently fall back to the
+// defaults so a malformed client URL never 502s the dashboard.
+//
+// A 10-second in-memory cache (sync.Map, keyed by stream name)
+// absorbs burst traffic — e.g. the dashboard opening multiple
+// camera cards at once, or the operator's browser firing
+// prefetch requests. The cache is intentionally short so the
+// preview still tracks live motion. The X-Frame-Cache response
+// header exposes HIT/MISS for debugging.
 func (h *CameraHandler) Frame(c *gin.Context) {
 	cam, ok := h.requireCanRead(c)
 	if !ok {
@@ -692,20 +721,77 @@ func (h *CameraHandler) Frame(c *gin.Context) {
 		return
 	}
 
-	body, contentType, err := h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName)
+	// Parse quality (1-100, default 30). Fall back to the default
+	// on any parse or range error so a bad client value can never
+	// 502 the upstream.
+	quality, err := strconv.Atoi(c.DefaultQuery("quality", "30"))
+	if err != nil || quality < 1 || quality > 100 {
+		quality = 30
+	}
+	// Parse width (80-1920, default 640). Same fallback policy.
+	width, err := strconv.Atoi(c.DefaultQuery("width", "640"))
+	if err != nil || width < 80 || width > 1920 {
+		width = 640
+	}
+
+	// Frames are fresh snapshots — discourage browser/proxy
+	// caching so the operator always sees the latest view on
+	// reload. The 10s server-side cache below is the only caching
+	// layer applied.
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+
+	// Cache lookup. A hit within the 10s TTL is returned verbatim
+	// without contacting go2rtc, which collapses the 1-2s
+	// cold-stream cost during burst traffic.
+	if v, ok := h.frameCache.Load(cam.StreamName); ok {
+		if entry, ok := v.(*frameCacheEntry); ok && time.Since(entry.ts) < 10*time.Second {
+			contentType := entry.contentType
+			if contentType == "" {
+				contentType = "image/jpeg"
+			}
+			c.Header("X-Frame-Cache", "HIT")
+			c.Data(http.StatusOK, contentType, entry.data)
+			return
+		}
+	}
+
+	// Cache miss or expired — fetch a fresh frame from go2rtc and
+	// buffer the full body so we can both return it and cache it.
+	body, contentType, err := h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "failed to fetch frame: "+err.Error())
+		// v1.7.3: retry once after 3s to cover ffmpeg cold start / restart
+		log.Printf("frame: first attempt failed for %s, retrying in 3s: %v", cam.StreamName, err)
+		select {
+		case <-time.After(3 * time.Second):
+		case <-c.Request.Context().Done():
+			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame: "+err.Error())
+			return
+		}
+		body, contentType, err = h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
+		if err != nil {
+			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame: "+err.Error())
+			return
+		}
+		log.Printf("frame: retry succeeded for %s", cam.StreamName)
+	}
+	data, err := io.ReadAll(body)
+	body.Close()
+	if err != nil {
+		utils.Fail(c, http.StatusBadGateway, "failed to read frame: "+err.Error())
 		return
 	}
-	defer body.Close()
 
-	// Frames are fresh snapshots — discourage caching so the
-	// operator always sees the latest view on reload.
-	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	h.frameCache.Store(cam.StreamName, &frameCacheEntry{
+		data:        data,
+		contentType: contentType,
+		ts:          time.Now(),
+	})
+
 	if contentType == "" {
 		contentType = "image/jpeg"
 	}
-	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
+	c.Header("X-Frame-Cache", "MISS")
+	c.Data(http.StatusOK, contentType, data)
 }
 
 // StreamMP4 — GET /api/v1/cameras/:id/stream.mp4
@@ -826,10 +912,16 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	// Run ffmpeg: concat demuxer + stream copy + faststart (moov at
 	// start for instant playback). Output to temp file, then serve.
 	outPath := filepath.Join(tmpDir, "out.mp4")
+	// v1.6.39: add -fflags +genpts -avoid_negative_ts make_zero to
+	// regenerate PTS/DTS so the concatenated 10s segments have
+	// continuous timestamps. Without this, ExoPlayer sees PTS jumps
+	// at each segment boundary, causing visual glitches every ~10s.
 	cmd := exec.Command("ffmpeg", "-y",
 		"-f", "concat", "-safe", "0",
 		"-i", listPath,
 		"-c", "copy",
+		"-fflags", "+genpts",
+		"-avoid_negative_ts", "make_zero",
 		"-movflags", "faststart",
 		outPath)
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -949,11 +1041,20 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 
 	answer, err := h.Reg.Go2.ExchangeSDP(c.Request.Context(), cam.StreamName, body)
 	if err != nil {
-		// 502 because the upstream (go2rtc) is the failing party
-		// — the request itself was well-formed. The go2rtc error
-		// message is included so the front-end can render it.
-		utils.Fail(c, http.StatusBadGateway, err.Error())
-		return
+		// v1.7.3: retry once after 3s to cover ffmpeg cold start
+		log.Printf("webrtc: first SDP exchange failed for %s, retrying in 3s: %v", cam.StreamName, err)
+		select {
+		case <-time.After(3 * time.Second):
+		case <-c.Request.Context().Done():
+			utils.Fail(c, http.StatusBadGateway, err.Error())
+			return
+		}
+		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), cam.StreamName, body)
+		if err != nil {
+			utils.Fail(c, http.StatusBadGateway, err.Error())
+			return
+		}
+		log.Printf("webrtc: retry succeeded for %s", cam.StreamName)
 	}
 
 	// go2rtc returns the SDP answer as the response body. We
@@ -1035,6 +1136,123 @@ func (h *CameraHandler) Delete(c *gin.Context) {
 	utils.Success(c, gin.H{"id": id})
 }
 
+// requireCanManageShares loads the camera at :id and rejects the
+// request unless the caller is an admin or the camera's owner. This
+// is STRICTER than requireCanRead: a user who only has access via a
+// CameraShare row can READ the camera (stream, recordings, frames)
+// but cannot grant access to others or revoke existing shares.
+// Sharing is an owner/admin privilege — letting a shared viewer
+// re-share would be a privilege escalation.
+//
+// Returns the loaded *model.Camera on success so handlers don't
+// re-fetch.
+func (h *CameraHandler) requireCanManageShares(c *gin.Context) (*model.Camera, bool) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return nil, false
+	}
+	cam, err := h.Reg.Get(uint(id))
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "camera not found")
+		return nil, false
+	}
+	uid, isAdmin, ok := h.callerIsAdmin(c)
+	if !ok {
+		utils.Fail(c, http.StatusUnauthorized, "unauthenticated")
+		return nil, false
+	}
+	if !isAdmin && cam.OwnerID != uid {
+		utils.Fail(c, http.StatusForbidden, "only the camera owner or an admin can manage shares")
+		return nil, false
+	}
+	return cam, true
+}
+
+// shareReq is the wire format for POST /api/v1/cameras/:id/shares.
+//
+//	{ "user_id": 42 }
+type shareReq struct {
+	UserID uint `json:"user_id" binding:"required"`
+}
+
+// ShareCamera — POST /api/v1/cameras/:id/shares
+//
+// Grants the given user read access to the camera. Idempotent —
+// re-sharing with the same user is a no-op (200, not 409). Only
+// the camera owner or an admin may call this (enforced by
+// requireCanManageShares).
+func (h *CameraHandler) ShareCamera(c *gin.Context) {
+	cam, ok := h.requireCanManageShares(c)
+	if !ok {
+		return
+	}
+	var req shareReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.UserID == 0 {
+		utils.Fail(c, http.StatusBadRequest, "user_id required")
+		return
+	}
+	// Prevent self-sharing: the owner already has access by
+	// virtue of ownership, and an admin already has access by
+	// virtue of being admin. Inserting a redundant row would
+	// just clutter ListShares and confuse the dashboard's
+	// viewer list.
+	if req.UserID == cam.OwnerID {
+		utils.Fail(c, http.StatusBadRequest, "cannot share with the camera owner (already has access)")
+		return
+	}
+	if err := h.Reg.ShareCamera(cam.ID, req.UserID); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": req.UserID})
+}
+
+// UnshareCamera — DELETE /api/v1/cameras/:id/shares/:user_id
+//
+// Revokes the given user's read access to the camera. Idempotent —
+// unsharing a user who was never shared is a no-op (200, not 404).
+// Only the camera owner or an admin may call this.
+func (h *CameraHandler) UnshareCamera(c *gin.Context) {
+	cam, ok := h.requireCanManageShares(c)
+	if !ok {
+		return
+	}
+	uid, err := strconv.Atoi(c.Param("user_id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid user_id")
+		return
+	}
+	if err := h.Reg.UnshareCamera(cam.ID, uint(uid)); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": uid})
+}
+
+// ListShares — GET /api/v1/cameras/:id/shares
+//
+// Returns the list of users the camera has been shared with. The
+// caller must be able to read the camera (requireCanRead) — a
+// shared viewer can see who else has access, but only the owner
+// or an admin can mutate the list.
+func (h *CameraHandler) ListShares(c *gin.Context) {
+	cam, ok := h.requireCanRead(c)
+	if !ok {
+		return
+	}
+	shares, err := h.Reg.ListShares(cam.ID)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, shares)
+}
+
 // ptzReq is the wire format for POST /api/v1/cameras/:id/ptz.
 //
 //	{ "command": "left", "speed": 0.5, "profile_token": "" }
@@ -1049,19 +1267,16 @@ type ptzReq struct {
 
 // PTZ — POST /api/v1/cameras/:id/ptz
 func (h *CameraHandler) PTZ(c *gin.Context) {
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		utils.Fail(c, http.StatusBadRequest, "invalid id")
+	// v1.7.1: moved from adminCam to camGroup so non-admin users
+	// with shared read access can also control PTZ. requireCanRead
+	// enforces per-camera visibility (owner / admin / shared viewer).
+	cam, ok := h.requireCanRead(c)
+	if !ok {
 		return
 	}
 	var req ptzReq
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.Fail(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	cam, err := h.Reg.Get(uint(id))
-	if err != nil {
-		utils.Fail(c, http.StatusNotFound, "camera not found")
 		return
 	}
 	if cam.Credentials == nil {

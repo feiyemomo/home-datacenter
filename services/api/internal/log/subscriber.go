@@ -42,7 +42,10 @@ func NewSubscriber(db *gorm.DB, bus *eventbus.Bus) *Subscriber {
 // intended lifecycle is a single Start at process boot.
 func (s *Subscriber) Start() {
 	topics := []string{
-		eventbus.TopicDeviceStatus,
+		// v1.6.41: TopicDeviceStatus removed — it duplicated the
+		// camera online/offline logs ("设备 #N 上线" alongside
+		// "摄像头 X 上线"). Camera-specific topics below carry the
+		// friendly camera name and are sufficient for auditing.
 		eventbus.TopicCameraOnline,
 		eventbus.TopicCameraOffline,
 		eventbus.TopicCameraStatusChanged,
@@ -99,12 +102,12 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 }
 
 // pruneSystemLogs enforces per-level retention so routine events
-// (user login, camera status_changed) don't grow system_logs
+// (device online, camera status_changed) don't grow system_logs
 // unbounded and crowd out critical events in queries.
 //
 // Retention table (v1.6.37):
 //   - critical: unlimited (audit trail — camera/device offline)
-//   - normal:   keep newest 500 rows (user login/logout, online)
+//   - normal:   keep newest 500 rows (device online)
 //   - info:     keep newest 200 rows (camera status_changed)
 //
 // Runs on every insert. Cheap because:
@@ -168,20 +171,7 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 	)
 
 	switch topic {
-	case eventbus.TopicDeviceStatus:
-		var p eventbus.DeviceStatusPayload
-		if err := json.Unmarshal(e.Payload, &p); err != nil {
-			return nil
-		}
-		ts = p.TS
-		message = fmt.Sprintf("设备 #%d %s", p.DeviceID, translateStatus(p.Status))
-		// Device offline is critical (lost connectivity); online is routine.
-		if p.Status == "offline" {
-			level = model.LevelCritical
-		} else {
-			level = model.LevelNormal
-		}
-
+	// v1.6.41: TopicDeviceStatus case removed — no longer subscribed.
 	case eventbus.TopicCameraOnline,
 		eventbus.TopicCameraOffline,
 		eventbus.TopicCameraStatusChanged:

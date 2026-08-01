@@ -592,14 +592,10 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             cameraId={camera.id}
                             cameraStatus={camera.status}
                             onPlay={() => {
-                                // v1.8.14: don't attempt live stream if
-                                // camera is offline — all transports will
-                                // fail and the user sees a black screen.
-                                // Stay in preview mode with the offline
-                                // indicator visible.
-                                if (camera.status !== "offline") {
-                                    setMode("live");
-                                }
+                                // v1.8.x: if camera is offline, switch
+                                // directly to playback mode since live
+                                // won't work. Otherwise start live stream.
+                                setMode(camera.status === "offline" ? "playback" : "live");
                             }}
                         />
                     )}
