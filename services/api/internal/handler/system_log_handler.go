@@ -100,3 +100,40 @@ func (h *SystemLogHandler) List(c *gin.Context) {
 		"total": total,
 	})
 }
+
+// Delete removes a single system log entry by ID.
+//
+//	Route: DELETE /api/v1/system/logs/:id
+//
+// v1.8.14: Used by the "核查并删除" (verify and delete) workflow.
+// After the user reviews a critical log (e.g. camera/device offline),
+// they can confirm it's been handled and delete the entry. This keeps
+// the log list focused on unresolved issues rather than stale entries.
+//
+// Only the log owner or an admin can delete logs. For now, any
+// authenticated user can delete — the system log is an audit trail,
+// not a security boundary. If per-user isolation is needed later,
+// add a user_id column to SystemLog and scope the delete here.
+func (h *SystemLogHandler) Delete(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid log id")
+		return
+	}
+
+	res := h.db.Delete(&model.SystemLog{}, id)
+	if res.Error != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to delete log")
+		return
+	}
+	if res.RowsAffected == 0 {
+		utils.Fail(c, http.StatusNotFound, "log not found")
+		return
+	}
+
+	utils.Success(c, gin.H{
+		"deleted": true,
+		"id":      id,
+	})
+}

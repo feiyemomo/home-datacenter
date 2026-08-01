@@ -42,6 +42,7 @@ func InitDB(dbPath string) {
 		&model.User{},
 		&model.Device{},
 		&model.Camera{},
+		&model.CameraShare{},
 		&model.Recording{},
 		&model.Rule{},
 		&model.SystemLog{},

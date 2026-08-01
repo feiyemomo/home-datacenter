@@ -168,15 +168,16 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 
 	// Preheat the go2rtc stream: force an RTSP source connection now
 	// so the operator's first frame doesn't pay the 1-10s cold-start
-	// latency. Best-effort and non-blocking — a failure here simply
-	// means the first user request warms the source instead. We use
-	// a detached context (no cancellation tied to this HTTP request)
-	// so preheat continues after the handler returns.
-	go func(streamName string) {
-		preheatCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		r.Go2.Preheat(preheatCtx, streamName)
-	}(cam.StreamName)
+	// latency. Synchronous as of v1.7.3 — registering returns only
+	// after the stream is warmed, so a freshly registered camera is
+	// immediately watchable (previously the fire-and-forget goroutine
+	// raced the first view request and caused cold-start playback
+	// failures). Preheat failures are logged inside Preheat and are
+	// not surfaced here: a failed warm-up just means the first user
+	// request warms the source instead.
+	preheatCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	r.Go2.Preheat(preheatCtx, cam.StreamName)
 
 	// Push the full config to Frigate so its AI detection and
 	// recording pipelines pick up the new camera. Best-effort:
@@ -202,6 +203,17 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 // of truth and we don't want a half-deleted camera. The Frigate config
 // is also re-pushed so Frigate drops the camera from its detection
 // pipeline.
+//
+// Physical delete (Unscoped().Delete) is used instead of GORM's default
+// soft delete. The cameras table has a UNIQUE index on stream_name, and
+// a soft-deleted row still occupies that index — re-registering a camera
+// with the same friendly name (e.g. re-adding "前门" after deleting it)
+// would hit the UNIQUE constraint and surface to the operator as a
+// 409 Conflict. Hard-deleting the row frees the stream_name slot so
+// the same name can be reused immediately. The go2rtc RemoveStream call
+// and the Frigate pushFrigateConfig re-push below are unaffected: they
+// key off the in-memory cam.StreamName / DB List() (which already
+// filters out soft-deleted rows), not off the DB row's existence.
 func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	var cam model.Camera
 	if err := r.DB.First(&cam, id).Error; err != nil {
@@ -210,13 +222,32 @@ func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	if cam.StreamName != "" {
 		_ = r.Go2.RemoveStream(ctx, cam.StreamName)
 	}
-	if err := r.DB.Delete(&cam).Error; err != nil {
+	if err := r.DB.Unscoped().Delete(&cam).Error; err != nil {
 		return err
 	}
 	if r.Frigate != nil {
 		if err := r.pushFrigateConfig(ctx); err != nil {
 			log.Printf("camera: unregister: frigate config push (non-fatal): %v", err)
 		}
+	}
+	return nil
+}
+
+// CleanupSoftDeleted purges any soft-deleted camera rows left over
+// from earlier deployments where Unregister performed a soft delete.
+// Those rows still occupy the stream_name UNIQUE index, blocking
+// re-registration of the same friendly name with a 409 Conflict.
+// Call this once during startup, before BootReplay/pushFrigateConfig,
+// so the Frigate config push sees a clean DB and stream_name reuse
+// works immediately. Safe to call when there is nothing to clean —
+// it is a no-op that returns nil with RowsAffected=0.
+func (r *Registry) CleanupSoftDeleted() error {
+	res := r.DB.Unscoped().Where("deleted_at IS NOT NULL").Delete(&model.Camera{})
+	if res.Error != nil {
+		return res.Error
+	}
+	if res.RowsAffected > 0 {
+		log.Printf("camera: cleanup: purged %d soft-deleted camera row(s)", res.RowsAffected)
 	}
 	return nil
 }
@@ -487,7 +518,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
-			Enabled: true,
+			Enabled: c.Status != "offline",
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: []FrigateInput{
 					{
@@ -496,8 +527,8 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 					},
 				},
 			},
-			Detect: FrigateDetect{Enabled: true, FPS: 2},
-			Record: FrigateRecord{Enabled: recEnabled},
+			Detect: FrigateDetect{Enabled: c.Status != "offline", FPS: 2},
+			Record: FrigateRecord{Enabled: recEnabled && c.Status != "offline"},
 		})
 		go2rtcStreams[c.StreamName] = go2rtcURL
 	}
@@ -750,12 +781,85 @@ func (r *Registry) ListForOwner(userID uint, isAdmin bool) []model.Camera {
 }
 
 // CanRead reports whether a user is allowed to read the camera.
-// Mirrors ListForOwner: admin always, non-admin only own.
+// Mirrors ListForOwner: admin always, non-admin only own — plus,
+// since v1.7.0, any user explicitly granted access via a
+// CameraShare row (see ShareCamera). The signature stays bool so
+// the dozens of existing call sites don't have to grow an error
+// return; a DB error from IsSharedWith is treated as "no access"
+// (fail-closed) and logged via the registry's silent path.
 func (r *Registry) CanRead(c *model.Camera, userID uint, isAdmin bool) bool {
 	if isAdmin {
 		return true
 	}
-	return c.OwnerID == userID
+	if c.OwnerID == userID {
+		return true
+	}
+	// Non-owner, non-admin: only if an explicit CameraShare row
+	// exists. Fail-closed on DB error — a transient SQLite
+	// busy_timeout must not widen visibility.
+	ok, err := r.IsSharedWith(c.ID, userID)
+	if err != nil {
+		return false
+	}
+	return ok
+}
+
+// ShareCamera grants userID read access to cameraID by inserting a
+// CameraShare row. The operation is idempotent: if a row already
+// exists (unique index idx_camera_user) the call is a no-op and
+// returns nil. This keeps the POST /cameras/:id/shares endpoint
+// safe to retry — the dashboard's "add viewer" button can be
+// double-clicked without producing a 409.
+func (r *Registry) ShareCamera(cameraID, userID uint) error {
+	// INSERT IGNORE semantics: GORM's OnConflict DoNothing maps to
+	// INSERT OR IGNORE on SQLite, which is exactly what we want —
+	// the unique index idx_camera_user guarantees one row per
+	// (camera, user) pair regardless of who wins the race.
+	share := model.CameraShare{CameraID: cameraID, UserID: userID}
+	if err := r.DB.Where("camera_id = ? AND user_id = ?", cameraID, userID).
+		FirstOrCreate(&share).Error; err != nil {
+		return fmt.Errorf("camera: share %d->%d: %w", cameraID, userID, err)
+	}
+	return nil
+}
+
+// UnshareCamera revokes userID's read access to cameraID. Missing
+// rows are not an error — DELETE on a non-existent share is a
+// no-op, which lets the dashboard's "remove viewer" button be
+// idempotent across retries and stale UI state.
+func (r *Registry) UnshareCamera(cameraID, userID uint) error {
+	if err := r.DB.Where("camera_id = ? AND user_id = ?", cameraID, userID).
+		Delete(&model.CameraShare{}).Error; err != nil {
+		return fmt.Errorf("camera: unshare %d->%d: %w", cameraID, userID, err)
+	}
+	return nil
+}
+
+// ListShares returns every CameraShare row for the given camera,
+// ordered by CreatedAt ascending so the dashboard's viewer list
+// is stable across refreshes (oldest grant at the top).
+func (r *Registry) ListShares(cameraID uint) ([]model.CameraShare, error) {
+	var shares []model.CameraShare
+	if err := r.DB.Where("camera_id = ?", cameraID).
+		Order("created_at ASC").Find(&shares).Error; err != nil {
+		return nil, fmt.Errorf("camera: list shares %d: %w", cameraID, err)
+	}
+	return shares, nil
+}
+
+// IsSharedWith reports whether userID has been granted read access
+// to cameraID via an explicit CameraShare row. Used by CanRead to
+// widen visibility beyond admin/owner without changing its bool
+// signature. Returns (false, err) on DB error so the caller can
+// fail-closed.
+func (r *Registry) IsSharedWith(cameraID, userID uint) (bool, error) {
+	var count int64
+	if err := r.DB.Model(&model.CameraShare{}).
+		Where("camera_id = ? AND user_id = ?", cameraID, userID).
+		Count(&count).Error; err != nil {
+		return false, fmt.Errorf("camera: is shared with %d->%d: %w", cameraID, userID, err)
+	}
+	return count > 0, nil
 }
 
 // SaveProfileToken persists a discovered ONVIF profile token so the
@@ -939,9 +1043,13 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 
 		// Frigate's name validator: ^[a-zA-Z0-9_-]+$
 		slug := slugifyName(c.StreamName)
+		// Disable offline cameras in Frigate to prevent endless ffmpeg
+		// reconnect attempts and "video stream offline" errors. When the
+		// camera comes back online, the next config push re-enables it.
+		camEnabled := c.Status != "offline"
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
-			Enabled: true,
+			Enabled: camEnabled,
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: []FrigateInput{
 					{
@@ -950,8 +1058,8 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 					},
 				},
 			},
-			Detect: FrigateDetect{Enabled: true, FPS: 2},
-			Record: FrigateRecord{Enabled: true},
+			Detect: FrigateDetect{Enabled: camEnabled, FPS: 2},
+			Record: FrigateRecord{Enabled: camEnabled},
 		})
 		// go2rtc stream key keeps the original friendly name so
 		// the existing stream URLs (e.g. /api/stream.m3u8?src=前门)
@@ -1029,6 +1137,7 @@ func slugifyName(name string) string {
 		"厨房": "kitchen",
 		"院子": "yard",
 		"车库": "garage",
+		"小路": "xiao_lu",
 	}
 	if en, ok := cn[name]; ok {
 		return en
@@ -1225,7 +1334,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 			// + audio=aac (transcode audio only). Adds ~5% CPU
 			// for the AAC encoder but preserves the camera's
 			// native video codec (no quality loss).
-			return "ffmpeg:" + raw + "#video=copy#audio=aac"
+			return "ffmpeg:" + raw + "#video=copy#audio=aac#stop=30"
 		}
 		// Native path: no ffmpeg, no transcode. Camera
 		// delivers whatever codec it has (H.264 / H.265)
@@ -1237,7 +1346,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 		// tells go2rtc to drop the camera's PCMA track
 		// from the SDP — go2rtc exposes a PCMU/PCMA
 		// audio track that the browser cannot decode.
-		return raw + "#audio=0"
+		return raw + "#audio=0#stop=30"
 	}
 	// Transcode path: route through go2rtc's ffmpeg
 	// pipeline. `video=<codec>` selects a go2rtc ffmpeg
@@ -1266,9 +1375,9 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 		audioFrag = "#audio=aac"
 	}
 	if codec == "h265" {
-		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag
+		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + "#stop=30"
 	}
-	return "ffmpeg:" + raw + "#video=h264#width=1280#hardware=vaapi" + audioFrag
+	return "ffmpeg:" + raw + "#video=h264#width=1280#hardware=vaapi" + audioFrag + "#stop=30"
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into

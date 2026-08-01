@@ -258,8 +258,14 @@ func (c *Go2RTCClient) HLSURL(streamName string) string {
 // go2rtc exposes GET /api/frame.jpeg?src=<name> which grabs the
 // next keyframe from the source. The first call on a cold stream
 // may take 1-2s while go2rtc connects to the RTSP source.
-func (c *Go2RTCClient) Frame(ctx context.Context, streamName string) (io.ReadCloser, string, error) {
-	u := fmt.Sprintf("%s/api/frame.jpeg?src=%s", c.Base, url.QueryEscape(streamName))
+//
+// quality (1-100) is forwarded to go2rtc as the JPEG encoder quality;
+// width (px) is forwarded as the optional resize target. The caller
+// is responsible for clamping to valid ranges — go2rtc rejects
+// out-of-range values with a 400.
+func (c *Go2RTCClient) Frame(ctx context.Context, streamName string, quality, width int) (io.ReadCloser, string, error) {
+	u := fmt.Sprintf("%s/api/frame.jpeg?src=%s&quality=%d&width=%d",
+		c.Base, url.QueryEscape(streamName), quality, width)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, "", err
@@ -332,7 +338,9 @@ func (c *Go2RTCClient) StreamMP4(ctx context.Context, streamName string) (io.Rea
 // keepalive is 5s on the bundled upstream version), so subsequent
 // HLS/MP4/WebRTC requests reuse the warm source connection.
 func (c *Go2RTCClient) Preheat(ctx context.Context, streamName string) {
-	body, _, err := c.Frame(ctx, streamName)
+	// Use the same defaults as the Frame handler so preheat warms
+	// the path users will actually hit (quality=30, width=640).
+	body, _, err := c.Frame(ctx, streamName, 30, 640)
 	if err != nil {
 		// Don't propagate — preheat is best-effort.
 		return
