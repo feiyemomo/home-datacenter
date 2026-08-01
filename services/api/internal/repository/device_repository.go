@@ -18,7 +18,23 @@ func NewDeviceRepository(db *gorm.DB) *DeviceRepository {
 	}
 }
 
+// Create 创建设备
+// 自动查找最小可用 ID 以复用已删除设备释放的 ID
 func (r *DeviceRepository) Create(device *model.Device) error {
+	var minID uint
+	r.db.Raw(`
+		SELECT COALESCE(MIN(t.id) + 1, 1) FROM (
+			SELECT 0 AS id
+			UNION ALL
+			SELECT id FROM devices
+		) t
+		WHERE NOT EXISTS (
+			SELECT 1 FROM devices d WHERE d.id = t.id + 1
+		)
+	`).Scan(&minID)
+	if minID > 0 {
+		device.ID = minID
+	}
 	return r.db.Create(device).Error
 }
 
