@@ -7,6 +7,7 @@ import Dashboard from "@/pages/Dashboard";
 import Cameras from "@/pages/Cameras";
 import Network from "@/pages/Network";
 import DeviceCreate from "@/pages/DeviceCreate";
+import Logs from "@/pages/Logs";
 import MqttDebug from "@/pages/MqttDebug";
 import Profile from "@/pages/Profile";
 import Users from "@/pages/Users";
@@ -57,6 +58,16 @@ export default function App() {
                         <ProtectedRoute>
                             <Layout>
                                 <Network />
+                            </Layout>
+                        </ProtectedRoute>
+                    }
+                />
+                <Route
+                    path="/logs"
+                    element={
+                        <ProtectedRoute adminOnly>
+                            <Layout>
+                                <Logs />
                             </Layout>
                         </ProtectedRoute>
                     }
