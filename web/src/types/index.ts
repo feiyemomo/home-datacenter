@@ -27,6 +27,7 @@ export type NullTime = string | { Time: string; Valid: boolean } | null;
 export interface Device {
     id: number;
     user_id: number;
+    user_name: string;
     device_name: string;
     last_login_at: NullTime;
     revoked_at: NullTime;
@@ -351,6 +352,25 @@ export interface PeerEndpoint {
     ipv6?: string;
     registered_at: string;
     expires_at: string;
+}
+
+// -------------------- System Logs (Phase 6) --------------------
+
+/** A system log entry from GET /api/v1/system/logs. */
+export interface SystemLog {
+    id: number;
+    event_type: string;
+    level: "critical" | "normal" | "info" | string;
+    message: string;
+    payload: string;
+    ts: number;
+    created_at: string;
+}
+
+/** Response of GET /api/v1/system/logs. */
+export interface SystemLogListResponse {
+    logs: SystemLog[];
+    total: number;
 }
 
 // -------------------- Events (Phase 6) --------------------

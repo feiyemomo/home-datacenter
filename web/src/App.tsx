@@ -7,7 +7,6 @@ import Dashboard from "@/pages/Dashboard";
 import Cameras from "@/pages/Cameras";
 import Network from "@/pages/Network";
 import DeviceCreate from "@/pages/DeviceCreate";
-import Devices from "@/pages/Devices";
 import MqttDebug from "@/pages/MqttDebug";
 import Profile from "@/pages/Profile";
 import Users from "@/pages/Users";
@@ -19,7 +18,6 @@ import Users from "@/pages/Users";
  * - /dashboard        auth
  * - /cameras          auth (admin for mutating)
  * - /cameras/new      auth + admin (dedicated device-create page)
- * - /devices          auth
  * - /users            auth + admin
  * - /mqtt             auth + admin
  * - /profile          auth
@@ -69,16 +67,6 @@ export default function App() {
                         <ProtectedRoute adminOnly>
                             <Layout>
                                 <DeviceCreate />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/devices"
-                    element={
-                        <ProtectedRoute>
-                            <Layout>
-                                <Devices />
                             </Layout>
                         </ProtectedRoute>
                     }

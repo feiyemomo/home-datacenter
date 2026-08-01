@@ -41,6 +41,7 @@ func NewDeviceHandler(
 type deviceResponse struct {
 	ID          uint           `json:"id"`
 	UserID      uint           `json:"user_id"`
+	UserName    string         `json:"user_name"`
 	DeviceName  string         `json:"device_name"`
 	LastLoginAt utils.NullTime `json:"last_login_at"`
 	RevokedAt   utils.NullTime `json:"revoked_at"`
@@ -49,10 +50,11 @@ type deviceResponse struct {
 	UpdatedAt   string         `json:"updated_at"`
 }
 
-func toDeviceResponse(d model.Device) deviceResponse {
+func toDeviceResponse(d model.Device, userName string) deviceResponse {
 	return deviceResponse{
 		ID:          d.ID,
 		UserID:      d.UserID,
+		UserName:    userName,
 		DeviceName:  d.DeviceName,
 		LastLoginAt: d.LastLoginAt,
 		RevokedAt:   d.RevokedAt,
@@ -101,9 +103,23 @@ func (h *DeviceHandler) List(c *gin.Context) {
 		return
 	}
 
+	// Build a map of user_id -> user_name for the devices in this result.
+	userNames := make(map[uint]string)
+	for _, d := range devices {
+		if _, ok := userNames[d.UserID]; !ok {
+			if u, err := h.userService.GetByID(d.UserID); err == nil {
+				userNames[d.UserID] = u.Name
+			}
+		}
+	}
+
 	result := make([]deviceResponse, 0, len(devices))
 	for _, d := range devices {
-		result = append(result, toDeviceResponse(d))
+		uname := userNames[d.UserID]
+		if uname == "" {
+			uname = user.Name
+		}
+		result = append(result, toDeviceResponse(d, uname))
 	}
 
 	utils.Success(c, gin.H{
@@ -156,8 +172,13 @@ func (h *DeviceHandler) Create(c *gin.Context) {
 		return
 	}
 
+	userName := ""
+	if u, err := h.userService.GetByID(userID); err == nil {
+		userName = u.Name
+	}
+
 	utils.Success(c, gin.H{
-		"device":     toDeviceResponse(*device),
+		"device":     toDeviceResponse(*device, userName),
 		"access_key": accessKey,
 	})
 }

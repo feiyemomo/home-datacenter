@@ -270,7 +270,7 @@ export default function Devices() {
                                                 </div>
                                             </td>
                                             <td className="px-4 py-3 text-fg-muted">
-                                                #{d.user_id}
+                                                {d.user_name || `#${d.user_id}`}
                                             </td>
                                             <td className="px-4 py-3">
                                                 {isRevoked ? (
