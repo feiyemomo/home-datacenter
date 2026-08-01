@@ -233,3 +233,113 @@ func (h *DeviceHandler) Delete(c *gin.Context) {
 
 	utils.Success(c, nil)
 }
+
+// RotateToken increments the device's token_version, invalidating
+// all existing JWT tokens for that device. The client must re-bind
+// with its access_key to obtain a fresh token.
+//
+//	Admin    -> may rotate any device
+//	Non-admin -> 403 forbidden
+//
+// Route: POST /api/v1/device/:id/rotate-token
+// Status: 200 on success
+// Status: 403 if the caller is not admin
+// Status: 404 if the device is not found
+func (h *DeviceHandler) RotateToken(c *gin.Context) {
+	userID := c.GetUint("user_id")
+
+	idStr := c.Param("id")
+	idParsed, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid device id")
+		return
+	}
+	deviceID := uint(idParsed)
+
+	// Load the device first so we can check ownership.
+	device, err := h.deviceService.GetDeviceByID(deviceID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "device not found")
+		return
+	}
+
+	// Admin-only check.
+	user, err := h.userService.GetByID(userID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
+	if !user.IsAdmin {
+		utils.Fail(c, http.StatusForbidden, "admin only")
+		return
+	}
+
+	if err := h.deviceService.RotateToken(deviceID); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to rotate token")
+		return
+	}
+
+	utils.Success(c, gin.H{
+		"device_id":     deviceID,
+		"device_name":   device.DeviceName,
+		"token_version": device.TokenVersion + 1,
+	})
+}
+
+// HardDelete permanently removes a device row from the database.
+//
+// Unlike Delete (which only revokes), this wipes the row entirely.
+// To prevent accidental data loss, the device must already be
+// revoked — HardDelete on an active device returns 400.
+//
+//	Admin    -> may hard-delete any device
+//	Non-admin -> may only hard-delete their own devices
+//
+// Route: DELETE /api/v1/device/:id/hard
+// Status: 200 + nil on success
+// Status: 400 if the device has not been revoked yet
+// Status: 403 if the caller is neither admin nor the owner
+func (h *DeviceHandler) HardDelete(c *gin.Context) {
+	userID := c.GetUint("user_id")
+
+	idStr := c.Param("id")
+	idParsed, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid device id")
+		return
+	}
+	deviceID := uint(idParsed)
+
+	// Load the device first so we can check ownership.
+	device, err := h.deviceService.GetDeviceByID(deviceID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "device not found")
+		return
+	}
+
+	// Ownership / admin check.
+	user, err := h.userService.GetByID(userID)
+	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
+	if !user.IsAdmin && device.UserID != userID {
+		utils.Fail(c, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	// Safety gate: the device must already be revoked before it can
+	// be hard-deleted. This prevents wiping an active session's
+	// device row out from under a logged-in user.
+	if !device.RevokedAt.Valid {
+		utils.Fail(c, http.StatusBadRequest, "device must be revoked before hard delete")
+		return
+	}
+
+	if err := h.deviceService.HardDeleteDevice(deviceID); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to hard delete device")
+		return
+	}
+
+	utils.Success(c, nil)
+}

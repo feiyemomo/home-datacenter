@@ -151,6 +151,17 @@ func (r *DeviceRepository) DeleteByUser(userID uint) (int64, error) {
 	return res.RowsAffected, res.Error
 }
 
+// IncrementTokenVersion increments the device's token_version by 1.
+// All existing JWT tokens issued at the old version are immediately
+// invalidated — the client must re-bind with its access_key.
+func (r *DeviceRepository) IncrementTokenVersion(deviceID uint) error {
+	return r.db.
+		Model(&model.Device{}).
+		Where("id = ?", deviceID).
+		UpdateColumn("token_version", gorm.Expr("token_version + 1")).
+		Error
+}
+
 // UpdateLastSeen persists last_seen_at and last_ip for a device.
 // Called asynchronously by the device Manager on every heartbeat.
 func (r *DeviceRepository) UpdateLastSeen(

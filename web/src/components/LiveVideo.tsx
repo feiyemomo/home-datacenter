@@ -590,7 +590,17 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                     {mode === "preview" && (
                         <PreviewFrame
                             cameraId={camera.id}
-                            onPlay={() => setMode("live")}
+                            cameraStatus={camera.status}
+                            onPlay={() => {
+                                // v1.8.14: don't attempt live stream if
+                                // camera is offline — all transports will
+                                // fail and the user sees a black screen.
+                                // Stay in preview mode with the offline
+                                // indicator visible.
+                                if (camera.status !== "offline") {
+                                    setMode("live");
+                                }
+                            }}
                         />
                     )}
                     {mode === "live" && (
@@ -784,13 +794,21 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
  */
 function PreviewFrame({
     cameraId,
+    cameraStatus,
     onPlay,
 }: {
     cameraId: number;
+    cameraStatus: "online" | "offline" | "unknown";
     onPlay: () => void;
 }) {
     const [error, setError] = useState(false);
     const [refreshCounter, setRefreshCounter] = useState(0);
+
+    // v1.8.14: if camera is offline, show "预览不可用" immediately
+    // without attempting any network request. The HTTP call would
+    // fail anyway, and on a slow connection the 10s timeout would
+    // leave the user staring at a black screen.
+    const isOffline = cameraStatus === "offline";
 
     // Refresh the preview JPEG every 10s while mounted (i.e. while
     // mode is still preview). The counter is appended as a cache-
@@ -798,15 +816,16 @@ function PreviewFrame({
     // a stale one from the HTTP cache. Cleared on unmount (which
     // happens when the parent switches to live/playback mode).
     useEffect(() => {
+        if (isOffline) return;
         const interval = window.setInterval(() => {
             setRefreshCounter((c) => c + 1);
         }, 10_000);
         return () => window.clearInterval(interval);
-    }, []);
+    }, [isOffline]);
 
     return (
         <div className="absolute inset-0 flex items-center justify-center bg-black">
-            {error ? (
+            {error || isOffline ? (
                 <div className="flex flex-col items-center text-fg-muted">
                     <AlertTriangle className="mb-2 h-6 w-6 text-[rgb(var(--accent-danger))]" />
                     <span className="text-xs">预览不可用</span>

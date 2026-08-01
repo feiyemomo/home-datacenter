@@ -29,6 +29,14 @@ type Device struct {
 
 	LastIP string
 
+	// TokenVersion is incremented by the admin API to invalidate
+	// all existing JWT tokens for this device. When a client
+	// presents a JWT whose token_version < DB value, the middleware
+	// rejects it with "token version mismatch", forcing the client
+	// to re-bind with its access_key to get a fresh token.
+	// Defaults to 1 for newly created devices.
+	TokenVersion int `gorm:"default:1"`
+
 	CreatedAt time.Time
 	UpdatedAt time.Time
 }

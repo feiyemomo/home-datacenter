@@ -170,6 +170,13 @@ services:
       - ./deploy/frigate/config.yml:/config/config.yml
       - ./data/frigate:/media/frigate
       - ./data/recordings:/data/recordings
+    # Shared memory for Frigate's inter-process frame passing
+    # (capture → detect → output). Docker's default 64MB is too
+    # small for 3+ high-res cameras (2560x1440 yuv420p ≈ 5.5MB
+    # per frame); starvation causes camera_fps=0 even though
+    # ffmpeg is producing frames. 512MB covers 3 cameras with
+    # comfortable headroom.
+    shm_size: 512m
     # Intel GPU (UHD Graphics 600 on J4125) passthrough for VAAPI
     # hardware decoding. /dev/dri/renderD128 is the compute-only
     # render node — safer than /dev/dri/card0 which grants display

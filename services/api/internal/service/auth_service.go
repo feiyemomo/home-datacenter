@@ -68,8 +68,10 @@ func (s *AuthService) Bind(
 		return "", nil, err
 	}
 
-	// Issue a long-lived JWT (365d, see utils.TokenExpireDays)
-	token, err := utils.GenerateToken(userID, device.ID)
+	// Issue a long-lived JWT (365d, see utils.TokenExpireDays).
+	// Embed the device's current token_version so the middleware can
+	// reject tokens issued before an admin rotation.
+	token, err := utils.GenerateToken(userID, device.ID, device.TokenVersion)
 	if err != nil {
 		return "", nil, err
 	}
