@@ -14,6 +14,7 @@ import (
 //   - X-Content-Type-Options: nosniff   — stop MIME sniffing on JSON
 //   - X-Frame-Options: DENY              — prevent clickjacking via iframe
 //   - Referrer-Policy: no-referrer      — avoid leaking the dashboard URL
+//   - Content-Security-Policy: default-src 'self' — High-level XSS mitigation
 //   - Cache-Control: no-store           — never cache authenticated JSON
 //
 // The web SPA is served by nginx (separate service) with its own caching
@@ -25,6 +26,7 @@ func applySecurityHeaders(c *gin.Context) {
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Frame-Options", "DENY")
 	h.Set("Referrer-Policy", "no-referrer")
+	h.Set("Content-Security-Policy", "default-src 'self'")
 	h.Set("Cache-Control", securityHeaders)
 }
 

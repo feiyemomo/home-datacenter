@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"time"
 
@@ -486,7 +487,16 @@ func main() {
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	log.Printf("server started on %s", addr)
 
-	if err := r.Run(addr); err != nil {
+	s := &http.Server{
+		Addr:           addr,
+		Handler:        r,
+		ReadTimeout:    15 * time.Second,
+		WriteTimeout:   15 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1MB
+	}
+
+	if err := s.ListenAndServe(); err != nil {
 		log.Fatalf("failed to start server: %v", err)
 	}
 }

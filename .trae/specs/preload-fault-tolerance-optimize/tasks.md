@@ -127,11 +127,11 @@
   - [ ] Android: 各页面显示统一 loading/error/empty 状态
   - [ ] Android: Dashboard 30s 兜底轮询正常，WebSocket 事件驱动更新正常
 
-- [ ] Task 19: 版本更新
-  - [ ] Android versionCode 递增，versionName 更新
-  - [ ] 创建 release notes
-  - [ ] 构建 APK 并推送到 NAS
-  - [ ] 提交 Git
+- [x] Task 19: 版本更新
+  - [x] Android versionCode 递增（106），versionName 更新（1.7.12）
+  - [x] 创建 release notes
+  - [x] 构建 APK 并推送到 NAS
+  - [x] 提交 Git
 
 # Task Dependencies
 - Task 5 (Dashboard 预加载) 依赖 Task 4 (usePrefetch hook)

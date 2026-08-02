@@ -359,7 +359,7 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
-		respBody, _ := io.ReadAll(resp.Body)
+		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
 		return fmt.Errorf("frigate returned %d: %s", resp.StatusCode, string(respBody))
 	}
 

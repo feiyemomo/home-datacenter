@@ -80,7 +80,7 @@
 
 ## 版本
 
-- [ ] Android versionCode 递增，versionName 更新
-- [ ] release notes 创建
-- [ ] APK 构建并推送到 NAS
-- [ ] Git 提交
+- [x] Android versionCode 递增（106），versionName 更新（1.7.12）
+- [x] release notes 创建
+- [x] APK 构建并推送到 NAS
+- [x] Git 提交
