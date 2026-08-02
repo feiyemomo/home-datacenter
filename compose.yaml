@@ -135,6 +135,8 @@ services:
       - NET_BIND_SERVICE
       - CHOWN
       - FOWNER
+      - SETGID
+      - SETUID
     # Port 8088 on the host maps to 80 in the container. Port 80
     # on the host is typically occupied by the NAS web UI.
     #
