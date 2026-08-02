@@ -24,9 +24,6 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 
-/**
- * WeatherCard — top-of-dashboard weather summary with enhanced liquid glass styling.
- */
 function WeatherCardInner() {
     const { data: weather, loading, error } = useCachedFetch<WeatherResponse>(
         "home.dashboard.weather",
@@ -75,19 +72,12 @@ function WeatherCardInner() {
 
     return (
         <Card className="animate-fade-in relative overflow-hidden glass glass-glow card-lift">
-            {/* Gradient background */}
-            <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.12)] via-[rgb(var(--accent-primary)/0.06)] to-transparent" />
-            {/* Top highlight */}
-            <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--accent-warm)/0.3)] to-transparent" />
-            {/* Decorative glow */}
-            <div className="pointer-events-none absolute -right-8 -top-8 h-32 w-32 rounded-full bg-[rgb(var(--accent-warm)/0.15)] blur-3xl" />
-
             <CardHeader className="relative flex-row items-center justify-between pb-3">
                 <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
                     <Icon size={15} className="text-[rgb(var(--accent-warm))]" /> 天气
                 </CardTitle>
                 {areaName && (
-                    <Badge variant="outline" className="gap-1 text-[10px] glass-subtle">
+                    <Badge variant="outline" className="gap-1 text-[10px] glass-subtle text-fg-muted/80">
                         <MapPin size={9} />
                         {areaName}{region ? ` · ${region}` : ""}
                     </Badge>
@@ -108,15 +98,14 @@ function WeatherCardInner() {
                     </div>
                 ) : (
                     <div className="flex items-center gap-5">
-                        {/* Big icon + temp */}
                         <div className="flex items-center gap-4">
-                            <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-warm)/0.2)] to-[rgb(var(--accent-warm)/0.06)] ring-1 ring-inset ring-[rgb(var(--accent-warm)/0.25)] shadow-[0_8px_24px_rgb(var(--accent-warm)/0.15)] transition-transform duration-300 hover:scale-105">
-                                <Icon size={32} className="text-[rgb(var(--accent-warm))]" />
-                                <div className="absolute inset-0 rounded-2xl bg-gradient-to-t from-transparent to-white/15" />
+                            <div className="relative flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-warm)/0.15)] to-[rgb(var(--accent-warm)/0.05)] ring-1 ring-inset ring-[rgb(var(--accent-warm)/0.15)] shadow-[0_4px_12px_rgb(var(--accent-warm)/0.08)] transition-transform duration-300 hover:scale-105">
+                                <Icon size={28} className="text-[rgb(var(--accent-warm))]" />
+                                <div className="absolute inset-0 rounded-2xl bg-gradient-to-t from-transparent to-white/10" />
                             </div>
                             <div>
                                 <div className="flex items-baseline gap-1">
-                                    <span className="text-4xl font-semibold tracking-tight text-fg">
+                                    <span className="text-5xl font-semibold tracking-tight text-fg">
                                         {tempC ?? "—"}
                                     </span>
                                     <span className="text-lg text-fg-muted">°C</span>
@@ -125,34 +114,33 @@ function WeatherCardInner() {
                             </div>
                         </div>
 
-                        <div className="h-12 w-px bg-gradient-to-b from-transparent via-[rgb(var(--border)/0.5)] to-transparent" />
+                        <div className="h-10 w-px bg-[rgb(var(--border)/0.3)]" />
 
-                        {/* Secondary stats */}
-                        <div className="ml-auto grid grid-cols-3 gap-4 text-xs">
+                        <div className="ml-auto grid grid-cols-3 gap-3 text-xs">
                             <div className="flex flex-col items-center gap-1">
-                                <div className="flex items-center gap-1 text-fg-subtle">
+                                <div className="flex items-center gap-1 text-fg-muted/80">
                                     <Thermometer size={11} />
                                     <span>体感</span>
                                 </div>
-                                <span className="text-lg font-semibold text-fg">
+                                <span className="text-base font-semibold text-fg">
                                     {feelsC ?? "—"}°
                                 </span>
                             </div>
                             <div className="flex flex-col items-center gap-1">
-                                <div className="flex items-center gap-1 text-fg-subtle">
+                                <div className="flex items-center gap-1 text-fg-muted/80">
                                     <Droplets size={11} />
                                     <span>湿度</span>
                                 </div>
-                                <span className="text-lg font-semibold text-fg">
+                                <span className="text-base font-semibold text-fg">
                                     {humidity ?? "—"}<span className="text-xs text-fg-muted">%</span>
                                 </span>
                             </div>
                             <div className="flex flex-col items-center gap-1">
-                                <div className="flex items-center gap-1 text-fg-subtle">
+                                <div className="flex items-center gap-1 text-fg-muted/80">
                                     <Wind size={11} />
                                     <span>风速</span>
                                 </div>
-                                <span className="text-lg font-semibold text-fg">
+                                <span className="text-base font-semibold text-fg">
                                     {windKmph ?? "—"}
                                     <span className="text-xs text-fg-muted"> km/h</span>
                                     {windDir ? <span className="ml-1 text-[10px] text-fg-muted">{windDir}</span> : ""}

@@ -58,43 +58,37 @@ export default function Cameras() {
     return (
         <div className="space-y-5 animate-fade-in">
             {/* Page header */}
-            <div className="glass-subtle relative overflow-hidden rounded-2xl px-5 py-4 card-lift">
-                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-info)/0.8)] via-[rgb(var(--accent-primary)/0.5)] to-transparent" />
-                <div className="pointer-events-none absolute -right-8 -top-8 h-28 w-28 rounded-full bg-[rgb(var(--accent-info)/0.1)] blur-3xl" />
-                <div className="relative flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-[rgb(var(--accent-info)/0.2)] to-[rgb(var(--accent-primary)/0.1)] ring-1 ring-inset ring-[rgb(var(--accent-info)/0.2)] text-[rgb(var(--accent-info))]">
-                            <CameraIcon size={20} />
-                        </div>
-                        <div>
-                            <h2 className="text-lg font-semibold tracking-tight text-fg">摄像头</h2>
-                            <p className="text-xs text-fg-muted">
-                                {(cams ?? []).length} 个设备 · 实时监控与录像回放
-                            </p>
-                        </div>
+            <div className="animate-fade-in flex items-center justify-between pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
+                <div className="flex items-center gap-3">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-[rgb(var(--accent-info)/0.15)] to-[rgb(var(--accent-primary)/0.08)] ring-1 ring-inset ring-[rgb(var(--accent-info)/0.15)] text-[rgb(var(--accent-info))]">
+                        <CameraIcon size={18} />
                     </div>
-                    <div className="flex gap-2">
+                    <div>
+                        <h2 className="text-base font-medium tracking-tight text-fg">摄像头</h2>
+                        <p className="text-xs text-fg-muted">
+                            {(cams ?? []).length} 个设备 · 实时监控与录像回放
+                        </p>
+                    </div>
+                </div>
+                <div className="flex gap-2">
+                    <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={refetch}
+                        disabled={loading}
+                    >
+                        <RefreshCcw size={14} className={loading ? "animate-spin mr-1.5" : "mr-1.5"} />
+                        刷新
+                    </Button>
+                    {isAdmin && (
                         <Button
                             size="sm"
-                            variant="outline"
-                            onClick={refetch}
-                            disabled={loading}
-                            className="glass-subtle hover:glass transition-all"
+                            onClick={() => nav("/cameras/new")}
                         >
-                            <RefreshCcw size={14} className={loading ? "animate-spin mr-1.5" : "mr-1.5"} />
-                            刷新
+                            <Plus size={14} className="mr-1.5" />
+                            注册
                         </Button>
-                        {isAdmin && (
-                            <Button
-                                size="sm"
-                                onClick={() => nav("/cameras/new")}
-                                className="shadow-lg shadow-[rgb(var(--accent-primary)/0.2)] transition-all hover:scale-105"
-                            >
-                                <Plus size={14} className="mr-1.5" />
-                                注册
-                            </Button>
-                        )}
-                    </div>
+                    )}
                 </div>
             </div>
 
@@ -102,7 +96,7 @@ export default function Cameras() {
                 <ErrorRetry message={fetchError.message} onRetry={refetch} />
             )}
             {error && (
-                <div className="glass rounded-2xl bg-gradient-to-r from-[rgb(var(--accent-danger)/0.12)] to-[rgb(var(--accent-danger)/0.04)] px-4 py-3 text-sm text-[rgb(var(--accent-danger))] border border-[rgb(var(--accent-danger)/0.2)]">
+                <div className="animate-fade-in rounded-2xl bg-[rgb(var(--accent-danger)/0.08)] px-4 py-3 text-sm text-[rgb(var(--accent-danger)/0.9)]">
                     {error}
                 </div>
             )}
@@ -122,8 +116,8 @@ export default function Cameras() {
                             />
                         ))}
                         {(cams ?? []).length === 0 && !loading && (
-                            <div className="col-span-full glass glass-glow rounded-2xl p-10 text-center animate-fade-in">
-                                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl glass-subtle">
+                            <div className="col-span-full rounded-2xl border border-[rgb(var(--border)/0.2)] p-10 text-center animate-fade-in">
+                                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.4)]">
                                     <CameraIcon size={28} className="text-fg-subtle" />
                                 </div>
                                 <p className="text-sm font-medium text-fg">暂无注册的摄像头</p>
@@ -189,9 +183,9 @@ function CamCard({
     const badgeLabel = codecBadgeLabel(cam);
 
     return (
-        <div className="group flex flex-col overflow-hidden glass glass-glow glass-hover-lift rounded-2xl animate-fade-in">
+        <div className="group flex flex-col overflow-hidden glass card-lift rounded-2xl animate-fade-in shadow-[0_0_20px_rgb(var(--accent-warm)/0.06)]">
             {/* Header */}
-            <div className="flex items-center justify-between gap-3 glass-subtle px-4 py-3 border-b border-[rgb(var(--border)/0.15)]">
+            <div className="flex items-center justify-between gap-3 px-4 py-2.5">
                 <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
                         <h3 className="truncate text-sm font-semibold tracking-tight text-fg">

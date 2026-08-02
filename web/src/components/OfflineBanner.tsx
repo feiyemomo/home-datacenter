@@ -30,18 +30,18 @@ export default function OfflineBanner({ onRetry }: OfflineBannerProps) {
                     : "-translate-y-full opacity-0 pointer-events-none",
             )}
         >
-            <div className="mx-auto flex max-w-4xl items-center gap-3 rounded-bl-2xl rounded-br-2xl border border-t-0 border-[rgb(var(--accent-danger)/0.4)] bg-[rgb(var(--accent-danger)/0.15)] px-4 py-3 shadow-lg backdrop-blur-2xl">
+            <div className="mx-auto flex max-w-4xl items-center gap-3 rounded-bl-2xl rounded-br-2xl border border-t-0 border-[rgb(var(--accent-danger)/0.15)] bg-[rgb(var(--accent-danger)/0.08)] px-4 py-3 shadow-lg backdrop-blur-2xl">
                 {/* Icon */}
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--accent-danger)/0.2)]">
+                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-[rgb(var(--accent-danger)/0.1)]">
                     <RefreshCw
                         size={14}
-                        className="animate-spin text-[rgb(var(--accent-danger))]"
+                        className="animate-spin text-[rgb(var(--accent-danger)/0.8)]"
                         style={{ animationDuration: "3s" }}
                     />
                 </div>
 
                 {/* Message */}
-                <p className="flex-1 text-sm font-medium text-[rgb(var(--accent-danger))]">
+                <p className="flex-1 text-sm font-medium text-[rgb(var(--accent-danger)/0.9)]">
                     网络已断开，显示缓存数据
                 </p>
 
@@ -50,7 +50,7 @@ export default function OfflineBanner({ onRetry }: OfflineBannerProps) {
                     <button
                         type="button"
                         onClick={onRetry}
-                        className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-[rgb(var(--accent-danger))] transition-colors hover:bg-[rgb(var(--accent-danger)/0.15)] active:bg-[rgb(var(--accent-danger)/0.2)]"
+                        className="flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-medium text-[rgb(var(--accent-danger)/0.9)] transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] active:bg-[rgb(var(--accent-danger)/0.15)]"
                     >
                         <RefreshCw size={12} />
                         重试
@@ -61,7 +61,7 @@ export default function OfflineBanner({ onRetry }: OfflineBannerProps) {
                 <button
                     type="button"
                     onClick={dismissOffline}
-                    className="flex h-6 w-6 items-center justify-center rounded-full text-[rgb(var(--accent-danger)/0.6)] transition-colors hover:bg-[rgb(var(--accent-danger)/0.15)] hover:text-[rgb(var(--accent-danger))]"
+                    className="flex h-6 w-6 items-center justify-center rounded-full text-[rgb(var(--accent-danger)/0.5)] transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger)/0.9)]"
                     aria-label="关闭提示"
                 >
                     <X size={14} />

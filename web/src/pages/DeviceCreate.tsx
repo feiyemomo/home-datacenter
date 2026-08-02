@@ -248,7 +248,7 @@ export default function DeviceCreate() {
             ) : (
                 <form className="space-y-6" onSubmit={onSubmit}>
                     {submit.kind === "err" && (
-                        <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
+                        <div className="rounded-xl px-4 py-3 text-sm bg-[rgb(var(--accent-danger)/0.08)] text-[rgb(var(--accent-danger)/0.9)]">
                             {submit.message}
                         </div>
                     )}

@@ -28,7 +28,7 @@ function AlertItem({ alert, onViewSnapshot, onNavigateToCamera }: AlertItemProps
     };
 
     return (
-        <li className="group flex gap-3 glass-subtle rounded-xl p-2 transition-colors hover:bg-[rgb(var(--bg-subtle)/0.3)]">
+        <li className="group flex gap-3 rounded-xl p-2 transition-colors hover:bg-[rgb(var(--bg-subtle)/0.3)]">
             {/* Thumbnail / icon — click opens full-resolution modal */}
             {alert.has_snapshot ? (
                 <button
@@ -48,8 +48,8 @@ function AlertItem({ alert, onViewSnapshot, onNavigateToCamera }: AlertItemProps
                     </span>
                 </button>
             ) : (
-                <div className="flex h-16 w-24 shrink-0 items-center justify-center rounded-lg bg-[rgb(var(--accent-warm)/0.1)]">
-                    <AlertTriangle size={18} className="text-[rgb(var(--accent-warm)/0.5)]" />
+                <div className="flex h-16 w-24 shrink-0 items-center justify-center rounded-lg bg-[rgb(var(--bg-subtle)/0.3)]">
+                    <AlertTriangle size={18} className="text-fg-subtle" />
                 </div>
             )}
 

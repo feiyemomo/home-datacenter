@@ -62,16 +62,16 @@ export default function Login() {
     return (
         <div className="relative flex min-h-screen items-center justify-center overflow-hidden bg-surface px-4">
             {/* Ambient orbs */}
-            <div className="orb orb-warm" style={{ width: 500, height: 500, top: -150, left: -150 }} />
-            <div className="orb orb-cool" style={{ width: 400, height: 400, bottom: -100, right: -100 }} />
-            <div className="orb orb-accent" style={{ width: 300, height: 300, top: "50%", left: "60%" }} />
+            <div className="orb orb-warm" style={{ width: 550, height: 550, top: -180, left: -150 }} />
+            <div className="orb orb-cool" style={{ width: 450, height: 450, bottom: -120, right: -120 }} />
+            <div className="orb orb-accent" style={{ width: 250, height: 250, top: "50%", left: "55%" }} />
 
             <Card className="w-full max-w-md animate-scale-in">
                 <CardHeader className="items-center text-center">
-                    <div className="mx-auto mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-primary)/0.6)] to-[rgb(var(--accent-warm)/0.4)] text-white glass-glow">
+                    <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-warm)/0.6)] to-[rgb(var(--accent-primary)/0.4)] text-white glass-glow">
                         <Server size={26} />
                     </div>
-                    <CardTitle className="text-base">登录到家庭数据中心</CardTitle>
+                    <CardTitle className="text-[15px] font-medium">登录到家庭数据中心</CardTitle>
                     <p className="text-xs text-fg-muted">
                         将此浏览器绑定到已存在的设备凭据。
                     </p>
@@ -123,7 +123,7 @@ export default function Login() {
                         </div>
 
                         {error && (
-                            <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))] animate-fade-in">
+                            <div className="rounded-xl bg-[rgb(var(--accent-danger)/0.08)] px-4 py-3 text-xs text-[rgb(var(--accent-danger)/0.9)] animate-fade-in">
                                 {error}
                             </div>
                         )}

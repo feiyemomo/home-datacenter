@@ -42,7 +42,7 @@ export default function Logs() {
     if (!isAdmin) {
         return (
             <div className="space-y-6">
-                <div className="animate-fade-in glass-subtle relative overflow-hidden rounded-2xl px-5 py-4">
+                <div className="animate-fade-in pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
                     <h2 className="text-lg font-semibold tracking-tight text-fg">系统日志</h2>
                     <p className="mt-0.5 text-xs text-fg-muted">无权限查看系统日志。</p>
                 </div>
@@ -55,25 +55,22 @@ export default function Logs() {
     return (
         <div className="space-y-6">
             {/* Page header */}
-            <div className="animate-fade-in glass-subtle relative overflow-hidden rounded-2xl px-5 py-4">
-                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-warm)/0.8)] via-[rgb(var(--accent-primary)/0.5)] to-transparent" />
-                <div className="relative flex items-center justify-between">
-                    <div>
-                        <h2 className="text-lg font-semibold tracking-tight text-fg">系统日志</h2>
-                        <p className="mt-0.5 text-xs text-fg-muted">
-                            共 {total} 条日志记录。
-                        </p>
-                    </div>
-                    <button
-                        type="button"
-                        onClick={() => refetch()}
-                        disabled={loading}
-                        className="inline-flex items-center gap-1 text-xs text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
-                    >
-                        <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-                        刷新
-                    </button>
+            <div className="animate-fade-in flex items-center justify-between pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
+                <div>
+                    <h2 className="text-lg font-semibold tracking-tight text-fg">系统日志</h2>
+                    <p className="mt-0.5 text-xs text-fg-muted">
+                        共 {total} 条日志记录。
+                    </p>
                 </div>
+                <button
+                    type="button"
+                    onClick={() => refetch()}
+                    disabled={loading}
+                    className="inline-flex items-center gap-1 text-xs text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
+                >
+                    <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+                    刷新
+                </button>
             </div>
 
             {fetchError && (
