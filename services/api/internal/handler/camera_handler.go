@@ -168,7 +168,8 @@ type registerReq struct {
 func (h *CameraHandler) Register(c *gin.Context) {
 	var req registerReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] register invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	uid, _, ok := h.callerIsAdmin(c)
@@ -209,10 +210,11 @@ func (h *CameraHandler) Register(c *gin.Context) {
 			utils.Fail(c, http.StatusConflict, "a camera with this name already exists (the dashboard name is the go2rtc stream key); pick a unique name")
 			return
 		}
-		utils.Fail(c, http.StatusBadGateway, msg)
+		log.Printf("[handler] failed to register camera: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to register camera")
 		return
 	}
-	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam)))
+	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), true))
 }
 
 // SetPreset — PUT /api/v1/cameras/:id/presets/:alias
@@ -235,12 +237,14 @@ func (h *CameraHandler) SetPreset(c *gin.Context) {
 	}
 	var req presetSetReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] set preset invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	cam, err := h.Reg.SetPreset(uint(id), alias, req.Token)
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to set preset: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to set preset")
 		return
 	}
 	utils.Success(c, gin.H{"id": id, "alias": alias, "token": req.Token, "presets": cam.Presets})
@@ -255,7 +259,8 @@ func (h *CameraHandler) DeletePreset(c *gin.Context) {
 	}
 	cam, err := h.Reg.DeletePreset(uint(id), c.Param("alias"))
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to delete preset: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to delete preset")
 		return
 	}
 	utils.Success(c, gin.H{"id": id, "presets": cam.Presets})
@@ -270,7 +275,8 @@ func (h *CameraHandler) ListPresets(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	ps, err := h.Reg.ListPresets(c.Request.Context(), uint(id))
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, err.Error())
+		log.Printf("[handler] failed to list presets: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to list presets")
 		return
 	}
 	utils.Success(c, ps)
@@ -292,11 +298,13 @@ func (h *CameraHandler) GotoPreset(c *gin.Context) {
 	alias := c.Param("alias")
 	var req gotoPresetReq
 	if err := c.ShouldBindJSON(&req); err != nil && err.Error() != "EOF" {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] goto preset invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.Reg.GotoPreset(c.Request.Context(), uint(id), alias, req.Speed); err != nil {
-		utils.Fail(c, http.StatusBadGateway, err.Error())
+		log.Printf("[handler] failed to goto preset: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to goto preset")
 		return
 	}
 	utils.Success(c, gin.H{"id": id, "alias": alias, "speed": req.Speed})
@@ -314,7 +322,8 @@ func (h *CameraHandler) GotoPreset(c *gin.Context) {
 // restriction) still work for backward compatibility but cannot be
 // (re)set to those values via this API.
 func (h *CameraHandler) UpdateCodec(c *gin.Context) {
-	if _, _, ok := h.callerIsAdmin(c); !ok {
+	if _, isAdmin, ok := h.callerIsAdmin(c); !ok || !isAdmin {
+		utils.Fail(c, http.StatusForbidden, "admin only")
 		return
 	}
 	id, err := strconv.Atoi(c.Param("id"))
@@ -326,11 +335,13 @@ func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 		Codec string `json:"codec"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] update codec invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.Reg.UpdateCodec(c.Request.Context(), uint(id), body.Codec); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to update codec: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to update codec")
 		return
 	}
 	utils.Success(c, gin.H{"id": id, "codec": body.Codec})
@@ -346,7 +357,8 @@ func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 // the audio track at the source (saves bandwidth). Re-pushes the
 // go2rtc stream so the change is live immediately.
 func (h *CameraHandler) UpdateAudio(c *gin.Context) {
-	if _, _, ok := h.callerIsAdmin(c); !ok {
+	if _, isAdmin, ok := h.callerIsAdmin(c); !ok || !isAdmin {
+		utils.Fail(c, http.StatusForbidden, "admin only")
 		return
 	}
 	id, err := strconv.Atoi(c.Param("id"))
@@ -358,11 +370,13 @@ func (h *CameraHandler) UpdateAudio(c *gin.Context) {
 		Enabled bool `json:"enabled"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] update audio invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.Reg.UpdateAudio(c.Request.Context(), uint(id), body.Enabled); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to update audio: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to update audio")
 		return
 	}
 	utils.Success(c, gin.H{"id": id, "audio": body.Enabled})
@@ -388,11 +402,13 @@ func (h *CameraHandler) SetRecordingPlan(c *gin.Context) {
 		RetentionDays  int  `json:"retention_days"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] set recording plan invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if err := h.Reg.SetRecordingEnabled(c.Request.Context(), uint(id), body.Enabled, body.RetentionDays); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to set recording plan: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to set recording plan")
 		return
 	}
 	utils.Success(c, gin.H{
@@ -436,7 +452,8 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 	before := time.Now().Unix()
 	buckets, err := h.Reg.ListRecordingMinutesFromDisk(cam, after, before)
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to list recordings: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to list recordings")
 		return
 	}
 
@@ -504,7 +521,8 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 	// without a second round-trip per event.
 	events, err := h.Reg.Frigate.ListEvents(c.Request.Context(), limit, true)
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "failed to fetch frigate events: "+err.Error())
+		log.Printf("[handler] failed to fetch frigate events: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch frigate events")
 		return
 	}
 
@@ -597,14 +615,7 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 		return
 	}
 
-	// v1.8.2 debug: log every motion-ranges request so we can see
-	// exactly what the backend receives from the dashboard. This is
-	// temporary — remove once the "0 events" issue is resolved.
-	log.Printf("[motion-ranges] cam_id=%d stream_name=%q slug=%q after=%d before=%d frigate_nil=%v",
-		cam.ID, cam.StreamName, h.Reg.FrigateSlug(cam), after, before, h.Reg.Frigate == nil)
-
 	if h.Reg.Frigate == nil {
-		log.Printf("[motion-ranges] RETURNING EMPTY: Frigate client is nil (config issue)")
 		utils.Success(c, gin.H{"ranges": []any{}, "total": 0})
 		return
 	}
@@ -612,8 +623,8 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 	slug := h.Reg.FrigateSlug(cam)
 	ranges, err := h.Reg.Frigate.ListMotionRanges(c.Request.Context(), slug, after, before)
 	if err != nil {
-		log.Printf("[motion-ranges] RETURNING ERROR: %v", err)
-		utils.Fail(c, http.StatusBadGateway, "failed to fetch motion ranges: "+err.Error())
+		log.Printf("[handler] failed to fetch motion ranges: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch motion ranges")
 		return
 	}
 	if ranges == nil {
@@ -622,7 +633,6 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 		// to handle null separately.
 		ranges = []camera.MotionRange{}
 	}
-	log.Printf("[motion-ranges] RETURNING %d ranges for slug=%q", len(ranges), slug)
 	utils.Success(c, gin.H{"ranges": ranges, "total": len(ranges)})
 }
 
@@ -645,7 +655,8 @@ func (h *CameraHandler) AlertSnapshot(c *gin.Context) {
 
 	body, contentType, err := h.Reg.Frigate.EventSnapshot(c.Request.Context(), eventID)
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "failed to fetch snapshot: "+err.Error())
+		log.Printf("[handler] failed to fetch snapshot: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch snapshot")
 		return
 	}
 	defer body.Close()
@@ -676,7 +687,8 @@ func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
 
 	body, contentType, err := h.Reg.Frigate.EventThumbnail(c.Request.Context(), eventID)
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "failed to fetch thumbnail: "+err.Error())
+		log.Printf("[handler] failed to fetch thumbnail: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to fetch thumbnail")
 		return
 	}
 	defer body.Close()
@@ -764,20 +776,28 @@ func (h *CameraHandler) Frame(c *gin.Context) {
 		select {
 		case <-time.After(3 * time.Second):
 		case <-c.Request.Context().Done():
-			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame: "+err.Error())
+			log.Printf("[handler] failed to fetch frame: %v", err)
+			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame")
 			return
 		}
 		body, contentType, err = h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
 		if err != nil {
-			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame: "+err.Error())
+			log.Printf("[handler] failed to fetch frame: %v", err)
+			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame")
 			return
 		}
 		log.Printf("frame: retry succeeded for %s", cam.StreamName)
 	}
-	data, err := io.ReadAll(body)
+	// 10MB cap: a go2rtc frame is a single JPEG/MJPEG snapshot,
+	// typically well under 1MB. Without a bound, a malicious or
+	// buggy upstream streaming an unbounded body could exhaust API
+	// memory (OOM). LimitReader prevents that while staying far
+	// above any legitimate frame size.
+	data, err := io.ReadAll(io.LimitReader(body, 10*1024*1024))
 	body.Close()
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "failed to read frame: "+err.Error())
+		log.Printf("[handler] failed to read frame: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to read frame")
 		return
 	}
 
@@ -821,7 +841,8 @@ func (h *CameraHandler) StreamMP4(c *gin.Context) {
 	// the RTSP source connection alive indefinitely.
 	body, contentType, err := h.Reg.Go2.StreamMP4(c.Request.Context(), cam.StreamName)
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "failed to open stream: "+err.Error())
+		log.Printf("[handler] failed to open stream: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to open stream")
 		return
 	}
 	defer body.Close()
@@ -873,7 +894,8 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	// constructing paths from minuteStart + offset.
 	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
 	if err != nil {
-		utils.Fail(c, http.StatusNotFound, "no recording directory for this minute: "+err.Error())
+		log.Printf("[handler] no recording directory for this minute: %v", err)
+		utils.Fail(c, http.StatusNotFound, "no recording directory for this minute")
 		return
 	}
 	if len(paths) == 0 {
@@ -891,7 +913,8 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	// Multiple segments: concatenate with ffmpeg stream copy.
 	tmpDir, err := os.MkdirTemp("", "rec_")
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, "create temp dir: "+err.Error())
+		log.Printf("[handler] create temp dir: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "create temp dir")
 		return
 	}
 	defer os.RemoveAll(tmpDir)
@@ -905,7 +928,8 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	}
 	listPath := filepath.Join(tmpDir, "list.txt")
 	if err := os.WriteFile(listPath, []byte(listBuilder.String()), 0o644); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, "write concat list: "+err.Error())
+		log.Printf("[handler] write concat list: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "write concat list")
 		return
 	}
 
@@ -971,7 +995,8 @@ func (h *CameraHandler) ICE(c *gin.Context) {
 	// configs. The ETag is wrapped in quotes per RFC 7232.
 	payload, err := json.Marshal(cfg)
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, "marshal ice config: "+err.Error())
+		log.Printf("[handler] marshal ice config: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "marshal ice config")
 		return
 	}
 	sum := sha256.Sum256(payload)
@@ -1031,7 +1056,8 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 	// memory.
 	body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<16))
 	if err != nil {
-		utils.Fail(c, http.StatusBadRequest, "read sdp body: "+err.Error())
+		log.Printf("[handler] read sdp body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "read sdp body")
 		return
 	}
 	if len(body) == 0 {
@@ -1046,12 +1072,14 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 		select {
 		case <-time.After(3 * time.Second):
 		case <-c.Request.Context().Done():
-			utils.Fail(c, http.StatusBadGateway, err.Error())
+			log.Printf("[handler] failed to exchange SDP: %v", err)
+			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP")
 			return
 		}
 		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), cam.StreamName, body)
 		if err != nil {
-			utils.Fail(c, http.StatusBadGateway, err.Error())
+			log.Printf("[handler] failed to exchange SDP: %v", err)
+			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP")
 			return
 		}
 		log.Printf("webrtc: retry succeeded for %s", cam.StreamName)
@@ -1098,10 +1126,12 @@ func (h *CameraHandler) Preheat(c *gin.Context) {
 
 // List — GET /api/v1/cameras
 func (h *CameraHandler) List(c *gin.Context) {
+	uid, isAdmin, ok := h.callerIsAdmin(c)
 	cams := h.Reg.List()
 	views := make([]gin.H, 0, len(cams))
 	for i := range cams {
-		views = append(views, cameraView(&cams[i], h.Reg.StreamConfig(&cams[i])))
+		isPrivileged := ok && (isAdmin || cams[i].OwnerID == uid)
+		views = append(views, cameraView(&cams[i], h.Reg.StreamConfig(&cams[i]), isPrivileged))
 	}
 	utils.Success(c, views)
 }
@@ -1118,7 +1148,9 @@ func (h *CameraHandler) Get(c *gin.Context) {
 		utils.Fail(c, http.StatusNotFound, "camera not found")
 		return
 	}
-	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam)))
+	uid, isAdmin, ok := h.callerIsAdmin(c)
+	isPrivileged := ok && (isAdmin || cam.OwnerID == uid)
+	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), isPrivileged))
 }
 
 // Delete — DELETE /api/v1/cameras/:id
@@ -1129,7 +1161,8 @@ func (h *CameraHandler) Delete(c *gin.Context) {
 		return
 	}
 	if err := h.Reg.Unregister(c.Request.Context(), uint(id)); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to unregister camera: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to unregister camera")
 		return
 	}
 	h.ONVIF.Forget(uint(id))
@@ -1189,7 +1222,8 @@ func (h *CameraHandler) ShareCamera(c *gin.Context) {
 	}
 	var req shareReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] share camera invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if req.UserID == 0 {
@@ -1206,7 +1240,8 @@ func (h *CameraHandler) ShareCamera(c *gin.Context) {
 		return
 	}
 	if err := h.Reg.ShareCamera(cam.ID, req.UserID); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to share camera: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to share camera")
 		return
 	}
 	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": req.UserID})
@@ -1228,7 +1263,8 @@ func (h *CameraHandler) UnshareCamera(c *gin.Context) {
 		return
 	}
 	if err := h.Reg.UnshareCamera(cam.ID, uint(uid)); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to unshare camera: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to unshare camera")
 		return
 	}
 	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": uid})
@@ -1247,7 +1283,8 @@ func (h *CameraHandler) ListShares(c *gin.Context) {
 	}
 	shares, err := h.Reg.ListShares(cam.ID)
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to list shares: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to list shares")
 		return
 	}
 	utils.Success(c, shares)
@@ -1276,7 +1313,8 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 	}
 	var req ptzReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] ptz invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
 	if cam.Credentials == nil {
@@ -1325,7 +1363,8 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 		user, pass, profile,
 		camera.PTZCommand(req.Command), speed,
 	); err != nil {
-		utils.Fail(c, http.StatusBadGateway, err.Error())
+		log.Printf("[handler] failed to execute PTZ command: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "failed to execute PTZ command")
 		return
 	}
 	utils.Success(c, gin.H{
@@ -1337,15 +1376,25 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 
 // cameraView is the public projection of a Camera record: it drops
 // the encrypted Credentials blob and embeds the live stream URLs.
-func cameraView(cam *model.Camera, stream camera.StreamConfig) gin.H {
+// When isPrivileged is false (non-admin shared viewer), host and
+// port fields are masked to prevent internal network disclosure.
+func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool) gin.H {
+	host := cam.Host
+	onvifPort := cam.ONVIFPort
+	rtspPort := cam.RTSPPort
+	if !isPrivileged {
+		host = "***"
+		onvifPort = 0
+		rtspPort = 0
+	}
 	return gin.H{
 		"id":           cam.ID,
 		"type":         cam.Type,
 		"name":         cam.Name,
 		"vendor":       cam.Vendor,
-		"host":         cam.Host,
-		"onvif_port":   cam.ONVIFPort,
-		"rtsp_port":    cam.RTSPPort,
+		"host":         host,
+		"onvif_port":   onvifPort,
+		"rtsp_port":    rtspPort,
 		"channel_id":   cam.ChannelID,
 		"status":       cam.Status,
 		"last_seen_at": cam.LastSeenAt,

@@ -4,7 +4,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -40,9 +44,13 @@ type WeatherHandler struct {
 
 	// cache holds the last successful response. wttr.in updates
 	// at most once per ~10 min, so a 5-min TTL is safe.
-	cache     string
-	cachedAt  time.Time
-	cacheTTL  time.Duration
+	cache    string
+	cachedAt time.Time
+	cacheTTL time.Duration
+
+	// mu protects cache and cachedAt, which are read and written
+	// by concurrent HTTP handlers.
+	mu sync.RWMutex
 }
 
 // NewWeatherHandler creates a weather proxy handler.
@@ -66,9 +74,13 @@ func NewWeatherHandler() *WeatherHandler {
 func (h *WeatherHandler) Weather(c *gin.Context) {
 	// Serve from cache if fresh — avoids hitting wttr.in on every
 	// app open.
-	if h.cache != "" && time.Since(h.cachedAt) < h.cacheTTL {
+	h.mu.RLock()
+	cached := h.cache
+	cachedAt := h.cachedAt
+	h.mu.RUnlock()
+	if cached != "" && time.Since(cachedAt) < h.cacheTTL {
 		var data interface{}
-		if err := json.Unmarshal([]byte(h.cache), &data); err == nil {
+		if err := json.Unmarshal([]byte(cached), &data); err == nil {
 			utils.Success(c, data)
 			return
 		}
@@ -81,17 +93,21 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	// public IP via NAT) are located correctly.
 	clientIP := c.ClientIP()
 
-	url := fmt.Sprintf("https://wttr.in/%s?format=j1", h.defaultLocation)
-	if clientIP != "" && clientIP != "127.0.0.1" && clientIP != "::1" {
-		// For LAN/private IPs, wttr.in would locate the server's
-		// public IP anyway — so we just use the default location.
-		// For public IPs, we let wttr.in geolocate.
-		if isPublicIP(clientIP) {
-			url = fmt.Sprintf("https://wttr.in/%s?format=j1", clientIP)
-		}
+	// Build the wttr.in URL. We use url.URL + url.PathEscape so a
+	// spoofed X-Forwarded-For value (which c.ClientIP() trusts) can't
+	// inject path components or query strings into the request.
+	target := h.defaultLocation
+	if isPublicIP(clientIP) {
+		target = clientIP
+	}
+	u := &url.URL{
+		Scheme:   "https",
+		Host:     "wttr.in",
+		Path:     "/" + url.PathEscape(target),
+		RawQuery: "format=j1",
 	}
 
-	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, u.String(), nil)
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to build weather request")
 		return
@@ -101,15 +117,17 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		utils.Fail(c, http.StatusBadGateway, "weather service unavailable: "+err.Error())
+		log.Printf("[handler] weather service unavailable: %v", err)
+		utils.Fail(c, http.StatusBadGateway, "weather service unavailable")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
+		log.Printf("[handler] weather service returned status %d: %s", resp.StatusCode, string(body))
 		utils.Fail(c, http.StatusBadGateway,
-			fmt.Sprintf("wttr.in returned %d: %s", resp.StatusCode, string(body)))
+			fmt.Sprintf("weather service returned status %d", resp.StatusCode))
 		return
 	}
 
@@ -120,8 +138,10 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	}
 
 	// Cache the raw JSON body.
+	h.mu.Lock()
 	h.cache = string(body)
 	h.cachedAt = time.Now()
+	h.mu.Unlock()
 
 	// Parse and re-wrap in our envelope.
 	var data interface{}
@@ -133,40 +153,22 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	utils.Success(c, data)
 }
 
-// isPublicIP reports whether ip is a public (non-RFC1918/non-loopback)
-// IPv4 or IPv6 address. We only forward public IPs to wttr.in for
-// geolocation — private LAN IPs would confuse wttr.in (it would
-// try to locate 192.168.x.y and fall back to its own server location).
-func isPublicIP(ip string) bool {
-	if ip == "" {
+// isPublicIP reports whether ipStr is a public (non-RFC1918/non-loopback/
+// non-link-local/non-unspecified) IPv4 or IPv6 address. We only forward
+// public IPs to wttr.in for geolocation — private LAN IPs would confuse
+// wttr.in (it would try to locate 192.168.x.y and fall back to its own
+// server location).
+//
+// Unlike naive string-prefix matching, net.ParseIP fully validates the
+// address and rejects anything that isn't a well-formed IP literal, so
+// a spoofed X-Forwarded-For value like "192.168.1.1/../../etc" can't
+// sneak past the check.
+func isPublicIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
 		return false
 	}
-	// Quick check: reject obvious private ranges. The full check
-	// is more involved, but this covers the common cases.
-	switch {
-	case ip == "127.0.0.1", ip == "::1":
-		return false
-	case len(ip) >= 8 && ip[:8] == "192.168.":
-		return false
-	case len(ip) >= 3 && ip[:3] == "10.":
-		return false
-	case len(ip) >= 7 && ip[:7] == "172.16." || len(ip) >= 7 && ip[:7] == "172.17." ||
-		len(ip) >= 7 && ip[:7] == "172.18." || len(ip) >= 7 && ip[:7] == "172.19." ||
-		len(ip) >= 7 && ip[:7] == "172.20." || len(ip) >= 7 && ip[:7] == "172.21." ||
-		len(ip) >= 7 && ip[:7] == "172.22." || len(ip) >= 7 && ip[:7] == "172.23." ||
-		len(ip) >= 7 && ip[:7] == "172.24." || len(ip) >= 7 && ip[:7] == "172.25." ||
-		len(ip) >= 7 && ip[:7] == "172.26." || len(ip) >= 7 && ip[:7] == "172.27." ||
-		len(ip) >= 7 && ip[:7] == "172.28." || len(ip) >= 7 && ip[:7] == "172.29." ||
-		len(ip) >= 7 && ip[:7] == "172.30." || len(ip) >= 7 && ip[:7] == "172.31.":
-		return false
-	case len(ip) >= 5 && ip[:5] == "169.2":
-		// 169.254.x.y link-local
-		return false
-	case len(ip) >= 4 && ip[:4] == "fc00" || len(ip) >= 4 && ip[:4] == "fd00":
-		// ULA
-		return false
-	case len(ip) >= 4 && ip[:4] == "fe80":
-		// link-local IPv6
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
 		return false
 	}
 	return true

@@ -24,7 +24,8 @@ const HEARTBEAT_INTERVAL_MS = 25000;
 /**
  * WebSocket hook with auto-reconnect and heartbeat.
  *
- * - Connects on mount if a token exists; uses /api/v1/ws?token=<jwt>
+ * - Connects on mount if a token exists; passes the JWT via the
+ *   Sec-WebSocket-Protocol subprotocol ("bearer.<jwt>")
  * - Auto-reconnects on close (3s delay, max 5 retries)
  * - Sends a heartbeat every 25s to keep the server's pong timer happy
  * - Parses incoming JSON into the WsMessage envelope
@@ -76,13 +77,15 @@ export function useWebSocket(autoConnect = true): UseWebSocketResult {
 
         const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
         // The Vite dev proxy forwards /api/v1/ws to the backend with ws:true.
-        const url = `${proto}//${window.location.host}/api/v1/ws?token=${encodeURIComponent(
-            token,
-        )}`;
+        // Token is passed via the Sec-WebSocket-Protocol subprotocol header
+        // ("bearer.<jwt>") instead of a query param, so it never lands in
+        // server logs, referer headers, or browser history. The server
+        // echoes the selected subprotocol back in the handshake response.
+        const url = `${proto}//${window.location.host}/api/v1/ws`;
 
         let socket: WebSocket;
         try {
-            socket = new WebSocket(url);
+            socket = new WebSocket(url, ["bearer." + token]);
         } catch {
             scheduleReconnect();
             return;

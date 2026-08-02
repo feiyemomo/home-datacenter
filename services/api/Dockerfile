@@ -36,6 +36,23 @@ RUN apk add --no-cache ffmpeg tzdata
 COPY --from=builder /app/server .
 COPY --from=builder /app/configs ./configs
 
+# Run as a non-root user (UID 1000) for defense in depth. The
+# binary and configs are world-readable by default (go build
+# produces 0755, COPY preserves source perms), so the app user
+# can execute /server and read /configs without extra chmod.
+#
+# /data is the mount point for bind volumes (sqlite, recordings).
+# We create it here and chown it so the directory exists with
+# correct ownership even before the bind mount is attached. Note:
+# for bind mounts the host directory's permissions take precedence
+# — ensure ./data/sqlite and ./data/recordings on the host are
+# writable by UID 1000.
+RUN adduser -D -u 1000 app \
+    && mkdir -p /data \
+    && chown app:app /data
+
+USER app
+
 EXPOSE 8080
 
 CMD ["/server"]

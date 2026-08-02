@@ -8,6 +8,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
@@ -56,9 +57,9 @@ type BindRequest struct {
 //     operator can click a sidebar link to open Frigate's UI
 //     without re-logging in.)
 //
-// The cookie is NOT HttpOnly because the dashboard already stores
-// the same JWT in localStorage (XSS-readable) — the cookie is just
-// a transport for the same secret, not a fresh attack surface.
+// The cookie is HttpOnly (prevents XSS theft) and serves as a secondary
+// auth channel for sub-resource requests (e.g. <img> tags, /go2rtc/, /frigate/).
+// The primary token store is localStorage + Authorization: Bearer header.
 // SameSite=Lax is enough: it blocks cross-site XHR/fetch but
 // allows top-level navigations (which is how the dashboard opens
 // /frigate/).
@@ -101,9 +102,22 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 	// use to ride the cookie) is blocked by the browser.
 	// The cookie is also HttpOnly — localStorage is the primary
 	// token store and the cookie is a secondary channel.
+	//
+	// The Secure flag is configurable (server.secure_cookie). It
+	// defaults to false because the LAN dashboard is served over
+	// plain HTTP, where a Secure cookie would be silently dropped
+	// by the browser and break the /frigate/ & /go2rtc/
+	// auth_request navigations. HTTPS-only deployments (e.g.
+	// Cloudflare Tunnel) opt in to prevent the cookie from ever
+	// being sent over an unencrypted hop — that's the right
+	// trade-off once TLS terminates the connection end-to-end.
 	const maxAge = 365 * 24 * 60 * 60
+	secureCookie := false
+	if config.AppConfig != nil {
+		secureCookie = config.AppConfig.Server.SecureCookie
+	}
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie("home_token", token, maxAge, "/", "", false, true)
+	c.SetCookie("home_token", token, maxAge, "/", "", secureCookie, true)
 
 	utils.Success(c, gin.H{
 		"token": token,
@@ -223,4 +237,19 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 		"device_id": claims.DeviceID,
 		"valid":     true,
 	})
+}
+
+// Logout clears the home_token cookie server-side.
+// The cookie is HttpOnly, so JavaScript cannot delete it — the frontend
+// must call this endpoint to ensure the cookie is properly expired.
+//
+//	Route: POST /api/v1/auth/logout
+func (h *AuthHandler) Logout(c *gin.Context) {
+	secureCookie := false
+	if config.AppConfig != nil {
+		secureCookie = config.AppConfig.Server.SecureCookie
+	}
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("home_token", "", -1, "/", "", secureCookie, true)
+	utils.Success(c, gin.H{"logged_out": true})
 }

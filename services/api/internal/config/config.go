@@ -40,6 +40,16 @@ type ServerConfig struct {
 	// (local dev). In production list the dashboard hostname(s),
 	// e.g. ["dashboard.feiyemomo.top"].
 	AllowedOrigins []string `mapstructure:"allowed_origins"`
+
+	// SecureCookie toggles the Secure attribute on the home_token
+	// auth cookie set by /auth/bind. Default false because the LAN
+	// dashboard is served over plain HTTP (Secure cookies would be
+	// silently dropped by the browser, breaking /frigate/ and
+	// /go2rtc/ auth_request navigations). Set to true when the
+	// dashboard is reachable only over HTTPS (e.g. production
+	// Cloudflare Tunnel deployment) so the cookie is never sent
+	// over an unencrypted hop.
+	SecureCookie bool `mapstructure:"secure_cookie"`
 }
 
 // DatabaseConfig holds database connection settings.
@@ -210,6 +220,10 @@ func Load(path string) error {
 	// Defaults — keep the app runnable even if a field is omitted.
 	v.SetDefault("server.port", 8080)
 	v.SetDefault("server.allowed_origins", []string{})
+	// SecureCookie defaults to false: the LAN dashboard is served
+	// over plain HTTP, where a Secure cookie would be dropped by
+	// the browser. HTTPS deployments opt in via config.
+	v.SetDefault("server.secure_cookie", false)
 	v.SetDefault("database.path", "/data/sqlite/app.db")
 	v.SetDefault("jwt.secret", "")
 	v.SetDefault("jwt.expire_days", 365)

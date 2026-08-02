@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"net"
 	"os"
 	"strconv"
@@ -103,7 +104,8 @@ func (h *NetworkHandler) RegisterP2P(c *gin.Context) {
 		IPv6       string `json:"ipv6"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
-		utils.Fail(c, 400, "invalid request: "+err.Error())
+		log.Printf("[handler] invalid request: %v", err)
+		utils.Fail(c, 400, "invalid request")
 		return
 	}
 

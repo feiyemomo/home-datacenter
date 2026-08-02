@@ -1,6 +1,7 @@
 package automation
 
 import (
+	"log"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -123,7 +124,8 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 	if err := validateAction(req.Action); err != nil {
-		utils.Fail(c, http.StatusBadRequest, err.Error())
+		log.Printf("[handler] invalid action: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid action")
 		return
 	}
 
@@ -179,7 +181,8 @@ func (h *Handler) Update(c *gin.Context) {
 	}
 	if req.Action.Type != "" {
 		if err := validateAction(req.Action); err != nil {
-			utils.Fail(c, http.StatusBadRequest, err.Error())
+			log.Printf("[handler] invalid action: %v", err)
+			utils.Fail(c, http.StatusBadRequest, "invalid action")
 			return
 		}
 	}
@@ -259,7 +262,8 @@ func (h *Handler) Test(c *gin.Context) {
 	// Run the action synchronously so we can report success/failure
 	// back to the caller.
 	if err := h.Engine.executeAction(r.Action, ev); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, "action failed: "+err.Error())
+		log.Printf("[handler] action failed: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "action failed")
 		return
 	}
 	utils.Success(c, gin.H{
@@ -389,7 +393,8 @@ func (h *Handler) Cooldown(c *gin.Context) {
 		return
 	}
 	if err := h.Engine.PinCooldown(uint(id), time.Duration(body.Seconds)*time.Second); err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		log.Printf("[handler] failed to set cooldown: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to set cooldown")
 		return
 	}
 	utils.Success(c, gin.H{"id": id, "cooldown_s": body.Seconds})
