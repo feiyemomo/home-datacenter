@@ -279,7 +279,9 @@ services:
     #   2. Replace the command below with:
     #      tunnel --no-autoupdate run --token ${CLOUDFLARE_TOKEN}
     #   3. Remove the volumes below
-    command: tunnel --no-autoupdate --protocol http2 --config /etc/cloudflared/config.yaml run
+    command: tunnel --no-autoupdate --config /etc/cloudflared/config.yaml run
+    environment:
+      - TUNNEL_TRANSPORT_PROTOCOL=http2
     volumes:
       - ./deploy/cloudflared/config.yaml:/etc/cloudflared/config.yaml:ro
       - ./deploy/cloudflared/credentials.json:/etc/cloudflared/credentials.json:ro
