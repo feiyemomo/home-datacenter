@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
-import { Plus, RefreshCw, Trash2, Loader2, UserCog, ShieldAlert, Copy, Check } from "lucide-react";
+import { useEffect, useState } from "react";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
+import { Plus, RefreshCw, Trash2, Loader2, UserCog, Copy, Check } from "lucide-react";
 import { createUser, deleteUser, listUsers, updateUser } from "@/api/user";
 import { ApiError } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
@@ -15,6 +16,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { ErrorRetry } from "@/components/ErrorRetry";
 
 /**
  * Users page (admin-only).
@@ -36,9 +38,13 @@ export default function Users() {
     const auth = useAuth();
     const me = auth.user;
 
-    const [users, setUsers] = useState<UserListEntry[]>([]);
-    const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
+
+    const { data: users, loading, error: fetchError, refetch } = useCachedFetch<UserListEntry[]>(
+        "home.users.list",
+        listUsers,
+        {}, // 不轮询
+    );
 
     // Create form state
     const [showCreate, setShowCreate] = useState(false);
@@ -58,29 +64,9 @@ export default function Users() {
     const [deletingId, setDeletingId] = useState<number | null>(null);
     const [confirmDeleteId, setConfirmDeleteId] = useState<number | null>(null);
 
-    const adminCount = users.filter((u) => u.is_admin).length;
+    const displayError = fetchError?.message || error;
 
-    const refresh = useCallback(async () => {
-        setError(null);
-        try {
-            const rows = await listUsers();
-            setUsers(rows);
-        } catch (err) {
-            setError(
-                err instanceof ApiError
-                    ? err.message
-                    : err instanceof Error
-                        ? err.message
-                        : "加载用户失败",
-            );
-        } finally {
-            setLoading(false);
-        }
-    }, []);
-
-    useEffect(() => {
-        refresh();
-    }, [refresh]);
+    const adminCount = (users ?? []).filter((u) => u.is_admin).length;
 
     async function handleCreate() {
         const name = newName.trim();
@@ -99,7 +85,7 @@ export default function Users() {
             setNewIsAdmin(false);
             setShowCreate(false);
             setCreateResult(result);
-            await refresh();
+            refetch();
         } catch (err) {
             setError(
                 err instanceof ApiError
@@ -149,7 +135,7 @@ export default function Users() {
                 const { [u.id]: _drop, ...rest } = prev;
                 return rest;
             });
-            await refresh();
+            refetch();
         } catch (err) {
             setError(
                 err instanceof ApiError
@@ -184,7 +170,7 @@ export default function Users() {
         setError(null);
         try {
             await updateUser(u.id, { is_admin: nextIsAdmin });
-            await refresh();
+            refetch();
         } catch (err) {
             setError(
                 err instanceof ApiError
@@ -204,7 +190,7 @@ export default function Users() {
         try {
             await deleteUser(u.id);
             setConfirmDeleteId(null);
-            await refresh();
+            refetch();
         } catch (err) {
             setError(
                 err instanceof ApiError
@@ -224,14 +210,14 @@ export default function Users() {
                 <div>
                     <h2 className="text-lg font-semibold text-fg">用户</h2>
                     <p className="text-xs text-fg-muted">
-                        仅管理员可见。共 {users.length} 位用户 · {adminCount} 位管理员。
+                        仅管理员可见。共 {(users ?? []).length} 位用户 · {adminCount} 位管理员。
                     </p>
                 </div>
                 <div className="flex items-center gap-2">
                     <Button
                         variant="outline"
                         size="sm"
-                        onClick={refresh}
+                        onClick={refetch}
                         disabled={loading}
                     >
                         {loading ? (
@@ -248,11 +234,8 @@ export default function Users() {
                 </div>
             </div>
 
-            {error && (
-                <div className="flex items-start gap-2 rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
-                    <ShieldAlert size={16} className="mt-0.5 shrink-0" />
-                    <span>{error}</span>
-                </div>
+            {displayError && (
+                <ErrorRetry message={displayError} onRetry={refetch} />
             )}
 
             {showCreate && (
@@ -371,7 +354,7 @@ export default function Users() {
                                 </tr>
                             </thead>
                             <tbody className="divide-[rgb(var(--border)/0.3)]">
-                                {users.length === 0 && !loading && (
+                                {(users ?? []).length === 0 && !loading && (
                                     <tr>
                                         <td
                                             colSpan={5}
@@ -381,7 +364,7 @@ export default function Users() {
                                         </td>
                                     </tr>
                                 )}
-                                {users.map((u) => {
+                                {(users ?? []).map((u) => {
                                     const isMe = me?.id === u.id;
                                     const isEditing = editing[u.id] !== undefined;
                                     const isOnlyAdmin = u.is_admin && adminCount <= 1;

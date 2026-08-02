@@ -1,8 +1,8 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Activity, RefreshCw } from "lucide-react";
 import { listSystemLogs } from "@/api/system";
 import { useAuth } from "@/hooks/useAuth";
-import type { SystemLog } from "@/types";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
 import {
     Card,
     CardContent,
@@ -10,6 +10,7 @@ import {
     CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { ErrorRetry } from "@/components/ErrorRetry";
 
 /**
  * Logs page — full system log browser.
@@ -19,26 +20,24 @@ import { Badge } from "@/components/ui/badge";
  */
 export default function Logs() {
     const { isAdmin } = useAuth();
-    const [logs, setLogs] = useState<SystemLog[]>([]);
     const [total, setTotal] = useState(0);
-    const [loading, setLoading] = useState(false);
     const [page, setPage] = useState(0);
     const pageSize = 50;
 
-    const loadLogs = (offset: number) => {
-        setLoading(true);
-        listSystemLogs(pageSize, offset)
-            .then((res) => {
-                setLogs(res.logs ?? []);
-                setTotal(res.total);
-            })
-            .catch(() => {})
-            .finally(() => setLoading(false));
-    };
+    const { data, loading, refetch, error: fetchError } = useCachedFetch(
+        `home.logs.page.${page}`,
+        useCallback(async () => {
+            const res = await listSystemLogs(pageSize, page * pageSize);
+            return res;
+        }, [page]),
+        {},
+    );
+
+    const logs = data?.logs ?? [];
 
     useEffect(() => {
-        loadLogs(page * pageSize);
-    }, [page]);
+        if (data) setTotal(data.total);
+    }, [data]);
 
     if (!isAdmin) {
         return (
@@ -67,7 +66,7 @@ export default function Logs() {
                     </div>
                     <button
                         type="button"
-                        onClick={() => loadLogs(page * pageSize)}
+                        onClick={() => refetch()}
                         disabled={loading}
                         className="inline-flex items-center gap-1 text-xs text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
                     >
@@ -76,6 +75,10 @@ export default function Logs() {
                     </button>
                 </div>
             </div>
+
+            {fetchError && (
+                <ErrorRetry message={fetchError.message} onRetry={refetch} />
+            )}
 
             {/* Log list */}
             <Card className="animate-fade-in">

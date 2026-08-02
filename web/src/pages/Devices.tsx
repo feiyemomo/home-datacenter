@@ -1,11 +1,12 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { HardDrive, RefreshCw, Trash2, Loader2 } from "lucide-react";
 import { listDevices, revokeDevice } from "@/api/device";
 import { getSystemStatus } from "@/api/system";
 import { ApiError } from "@/api/client";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { cn, formatDateTime } from "@/lib/utils";
-import type { Device, SystemStatus, WsMessage } from "@/types";
+import type { Device, WsMessage } from "@/types";
 import {
     Card,
     CardContent,
@@ -15,6 +16,7 @@ import {
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { ErrorRetry } from "@/components/ErrorRetry";
 
 /**
  * Devices page.
@@ -26,40 +28,35 @@ import { Badge } from "@/components/ui/badge";
  *   - DELETE /device/:id to revoke
  */
 export default function Devices() {
-    const [devices, setDevices] = useState<Device[]>([]);
-    const [status, setStatus] = useState<SystemStatus | null>(null);
-    const [loading, setLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const [revokingId, setRevokingId] = useState<number | null>(null);
     const [confirmId, setConfirmId] = useState<number | null>(null);
 
     const { lastMessage, subscribe } = useWebSocket();
 
-    const refreshAll = useCallback(async () => {
-        setError(null);
-        try {
-            const [devs, sys] = await Promise.all([
-                listDevices(),
-                getSystemStatus().catch(() => null),
-            ]);
-            setDevices(devs);
-            setStatus(sys);
-        } catch (err) {
-            setError(
-                err instanceof ApiError
-                    ? err.message
-                    : err instanceof Error
-                        ? err.message
-                        : "加载设备失败",
-            );
-        } finally {
-            setLoading(false);
-        }
+    const fetchAll = useCallback(async () => {
+        const [devs, sys] = await Promise.all([
+            listDevices(),
+            getSystemStatus().catch(() => null),
+        ]);
+        return { devices: devs, status: sys };
     }, []);
 
+    const { data, loading, error: fetchError, refetch, mutate } = useCachedFetch(
+        "home.devices.list",
+        fetchAll,
+        { refetchMs: 30000 },
+    );
+
+    const devices = data?.devices ?? [];
+    const status = data?.status ?? null;
+
+    // Keep a ref to the latest data so WebSocket handlers can read
+    // the current cached value without stale closures.
+    const dataRef = useRef(data);
     useEffect(() => {
-        refreshAll();
-    }, [refreshAll]);
+        dataRef.current = data;
+    }, [data]);
 
     // Subscribe to device status events for live updates.
     useEffect(() => {
@@ -76,7 +73,7 @@ export default function Devices() {
         if (!topic.startsWith("device")) return;
         if (topic !== "device.status") {
             // telemetry/command — not interesting for online state.
-            getSystemStatus().then(setStatus).catch(() => undefined);
+            refetch();
             return;
         }
         const payload = (lastMessage.payload ?? {}) as {
@@ -85,24 +82,32 @@ export default function Devices() {
         };
         const id = payload.device_id;
         if (typeof id !== "number") return;
-        setStatus((prev) => {
-            if (!prev) return prev;
-            const ids = new Set(prev.online_device_ids ?? []);
+        const current = dataRef.current;
+        if (current?.status) {
+            const ids = new Set(current.status.online_device_ids ?? []);
             if (payload.status === "online" || payload.status === "heartbeat") {
                 ids.add(id);
             } else if (payload.status === "offline") {
                 ids.delete(id);
             }
-            return {
-                ...prev,
-                online_device_ids: Array.from(ids),
-                online_device_count: ids.size,
-            };
-        });
+            mutate({
+                ...current,
+                status: {
+                    ...current.status,
+                    online_device_ids: Array.from(ids),
+                    online_device_count: ids.size,
+                },
+            });
+        }
         // Best-effort reconcile with the server (handles edge cases
         // like the dashboard not having seen the latest sweep).
-        getSystemStatus().then(setStatus).catch(() => undefined);
-    }, [lastMessage]);
+        getSystemStatus().then((newStatus) => {
+            const cur = dataRef.current;
+            if (cur) {
+                mutate({ ...cur, status: newStatus });
+            }
+        }).catch(() => undefined);
+    }, [lastMessage, mutate, refetch]);
 
     // Maintain a Set of online device IDs, updated from both polling
     // and WebSocket events.
@@ -122,9 +127,7 @@ export default function Devices() {
             lastMessage.topic?.startsWith("device") &&
             lastMessage.topic !== "device.status"
         ) {
-            getSystemStatus()
-                .then(setStatus)
-                .catch(() => undefined);
+            refetch();
         } else if (lastMessage.type === "online_list") {
             // Server sends {"device_ids": [...], "count": N} as the payload.
             const payload = lastMessage.payload as
@@ -132,18 +135,20 @@ export default function Devices() {
                 | null;
             const ids = payload?.device_ids;
             if (Array.isArray(ids)) {
-                setStatus((prev) =>
-                    prev
-                        ? { ...prev, online_device_ids: ids, online_device_count: ids.length }
-                        : prev,
-                );
+                const current = dataRef.current;
+                if (current?.status) {
+                    mutate({
+                        ...current,
+                        status: { ...current.status, online_device_ids: ids, online_device_count: ids.length },
+                    });
+                } else {
+                    refetch();
+                }
             } else {
-                getSystemStatus()
-                    .then(setStatus)
-                    .catch(() => undefined);
+                refetch();
             }
         }
-    }, [lastMessage]);
+    }, [lastMessage, mutate, refetch]);
 
     async function handleRevoke(device: Device) {
         setError(null);
@@ -151,13 +156,17 @@ export default function Devices() {
         try {
             await revokeDevice(device.id);
             // Optimistically mark as revoked locally.
-            setDevices((prev) =>
-                prev.map((d) =>
-                    d.id === device.id
-                        ? { ...d, revoked_at: new Date().toISOString() }
-                        : d,
-                ),
-            );
+            const current = dataRef.current;
+            if (current) {
+                mutate({
+                    ...current,
+                    devices: current.devices.map((d) =>
+                        d.id === device.id
+                            ? { ...d, revoked_at: new Date().toISOString() }
+                            : d,
+                    ),
+                });
+            }
             setConfirmId(null);
         } catch (err) {
             setError(
@@ -184,7 +193,7 @@ export default function Devices() {
                 <Button
                     variant="outline"
                     size="sm"
-                    onClick={refreshAll}
+                    onClick={refetch}
                     disabled={loading}
                 >
                     {loading ? (
@@ -196,10 +205,8 @@ export default function Devices() {
                 </Button>
             </div>
 
-            {error && (
-                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
-                    {error}
-                </div>
+            {(error || fetchError) && (
+                <ErrorRetry message={fetchError?.message || error || ""} onRetry={refetch} />
             )}
 
             <Card>

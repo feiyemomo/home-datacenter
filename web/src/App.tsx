@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { Layout } from "@/components/Layout";
+import OfflineBanner from "@/components/OfflineBanner";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Cameras from "@/pages/Cameras";
@@ -29,6 +30,7 @@ import Users from "@/pages/Users";
 export default function App() {
     return (
         <AuthProvider>
+            <OfflineBanner />
             <Routes>
                 <Route path="/login" element={<Login />} />
 
