@@ -12,9 +12,9 @@ export const Input = forwardRef<HTMLInputElement, InputProps>(
                 "flex h-9 w-full rounded-xl px-3 py-1 text-sm text-fg",
                 "glass-subtle",
                 "placeholder:text-fg-subtle",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-primary)/0.5)] focus-visible:bg-[rgb(var(--glass-bg)/0.5)]",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-warm)/0.3)] focus-visible:ring-offset-0 focus-visible:border-[rgb(var(--accent-warm)/0.2)] focus-visible:shadow-[0_0_12px_rgb(var(--accent-warm)/0.15)]",
                 "disabled:cursor-not-allowed disabled:opacity-40",
-                "transition-all duration-300 ease-out",
+                "transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
                 className,
             )}
             {...props}
@@ -34,9 +34,9 @@ export const Textarea = forwardRef<HTMLTextAreaElement, TextareaProps>(
                 "flex min-h-[120px] w-full rounded-xl px-3 py-2 text-sm text-fg font-mono",
                 "glass-subtle",
                 "placeholder:text-fg-subtle",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-primary)/0.5)] focus-visible:bg-[rgb(var(--glass-bg)/0.5)]",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-warm)/0.3)] focus-visible:ring-offset-0 focus-visible:border-[rgb(var(--accent-warm)/0.2)] focus-visible:shadow-[0_0_12px_rgb(var(--accent-warm)/0.15)]",
                 "disabled:cursor-not-allowed disabled:opacity-40",
-                "transition-all duration-300 ease-out",
+                "transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
                 className,
             )}
             {...props}
@@ -55,9 +55,9 @@ export const Select = forwardRef<HTMLSelectElement, SelectProps>(
             className={cn(
                 "flex h-9 w-full rounded-xl px-3 py-1 text-sm text-fg",
                 "glass-subtle",
-                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-primary)/0.5)]",
+                "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[rgb(var(--accent-warm)/0.3)] focus-visible:ring-offset-0 focus-visible:border-[rgb(var(--accent-warm)/0.2)] focus-visible:shadow-[0_0_12px_rgb(var(--accent-warm)/0.15)]",
                 "disabled:cursor-not-allowed disabled:opacity-40",
-                "transition-all duration-300 ease-out",
+                "transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]",
                 className,
             )}
             {...props}

@@ -10,9 +10,9 @@ interface LiveAlertBannerProps {
 
 export default function LiveAlertBanner({ alert, onViewSnapshot }: LiveAlertBannerProps) {
     return (
-        <div className="animate-fade-in glass rounded-2xl bg-[rgb(var(--accent-warm)/0.15)] border border-[rgb(var(--accent-warm)/0.3)] px-4 py-3">
+        <div className="animate-fade-in rounded-xl bg-[rgb(var(--accent-warm)/0.08)] border border-[rgb(var(--accent-warm)/0.15)] px-4 py-3">
             <div className="flex items-center gap-3">
-                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[rgb(var(--accent-warm)/0.2)]">
+                <div className="flex h-8 w-8 items-center justify-center rounded-full bg-[rgb(var(--accent-warm)/0.12)]">
                     <AlertTriangle size={16} className="text-[rgb(var(--accent-warm))]" />
                 </div>
                 <div className="min-w-0 flex-1">
@@ -35,7 +35,7 @@ export default function LiveAlertBanner({ alert, onViewSnapshot }: LiveAlertBann
                     <button
                         type="button"
                         onClick={() => onViewSnapshot(alert)}
-                        className="relative h-12 w-16 shrink-0 overflow-hidden rounded-lg bg-black/30 transition-transform hover:scale-105"
+                        className="relative h-12 w-16 shrink-0 overflow-hidden rounded-lg bg-black/30"
                         title="点击查看截图"
                     >
                         <img

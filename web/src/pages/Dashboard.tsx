@@ -36,15 +36,8 @@ import AlertItem from "@/components/dashboard/AlertItem";
 import AlertSnapshotModal from "@/components/dashboard/AlertSnapshotModal";
 import SystemSnapshot from "@/components/dashboard/SystemSnapshot";
 
-/**
- * The NAS's DDNS domain — pure-AAAA record (no A record), so any
- * access via this hostname is an IPv6 direct connection.
- */
 const NAS_DDNS_DOMAIN = "nas.feiyemomo.top";
 
-/**
- * Determine the current dashboard connection path.
- */
 function detectApiPath(): "lan" | "ipv6" | "remote" {
     if (typeof window === "undefined") return "remote";
     const h = window.location.hostname;
@@ -57,9 +50,6 @@ function detectApiPath(): "lan" | "ipv6" | "remote" {
     return "remote";
 }
 
-/**
- * Dashboard: stat cards + live detection alerts with enhanced UI.
- */
 export default function Dashboard() {
     const navigate = useNavigate();
     const { isAdmin } = useAuth();
@@ -208,35 +198,30 @@ export default function Dashboard() {
 
     return (
         <div className="space-y-6">
-            {/* Page header */}
-            <div className="animate-fade-in glass-subtle relative overflow-hidden rounded-2xl px-5 py-4 card-lift">
-                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-warm)/0.9)] via-[rgb(var(--accent-primary)/0.6)] to-transparent" />
-                <div className="pointer-events-none absolute -right-10 -top-10 h-32 w-32 rounded-full bg-[rgb(var(--accent-warm)/0.1)] blur-3xl" />
-                <div className="pointer-events-none absolute -left-5 -bottom-5 h-24 w-24 rounded-full bg-[rgb(var(--accent-primary)/0.08)] blur-2xl" />
-                <div className="relative flex items-center justify-between">
-                    <div>
-                        <h2 className="text-xl font-semibold tracking-tight text-fg">
-                            仪表盘
-                        </h2>
-                        <p className="mt-0.5 text-xs text-fg-muted">
-                            实时系统指标，每 10 秒自动刷新
-                        </p>
-                    </div>
-                    {loading ? (
-                        <RefreshCw size={18} className="animate-spin text-fg-subtle" />
-                    ) : (
-                        <Badge variant={error ? "danger" : "success"} className="gap-1.5 shadow-sm">
-                            <span
-                                className={`pulse-dot inline-block h-2 w-2 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
-                            />
-                            {error ? "连接异常" : "实时连接"}
-                        </Badge>
-                    )}
+            {/* Page header - simplified */}
+            <div className="animate-fade-in flex items-center justify-between pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
+                <div>
+                    <h2 className="text-xl font-semibold tracking-tight text-fg">
+                        仪表盘
+                    </h2>
+                    <p className="mt-0.5 text-xs text-fg-muted">
+                        实时系统指标，每 10 秒自动刷新
+                    </p>
                 </div>
+                {loading ? (
+                    <RefreshCw size={18} className="animate-spin text-fg-subtle" />
+                ) : (
+                    <Badge variant={error ? "danger" : "success"} className="gap-1.5 shadow-sm">
+                        <span
+                            className={`pulse-dot inline-block h-2 w-2 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
+                        />
+                        {error ? "连接异常" : "实时连接"}
+                    </Badge>
+                )}
             </div>
 
             {error && (
-                <div className="animate-fade-in glass rounded-2xl bg-gradient-to-r from-[rgb(var(--accent-danger)/0.12)] to-[rgb(var(--accent-danger)/0.04)] px-4 py-3 text-sm text-[rgb(var(--accent-danger))] border border-[rgb(var(--accent-danger)/0.2)]">
+                <div className="animate-fade-in glass rounded-2xl bg-gradient-to-r from-[rgb(var(--accent-danger)/0.08)] to-[rgb(var(--accent-danger)/0.02)] px-4 py-3 text-sm text-[rgb(var(--accent-danger)/0.9)]">
                     {error}
                 </div>
             )}
@@ -253,11 +238,11 @@ export default function Dashboard() {
             )}
 
             {/* Stat cards grid */}
-            <div className="animate-fade-in grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4 stagger-children">
+            <div className="animate-fade-in grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4 stagger-children">
                 <StatCard
                     label="在线设备"
                     value={String(onlineCount)}
-                    icon={<Activity size={18} />}
+                    icon={<Activity size={16} />}
                     accent="emerald"
                     hint={
                         status ? (
@@ -271,7 +256,7 @@ export default function Dashboard() {
                     label="MQTT 状态"
                     value={status ? (status.mqtt_connected ? "已连接" : "中断") : "—"}
                     icon={
-                        status?.mqtt_connected ? <Wifi size={18} /> : <WifiOff size={18} />
+                        status?.mqtt_connected ? <Wifi size={16} /> : <WifiOff size={16} />
                     }
                     accent={status?.mqtt_connected ? "emerald" : "amber"}
                     hint={
@@ -288,14 +273,14 @@ export default function Dashboard() {
                 <StatCard
                     label="WS 客户端"
                     value={status ? String(status.ws_clients) : "—"}
-                    icon={<Radio size={18} />}
+                    icon={<Radio size={16} />}
                     accent="sky"
                     hint="已连接的应用客户端"
                 />
                 <StatCard
                     label="运行时长"
                     value={uptime}
-                    icon={<Clock size={18} />}
+                    icon={<Clock size={16} />}
                     accent="violet"
                     hint={
                         status ? (
@@ -309,20 +294,17 @@ export default function Dashboard() {
 
             {/* Network + Logs row */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {/* Network quality card - enhanced */}
+                {/* Network quality card */}
                 <Card
                     className="animate-fade-in group relative overflow-hidden glass glass-glow card-lift cursor-pointer transition-all"
                     onClick={() => navigate("/network")}
                 >
-                    <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-info)/0.08)] via-transparent to-[rgb(var(--accent-primary)/0.05)]" />
-                    <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--accent-info)/0.3)] to-transparent" />
-
                     <CardHeader className="relative flex-row items-center justify-between pb-3">
                         <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
                             <Globe size={15} /> 网络质量
                         </CardTitle>
                         <div className="flex items-center gap-2">
-                            <Badge variant="outline" className="gap-1 text-[10px] glass-subtle">
+                            <Badge variant="outline" className="gap-1 text-[10px] text-fg-muted/70 border-[rgb(var(--border)/0.3)]">
                                 <NetworkIcon size={10} />
                                 <span
                                     className={`pulse-dot inline-block h-1.5 w-1.5 rounded-full ${
@@ -340,10 +322,9 @@ export default function Dashboard() {
                     <CardContent className="relative">
                         <div className="flex items-center justify-between">
                             <div className="flex items-center gap-4">
-                                {/* Quality gauge */}
-                                <div className="relative flex h-14 w-14 items-center justify-center">
-                                    <div className="absolute inset-0 rounded-full bg-gradient-to-br from-[rgb(var(--accent-warm)/0.15)] to-[rgb(var(--accent-primary)/0.1)]" />
-                                    <Gauge size={28} className={`${
+                                <div className="relative flex h-12 w-12 items-center justify-center">
+                                    <div className="absolute inset-0 rounded-full bg-gradient-to-br from-[rgb(var(--accent-warm)/0.1)] to-[rgb(var(--accent-primary)/0.06)]" />
+                                    <Gauge size={24} className={`${
                                         currentQuality >= 4 ? "text-[rgb(var(--accent-success))]" :
                                         currentQuality >= 3 ? "text-[rgb(var(--accent-warm))]" :
                                         "text-[rgb(var(--accent-danger))]"
@@ -351,7 +332,7 @@ export default function Dashboard() {
                                 </div>
                                 <div>
                                     <div className="flex items-center gap-2">
-                                        <span className={`text-2xl font-semibold ${
+                                        <span className={`text-xl font-semibold ${
                                             currentQuality >= 4 ? "text-[rgb(var(--accent-success))]" :
                                             currentQuality >= 3 ? "text-[rgb(var(--accent-warm))]" :
                                             "text-[rgb(var(--accent-danger))]"
@@ -365,7 +346,7 @@ export default function Dashboard() {
                                             {[1, 2, 3, 4, 5].map((n) => (
                                                 <Star
                                                     key={n}
-                                                    size={13}
+                                                    size={11}
                                                     className={
                                                         n <= currentQuality
                                                             ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))] drop-shadow-[0_0_4px_rgb(var(--accent-warm)/0.4)]"
@@ -378,22 +359,16 @@ export default function Dashboard() {
                                     </div>
                                 </div>
                             </div>
-                            <div className="text-right text-xs text-fg-subtle group-hover:text-fg-muted transition-colors">
-                                点击查看详情 →
-                            </div>
                         </div>
                     </CardContent>
                 </Card>
 
-                {/* System logs card - enhanced */}
+                {/* System logs card */}
                 {isAdmin && (
                     <Card
                         className="animate-fade-in group relative overflow-hidden glass glass-glow card-lift cursor-pointer transition-all"
                         onClick={() => navigate("/logs")}
                     >
-                        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.06)] via-transparent to-[rgb(var(--accent-primary)/0.04)]" />
-                        <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--border)/0.4)] to-transparent" />
-
                         <CardHeader className="relative flex-row items-center justify-between pb-3">
                             <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
                                 <Activity size={15} /> 系统日志
@@ -406,11 +381,11 @@ export default function Dashboard() {
                             {!systemLogs || systemLogs.length === 0 ? (
                                 <div className="py-3 text-center text-xs text-fg-subtle">暂无日志记录</div>
                             ) : (
-                                <ul className="space-y-2">
+                                <ul className="space-y-1.5">
                                     {(systemLogs ?? []).slice(0, 3).map((log, idx) => (
                                         <li
                                             key={log.id}
-                                            className="flex items-center gap-2 text-xs glass-subtle rounded-lg px-2.5 py-2 transition-all group-hover:bg-[rgb(var(--bg-subtle)/0.3)]"
+                                            className="flex items-center gap-2 text-xs px-2 py-1.5 rounded-lg hover:bg-[rgb(var(--bg-subtle)/0.3)] transition-colors"
                                             style={{ animationDelay: `${idx * 80}ms` }}
                                         >
                                             <Badge
@@ -432,9 +407,6 @@ export default function Dashboard() {
                                     ))}
                                 </ul>
                             )}
-                            <div className="mt-2 text-right text-[10px] text-fg-subtle group-hover:text-fg-muted transition-colors">
-                                查看全部日志 →
-                            </div>
                         </CardContent>
                     </Card>
                 )}
@@ -442,8 +414,6 @@ export default function Dashboard() {
 
             {/* Detection alerts list */}
             <Card className="animate-fade-in relative overflow-hidden glass glass-glow">
-                <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--border)/0.4)] to-transparent" />
-
                 <CardHeader className="relative flex-row items-center justify-between pb-3">
                     <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
                         <Activity size={15} /> 检测报警
@@ -456,7 +426,7 @@ export default function Dashboard() {
                             type="button"
                             onClick={refetchAlerts}
                             disabled={alertsLoading}
-                            className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] text-fg-muted transition-all glass-subtle hover:glass hover:text-fg disabled:opacity-50"
+                            className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] text-fg-muted/70 transition-colors hover:text-fg-muted disabled:opacity-50"
                         >
                             <RefreshCw size={10} className={alertsLoading ? "animate-spin" : ""} />
                             刷新
@@ -471,8 +441,8 @@ export default function Dashboard() {
                         </div>
                     ) : alerts.length === 0 ? (
                         <div className="py-8 text-center">
-                            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full glass-subtle">
-                                <Activity size={20} className="text-fg-subtle" />
+                            <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.4)]">
+                                <Activity size={18} className="text-fg-subtle/60" />
                             </div>
                             <p className="text-xs text-fg-subtle">暂无检测报警</p>
                             <p className="mt-1 text-[10px] text-fg-subtle/70">系统运行正常，未检测到异常活动</p>

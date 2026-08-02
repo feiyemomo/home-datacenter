@@ -95,7 +95,7 @@ export default function Network() {
     return (
         <div className="animate-fade-in space-y-6">
             {/* Header */}
-            <div className="flex items-center justify-between">
+            <div className="animate-fade-in flex items-center justify-between pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
                 <div>
                     <h2 className="text-lg font-semibold text-fg">网络</h2>
                     <p className="text-xs text-fg-muted">

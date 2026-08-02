@@ -65,7 +65,7 @@ export default function Profile() {
 
     return (
         <div className="animate-fade-in space-y-6">
-            <div>
+            <div className="animate-fade-in pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
                 <h2 className="text-lg font-semibold text-fg">个人中心</h2>
                 <p className="text-xs text-fg-subtle">
                     您的账户、令牌声明与绑定的设备。
@@ -73,7 +73,7 @@ export default function Profile() {
             </div>
 
             {loading && (
-                <div className="rounded-xl glass bg-[rgb(var(--accent-blue)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-blue))]">
+                <div className="rounded-xl px-4 py-3 text-sm bg-[rgb(var(--accent-info)/0.08)] text-[rgb(var(--accent-info)/0.9)]">
                     加载中…
                 </div>
             )}

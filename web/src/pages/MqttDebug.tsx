@@ -137,7 +137,7 @@ export default function MqttDebug() {
 
     return (
         <div className="animate-fade-in space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="animate-fade-in flex flex-wrap items-center justify-between gap-3 pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
                 <div>
                     <h2 className="flex items-center gap-2 text-lg font-semibold text-fg">
                         <Radio size={18} /> MQTT 调试
@@ -271,12 +271,12 @@ export default function MqttDebug() {
                             </div>
 
                             {error && (
-                                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
+                                <div className="rounded-xl px-4 py-3 text-sm bg-[rgb(var(--accent-danger)/0.08)] text-[rgb(var(--accent-danger)/0.9)]">
                                     {error}
                                 </div>
                             )}
                             {result && (
-                                <div className="rounded-xl glass bg-[rgb(var(--accent-success)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-success))]">
+                                <div className="rounded-xl px-4 py-3 text-sm bg-[rgb(var(--accent-success)/0.08)] text-[rgb(var(--accent-success)/0.9)]">
                                     已发布到 <code className="font-mono">{result.topic}</code>{" "}
                                     (qos {result.qos})。
                                 </div>

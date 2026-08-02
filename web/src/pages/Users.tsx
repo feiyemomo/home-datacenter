@@ -206,7 +206,7 @@ export default function Users() {
 
     return (
         <div className="animate-fade-in space-y-6">
-            <div className="flex flex-wrap items-center justify-between gap-3">
+            <div className="animate-fade-in flex flex-wrap items-center justify-between gap-3 pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
                 <div>
                     <h2 className="text-lg font-semibold text-fg">用户</h2>
                     <p className="text-xs text-fg-muted">
