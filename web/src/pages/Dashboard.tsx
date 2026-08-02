@@ -10,6 +10,8 @@ import {
     Globe,
     Star,
     Network as NetworkIcon,
+    Zap,
+    Gauge,
 } from "lucide-react";
 import { getSystemStatus, listSystemLogs } from "@/api/system";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
@@ -36,24 +38,12 @@ import SystemSnapshot from "@/components/dashboard/SystemSnapshot";
 
 /**
  * The NAS's DDNS domain — pure-AAAA record (no A record), so any
- * access via this hostname is an IPv6 direct connection. The ISP
- * DHCPv6-PD prefix rotations are tracked by the DDNS provider, so
- * this constant never needs updating.
+ * access via this hostname is an IPv6 direct connection.
  */
 const NAS_DDNS_DOMAIN = "nas.feiyemomo.top";
 
 /**
  * Determine the current dashboard connection path.
- *
- * Returns:
- *  - "lan"       — direct LAN access (192.168.x.x, 10.x, 172.16-31.x)
- *  - "ipv6"      — IPv6 direct connection (DDNS domain or IPv6 literal,
- *                  bypasses Cloudflare Tunnel)
- *  - "remote"    — Cloudflare Tunnel or other remote path
- *
- * Used by the Network Quality card to show the current path chip.
- * The Android app uses BaseUrlResolver to actually probe paths;
- * on web we classify by current origin.
  */
 function detectApiPath(): "lan" | "ipv6" | "remote" {
     if (typeof window === "undefined") return "remote";
@@ -62,25 +52,20 @@ function detectApiPath(): "lan" | "ipv6" | "remote" {
     if (/^192\.168\./.test(h)) return "lan";
     if (/^10\./.test(h)) return "lan";
     if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return "lan";
-    // DDNS domain (nas.feiyemomo.top) — pure-AAAA record, so access
-    // via this hostname is an IPv6 direct connection.
     if (h === NAS_DDNS_DOMAIN) return "ipv6";
-    // Detect IPv6 literal addresses (wrapped in brackets like [::1] or [2001:db8::1])
     if (/^\[[0-9a-f:]+\]$/i.test(h)) return "ipv6";
     return "remote";
 }
 
 /**
- * Dashboard: stat cards + live detection alerts.
+ * Dashboard: stat cards + live detection alerts with enhanced UI.
  */
 export default function Dashboard() {
     const navigate = useNavigate();
     const { isAdmin } = useAuth();
     const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
     const [liveAlert, setLiveAlert] = useState<CameraAlert | null>(null);
-    // Alert selected for full-resolution snapshot viewing (modal).
     const [selectedAlert, setSelectedAlert] = useState<CameraAlert | null>(null);
-    // System logs for the dashboard log card, with silent background refresh.
     const {
         data: systemLogs,
         loading: _logsLoading,
@@ -91,10 +76,8 @@ export default function Dashboard() {
         { refetchMs: 10000 },
     );
 
-    // WebSocket for real-time events
     const ws = useWebSocket(true);
 
-    // Use refs to track latest values without triggering effect re-creation
     const lastMessageRef = useRef(ws.lastMessage);
     lastMessageRef.current = ws.lastMessage;
     const systemLogsRef = useRef(systemLogs);
@@ -102,17 +85,8 @@ export default function Dashboard() {
     const liveAlertRef = useRef(liveAlert);
     liveAlertRef.current = liveAlert;
 
-    // Force a fresh backend network detection on the first load only.
-    // The backend caches network status for 60s; without this, the
-    // displayed quality rating may be up to 60s stale on initial load.
-    // Subsequent polling refreshes use the cached backend response to
-    // avoid hammering STUN servers.
     const forceRefreshRef = useRef(true);
 
-    // System + network status: cached fetch with 10s silent background
-    // refresh. The cache lets us paint the last-known values instantly
-    // when the dashboard remounts (e.g. navigating back from another
-    // page), instead of showing a loading spinner for the first 5s.
     const {
         data: statusData,
         loading: statusLoading,
@@ -131,10 +105,6 @@ export default function Dashboard() {
     const error = statusError ? statusError.message : null;
     const loading = statusLoading && status === null;
 
-    // Historical alerts: cached fetch with 30s silent background
-    // refresh. The cache preserves the recent alert list across
-    // remounts so the operator doesn't see an empty list flash
-    // when navigating away and back.
     const {
         data: alertsData,
         loading: alertsLoading,
@@ -148,13 +118,9 @@ export default function Dashboard() {
 
     const { prefetchOnIdle } = usePrefetch();
 
-    // Preload other pages' data after dashboard loads
     useEffect(() => {
         if (statusData) {
-            // Preload cameras list using the prefetch hook
             prefetchOnIdle("home.cameras.list", () => listCameras(), 2000);
-
-            // Preload network status
             prefetchOnIdle("home.network.status", () =>
                 getNetworkStatus(false).then(res => [res, null] as any),
                 3000
@@ -162,14 +128,11 @@ export default function Dashboard() {
         }
     }, [statusData, prefetchOnIdle]);
 
-    // Listen for real-time events via WebSocket — effect depends only
-    // on stable callbacks, avoiding re-creation on every lastMessage change.
     useEffect(() => {
         const msg = lastMessageRef.current;
         if (!msg) return;
         if (msg.type !== "event") return;
 
-        // Handle system.log events for real-time log updates
         if (msg.topic === "system.log") {
             try {
                 const p = msg.payload as Record<string, unknown>;
@@ -190,7 +153,7 @@ export default function Dashboard() {
             } catch {
                 // Ignore malformed events
             }
-            return; // Don't fall through to camera.motion check
+            return;
         }
 
         if (msg.topic !== "camera.motion") return;
@@ -211,9 +174,7 @@ export default function Dashboard() {
                     has_clip: typeof p.has_clip === "boolean" ? p.has_clip : false,
                     has_snapshot: typeof p.has_snapshot === "boolean" ? p.has_snapshot : false,
                 });
-                // Auto-dismiss after 8 seconds
                 window.setTimeout(() => {
-                    // Only dismiss if the alert hasn't been replaced
                     setLiveAlert((current) => {
                         if (current && current.id === (typeof p.event_id === "string" ? p.event_id : String(p.ts ?? Date.now()))) {
                             return null;
@@ -227,9 +188,6 @@ export default function Dashboard() {
         }
     }, [mutateLogs]);
 
-    // Client-side IPv6 check — runs once on mount. Client IPv6 doesn't
-    // change frequently; re-checking every 5s would be wasteful and
-    // could cause CORS noise in the console.
     useEffect(() => {
         checkClientIPv6().then((v) => setClientIPv6(v));
     }, []);
@@ -238,7 +196,6 @@ export default function Dashboard() {
     const uptime = status ? formatUptime(status.uptime_seconds) : "—";
     const apiPath = detectApiPath();
 
-    // Star quality display for the network quality card
     const currentQuality = (() => {
         if (apiPath === "lan" || apiPath === "ipv6") return 5;
         if (netStatus?.strategy === "ipv6_direct" && clientIPv6 === false) return 3;
@@ -246,43 +203,45 @@ export default function Dashboard() {
         return netStatus?.quality ?? 0;
     })();
 
+    const qualityLabel = currentQuality >= 5 ? "极佳" : currentQuality >= 4 ? "优秀" : currentQuality >= 3 ? "良好" : currentQuality >= 2 ? "一般" : "较差";
+    const latencyHint = netStatus?.latency_ms ? `${netStatus.latency_ms}ms` : apiPath === "lan" ? "~10ms" : apiPath === "ipv6" ? "~30ms" : "—";
+
     return (
         <div className="space-y-6">
-            {/* Page header — liquid glass banner with warm accent glow.
-             * The gradient strip on the left anchors the title
-             * visually and ties into the ambient orb background. */}
-            <div className="animate-fade-in glass-subtle relative overflow-hidden rounded-2xl px-5 py-4">
-                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-warm)/0.8)] via-[rgb(var(--accent-primary)/0.5)] to-transparent" />
-                <div className="pointer-events-none absolute -right-8 -top-8 h-24 w-24 rounded-full bg-[rgb(var(--accent-warm)/0.08)] blur-2xl" />
+            {/* Page header */}
+            <div className="animate-fade-in glass-subtle relative overflow-hidden rounded-2xl px-5 py-4 card-lift">
+                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-warm)/0.9)] via-[rgb(var(--accent-primary)/0.6)] to-transparent" />
+                <div className="pointer-events-none absolute -right-10 -top-10 h-32 w-32 rounded-full bg-[rgb(var(--accent-warm)/0.1)] blur-3xl" />
+                <div className="pointer-events-none absolute -left-5 -bottom-5 h-24 w-24 rounded-full bg-[rgb(var(--accent-primary)/0.08)] blur-2xl" />
                 <div className="relative flex items-center justify-between">
                     <div>
-                        <h2 className="text-lg font-semibold tracking-tight text-fg">
+                        <h2 className="text-xl font-semibold tracking-tight text-fg">
                             仪表盘
                         </h2>
                         <p className="mt-0.5 text-xs text-fg-muted">
-                            实时系统指标，每 10 秒刷新。
+                            实时系统指标，每 10 秒自动刷新
                         </p>
                     </div>
                     {loading ? (
-                        <RefreshCw size={16} className="animate-spin text-fg-subtle" />
+                        <RefreshCw size={18} className="animate-spin text-fg-subtle" />
                     ) : (
-                        <Badge variant={error ? "danger" : "success"}>
+                        <Badge variant={error ? "danger" : "success"} className="gap-1.5 shadow-sm">
                             <span
-                                className={`mr-1 inline-block h-1.5 w-1.5 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
+                                className={`pulse-dot inline-block h-2 w-2 rounded-full ${error ? "bg-[rgb(var(--accent-danger))]" : "bg-[rgb(var(--accent-success))]"}`}
                             />
-                            {error ? "异常" : "实时"}
+                            {error ? "连接异常" : "实时连接"}
                         </Badge>
                     )}
                 </div>
             </div>
 
             {error && (
-                <div className="animate-fade-in glass rounded-2xl bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-sm text-[rgb(var(--accent-danger))]">
+                <div className="animate-fade-in glass rounded-2xl bg-gradient-to-r from-[rgb(var(--accent-danger)/0.12)] to-[rgb(var(--accent-danger)/0.04)] px-4 py-3 text-sm text-[rgb(var(--accent-danger))] border border-[rgb(var(--accent-danger)/0.2)]">
                     {error}
                 </div>
             )}
 
-            {/* Weather card — mirrors Android DashboardFragment's weather card. */}
+            {/* Weather card */}
             <WeatherCard />
 
             {/* Live detection alert banner */}
@@ -293,7 +252,8 @@ export default function Dashboard() {
                 />
             )}
 
-            <div className="animate-fade-in grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+            {/* Stat cards grid */}
+            <div className="animate-fade-in grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4 stagger-children">
                 <StatCard
                     label="在线设备"
                     value={String(onlineCount)}
@@ -318,7 +278,7 @@ export default function Dashboard() {
                         status ? (
                             <span className="inline-flex items-center gap-1.5">
                                 <span
-                                    className={`inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
+                                    className={`pulse-dot inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
                                 />
                                 {status.mqtt_connected ? "代理可达" : "代理离线"}
                             </span>
@@ -347,22 +307,25 @@ export default function Dashboard() {
                 />
             </div>
 
+            {/* Network + Logs row */}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-                {/* Network quality summary - compact */}
+                {/* Network quality card - enhanced */}
                 <Card
-                    className="animate-fade-in cursor-pointer transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
+                    className="animate-fade-in group relative overflow-hidden glass glass-glow card-lift cursor-pointer transition-all"
                     onClick={() => navigate("/network")}
                 >
-                    <CardHeader className="flex-row items-center justify-between pb-2">
-                        <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
-                            <Globe size={16} /> 网络质量
+                    <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-info)/0.08)] via-transparent to-[rgb(var(--accent-primary)/0.05)]" />
+                    <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--accent-info)/0.3)] to-transparent" />
+
+                    <CardHeader className="relative flex-row items-center justify-between pb-3">
+                        <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
+                            <Globe size={15} /> 网络质量
                         </CardTitle>
                         <div className="flex items-center gap-2">
-                            {/* Path chip */}
-                            <Badge variant="outline" className="text-[10px] gap-1">
+                            <Badge variant="outline" className="gap-1 text-[10px] glass-subtle">
                                 <NetworkIcon size={10} />
                                 <span
-                                    className={`inline-block h-1.5 w-1.5 rounded-full ${
+                                    className={`pulse-dot inline-block h-1.5 w-1.5 rounded-full ${
                                         apiPath === "lan"
                                             ? "bg-[rgb(var(--accent-success))]"
                                             : apiPath === "ipv6"
@@ -370,103 +333,152 @@ export default function Dashboard() {
                                                 : "bg-[rgb(var(--accent-warm))]"
                                     }`}
                                 />
-                                {apiPath === "lan" ? "局域网" : apiPath === "ipv6" ? "IPv6 直连" : "远程"}
+                                {apiPath === "lan" ? "局域网" : apiPath === "ipv6" ? "IPv6 直连" : "远程隧道"}
                             </Badge>
-                            {/* Stars */}
-                            <div className="flex items-center gap-0.5">
-                                {[1, 2, 3, 4, 5].map((n) => (
-                                    <Star
-                                        key={n}
-                                        size={14}
-                                        className={
-                                            n <= currentQuality
-                                                ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))]"
-                                                : "fill-none text-fg-subtle"
-                                        }
-                                    />
-                                ))}
-                            </div>
                         </div>
                     </CardHeader>
+                    <CardContent className="relative">
+                        <div className="flex items-center justify-between">
+                            <div className="flex items-center gap-4">
+                                {/* Quality gauge */}
+                                <div className="relative flex h-14 w-14 items-center justify-center">
+                                    <div className="absolute inset-0 rounded-full bg-gradient-to-br from-[rgb(var(--accent-warm)/0.15)] to-[rgb(var(--accent-primary)/0.1)]" />
+                                    <Gauge size={28} className={`${
+                                        currentQuality >= 4 ? "text-[rgb(var(--accent-success))]" :
+                                        currentQuality >= 3 ? "text-[rgb(var(--accent-warm))]" :
+                                        "text-[rgb(var(--accent-danger))]"
+                                    }`} />
+                                </div>
+                                <div>
+                                    <div className="flex items-center gap-2">
+                                        <span className={`text-2xl font-semibold ${
+                                            currentQuality >= 4 ? "text-[rgb(var(--accent-success))]" :
+                                            currentQuality >= 3 ? "text-[rgb(var(--accent-warm))]" :
+                                            "text-[rgb(var(--accent-danger))]"
+                                        }`}>
+                                            {qualityLabel}
+                                        </span>
+                                        <Zap size={14} className="text-fg-subtle" />
+                                    </div>
+                                    <div className="mt-1 flex items-center gap-2">
+                                        <div className="flex items-center gap-0.5">
+                                            {[1, 2, 3, 4, 5].map((n) => (
+                                                <Star
+                                                    key={n}
+                                                    size={13}
+                                                    className={
+                                                        n <= currentQuality
+                                                            ? "fill-[rgb(var(--accent-warm))] text-[rgb(var(--accent-warm))] drop-shadow-[0_0_4px_rgb(var(--accent-warm)/0.4)]"
+                                                            : "fill-none text-fg-subtle/40"
+                                                    }
+                                                />
+                                            ))}
+                                        </div>
+                                        <span className="text-xs text-fg-muted">{latencyHint}</span>
+                                    </div>
+                                </div>
+                            </div>
+                            <div className="text-right text-xs text-fg-subtle group-hover:text-fg-muted transition-colors">
+                                点击查看详情 →
+                            </div>
+                        </div>
+                    </CardContent>
                 </Card>
 
+                {/* System logs card - enhanced */}
                 {isAdmin && (
                     <Card
-                        className="animate-fade-in cursor-pointer transition-colors hover:bg-[rgb(var(--bg-subtle)/0.2)]"
+                        className="animate-fade-in group relative overflow-hidden glass glass-glow card-lift cursor-pointer transition-all"
                         onClick={() => navigate("/logs")}
                     >
-                        <CardHeader className="flex-row items-center justify-between pb-2">
-                            <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
-                                <Activity size={16} /> 系统日志
+                        <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.06)] via-transparent to-[rgb(var(--accent-primary)/0.04)]" />
+                        <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--border)/0.4)] to-transparent" />
+
+                        <CardHeader className="relative flex-row items-center justify-between pb-3">
+                            <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
+                                <Activity size={15} /> 系统日志
                             </CardTitle>
-                            <Badge variant="outline" className="text-[10px]">
-                                {systemLogs?.length ?? 0} 条
+                            <Badge variant="outline" className="text-[10px] glass-subtle">
+                                {systemLogs?.length ?? 0} 条最新
                             </Badge>
                         </CardHeader>
-                        <CardContent>
+                        <CardContent className="relative">
                             {!systemLogs || systemLogs.length === 0 ? (
-                                <div className="text-xs text-fg-subtle">暂无日志</div>
+                                <div className="py-3 text-center text-xs text-fg-subtle">暂无日志记录</div>
                             ) : (
-                                <ul className="space-y-1">
-                                    {(systemLogs ?? []).slice(0, 3).map((log) => (
-                                        <li key={log.id} className="flex items-center gap-2 text-xs">
+                                <ul className="space-y-2">
+                                    {(systemLogs ?? []).slice(0, 3).map((log, idx) => (
+                                        <li
+                                            key={log.id}
+                                            className="flex items-center gap-2 text-xs glass-subtle rounded-lg px-2.5 py-2 transition-all group-hover:bg-[rgb(var(--bg-subtle)/0.3)]"
+                                            style={{ animationDelay: `${idx * 80}ms` }}
+                                        >
                                             <Badge
                                                 variant={
                                                     log.level === "critical" ? "danger"
                                                         : log.level === "normal" ? "info"
                                                             : "outline"
                                                 }
-                                                className="text-[9px] shrink-0"
+                                                className="shrink-0 text-[9px] shadow-sm"
                                             >
                                                 {log.level === "critical" ? "严重"
                                                     : log.level === "normal" ? "普通"
                                                         : "信息"}
                                             </Badge>
-                                            <span className="min-w-0 flex-1 truncate text-fg-muted">
+                                            <span className="min-w-0 flex-1 truncate text-fg-muted group-hover:text-fg transition-colors">
                                                 {log.message || log.event_type}
                                             </span>
                                         </li>
                                     ))}
                                 </ul>
                             )}
+                            <div className="mt-2 text-right text-[10px] text-fg-subtle group-hover:text-fg-muted transition-colors">
+                                查看全部日志 →
+                            </div>
                         </CardContent>
                     </Card>
                 )}
             </div>
 
             {/* Detection alerts list */}
-            <Card className="animate-fade-in">
-                <CardHeader className="flex-row items-center justify-between pb-2">
-                    <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
-                        <Activity size={16} /> 检测报警
+            <Card className="animate-fade-in relative overflow-hidden glass glass-glow">
+                <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--border)/0.4)] to-transparent" />
+
+                <CardHeader className="relative flex-row items-center justify-between pb-3">
+                    <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
+                        <Activity size={15} /> 检测报警
                     </CardTitle>
                     <div className="flex items-center gap-2">
-                        <Badge variant="outline" className="text-[10px]">
-                            {alerts.length} 条
+                        <Badge variant="outline" className="text-[10px] glass-subtle">
+                            {alerts.length} 条记录
                         </Badge>
                         <button
                             type="button"
                             onClick={refetchAlerts}
                             disabled={alertsLoading}
-                            className="inline-flex items-center gap-1 text-[10px] text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
+                            className="inline-flex items-center gap-1 rounded-lg px-2 py-1 text-[10px] text-fg-muted transition-all glass-subtle hover:glass hover:text-fg disabled:opacity-50"
                         >
                             <RefreshCw size={10} className={alertsLoading ? "animate-spin" : ""} />
                             刷新
                         </button>
                     </div>
                 </CardHeader>
-                <CardContent>
+                <CardContent className="relative">
                     {alertsLoading && alerts.length === 0 ? (
-                        <div className="flex items-center justify-center py-6 text-xs text-fg-muted">
-                            <RefreshCw size={12} className="mr-1.5 animate-spin" />
-                            加载中…
+                        <div className="flex items-center justify-center py-8 text-xs text-fg-muted">
+                            <RefreshCw size={14} className="mr-2 animate-spin" />
+                            加载报警记录中…
                         </div>
                     ) : alerts.length === 0 ? (
-                        <div className="py-6 text-center text-xs text-fg-subtle">
-                            暂无检测报警
+                        <div className="py-8 text-center">
+                            <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center rounded-full glass-subtle">
+                                <Activity size={20} className="text-fg-subtle" />
+                            </div>
+                            <p className="text-xs text-fg-subtle">暂无检测报警</p>
+                            <p className="mt-1 text-[10px] text-fg-subtle/70">系统运行正常，未检测到异常活动</p>
                         </div>
                     ) : (
-                        <ul className="max-h-80 space-y-2 overflow-y-auto pr-0.5">
+                        <ul className="max-h-80 space-y-2 overflow-y-auto pr-1 stagger-children">
                             {alerts.map((alert) => (
                                 <AlertItem
                                     key={alert.id}
@@ -488,7 +500,7 @@ export default function Dashboard() {
                 />
             )}
 
-            {/* Raw JSON snapshot — collapsed by default. */}
+            {/* Raw JSON snapshot */}
             <SystemSnapshot status={status} />
         </div>
     );

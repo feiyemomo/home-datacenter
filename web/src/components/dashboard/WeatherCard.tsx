@@ -12,6 +12,7 @@ import {
     Droplets,
     Wind,
     MapPin,
+    Thermometer,
 } from "lucide-react";
 import { getWeather, wmoToIcon, type WeatherResponse } from "@/api/weather";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
@@ -24,23 +25,9 @@ import {
 import { Badge } from "@/components/ui/badge";
 
 /**
- * WeatherCard — top-of-dashboard weather summary, mirrors the
- * Android DashboardFragment's weather card. Calls GET /api/v1/weather
- * (proxied wttr.in j1) and renders current temp, "feels like",
- * WMO-code icon, location label, humidity + wind.
- *
- * The card degrades gracefully: if wttr.in is unreachable (the
- * backend's 5-min cache also helps), we show a compact "weather
- * unavailable" badge instead of a blank card.
+ * WeatherCard — top-of-dashboard weather summary with enhanced liquid glass styling.
  */
 function WeatherCardInner() {
-    // Cached fetch with silent background refresh every 10 min.
-    // wttr.in updates ~every 10 min and the backend caches for 5,
-    // so this rate is well-aligned with upstream freshness.
-    // The cache makes re-mounts (e.g. switching tabs back to the
-    // dashboard) instant — the previous weather payload is shown
-    // immediately from sessionStorage while a refresh runs in
-    // the background.
     const { data: weather, loading, error } = useCachedFetch<WeatherResponse>(
         "home.dashboard.weather",
         getWeather,
@@ -51,12 +38,8 @@ function WeatherCardInner() {
     const area = weather?.nearest_area?.[0];
 
     const code = cond?.weatherCode ? parseInt(cond.weatherCode, 10) : NaN;
-    // wttr.in's WMO codes match the open-meteo table for 0..99, but
-    // they also emit 113/116/119/122/143/176/200/227/230/248/260/263/266/281/284/293/296/299/302/305/308/311/314/317/320/323/326/329/332/335/338/350/353/356/359/362/365/368/371/374/377/386/389/392/395
-    // (legacy Codes). We normalize the common ones to the WMO table.
     const wmo = useMemo(() => {
         if (Number.isNaN(code)) return { icon: "cloud", label: "—" };
-        // Map wttr.in's 1xx codes down to WMO equivalents
         const m: Record<number, number> = {
             113: 0, 116: 2, 119: 3, 122: 3, 143: 45, 176: 51,
             200: 95, 227: 71, 230: 75, 248: 45, 260: 45,
@@ -71,7 +54,6 @@ function WeatherCardInner() {
         return wmoToIcon(normalized);
     }, [code]);
 
-    // Map icon name → lucide component
     const Icon = ({
         sun: Sun,
         cloud: Cloud,
@@ -92,69 +74,88 @@ function WeatherCardInner() {
     const region = area?.region?.[0]?.value;
 
     return (
-        <Card className="animate-fade-in relative overflow-hidden">
-            <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.15)] via-[rgb(var(--accent-primary)/0.05)] to-transparent" />
-            <CardHeader className="relative flex-row items-center justify-between pb-2">
-                <CardTitle className="flex items-center gap-2 text-xs tracking-wider text-fg-muted">
-                    <Icon size={16} className="text-[rgb(var(--accent-warm))]" /> 天气
+        <Card className="animate-fade-in relative overflow-hidden glass glass-glow card-lift">
+            {/* Gradient background */}
+            <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-[rgb(var(--accent-warm)/0.12)] via-[rgb(var(--accent-primary)/0.06)] to-transparent" />
+            {/* Top highlight */}
+            <div className="pointer-events-none absolute top-0 left-0 right-0 h-px bg-gradient-to-r from-transparent via-[rgb(var(--accent-warm)/0.3)] to-transparent" />
+            {/* Decorative glow */}
+            <div className="pointer-events-none absolute -right-8 -top-8 h-32 w-32 rounded-full bg-[rgb(var(--accent-warm)/0.15)] blur-3xl" />
+
+            <CardHeader className="relative flex-row items-center justify-between pb-3">
+                <CardTitle className="flex items-center gap-2 text-[11px] font-medium tracking-wider uppercase text-fg-muted">
+                    <Icon size={15} className="text-[rgb(var(--accent-warm))]" /> 天气
                 </CardTitle>
                 {areaName && (
-                    <Badge variant="outline" className="text-[10px] gap-1">
-                        <MapPin size={10} />
+                    <Badge variant="outline" className="gap-1 text-[10px] glass-subtle">
+                        <MapPin size={9} />
                         {areaName}{region ? ` · ${region}` : ""}
                     </Badge>
                 )}
             </CardHeader>
             <CardContent className="relative">
                 {loading ? (
-                    <div className="flex items-center gap-2 text-fg-muted">
-                        <RefreshCw size={14} className="animate-spin" />
-                        <span className="text-xs">加载中…</span>
+                    <div className="flex items-center gap-3 text-fg-muted">
+                        <RefreshCw size={16} className="animate-spin" />
+                        <span className="text-xs">加载天气中…</span>
                     </div>
                 ) : error || !cond ? (
-                    <div className="flex items-center gap-2 text-fg-muted">
-                        <Cloud size={20} className="opacity-50" />
+                    <div className="flex items-center gap-3 text-fg-muted">
+                        <Cloud size={22} className="opacity-40" />
                         <span className="text-xs">
-                            {error ? error.message : "天气数据不可用"}
+                            {error ? error.message : "天气数据暂时不可用"}
                         </span>
                     </div>
                 ) : (
-                    <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-5">
                         {/* Big icon + temp */}
-                        <div className="flex items-center gap-3">
-                            <div className="flex h-14 w-14 items-center justify-center rounded-2xl bg-[rgb(var(--accent-warm)/0.15)] ring-1 ring-inset ring-[rgb(var(--accent-warm)/0.3)]">
-                                <Icon size={28} className="text-[rgb(var(--accent-warm))]" />
+                        <div className="flex items-center gap-4">
+                            <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl bg-gradient-to-br from-[rgb(var(--accent-warm)/0.2)] to-[rgb(var(--accent-warm)/0.06)] ring-1 ring-inset ring-[rgb(var(--accent-warm)/0.25)] shadow-[0_8px_24px_rgb(var(--accent-warm)/0.15)] transition-transform duration-300 hover:scale-105">
+                                <Icon size={32} className="text-[rgb(var(--accent-warm))]" />
+                                <div className="absolute inset-0 rounded-2xl bg-gradient-to-t from-transparent to-white/15" />
                             </div>
                             <div>
                                 <div className="flex items-baseline gap-1">
-                                    <span className="text-3xl font-semibold tracking-tight text-fg">
+                                    <span className="text-4xl font-semibold tracking-tight text-fg">
                                         {tempC ?? "—"}
                                     </span>
-                                    <span className="text-sm text-fg-muted">°C</span>
+                                    <span className="text-lg text-fg-muted">°C</span>
                                 </div>
-                                <span className="text-xs text-fg-muted">{wmo.label}</span>
+                                <span className="text-sm text-fg-muted">{wmo.label}</span>
                             </div>
                         </div>
+
+                        <div className="h-12 w-px bg-gradient-to-b from-transparent via-[rgb(var(--border)/0.5)] to-transparent" />
+
                         {/* Secondary stats */}
-                        <div className="ml-auto grid grid-cols-3 gap-3 text-xs">
-                            <div className="flex flex-col items-center">
-                                <span className="text-fg-subtle">体感</span>
-                                <span className="font-medium text-fg">
+                        <div className="ml-auto grid grid-cols-3 gap-4 text-xs">
+                            <div className="flex flex-col items-center gap-1">
+                                <div className="flex items-center gap-1 text-fg-subtle">
+                                    <Thermometer size={11} />
+                                    <span>体感</span>
+                                </div>
+                                <span className="text-lg font-semibold text-fg">
                                     {feelsC ?? "—"}°
                                 </span>
                             </div>
-                            <div className="flex flex-col items-center">
-                                <Droplets size={12} className="text-fg-subtle" />
-                                <span className="font-medium text-fg">
-                                    {humidity ?? "—"}%
+                            <div className="flex flex-col items-center gap-1">
+                                <div className="flex items-center gap-1 text-fg-subtle">
+                                    <Droplets size={11} />
+                                    <span>湿度</span>
+                                </div>
+                                <span className="text-lg font-semibold text-fg">
+                                    {humidity ?? "—"}<span className="text-xs text-fg-muted">%</span>
                                 </span>
                             </div>
-                            <div className="flex flex-col items-center">
-                                <Wind size={12} className="text-fg-subtle" />
-                                <span className="font-medium text-fg">
+                            <div className="flex flex-col items-center gap-1">
+                                <div className="flex items-center gap-1 text-fg-subtle">
+                                    <Wind size={11} />
+                                    <span>风速</span>
+                                </div>
+                                <span className="text-lg font-semibold text-fg">
                                     {windKmph ?? "—"}
-                                    <span className="text-fg-subtle"> km/h</span>
-                                    {windDir ? ` ${windDir}` : ""}
+                                    <span className="text-xs text-fg-muted"> km/h</span>
+                                    {windDir ? <span className="ml-1 text-[10px] text-fg-muted">{windDir}</span> : ""}
                                 </span>
                             </div>
                         </div>
