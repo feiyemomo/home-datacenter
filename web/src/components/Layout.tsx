@@ -61,7 +61,7 @@ interface SidebarProps {
     onClose: () => void;
 }
 
-/** Left navigation rail with liquid glass style */
+/** Left navigation rail with enhanced liquid glass style */
 export function Sidebar({ open, onClose }: SidebarProps) {
     const { isAdmin, logout, user } = useAuth();
     const items = NAV_ITEMS.filter((i) => !i.adminOnly || isAdmin);
@@ -71,7 +71,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
             {/* Mobile backdrop */}
             {open && (
                 <div
-                    className="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm md:hidden animate-fade-in"
+                    className="fixed inset-0 z-30 bg-black/30 backdrop-blur-md md:hidden animate-fade-in"
                     onClick={onClose}
                     aria-hidden
                 />
@@ -79,60 +79,72 @@ export function Sidebar({ open, onClose }: SidebarProps) {
 
             <aside
                 className={cn(
-                    "fixed inset-y-0 left-0 z-40 flex w-64 flex-col glass-strong transition-all duration-500 ease-out",
+                    "fixed inset-y-0 left-0 z-40 flex w-64 flex-col glass-strong transition-all duration-500 cubic-bezier(0.32, 0.72, 0, 1)",
                     "md:static md:translate-x-0",
                     open ? "translate-x-0" : "-translate-x-full",
                 )}
             >
                 {/* Brand */}
                 <div className="flex h-16 items-center gap-3 px-5">
-                    <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-[rgb(var(--accent-primary)/0.6)] to-[rgb(var(--accent-warm)/0.4)] text-white glass-glow">
+                    <div className="relative flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-[rgb(var(--accent-primary)/0.7)] to-[rgb(var(--accent-warm)/0.5)] text-white shadow-lg shadow-[rgb(var(--accent-primary)/0.2)]">
                         <Server size={18} />
+                        <div className="absolute inset-0 rounded-xl bg-gradient-to-t from-transparent to-white/20" />
                     </div>
                     <div className="flex flex-col leading-tight">
-                        <span className="text-sm font-semibold text-fg">
+                        <span className="text-sm font-semibold tracking-tight text-fg">
                             家庭数据中心
                         </span>
-                        <span className="text-[10px] tracking-widest text-fg-subtle">
-                            控制面板
+                        <span className="text-[10px] tracking-widest text-fg-subtle uppercase">
+                            Control Panel
                         </span>
                     </div>
                     <button
-                        className="ml-auto text-fg-subtle hover:text-fg transition-colors md:hidden"
+                        className="ml-auto rounded-lg p-1.5 text-fg-subtle transition-all hover:bg-[rgb(var(--bg-subtle)/0.5)] hover:text-fg md:hidden"
                         onClick={onClose}
                         aria-label="关闭导航"
                     >
-                        <X size={20} />
+                        <X size={18} />
                     </button>
                 </div>
 
                 {/* Divider */}
-                <div className="mx-4 h-px bg-gradient-to-r from-transparent via-[rgb(var(--border)/0.5)] to-transparent" />
+                <div className="mx-4 h-px bg-gradient-to-r from-transparent via-[rgb(var(--border)/0.4)] to-transparent" />
 
                 {/* Nav links */}
-                <nav className="flex-1 space-y-1 overflow-y-auto p-3">
-                    {items.map((item, i) => (
+                <nav className="flex-1 space-y-1 overflow-y-auto p-3 stagger-children">
+                    {items.map((item) => (
                         <NavLink
                             key={item.to}
                             to={item.to}
                             onClick={onClose}
                             className={({ isActive }) =>
                                 cn(
-                                    "group flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-all duration-300 ease-out",
-                                    "animate-slide-in",
+                                    "group relative flex items-center gap-3 rounded-xl px-3 py-2.5 text-sm font-medium transition-all duration-300 ease-out",
                                     isActive
-                                        ? "glass text-[rgb(var(--accent-primary))] glass-glow"
-                                        : "text-fg-muted hover:bg-[rgb(var(--bg-subtle)/0.3)] hover:text-fg",
+                                        ? "glass text-[rgb(var(--accent-primary))] shadow-lg shadow-[rgb(var(--accent-primary)/0.1)]"
+                                        : "text-fg-muted hover:bg-[rgb(var(--bg-subtle)/0.4)] hover:text-fg",
                                 )
                             }
-                            style={{ animationDelay: `${i * 50}ms` }}
                         >
-                            {item.icon}
-                            <span>{item.label}</span>
-                            {item.adminOnly && (
-                                <Badge variant="info" className="ml-auto text-[10px]">
-                                    管理员
-                                </Badge>
+                            {({ isActive }) => (
+                                <>
+                                    {/* Active indicator glow */}
+                                    {isActive && (
+                                        <div className="absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r-full bg-gradient-to-b from-[rgb(var(--accent-primary))] to-[rgb(var(--accent-warm))] shadow-[0_0_8px_rgb(var(--accent-primary)/0.5)]" />
+                                    )}
+                                    <span className={cn(
+                                        "transition-transform duration-300",
+                                        isActive ? "scale-110" : "group-hover:scale-105"
+                                    )}>
+                                        {item.icon}
+                                    </span>
+                                    <span className="relative z-10">{item.label}</span>
+                                    {item.adminOnly && (
+                                        <Badge variant="info" className="ml-auto text-[9px] shadow-sm">
+                                            管理员
+                                        </Badge>
+                                    )}
+                                </>
                             )}
                         </NavLink>
                     ))}
@@ -140,9 +152,10 @@ export function Sidebar({ open, onClose }: SidebarProps) {
 
                 {/* Footer */}
                 <div className="p-3">
-                    <div className="mb-2 flex items-center gap-2 rounded-xl glass-subtle px-3 py-2.5">
-                        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-[rgb(var(--accent-primary)/0.3)] to-[rgb(var(--accent-warm)/0.2)] text-xs font-semibold text-[rgb(var(--accent-primary))]">
+                    <div className="relative mb-2 flex items-center gap-2.5 rounded-xl glass-subtle px-3 py-2.5 transition-all hover:glass">
+                        <div className="relative flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-[rgb(var(--accent-primary)/0.4)] to-[rgb(var(--accent-warm)/0.3)] text-xs font-semibold text-[rgb(var(--accent-primary))] shadow-inner">
                             {user?.name?.charAt(0)?.toUpperCase() ?? "?"}
+                            <div className="absolute inset-0 rounded-full bg-gradient-to-t from-transparent to-white/20" />
                         </div>
                         <div className="min-w-0 flex-1">
                             <p className="truncate text-xs font-medium text-fg">
@@ -153,19 +166,19 @@ export function Sidebar({ open, onClose }: SidebarProps) {
                             </p>
                         </div>
                         {isAdmin && (
-                            <Badge variant="success" className="text-[10px]">
-                                <Activity size={10} /> 管理员
+                            <Badge variant="success" className="text-[9px] shadow-sm pulse-dot bg-[rgb(var(--accent-success))]">
+                                <Activity size={9} /> 管理员
                             </Badge>
                         )}
                     </div>
                     <Button
                         variant="ghost"
                         size="sm"
-                        className="w-full justify-start text-fg-muted hover:text-[rgb(var(--accent-danger))]"
+                        className="w-full justify-start gap-2 text-fg-muted transition-all hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
                         onClick={logout}
                     >
-                        <LogOut size={16} />
-                        退出登录
+                        <LogOut size={15} />
+                        <span>退出登录</span>
                     </Button>
                 </div>
             </aside>
@@ -181,12 +194,6 @@ interface LayoutProps {
  * ThemeMenu — 3-state theme picker (light / dark / system) with a
  * glass dropdown. Replaces the old binary Sun/Moon toggle so the
  * operator can opt into "system" (follow OS prefers-color-scheme).
- *
- * The dropdown closes on outside-click, Escape, or option pick.
- * The icon reflects the *resolved* theme (what's actually applied
- * to <html>), while the highlighted option reflects the user's
- * choice (so "system" stays highlighted even if it resolves to
- * dark on this OS).
  */
 function ThemeMenu() {
     const { theme, resolved, setTheme } = useTheme();
@@ -231,13 +238,14 @@ function ThemeMenu() {
                 title={`主题：${themeLabel}（当前生效：${resolvedLabel}）`}
                 aria-expanded={open}
                 aria-haspopup="menu"
+                className="transition-all hover:bg-[rgb(var(--bg-subtle)/0.5)] hover:scale-105"
             >
                 <ActiveIcon size={16} />
             </Button>
             {open && (
                 <div
                     role="menu"
-                    className="absolute right-0 top-full mt-1 min-w-[150px] overflow-hidden rounded-xl glass-strong p-1 shadow-xl z-[100] animate-fade-in ring-1 ring-[rgb(var(--border)/0.4)]"
+                    className="absolute right-0 top-full mt-2 min-w-[160px] overflow-hidden rounded-xl glass-strong p-1.5 shadow-2xl animate-scale-in ring-1 ring-[rgb(var(--border)/0.3)]"
                 >
                     {options.map((opt) => {
                         const Icon = opt.icon;
@@ -252,15 +260,15 @@ function ThemeMenu() {
                                     setOpen(false);
                                 }}
                                 className={cn(
-                                    "flex w-full items-center gap-2 rounded-lg px-2.5 py-1.5 text-xs transition-colors",
+                                    "flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-xs transition-all",
                                     active
-                                        ? "bg-[rgb(var(--accent-primary)/0.15)] text-[rgb(var(--accent-primary))]"
+                                        ? "bg-gradient-to-r from-[rgb(var(--accent-primary)/0.15)] to-[rgb(var(--accent-warm)/0.08)] text-[rgb(var(--accent-primary))] shadow-sm"
                                         : "text-fg-muted hover:bg-[rgb(var(--bg-subtle)/0.5)] hover:text-fg",
                                 )}
                             >
-                                <Icon size={13} />
+                                <Icon size={13} className={active ? "animate-pulse" : ""} />
                                 <span className="flex-1 text-left">{opt.label}</span>
-                                {active && <Check size={12} />}
+                                {active && <Check size={12} className="text-[rgb(var(--accent-success))]" />}
                             </button>
                         );
                     })}
@@ -270,62 +278,66 @@ function ThemeMenu() {
     );
 }
 
-/** App shell with liquid glass layout */
+/** App shell with enhanced liquid glass layout */
 export function Layout({ children }: LayoutProps) {
     const [sidebarOpen, setSidebarOpen] = useState(false);
     const { resolved } = useTheme();
 
     return (
         <div className="relative flex h-screen overflow-hidden bg-surface">
-            {/* Ambient background orbs */}
-            <div className="orb orb-warm" style={{ width: 400, height: 400, top: -100, right: -100 }} />
-            <div className="orb orb-cool" style={{ width: 350, height: 350, bottom: -80, left: -80 }} />
-            <div className="orb orb-accent" style={{ width: 250, height: 250, top: "40%", left: "30%" }} />
+            {/* Ambient background orbs - enhanced with more depth */}
+            <div className="orb orb-warm" style={{ width: 500, height: 500, top: -150, right: -120, animationDelay: "0s" }} />
+            <div className="orb orb-cool" style={{ width: 400, height: 400, bottom: -100, left: -100, animationDelay: "-8s" }} />
+            <div className="orb orb-accent" style={{ width: 300, height: 300, top: "35%", left: "25%", animationDelay: "-15s" }} />
+            <div className="orb orb-warm" style={{ width: 250, height: 250, top: "60%", right: "15%", animationDelay: "-5s", opacity: 0.5 }} />
 
             <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
 
-            <div className="relative flex flex-1 flex-col overflow-hidden">
-                {/* Top header — z-40 so dropdowns inside (ThemeMenu)
-                 * can stack above main content but below the mobile
-                 * sidebar backdrop (z-30 is mobile backdrop; we use
-                 * z-40 on the header so the theme dropdown's z-[100]
-                 * cleanly rises above any card content below). */}
+            <div className="relative z-10 flex flex-1 flex-col overflow-hidden">
+                {/* Top header */}
                 <header className="relative z-40 flex h-16 shrink-0 items-center gap-3 glass-strong px-4 md:px-6 transition-all duration-500 ease-out">
                     <button
-                        className="text-fg-subtle hover:text-fg transition-colors md:hidden"
+                        className="rounded-lg p-2 text-fg-subtle transition-all hover:bg-[rgb(var(--bg-subtle)/0.5)] hover:text-fg hover:scale-105 md:hidden"
                         onClick={() => setSidebarOpen(true)}
                         aria-label="打开导航"
                     >
-                        <Menu size={22} />
+                        <Menu size={20} />
                     </button>
 
                     <div className="flex items-center gap-2">
-                        <h1 className="text-sm font-semibold text-fg">
+                        <h1 className="text-sm font-semibold tracking-tight text-fg">
                             家庭数据中心
                         </h1>
-                        <Badge variant="outline" className="hidden sm:inline-flex">
-                            <span className="mr-1 inline-block h-1.5 w-1.5 rounded-full bg-fg-subtle" />
+                        <Badge variant="outline" className="hidden sm:inline-flex items-center gap-1 text-[10px] glass-subtle">
+                            <span className={cn(
+                                "inline-block h-1.5 w-1.5 rounded-full",
+                                resolved === "dark" ? "bg-[rgb(var(--accent-primary))]" : "bg-[rgb(var(--accent-warm))]",
+                                "pulse-dot"
+                            )} />
                             {resolved === "dark" ? "暗色" : "亮色"}
                         </Badge>
                     </div>
 
-                    <div className="ml-auto flex items-center gap-3">
+                    <div className="ml-auto flex items-center gap-2">
                         <a
                             href="/health"
                             target="_blank"
                             rel="noreferrer"
-                            className="hidden text-xs text-fg-subtle hover:text-fg transition-colors sm:inline"
+                            className="hidden items-center gap-1.5 rounded-lg px-2.5 py-1.5 text-xs text-fg-muted transition-all hover:bg-[rgb(var(--bg-subtle)/0.5)] hover:text-fg sm:inline-flex"
                             title="后端健康检查"
                         >
-                            健康检查
+                            <Activity size={12} />
+                            <span>健康检查</span>
                         </a>
                         <ThemeMenu />
                     </div>
                 </header>
 
                 {/* Main scroll area */}
-                <main className="relative flex-1 overflow-y-auto p-4 md:p-6">
-                    {children}
+                <main className="relative z-10 flex-1 overflow-y-auto p-4 md:p-6">
+                    <div className="relative z-10">
+                        {children}
+                    </div>
                 </main>
             </div>
         </div>

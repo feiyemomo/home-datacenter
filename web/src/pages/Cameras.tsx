@@ -12,16 +12,8 @@ import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { LiveVideo } from "@/components/LiveVideo";
 import { ErrorRetry } from "@/components/ErrorRetry";
 
-// Only H.264 is offered in the dashboard codec selector. WebRTC's RTP
-// codec registry mandates H.264 (plus VP8/VP9/AV1) but NOT H.265, so
-// `passthrough` and `h265` always 502 on Chrome/Edge/Firefox WebRTC.
-// Legacy cameras with `codec=passthrough`/`h265` (set before this
-// restriction) still render correctly in the badge via
-// `codecBadgeLabel`, and the dropdown shows a disabled "(legacy)"
-// entry plus the selectable "H.264" so the operator can migrate.
 type CodecOption = "passthrough" | "h264" | "h265";
 
-/** Resolve the human-readable codec label for a camera badge. */
 function codecBadgeLabel(cam: Camera): string | null {
     if (cam.codec) {
         if (cam.codec === "passthrough") return "直通";
@@ -34,21 +26,7 @@ function codecBadgeLabel(cam: Camera): string | null {
 }
 
 /**
- * Cameras — list + live view + delete.
- *
- * Registration has moved to a dedicated page (/cameras/new,
- * DeviceCreate.tsx). The list page is now strictly for *browsing*
- * — the operator can refresh, watch live, and remove a camera, but
- * not stand up a new one inline. This keeps the cards above the
- * fold and gives the create flow its own URL to bookmark / share.
- *
- * Recording playback + recording toggle now live inside LiveVideo
- * itself (preview/live/playback mode switch). The page just routes
- * the URL params (camera, time) through to the per-card LiveVideo.
- *
- * Supports URL query params:
- *   - camera: camera ID to scroll to
- *   - time: unix timestamp to auto-play the corresponding recording
+ * Cameras — list + live view + delete with enhanced liquid glass styling.
  */
 export default function Cameras() {
     const { isAdmin } = useAuth();
@@ -78,24 +56,45 @@ export default function Cameras() {
     }
 
     return (
-        <div className="space-y-4 animate-fade-in">
-            <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                    <CameraIcon className="h-5 w-5 text-[rgb(var(--accent-primary))]" />
-                    <h2 className="text-lg font-semibold text-fg">摄像头</h2>
-                    <Badge variant="outline">{(cams ?? []).length}</Badge>
-                </div>
-                <div className="flex gap-2">
-                    <Button size="sm" variant="outline" onClick={refetch} disabled={loading}>
-                        <RefreshCcw size={14} className="mr-1" />
-                        刷新
-                    </Button>
-                    {isAdmin && (
-                        <Button size="sm" onClick={() => nav("/cameras/new")}>
-                            <Plus size={14} className="mr-1" />
-                            注册
+        <div className="space-y-5 animate-fade-in">
+            {/* Page header */}
+            <div className="glass-subtle relative overflow-hidden rounded-2xl px-5 py-4 card-lift">
+                <div className="pointer-events-none absolute inset-y-0 left-0 w-1 bg-gradient-to-b from-[rgb(var(--accent-info)/0.8)] via-[rgb(var(--accent-primary)/0.5)] to-transparent" />
+                <div className="pointer-events-none absolute -right-8 -top-8 h-28 w-28 rounded-full bg-[rgb(var(--accent-info)/0.1)] blur-3xl" />
+                <div className="relative flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                        <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-gradient-to-br from-[rgb(var(--accent-info)/0.2)] to-[rgb(var(--accent-primary)/0.1)] ring-1 ring-inset ring-[rgb(var(--accent-info)/0.2)] text-[rgb(var(--accent-info))]">
+                            <CameraIcon size={20} />
+                        </div>
+                        <div>
+                            <h2 className="text-lg font-semibold tracking-tight text-fg">摄像头</h2>
+                            <p className="text-xs text-fg-muted">
+                                {(cams ?? []).length} 个设备 · 实时监控与录像回放
+                            </p>
+                        </div>
+                    </div>
+                    <div className="flex gap-2">
+                        <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={refetch}
+                            disabled={loading}
+                            className="glass-subtle hover:glass transition-all"
+                        >
+                            <RefreshCcw size={14} className={loading ? "animate-spin mr-1.5" : "mr-1.5"} />
+                            刷新
                         </Button>
-                    )}
+                        {isAdmin && (
+                            <Button
+                                size="sm"
+                                onClick={() => nav("/cameras/new")}
+                                className="shadow-lg shadow-[rgb(var(--accent-primary)/0.2)] transition-all hover:scale-105"
+                            >
+                                <Plus size={14} className="mr-1.5" />
+                                注册
+                            </Button>
+                        )}
+                    </div>
                 </div>
             </div>
 
@@ -103,14 +102,14 @@ export default function Cameras() {
                 <ErrorRetry message={fetchError.message} onRetry={refetch} />
             )}
             {error && (
-                <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-3 py-2 text-sm">
+                <div className="glass rounded-2xl bg-gradient-to-r from-[rgb(var(--accent-danger)/0.12)] to-[rgb(var(--accent-danger)/0.04)] px-4 py-3 text-sm text-[rgb(var(--accent-danger))] border border-[rgb(var(--accent-danger)/0.2)]">
                     {error}
                 </div>
             )}
 
             <WsBridge>
                 {(onMsg) => (
-                    <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                    <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 stagger-children">
                         {(cams ?? []).map((cam) => (
                             <CamCard
                                 key={cam.id}
@@ -123,8 +122,14 @@ export default function Cameras() {
                             />
                         ))}
                         {(cams ?? []).length === 0 && !loading && (
-                            <div className="col-span-full glass rounded-2xl p-8 text-center text-sm text-fg-muted animate-fade-in">
-                                暂无注册的摄像头。{isAdmin ? "点击「注册」添加一个。" : "请联系管理员添加。"}
+                            <div className="col-span-full glass glass-glow rounded-2xl p-10 text-center animate-fade-in">
+                                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-2xl glass-subtle">
+                                    <CameraIcon size={28} className="text-fg-subtle" />
+                                </div>
+                                <p className="text-sm font-medium text-fg">暂无注册的摄像头</p>
+                                <p className="mt-1 text-xs text-fg-muted">
+                                    {isAdmin ? "点击右上角「注册」按钮添加第一个摄像头。" : "请联系管理员添加摄像头设备。"}
+                                </p>
                             </div>
                         )}
                     </div>
@@ -159,9 +164,6 @@ function CamCard({
     const [codecLoading, setCodecLoading] = useState(false);
     const [codecError, setCodecError] = useState<string | null>(null);
 
-    // Current codec value for the <Select>. Prefer the explicit
-    // `cam.codec`; fall back to legacy transcode bool (true ⇒ h264,
-    // false ⇒ passthrough) so the dropdown reflects server state.
     const currentCodec: CodecOption = cam.codec
         ? (cam.codec as CodecOption)
         : cam.transcode
@@ -170,9 +172,6 @@ function CamCard({
 
     async function onCodecChange(_: React.ChangeEvent<HTMLSelectElement>) {
         if (!isAdmin) return;
-        // Only "h264" is selectable now; the disabled "(legacy)" entry
-        // for non-h264 cameras can't be re-selected, so any onChange
-        // event means the operator chose "H.264" (migrate from legacy).
         const next = "h264" as const;
         if (next === currentCodec) return;
         setCodecLoading(true);
@@ -190,19 +189,19 @@ function CamCard({
     const badgeLabel = codecBadgeLabel(cam);
 
     return (
-        <div className="flex flex-col overflow-hidden glass glass-glow glass-hover-lift rounded-2xl animate-fade-in">
+        <div className="group flex flex-col overflow-hidden glass glass-glow glass-hover-lift rounded-2xl animate-fade-in">
             {/* Header */}
-            <div className="flex items-center justify-between gap-3 glass-subtle rounded-t-2xl px-4 py-3">
+            <div className="flex items-center justify-between gap-3 glass-subtle px-4 py-3 border-b border-[rgb(var(--border)/0.15)]">
                 <div className="min-w-0 flex-1">
                     <div className="flex items-center gap-2">
-                        <h3 className="truncate text-sm font-semibold text-fg">
+                        <h3 className="truncate text-sm font-semibold tracking-tight text-fg">
                             {cam.name}
                         </h3>
                         {badgeLabel && (
-                            <Badge variant="info" className="shrink-0 text-[9px]">{badgeLabel}</Badge>
+                            <Badge variant="info" className="shrink-0 text-[9px] shadow-sm">{badgeLabel}</Badge>
                         )}
                     </div>
-                    <p className="truncate text-[11px] text-fg-muted">
+                    <p className="truncate text-[11px] text-fg-muted mt-0.5">
                         {cam.vendor} · {cam.host}
                     </p>
                     {codecError && (
@@ -220,7 +219,7 @@ function CamCard({
                                 disabled={codecLoading}
                                 aria-label="输出编码"
                                 title="输出编码（WebRTC 要求 H.264）"
-                                className="glass-subtle rounded-lg h-7 w-[104px] px-1.5 py-0 text-[11px]"
+                                className="glass-subtle rounded-lg h-7 w-[104px] px-2 py-0 text-[11px] transition-all hover:glass"
                             >
                                 {currentCodec !== "h264" && (
                                     <option value={currentCodec} disabled>
@@ -230,16 +229,17 @@ function CamCard({
                                 <option value="h264">H.264</option>
                             </Select>
                             {codecLoading && (
-                                <Loader2 size={11} className="pointer-events-none absolute right-1.5 top-1/2 -translate-y-1/2 animate-spin text-fg-muted" />
+                                <Loader2 size={11} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 animate-spin text-fg-muted" />
                             )}
                         </div>
                     )}
-                    <Badge variant={statusVariant} className="text-[10px]">
+                    <Badge variant={statusVariant} className="text-[10px] shadow-sm gap-1">
+                        <span className={`inline-block h-1.5 w-1.5 rounded-full ${cam.status === "online" ? "bg-current pulse-dot" : "bg-current"}`} />
                         {cam.status === "online" ? "在线" : cam.status === "offline" ? "离线" : "未知"}
                     </Badge>
                     {isAdmin && (
                         <button
-                            className="rounded-md p-1.5 text-fg-subtle transition-colors hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))]"
+                            className="rounded-lg p-1.5 text-fg-subtle transition-all hover:bg-[rgb(var(--accent-danger)/0.1)] hover:text-[rgb(var(--accent-danger))] hover:scale-110"
                             onClick={onDelete}
                             aria-label="删除摄像头"
                             title="删除摄像头"
@@ -250,12 +250,8 @@ function CamCard({
                 </div>
             </div>
 
-            {/* Video — LiveVideo now owns preview / live / playback
-             * modes plus the recording list and the admin recording
-             * toggle. The aspect-video wrapper is preserved so the
-             * card keeps its frame shape before the LiveVideo Card
-             * mounts its inner surface. */}
-            <div className="relative aspect-video bg-black">
+            {/* Video */}
+            <div className="relative aspect-video bg-black/50">
                 <LiveVideo
                     camera={cam}
                     isAdmin={isAdmin}
@@ -269,9 +265,7 @@ function CamCard({
 }
 
 /**
- * WsBridge — child-as-render hook wrapper. The Cameras page owns
- * one WebSocket connection, and each CamCard subscribes to its own
- * "device.<id>" topic via the passed-down callback.
+ * WsBridge — child-as-render hook wrapper.
  */
 function WsBridge({ children }: { children: (onMsg: (h: (m: WsMessage) => void) => () => void) => React.ReactNode }) {
     const ws = useWebSocket(true);
@@ -281,18 +275,10 @@ function WsBridge({ children }: { children: (onMsg: (h: (m: WsMessage) => void) 
         if (ws.lastMessage) setLast(ws.lastMessage);
     }, [ws.lastMessage]);
 
-    // Provide each consumer a stable "give-me-the-latest-message"
-    // hook. The actual message routing happens inside LiveVideo
-    // (filters by device_id).
     const onMsg = useCallback(
         (h: (m: WsMessage) => void) => {
-            // Force a re-render trigger by reading `last` so the
-            // consumer re-subscribes only on identity change.
             void last;
             h(ws.lastMessage ?? { type: "noop", ts: 0 });
-            // The page is the single WS owner; the consumer just
-            // polls the latest message via the same channel. No
-            // explicit unsubscribe is required.
             return () => undefined;
         },
         [last, ws.lastMessage],

@@ -332,6 +332,8 @@ export interface NetworkStatus {
     direct_url?: string;
     /** Server's UDP endpoint for P2P hole punching (empty if unavailable). */
     p2p_endpoint?: string;
+    /** Measured latency in milliseconds. */
+    latency_ms?: number;
     checked_at: string;
 }
 
