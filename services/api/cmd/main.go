@@ -221,9 +221,29 @@ func main() {
 	// ---- HTTP server ----
 	r := gin.Default()
 
-	if err := r.SetTrustedProxies(nil); err != nil {
+	// Trust Docker bridge / LAN proxy ranges so c.ClientIP() resolves
+	// the real client IP from X-Forwarded-For for rate limiting.
+	if err := r.SetTrustedProxies([]string{
+		"172.16.0.0/12",  // Docker bridge
+		"192.168.0.0/16", // LAN
+		"10.0.0.0/8",     // LAN
+		"127.0.0.0/8",    // localhost (nginx same container)
+	}); err != nil {
 		log.Fatalf("failed to set trusted proxies: %v", err)
 	}
+
+	// Global request body size limit (1MB). Defends against DoS via
+	// oversized payloads that would otherwise be buffered fully before
+	// any handler runs. Installed after gin.Default()'s Logger/Recovery
+	// middleware so that rejected requests are still logged, and before
+	// any route group so it covers every endpoint. Routes that
+	// legitimately need larger bodies (e.g. file uploads) can wrap
+	// c.Request.Body with a larger http.MaxBytesReader in their own
+	// handler. No such routes exist today.
+	r.Use(func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20) // 1MB limit
+		c.Next()
+	})
 
 	// Health check (kept simple for Docker / Cloudflare probes)
 	r.GET("/health", func(c *gin.Context) {
@@ -281,6 +301,10 @@ func main() {
 			// No auth is required to *call* /auth/verify — you just
 			// need a valid bearer token in the Authorization header.
 			auth.GET("/verify", authHandler.Verify)
+			// POST /auth/logout clears the home_token cookie server-side.
+			// The cookie is HttpOnly so JS cannot delete it — the
+			// frontend must call this endpoint to expire it properly.
+			auth.POST("/logout", authHandler.Logout)
 		}
 
 		user := api.Group("/user")
@@ -330,11 +354,18 @@ func main() {
 			// subscriber. Newest first; supports limit/offset/
 			// event_type filters (see SystemLogHandler.List).
 			system.GET("/logs", systemLogHandler.List)
+		}
+		// Admin-only system routes. DELETE /logs/:id requires admin
+		// so a non-admin authenticated user can read audit logs but
+		// cannot purge them.
+		systemAdmin := api.Group("/system")
+		systemAdmin.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		{
 			// v1.8.14: delete a single log entry after manual
 			// verification. Used by the "核查并删除" workflow
 			// where the user reviews a critical offline log and
 			// removes it once the issue is resolved.
-			system.DELETE("/logs/:id", systemLogHandler.Delete)
+			systemAdmin.DELETE("/logs/:id", systemLogHandler.Delete)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so
@@ -361,7 +392,7 @@ func main() {
 		api.GET("/weather", middleware.JWTAuth(deviceRepo), weatherHandler.Weather)
 
 		mqttGroup := api.Group("/mqtt")
-		mqttGroup.Use(middleware.JWTAuth(deviceRepo))
+		mqttGroup.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
 		{
 			mqttGroup.POST("/publish", systemHandler.Publish)
 		}
@@ -488,12 +519,13 @@ func main() {
 	log.Printf("server started on %s", addr)
 
 	s := &http.Server{
-		Addr:           addr,
-		Handler:        r,
-		ReadTimeout:    15 * time.Second,
-		WriteTimeout:   15 * time.Second,
-		IdleTimeout:    60 * time.Second,
-		MaxHeaderBytes: 1 << 20, // 1MB
+		Addr:              addr,
+		Handler:           r,
+		ReadTimeout:       15 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
 	}
 
 	if err := s.ListenAndServe(); err != nil {

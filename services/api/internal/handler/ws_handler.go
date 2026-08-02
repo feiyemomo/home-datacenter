@@ -3,6 +3,7 @@ package handler
 import (
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -47,9 +48,13 @@ type UserService interface {
 
 // NewWebSocketHandler creates a handler for the /api/v1/ws endpoint.
 //
-// Origin policy: permissive (any origin). Use this for local
-// development only; for production prefer NewWebSocketHandlerWithOrigins
-// so CSWSH is blocked even if Cloudflare Tunnel is bypassed.
+// Origin policy: same-origin by default. Requests without an Origin
+// header (non-browser clients such as curl, the Android app, or CLI
+// tools) are allowed. Browser requests must have an Origin host that
+// matches the request's Host header, which blocks cross-site WebSocket
+// hijacking (CSWSH) from malicious websites. For an explicit allowlist
+// (e.g. when behind a Cloudflare Tunnel with a known dashboard
+// hostname), prefer NewWebSocketHandlerWithOrigins.
 func NewWebSocketHandler(
 	hub *ws.Hub,
 	deviceRepo *repository.DeviceRepository,
@@ -63,7 +68,20 @@ func NewWebSocketHandler(
 		userService: userService,
 		upgrader: websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool {
-				return true
+				// Default to same-origin check when no allowlist is
+				// configured. This prevents CSWSH attacks from
+				// malicious websites.
+				origin := r.Header.Get("Origin")
+				if origin == "" {
+					// Non-browser clients (curl, CLI) don't send
+					// Origin — allow them.
+					return true
+				}
+				u, err := url.Parse(origin)
+				if err != nil {
+					return false
+				}
+				return u.Host == r.Host
 			},
 		},
 	}
@@ -127,20 +145,63 @@ func stripScheme(s string) string {
 // Handle is the gin handler for GET /api/v1/ws.
 //
 // Token sources (in priority order):
-//  1. Authorization: Bearer <jwt>  (preferred — keeps token out of logs)
-//  2. ?token=<jwt>                  (browser fallback)
+//  1. Sec-WebSocket-Protocol: bearer.<jwt>  (preferred for browsers —
+//     browsers cannot set custom headers on a WS upgrade, so the JWT is
+//     carried as a subprotocol entry. Keeps the token out of the URL,
+//     server logs, referer headers, and browser history.)
+//  2. Authorization: Bearer <jwt>            (non-browser clients)
+//  3. ?token=<jwt>                            (legacy fallback for older
+//     clients, e.g. the Android app before it migrates to the subprotocol
+//     form. Exposes the token in URL/referer/logs.)
 //
-// The query-param form exposes the token in URL/referer/logs; the
-// no-store + no-referrer policy on API responses limits, but does not
-// eliminate, that exposure. Prefer the header form where possible.
+// Security note: Token passed via Sec-WebSocket-Protocol to avoid leakage
+// in server logs and browser history. The query-param form is retained
+// only for backward compatibility.
 func (h *WebSocketHandler) Handle(c *gin.Context) {
-	// 1. Extract JWT — try header first, then ?token= query param.
+	// 1. Extract JWT — prefer Sec-WebSocket-Protocol, then Authorization
+	//    header, then ?token= query param (legacy fallback).
+	//
+	// Browsers cannot set custom headers on a WebSocket upgrade request,
+	// so the token is carried as a subprotocol entry of the form
+	// "bearer.<jwt>". The selected subprotocol must be echoed back in the
+	// 101 response's Sec-WebSocket-Protocol header, otherwise the browser
+	// rejects the connection.
+	//
+	// Token passed via Sec-WebSocket-Protocol to avoid leakage in server
+	// logs and browser history.
 	tokenString := ""
-	authHeader := c.GetHeader("Authorization")
-	if strings.HasPrefix(authHeader, "Bearer ") {
-		tokenString = strings.TrimPrefix(authHeader, "Bearer ")
-	} else if q := c.Query("token"); q != "" {
-		tokenString = q
+	subprotocol := ""
+
+	// The Sec-WebSocket-Protocol header may appear multiple times and each
+	// value may itself be a comma-separated list (RFC 6455 §4.1). Walk all
+	// entries looking for a "bearer.<token>" entry.
+	for _, raw := range c.Request.Header["Sec-WebSocket-Protocol"] {
+		for _, p := range strings.Split(raw, ",") {
+			p = strings.TrimSpace(p)
+			if strings.HasPrefix(p, "bearer.") {
+				tokenString = strings.TrimPrefix(p, "bearer.")
+				subprotocol = p
+				break
+			}
+		}
+		if subprotocol != "" {
+			break
+		}
+	}
+
+	// Non-browser clients can still use the Authorization header.
+	if tokenString == "" {
+		authHeader := c.GetHeader("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+	}
+
+	// Backward-compat fallback: older clients (e.g. the Android app) still
+	// pass the token via ?token=. Keep this until all clients migrate to
+	// the Sec-WebSocket-Protocol form.
+	if tokenString == "" {
+		tokenString = c.Query("token")
 	}
 
 	if tokenString == "" {
@@ -177,7 +238,17 @@ func (h *WebSocketHandler) Handle(c *gin.Context) {
 	}
 
 	// 5. Upgrade to WebSocket.
-	conn, err := h.upgrader.Upgrade(c.Writer, c.Request, nil)
+	//
+	// Use a per-request copy of the upgrader so we can set Subprotocols
+	// (the selected subprotocol to echo back in the handshake response)
+	// without racing other in-flight upgrades that share h.upgrader. If a
+	// "bearer.<token>" subprotocol was supplied, echoing it back is
+	// required — the browser aborts the connection otherwise.
+	upgrader := h.upgrader
+	if subprotocol != "" {
+		upgrader.Subprotocols = []string{subprotocol}
+	}
+	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		// Upgrade already wrote an error response; just log.
 		return

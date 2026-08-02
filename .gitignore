@@ -8,6 +8,12 @@
 # Local config override holds the real jwt.secret; never commit it.
 services/api/configs/config.local.yaml
 
+# ---- Deploy secrets — never commit ----
+# Anyone cloning the repo must create these manually (see docs/security.md).
+deploy/cloudflared/credentials.json
+deploy/mosquitto/passwd
+deploy/frigate/config.yml
+
 # ---- IDE / OS ----
 .vscode/
 .idea/

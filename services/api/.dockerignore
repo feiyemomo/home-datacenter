@@ -1,0 +1,23 @@
+# Local config with secrets
+configs/config.local.yaml
+configs/*.local.yaml
+
+# Database
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# IDE and misc
+.git
+.gitignore
+.vscode
+.idea
+*.md
+.trae/

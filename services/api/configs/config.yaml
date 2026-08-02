@@ -21,6 +21,11 @@ server:
   # dashboard hostname(s) to block cross-site WebSocket hijacking.
   # allowed_origins:
   #   - dashboard.feiyemomo.top
+  # Set the Secure attribute on the home_token auth cookie. Default
+  # false: the LAN dashboard is served over plain HTTP, where a Secure
+  # cookie would be dropped by the browser. Set to true when the
+  # dashboard is reachable only over HTTPS (e.g. Cloudflare Tunnel).
+  secure_cookie: false
 
 database:
   path: /data/sqlite/app.db

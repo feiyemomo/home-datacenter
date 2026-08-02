@@ -13,6 +13,16 @@
 #     the api reaches it on the internal network as "mosquitto:1883".
 #     Set MQTT_BIND_PORT below if you need host access for local
 #     device testing.
+#
+# Security hardening:
+#   - All services run with no-new-privileges:true and cap_drop: ALL.
+#   - The web service adds back NET_BIND_SERVICE so nginx can bind
+#     port 80 (its master process still drops to the nginx user for
+#     worker processes via setuid — no setuid binary involved, so
+#     no-new-privileges does not interfere).
+#   - Frigate's ports 5000 (REST API) and 1984 (go2rtc) are bound to
+#     127.0.0.1 — no internal service needs them via the host; all
+#     reach Frigate on the Docker network as home-frigate:5000/1984.
 
 services:
   api:
@@ -20,6 +30,10 @@ services:
       context: ./services/api
     container_name: home-api
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Bind to 0.0.0.0 so LAN devices can reach the API directly.
     # In production behind Cloudflare Tunnel, the tunnel reaches the
     # API by service name (home-api) on the internal network.
@@ -77,6 +91,10 @@ services:
     image: eclipse-mosquitto:2
     container_name: home-mosquitto
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Not published by default. Uncomment and set MQTT_BIND_PORT only
     # if a local physical device needs to reach the broker from the host.
     # ports:
@@ -96,6 +114,16 @@ services:
       context: ./web
     container_name: home-web
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # nginx master starts as root to bind port 80 (needs
+    # NET_BIND_SERVICE), then drops to the nginx user for worker
+    # processes via setuid() — not execve of a setuid binary, so
+    # no-new-privileges does not interfere with privilege dropping.
+    cap_add:
+      - NET_BIND_SERVICE
     # Port 8088 on the host maps to 80 in the container. Port 80
     # on the host is typically occupied by the NAS web UI.
     #
@@ -138,6 +166,10 @@ services:
     image: ghcr.io/blakeblackshear/frigate:stable
     container_name: home-frigate
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     environment:
       - SET_CONFIG_BY_API=true
       - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-}
@@ -158,10 +190,16 @@ services:
       - FRIGATE_MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
       - FRIGATE_MQTT_PASSWORD=${MQTT_PASSWORD:-}
     ports:
-      # Frigate REST API (config, events, snapshots)
-      - "0.0.0.0:5000:5000"
-      # Bundled go2rtc HTTP API (HLS, WebRTC SDP signalling)
-      - "0.0.0.0:1984:1984"
+      # Frigate REST API (config, events, snapshots). Bound to
+      # 127.0.0.1 — all internal services (api, web nginx proxy)
+      # reach Frigate via the Docker network (home-frigate:5000),
+      # so the host port is only for local debugging.
+      - "127.0.0.1:5000:5000"
+      # Bundled go2rtc HTTP API (HLS, WebRTC SDP signalling).
+      # Bound to 127.0.0.1 — go2rtc has no built-in auth, so
+      # exposing it on 0.0.0.0 would let anyone on the LAN pull
+      # camera streams. Internal services use home-frigate:1984.
+      - "127.0.0.1:1984:1984"
       # WebRTC media: TCP ICE + UDP ICE. Browser needs direct
       # access for ICE connectivity checks.
       - "8555:8555"
@@ -186,6 +224,9 @@ services:
     # Without this, ffmpeg falls back to software decode → high CPU.
     # On Docker Desktop (Windows/WSL2) GPU passthrough is not
     # supported — comment out and remove hwaccel_args to fall back.
+    #
+    # GPU access is via the devices: directive (device cgroup),
+    # not via capabilities, so cap_drop: ALL does not affect VAAPI.
     devices:
       - /dev/dri:/dev/dri
     # Healthcheck: check the Frigate REST API is responding.
@@ -207,6 +248,10 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: home-cloudflared
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     # Config-file mode: ingress rules are defined locally in
     # deploy/cloudflared/config.yaml and the tunnel credentials are
     # in deploy/cloudflared/credentials.json. This avoids needing

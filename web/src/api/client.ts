@@ -15,22 +15,19 @@ export function setToken(token: string): void {
 }
 
 /** Remove the JWT and bounce to /login. */
-export function clearTokenAndRedirect(): void {
+export async function clearTokenAndRedirect(): Promise<void> {
+    // Call server-side logout to clear the HttpOnly cookie.
+    // The cookie is HttpOnly so JavaScript cannot delete it directly.
+    try {
+        await axios.post("/api/v1/auth/logout", null, {
+            headers: getToken() ? { Authorization: `Bearer ${getToken()}` } : {},
+        });
+    } catch {
+        // Ignore errors — proceed with local cleanup anyway.
+    }
     localStorage.removeItem(TOKEN_KEY);
-    // The same JWT lives in the `home_token` cookie (set by
-    // /api/v1/auth/bind so that nginx's `auth_request` against
-    // /frigate/ and /go2rtc/ can validate top-level
-    // navigations — see auth_handler.go's Bind comment). The
-    // cookie is non-HttpOnly on purpose so this client-side
-    // clear is the logout contract. Path=/, SameSite=Lax must
-    // match the attributes used at Set-Cookie time or the
-    // browser treats the deletion as a different cookie and
-    // ignores it. We deliberately do NOT pre-clear
-    // localStorage's token via window.location.reload() — the
-    // upcoming /login redirect handles the unmount.
     document.cookie = "home_token=; Max-Age=0; path=/; SameSite=Lax";
-    // Avoid clobbering history when already on a public route.
-    if (!window.location.pathname.startsWith("/login")) {
+    if (window.location.pathname !== "/login") {
         window.location.assign("/login");
     }
 }

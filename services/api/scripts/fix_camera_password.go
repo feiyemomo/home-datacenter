@@ -32,7 +32,7 @@ import (
 )
 
 func main() {
-	newPass := flag.String("new", "<CAM_PASSWORD>", "new camera password to apply to every row")
+	newPass := flag.String("new", "", "new camera password (required)")
 	go2Base := flag.String("go2rtc", "http://home-go2rtc:1984", "go2rtc base URL")
 	dbPath := flag.String("db", "", "override database path (defaults to config.database.path)")
 	// -rename-missing-keys: scan cameras whose stream_name still
@@ -47,7 +47,7 @@ func main() {
 	flag.Parse()
 
 	if *newPass == "" {
-		log.Fatal("new password must not be empty")
+		log.Fatal("new password is required: use -new <password>")
 	}
 
 	// Same config resolution as the API: APP_CONFIG env var, then
@@ -183,7 +183,7 @@ func main() {
 			continue
 		}
 		log.Printf("cam %d (%s): password updated (user=%q, was=%q, now=%q)",
-			c.ID, c.StreamName, user, oldPass, *newPass)
+		c.ID, c.StreamName, user, maskSecret(oldPass), maskSecret(*newPass))
 
 		// Re-push the RTSP URL to go2rtc. The rtspURL helper bakes
 		// in #audio=0 exactly like a fresh Register. We do NOT
@@ -216,4 +216,12 @@ func redactPass(rtsp string) string {
 		}
 	}
 	return u.String()
+}
+
+// maskSecret masks a raw secret string for safe logging.
+func maskSecret(s string) string {
+	if len(s) == 0 {
+		return ""
+	}
+	return "REDACTED"
 }

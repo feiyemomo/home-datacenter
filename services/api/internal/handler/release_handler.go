@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -90,7 +91,8 @@ type apkFile struct {
 func (h *ReleaseHandler) Latest(c *gin.Context) {
 	apk, err := h.findLatest()
 	if err != nil {
-		utils.Fail(c, http.StatusNotFound, "no releases available: "+err.Error())
+		log.Printf("[handler] no releases available: %v", err)
+		utils.Fail(c, http.StatusNotFound, "no releases available")
 		return
 	}
 
@@ -118,7 +120,8 @@ func (h *ReleaseHandler) Latest(c *gin.Context) {
 func (h *ReleaseHandler) Download(c *gin.Context) {
 	apk, err := h.findLatest()
 	if err != nil {
-		utils.Fail(c, http.StatusNotFound, "no releases available: "+err.Error())
+		log.Printf("[handler] no releases available: %v", err)
+		utils.Fail(c, http.StatusNotFound, "no releases available")
 		return
 	}
 
