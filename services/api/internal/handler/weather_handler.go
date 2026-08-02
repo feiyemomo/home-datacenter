@@ -107,13 +107,13 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 		utils.Fail(c, http.StatusBadGateway,
 			fmt.Sprintf("wttr.in returned %d: %s", resp.StatusCode, string(body)))
 		return
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to read weather response")
 		return

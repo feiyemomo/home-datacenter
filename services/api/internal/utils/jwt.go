@@ -7,11 +7,11 @@ import (
 )
 
 // JWT signing parameters. These are populated by main.go from
-// config.AppConfig.JWT at startup. Defaults are intentionally
-// insecure placeholders — production deployments must override
-// jwt.secret in configs/config.yaml.
+// config.AppConfig.JWT at startup. The default JWTSecret is an
+// empty string — config.go's validateJWTSecret will reject it at
+// startup unless a valid secret is provided via the config file.
 var (
-	JWTSecret       = "PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET"
+	JWTSecret       = ""
 	TokenExpireDays = 365
 )
 

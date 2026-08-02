@@ -99,9 +99,11 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 	// way the dashboard reaches /frigate/) carry the cookie,
 	// while cross-site XHR/fetch (the only path an attacker would
 	// use to ride the cookie) is blocked by the browser.
+	// The cookie is also HttpOnly — localStorage is the primary
+	// token store and the cookie is a secondary channel.
 	const maxAge = 365 * 24 * 60 * 60
 	c.SetSameSite(http.SameSiteLaxMode)
-	c.SetCookie("home_token", token, maxAge, "/", "", false, false)
+	c.SetCookie("home_token", token, maxAge, "/", "", false, true)
 
 	utils.Success(c, gin.H{
 		"token": token,
