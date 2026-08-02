@@ -8,7 +8,9 @@ import { listCameras, deleteCamera, updateCodec } from "@/api/camera";
 import type { Camera, WsMessage } from "@/types";
 import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { LiveVideo } from "@/components/LiveVideo";
+import { ErrorRetry } from "@/components/ErrorRetry";
 
 // Only H.264 is offered in the dashboard codec selector. WebRTC's RTP
 // codec registry mandates H.264 (plus VP8/VP9/AV1) but NOT H.265, so
@@ -51,37 +53,25 @@ function codecBadgeLabel(cam: Camera): string | null {
 export default function Cameras() {
     const { isAdmin } = useAuth();
     const nav = useNavigate();
-    const [cams, setCams] = useState<Camera[]>([]);
-    const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [searchParams] = useSearchParams();
 
     const targetCameraId = searchParams.get("camera") ? Number(searchParams.get("camera")) : undefined;
     const targetTime = searchParams.get("time") ? Number(searchParams.get("time")) : undefined;
 
-    const refresh = useCallback(async () => {
-        setLoading(true);
-        setError(null);
-        try {
-            const list = await listCameras();
-            setCams(list);
-        } catch (e) {
-            setError(e instanceof Error ? e.message : String(e));
-        } finally {
-            setLoading(false);
-        }
-    }, []);
-
-    useEffect(() => {
-        void refresh();
-    }, [refresh]);
+    const { data: cams, loading, error: fetchError, refetch, mutate } = useCachedFetch<Camera[]>(
+        "home.cameras.list",
+        listCameras,
+        { refetchMs: 30000 }
+    );
 
     async function remove(id: number) {
         if (!isAdmin) return;
         if (!confirm(`确认删除摄像头 ${id}？`)) return;
         try {
             await deleteCamera(id);
-            await refresh();
+            const list = await listCameras();
+            mutate(list);
         } catch (e) {
             setError(e instanceof Error ? e.message : String(e));
         }
@@ -93,10 +83,10 @@ export default function Cameras() {
                 <div className="flex items-center gap-2">
                     <CameraIcon className="h-5 w-5 text-[rgb(var(--accent-primary))]" />
                     <h2 className="text-lg font-semibold text-fg">摄像头</h2>
-                    <Badge variant="outline">{cams.length}</Badge>
+                    <Badge variant="outline">{(cams ?? []).length}</Badge>
                 </div>
                 <div className="flex gap-2">
-                    <Button size="sm" variant="outline" onClick={refresh} disabled={loading}>
+                    <Button size="sm" variant="outline" onClick={refetch} disabled={loading}>
                         <RefreshCcw size={14} className="mr-1" />
                         刷新
                     </Button>
@@ -109,6 +99,9 @@ export default function Cameras() {
                 </div>
             </div>
 
+            {fetchError && (
+                <ErrorRetry message={fetchError.message} onRetry={refetch} />
+            )}
             {error && (
                 <div className="glass bg-[rgb(var(--accent-danger)/0.1)] text-[rgb(var(--accent-danger))] rounded-lg px-3 py-2 text-sm">
                     {error}
@@ -118,18 +111,18 @@ export default function Cameras() {
             <WsBridge>
                 {(onMsg) => (
                     <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-                        {cams.map((cam) => (
+                        {(cams ?? []).map((cam) => (
                             <CamCard
                                 key={cam.id}
                                 cam={cam}
                                 isAdmin={isAdmin}
                                 onDelete={() => remove(cam.id)}
-                                onRefresh={refresh}
+                                onRefresh={refetch}
                                 onWsMessage={onMsg}
                                 targetTime={(targetCameraId === cam.id) ? targetTime : undefined}
                             />
                         ))}
-                        {cams.length === 0 && !loading && (
+                        {(cams ?? []).length === 0 && !loading && (
                             <div className="col-span-full glass rounded-2xl p-8 text-center text-sm text-fg-muted animate-fade-in">
                                 暂无注册的摄像头。{isAdmin ? "点击「注册」添加一个。" : "请联系管理员添加。"}
                             </div>

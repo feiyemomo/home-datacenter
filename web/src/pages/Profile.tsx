@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
     KeyRound,
     HardDrive,
@@ -8,10 +8,10 @@ import {
 } from "lucide-react";
 import { listDevices } from "@/api/device";
 import { getCurrentUser } from "@/api/system";
-import { ApiError } from "@/api/client";
-import { useAuth } from "@/hooks/useAuth";
 import { cn, formatCountdown, formatDateTime } from "@/lib/utils";
-import type { Device, JwtClaims, User } from "@/types";
+import { useAuth } from "@/hooks/useAuth";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
+import type { JwtClaims } from "@/types";
 import {
     Card,
     CardContent,
@@ -20,6 +20,7 @@ import {
     CardTitle,
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { ErrorRetry } from "@/components/ErrorRetry";
 
 /**
  * Profile page.
@@ -28,39 +29,26 @@ import { Badge } from "@/components/ui/badge";
  * and the list of devices bound to this user.
  */
 export default function Profile() {
-    const { user: ctxUser, claims, token } = useAuth();
-    const [user, setUser] = useState<User | null>(ctxUser);
-    const [devices, setDevices] = useState<Device[]>([]);
-    const [error, setError] = useState<string | null>(null);
+    const { claims, token } = useAuth();
+    const [error, _setError] = useState<string | null>(null);
     const [now, setNow] = useState(() => Date.now());
 
-    // Refresh user + bound devices on mount.
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            try {
-                const [u, all] = await Promise.all([
-                    getCurrentUser(),
-                    listDevices(),
-                ]);
-                if (cancelled) return;
-                setUser(u);
-                setDevices(all.filter((d) => d.user_id === u.id));
-            } catch (err) {
-                if (cancelled) return;
-                setError(
-                    err instanceof ApiError
-                        ? err.message
-                        : err instanceof Error
-                            ? err.message
-                            : "加载个人中心失败",
-                );
-            }
-        })();
-        return () => {
-            cancelled = true;
-        };
+    const fetchProfile = useCallback(async () => {
+        const [u, all] = await Promise.all([
+            getCurrentUser(),
+            listDevices(),
+        ]);
+        return { user: u, devices: all.filter((d) => d.user_id === u.id) };
     }, []);
+
+    const { data, loading, error: fetchError, refetch } = useCachedFetch(
+        "home.profile.info",
+        fetchProfile,
+        { refetchMs: 60000 },
+    );
+
+    const user = data?.user ?? null;
+    const devices = data?.devices ?? [];
 
     // 1-second ticker for the expiry countdown.
     useEffect(() => {
@@ -84,10 +72,14 @@ export default function Profile() {
                 </p>
             </div>
 
-            {error && (
-                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
-                    {error}
+            {loading && (
+                <div className="rounded-xl glass bg-[rgb(var(--accent-blue)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-blue))]">
+                    加载中…
                 </div>
+            )}
+
+            {(fetchError?.message || error) && (
+                <ErrorRetry message={(fetchError?.message ?? error) || ""} onRetry={refetch} />
             )}
 
             <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">

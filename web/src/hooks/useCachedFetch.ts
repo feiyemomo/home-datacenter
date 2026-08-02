@@ -31,6 +31,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
  * to decide whether to show a "refreshing…" indicator — currently
  * unused, reserved for future UX.
  */
+export interface CachedFetchResult<T> {
+    data: T | null;
+    loading: boolean;
+    error: Error | null;
+    refetch: () => void;
+    mutate: (newData: T | null) => void;
+    isStale: boolean;
+}
+
 export function useCachedFetch<T>(
     key: string,
     fetcher: () => Promise<T>,
@@ -41,14 +50,20 @@ export function useCachedFetch<T>(
         ttlMs?: number;
         /** Skip the fetch entirely when false. */
         enabled?: boolean;
+        /** Maximum number of retry attempts on failure (default: 3). */
+        maxRetries?: number;
+        /** Base delay in ms for exponential backoff (default: 1000). */
+        retryDelay?: number;
+        /** Callback fired when all retries have been exhausted. */
+        onError?: (error: Error) => void;
     } = {},
-): {
-    data: T | null;
-    loading: boolean;
-    error: Error | null;
-    refetch: () => void;
-} {
-    const { refetchMs = 0, enabled = true } = options;
+): CachedFetchResult<T> {
+    const {
+        refetchMs = 0,
+        enabled = true,
+        maxRetries = 3,
+        retryDelay = 1000,
+    } = options;
 
     // Read cached value synchronously on first render so the UI
     // can paint immediately without a loading flash.
@@ -77,6 +92,7 @@ export function useCachedFetch<T>(
     });
 
     const [error, setError] = useState<Error | null>(null);
+    const [isStale, setIsStale] = useState(false);
 
     // Keep a live ref to the fetcher so changes to the caller's
     // closure (e.g. new function identity each render) don't
@@ -84,29 +100,87 @@ export function useCachedFetch<T>(
     const fetcherRef = useRef(fetcher);
     fetcherRef.current = fetcher;
 
+    const onErrorRef = useRef(options.onError);
+    onErrorRef.current = options.onError;
+
     const fetchNow = useCallback(() => {
         let cancelled = false;
+        let retryCount = 0;
+
         (async () => {
-            try {
-                const v = await fetcherRef.current();
-                if (cancelled) return;
-                setData(v);
-                setError(null);
+            while (true) {
                 try {
-                    sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v }));
+                    const v = await fetcherRef.current();
+                    if (cancelled) return;
+                    setData(v);
+                    setError(null);
+                    setIsStale(false);
+                    try {
+                        sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v }));
+                    } catch {
+                        // private browsing or quota exceeded — accept
+                        // loss of persistence, the in-memory state is
+                        // still updated.
+                    }
+                    return;
+                } catch (e) {
+                    if (cancelled) return;
+                    retryCount++;
+                    if (retryCount <= maxRetries) {
+                        // Exponential backoff: 1s → 2s → 4s ...
+                        const delay = retryDelay * Math.pow(2, retryCount - 1);
+                        await new Promise((r) => setTimeout(r, delay));
+                        if (cancelled) return;
+                    } else {
+                        // All retries exhausted.
+                        const err = e instanceof Error ? e : new Error(String(e));
+
+                        // If cached data exists, keep showing it and
+                        // mark as stale instead of surfacing the error.
+                        let hasCachedData = false;
+                        try {
+                            hasCachedData = sessionStorage.getItem(key) !== null;
+                        } catch {
+                            // sessionStorage unavailable — treat as no cache.
+                        }
+
+                        if (hasCachedData) {
+                            setIsStale(true);
+                            // Keep existing data, do NOT set error.
+                        } else {
+                            setError(err);
+                        }
+
+                        onErrorRef.current?.(err);
+                        break;
+                    }
+                } finally {
+                    if (!cancelled) setLoading(false);
+                }
+            }
+        })();
+    }, [key, maxRetries, retryDelay]);
+
+    // mutate — allows external callers to update both the React
+    // state and sessionStorage cache directly (e.g. on WebSocket
+    // event).
+    const mutate = useCallback(
+        (newData: T | null) => {
+            setData(newData);
+            setError(null);
+            setIsStale(false);
+            if (newData !== null) {
+                try {
+                    sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v: newData }));
                 } catch {
                     // private browsing or quota exceeded — accept
                     // loss of persistence, the in-memory state is
                     // still updated.
                 }
-            } catch (e) {
-                if (cancelled) return;
-                setError(e instanceof Error ? e : new Error(String(e)));
-            } finally {
-                if (!cancelled) setLoading(false);
             }
-        })();
-    }, [key]);
+        },
+        [key],
+    );
 
     // Initial fetch + optional polling.
     useEffect(() => {
@@ -118,5 +192,5 @@ export function useCachedFetch<T>(
         }
     }, [fetchNow, refetchMs, enabled]);
 
-    return { data, loading, error, refetch: fetchNow };
+    return { data, loading, error, refetch: fetchNow, mutate, isStale };
 }

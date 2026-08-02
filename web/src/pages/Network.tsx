@@ -1,4 +1,5 @@
-import { useEffect, useState, useCallback } from "react";
+import { useState, useCallback } from "react";
+import { useCachedFetch } from "@/hooks/useCachedFetch";
 import {
     Globe,
     Network as NetworkIcon,
@@ -14,8 +15,7 @@ import {
     Server,
 } from "lucide-react";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
-import { ApiError } from "@/api/client";
-import type { NetworkStatus, ConnectionStrategy } from "@/types";
+import type { ConnectionStrategy } from "@/types";
 import {
     Card,
     CardContent,
@@ -25,6 +25,7 @@ import {
 } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ErrorRetry } from "@/components/ErrorRetry";
 
 /**
  * Detect whether the current page was loaded via the relay path
@@ -54,37 +55,24 @@ function isOnRelay(): boolean {
  *   3. If the probe succeeds, the client upgrades to the better path.
  */
 export default function Network() {
-    const [status, setStatus] = useState<NetworkStatus | null>(null);
-    const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
-    const [error, setError] = useState<string | null>(null);
-    const [refreshing, setRefreshing] = useState(false);
+    const [error, _setError] = useState<string | null>(null);
 
-    const fetchAll = useCallback(async (force = false) => {
-        try {
-            if (force) setRefreshing(true);
-            const [s, c] = await Promise.all([
-                getNetworkStatus(force),
-                checkClientIPv6(),
-            ]);
-            setStatus(s);
-            setClientIPv6(c);
-            setError(null);
-        } catch (err) {
-            setError(
-                err instanceof ApiError
-                    ? err.message
-                    : err instanceof Error
-                        ? err.message
-                        : "加载网络状态失败",
-            );
-        } finally {
-            setRefreshing(false);
-        }
+    const fetchNetworkData = useCallback(async () => {
+        const [s, c] = await Promise.all([
+            getNetworkStatus(false),
+            checkClientIPv6(),
+        ]);
+        return { status: s, clientIPv6: c };
     }, []);
 
-    useEffect(() => {
-        fetchAll();
-    }, [fetchAll]);
+    const { data, loading, error: fetchError, refetch } = useCachedFetch(
+        "home.network.status",
+        fetchNetworkData,
+        { refetchMs: 60000 },
+    );
+
+    const status = data?.status ?? null;
+    const clientIPv6 = data?.clientIPv6 ?? null;
 
     const strategyLabel: Record<ConnectionStrategy, string> = {
         ipv6_direct: "IPv6 直连",
@@ -117,18 +105,16 @@ export default function Network() {
                 <Button
                     variant="outline"
                     size="sm"
-                    onClick={() => fetchAll(true)}
-                    disabled={refreshing}
+                    onClick={() => refetch()}
+                    disabled={loading}
                 >
-                    <RefreshCw size={14} className={refreshing ? "animate-spin" : ""} />
+                    <RefreshCw size={14} className={loading ? "animate-spin" : ""} />
                     刷新
                 </Button>
             </div>
 
-            {error && (
-                <div className="rounded-xl glass bg-[rgb(var(--accent-danger)/0.1)] px-4 py-3 text-xs text-[rgb(var(--accent-danger))]">
-                    {error}
-                </div>
+            {(error || fetchError) && (
+                <ErrorRetry message={error || fetchError?.message || ""} onRetry={refetch} />
             )}
 
             {/* Connection model: Relay First, Then Upgrade */}
