@@ -103,22 +103,49 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | Endpoint | Auth | Purpose |
 |----------|------|---------|
 | `GET /health` | None | Docker/Cloudflare health probe |
-| `POST /api/v1/auth/bind` | None | Exchange AccessKey for JWT |
+| `POST /api/v1/auth/bind` | None | Exchange AccessKey for JWT (IP rate-limited) |
+| `GET /api/v1/auth/verify` | None | JWT validation for nginx auth_request (needs bearer token) |
+| `POST /api/v1/auth/logout` | JWT | Server-side logout, clears HttpOnly home_token cookie |
 | `GET /api/v1/user/me` | JWT | Current user profile |
 | `GET /api/v1/user` | JWT+admin | List all users with each user's `device_count` |
 | `POST /api/v1/user` | JWT+admin | Create user `{name, is_admin}` |
 | `GET /api/v1/user/:id` | JWT+admin | Fetch one user |
 | `PUT /api/v1/user/:id` | JWT+admin | Partial update `{name?, is_admin?}` (last-admin + self-demote guards) |
 | `DELETE /api/v1/user/:id` | JWT+admin | Delete user + cascade-delete their devices; returns `{deleted_devices:N}` |
-| `GET /api/v1/device/list` | JWT | List devices (admin=all, non-admin=own) |
+| `GET /api/v1/device/list` | JWT | List devices (admin=all, non-admin=own; `?scope=mine\|all`) |
+| `POST /api/v1/device` | JWT | Create a new device, returns plaintext access_key |
 | `DELETE /api/v1/device/:id` | JWT | Revoke device (soft delete) |
+| `DELETE /api/v1/device/:id/hard` | JWT+admin | Permanently delete an already-revoked device |
+| `POST /api/v1/device/:id/rotate-token` | JWT+admin | Increment `token_version`, invalidate all existing JWTs |
 | `GET /api/v1/system/status` | JWT | Dashboard metrics (MQTT/WS/online devices) |
+| `GET /api/v1/system/logs` | JWT | Audit log list (supports `limit`, `offset`, `event_type`, `level` filters) |
+| `DELETE /api/v1/system/logs/:id` | JWT+admin | Delete a single log entry (verify-and-delete workflow) |
 | `POST /api/v1/mqtt/publish` | JWT+admin | Publish to a `home-datacenter/` topic |
 | `GET /api/v1/cameras` | JWT | List cameras (platformized device view) |
 | `GET /api/v1/cameras/:id` | JWT | Fetch one camera + live stream URLs |
 | `POST /api/v1/cameras` | JWT+admin | Register a camera (encrypts creds, pushes RTSP to go2rtc) |
 | `DELETE /api/v1/cameras/:id` | JWT+admin | Unregister a camera (DB + go2rtc) |
-| `POST /api/v1/cameras/:id/ptz` | JWT+admin | Send ONVIF PTZ command (auto-discovers profile_token) |
+| `POST /api/v1/cameras/:id/ptz` | JWT | Send ONVIF PTZ command (auto-discovers profile_token; non-admin with read access) |
+| `POST /api/v1/cameras/:id/preheat` | JWT | Trigger go2rtc to pre-connect RTSP source (eliminate cold-start latency) |
+| `POST /api/v1/cameras/:id/webrtc` | JWT | WebRTC SDP exchange proxy → go2rtc (WHEP) |
+| `GET /api/v1/cameras/ice` | JWT | Browser ICE servers config (STUN/TURN) + `webrtc_base` |
+| `GET /api/v1/cameras/alerts` | JWT | List global alerts |
+| `GET /api/v1/cameras/:id/frame` | JWT | Live snapshot JPEG frame |
+| `GET /api/v1/cameras/:id/stream.mp4` | JWT | fMP4 live stream (for ExoPlayer ProgressiveMediaSource) |
+| `GET /api/v1/cameras/:id/recordings` | JWT | List recordings per camera |
+| `GET /api/v1/cameras/:id/recordings/:recId/file` | JWT | Play a specific recording MP4 file |
+| `GET /api/v1/cameras/:id/motion-ranges` | JWT | Motion-active time ranges within [after, before) |
+| `PUT /api/v1/cameras/:id/codec` | JWT+admin | Update codec (only `"h264"` accepted) |
+| `PUT /api/v1/cameras/:id/audio` | JWT+admin | Toggle audio transcoding `{enabled: bool}` |
+| `PUT /api/v1/cameras/:id/recording` | JWT+admin | Set recording plan |
+| `GET /api/v1/cameras/:id/presets/discover` | JWT | Discover PTZ presets |
+| `PUT /api/v1/cameras/:id/presets/:alias` | JWT+admin | Set PTZ preset |
+| `DELETE /api/v1/cameras/:id/presets/:alias` | JWT+admin | Delete PTZ preset |
+| `POST /api/v1/cameras/:id/preset/:alias` | JWT+admin | Go to PTZ preset |
+| `POST /api/v1/cameras/:id/shares` | JWT | Share camera with another user (owner or admin) |
+| `DELETE /api/v1/cameras/:id/shares/:user_id` | JWT | Unshare camera (owner or admin) |
+| `GET /api/v1/cameras/:id/shares` | JWT | List camera shares (requires read access) |
+| `DELETE /api/v1/cameras/:id/recordings/:recId` | JWT+admin | Delete a recording segment |
 | `GET /api/v1/automation/rules` | JWT+admin | List automation rules |
 | `POST /api/v1/automation/rules` | JWT+admin | Create automation rule |
 | `PUT /api/v1/automation/rules/:id` | JWT+admin | Update rule |
@@ -128,6 +155,16 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `GET /api/v1/automation/metrics?reset=1` | JWT+admin | Reset all metrics counters |
 | `GET /api/v1/automation/rules/:id/metrics` | JWT+admin | Per-rule metrics |
 | `POST /api/v1/automation/rules/:id/cooldown` | JWT+admin | Pin `lastFire` to silence a misbehaving rule (body `{seconds}`) |
+| `GET /api/v1/weather` | JWT | Weather data proxy (5-min cache, wttr.in backend) |
+| `GET /api/v1/network/status` | JWT | Network quality (IPv6/NAT/P2P/Relay) |
+| `GET /api/v1/network/ipv6` | JWT | NAS outbound IPv6 address + prefix rotation status |
+| `POST /api/v1/network/p2p/register` | JWT | Register P2P peer endpoint |
+| `DELETE /api/v1/network/p2p/register` | JWT | Unregister P2P peer |
+| `GET /api/v1/network/p2p/server-endpoint` | JWT | Server P2P endpoint |
+| `GET /api/v1/network/p2p/peers/:id` | JWT | Lookup specific peer |
+| `GET /api/v1/network/p2p/peers` | JWT+admin | List all registered peers |
+| `GET /api/v1/release/latest` | JWT | Latest app release metadata |
+| `GET /api/v1/release/latest/apk` | JWT | Download latest APK |
 | `GET /api/v1/ws` | JWT | WebSocket upgrade (header or `?token=`) |
 
 **Response Envelope:**
@@ -1118,4 +1155,75 @@ dashboard's v1.8.7 network-policy fixes. Both clients now:
 
 ---
 
-**Last Updated:** 2026-07-30 (v1.8.9: Android network policy sync — updated `BaseUrlResolver.IPV6_DIRECT_URL` to current ISP prefix and added `firstNetworkFetchDone` flag to `DashboardFragment` to force refresh on first fetch. See Phase 14 above. Earlier: v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review — fixed LiveVideo IPv6-literal classification, Dashboard quality rating unreachable branch, Network page upgrade action, and initial-load freshness. See Phase 12 above. v1.8.6 / v1.6.29 fix: Dashboard latency card now reflects warmup connection reuse. v1.8.5 IPv6 direct latency optimization — nginx upstream keepalive + OkHttp ConnectionPool + warmupConnection. v1.8.4 IPv6 prefix rotation auto-adaptation — see Phase 10 and `docs/ipv6-prefix-rotation.md`.)
+## Phase 15 (v1.8.13–v1.8.17): Log Cleanup, Security Hardening, Token Rotation, Liquid Glass, Theme Switch Fix
+
+### Phase 15 span: v1.8.13–v1.8.17 (Backend) + v1.7.12–v1.7.17 (Android)
+
+#### v1.8.13 — Log Subscriber Cleanup
+- **Removed `TopicDeviceStatus` subscription** from `log/subscriber.go` — it duplicated `camera.online`/`camera.offline` logs ("设备 #N 上线" alongside "摄像头 X 上线"). Camera-friendly-name logs are sufficient for auditing.
+- **Removed `user.login`/`user.logout` event logging** — routine auth events crowd out meaningful device/camera logs without adding audit value. WS Hub and automation engine still receive these events directly from the EventBus.
+
+#### v1.8.14 — Single Log Entry Deletion
+- **New endpoint**: `DELETE /api/v1/system/logs/:id` (admin only). Used for the "verify and delete" (核查并删除) workflow — the admin reviews a critical offline log entry and removes it once the issue is resolved.
+
+#### v1.8.15 — Admin Token Rotation
+- **New endpoint**: `POST /api/v1/device/:id/rotate-token` (admin only). Increments the device's `TokenVersion`, immediately invalidating all existing JWT tokens for that device.
+- **Device model**: `TokenVersion int` field (default 1). JWT claims include `token_version`. The middleware checks if `JWT.token_version < DB.token_version` at each request, rejecting with `"token version mismatch"`.
+- **Client silent re-bind**: On detecting `"token version mismatch"`, the client re-binds with its stored access_key silently, obtaining a fresh JWT without user intervention.
+
+#### v1.8.16 — Security Hardening
+- **Content-Security-Policy header**: All API responses now include `Content-Security-Policy: default-src 'self'` for high-level XSS mitigation.
+- **HttpOnly cookie**: The `home_token` JWT cookie is now set with `HttpOnly` flag, preventing JavaScript from reading it via `document.cookie`.
+- **Server timeouts**: `http.Server` configured with `ReadTimeout=15s`, `ReadHeaderTimeout=10s`, `WriteTimeout=15s`, `IdleTimeout=60s`, `MaxHeaderBytes=1MB`.
+- **Input size limiting**: `io.LimitReader` applied to request bodies in `weather_handler.go` and `frigate.go` to prevent large payload attacks.
+- **WebSocket CheckOrigin**: Strict origin validation for WebSocket upgrade requests.
+- **Removed insecure default JWT secret**: The placeholder value `PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET` was removed from `config.yaml`; the app now refuses to boot with any known placeholder.
+
+#### v1.8.17 — Web Dashboard Liquid Glass Visual Upgrade
+- **Global CSS upgrade**: Warm cream background, amber accent color, enhanced glass effects with `backdrop-blur` and shadows, unified `cubic-bezier(0.32, 0.72, 0, 1)` animation easing.
+- **UI component refresh**: Buttons, badges, cards, inputs all updated to liquid glass style. Layouts simplified (Dashboard, Login, etc.). Status components softened.
+- **`prefers-reduced-motion` support**: Animations disabled or reduced for users who prefer reduced motion.
+
+#### Android v1.7.14 — Liquid Glass Warm Color Upgrade
+- **Color system**: Changed primary color from coral orange to warm amber in `colors.xml` (both light and dark modes).
+- **Glass effects**: Soft shadows and top highlights in drawables (`bg_glass_card.xml`, `bg_button_primary.xml`, etc.).
+- **Component updates**: Primary buttons with warm gradients, CameraCard Compose dark mode adaptation, bottom navigation glass styling.
+- 14 files modified (+341/-188 lines).
+
+#### Android v1.7.15 — Theme Switch Gradient Fix
+- **Root cause**: Negative gradient angle (-90) in 5 drawable files (`bg_glass_card.xml`, `bg_glass_card_warm.xml`, `bg_card.xml`, `bg_card_rounded.xml`, `bg_bottom_nav_container.xml`). Android requires gradient angles to be non-negative multiples of 45.
+- **Fix**: Changed all occurrences of `angle="-90"` to `angle="270"` (equivalent angle).
+- **Missing Material3 color attributes**: Added `colorSurface`, `colorOnSurface`, `colorSurfaceVariant`, `colorOnSurfaceVariant`, `colorOutline` to `values-night/themes.xml`.
+
+#### Android v1.7.17 — Theme Switch CancellationException Fix
+- **Root cause**: Activity recreation during theme switch cancels all Fragment `lifecycleScope` coroutines. The `CancellationException` was caught by generic `catch (e: Exception)` blocks and displayed to the user as "job was cancelled". Additionally, `catch`/`finally` blocks accessed already-destroyed ViewBinding after `onDestroyView`, causing NPE.
+- **Fix**: Added `catch (e: CancellationException) { throw e }` before general Exception catches in all 6 Fragments (Dashboard, Settings, Users, Devices, Cameras, ServiceLogs). Added `view != null` checks before accessing `binding` in `catch`/`finally` blocks.
+- **Fragment state management**: `setupFragments()` in `MainActivity` now passes `savedInstanceState` to `super.onCreate()` and only adds Fragments when `savedInstanceState == null`, preventing `IllegalStateException: Fragment already added` during recreation.
+
+### Files Changed (Phase 15)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/log/subscriber.go` | Removed TopicDeviceStatus + user.login/logout subscriptions |
+| `services/api/internal/handler/system_log_handler.go` | Added Delete endpoint |
+| `services/api/internal/model/device.go` | Added TokenVersion field |
+| `services/api/internal/handler/device_handler.go` | Added RotateToken handler |
+| `services/api/cmd/main.go` | Added timeout config, CSP, new routes |
+| `services/api/internal/utils/response.go` | Added CSP security headers |
+| `services/api/internal/utils/jwt.go` | Added token_version claim, removed insecure default |
+| `services/api/internal/handler/auth_handler.go` | HttpOnly cookie, server-side logout |
+| `services/api/internal/handler/weather_handler.go` | io.LimitReader |
+| `services/api/internal/camera/frigate.go` | io.LimitReader |
+| `web/src/index.css` | Liquid glass CSS variables, warm palette, animations |
+| `web/src/components/*.tsx` | UI component liquid glass styling |
+| `web/src/pages/*.tsx` | Layout simplification, glass styling |
+| `Android/app/build.gradle.kts` | Version bumps (v1.7.12→v1.7.17) |
+| `Android/app/src/main/res/values/colors.xml` | Warm amber palette |
+| `Android/app/src/main/res/drawable/*.xml` | Glass effects, gradient angle fix |
+| `Android/app/src/main/res/values-night/themes.xml` | Missing Material3 color attributes |
+| `Android/app/src/main/java/.../MainActivity.kt` | Fragment state management fix |
+| `Android/app/src/main/java/.../ui/*/` | CancellationException handling in all 6 Fragments |
+
+---
+
+**Last Updated:** 2026-08-02 (v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. See Phase 15 above. Earlier: v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

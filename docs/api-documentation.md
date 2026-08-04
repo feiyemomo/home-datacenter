@@ -142,6 +142,7 @@ carries the following security headers (applied by `utils.applySecurityHeaders`)
 - `X-Frame-Options: DENY`
 - `Referrer-Policy: no-referrer`
 - `Cache-Control: no-store`
+- `Content-Security-Policy: default-src 'self'` (added v1.8.16)
 
 **Success:**
 
@@ -264,12 +265,15 @@ Content-Type: application/json
 {
   "user_id": 1,
   "device_id": 3,
+  "token_version": 1,
   "iat": 1782618533,
   "exp": 1814154533
 }
 ```
 
-`exp` is 365 days from `iat`.
+`exp` is 365 days from `iat`. `token_version` is the device's current
+token version (default 1); the middleware rejects requests where
+`JWT.token_version < DB.token_version`.
 
 ---
 
@@ -774,18 +778,278 @@ for the wire format (`{type, topic, payload, ts}`).
 
 **Flow:**
 
-1. Read `Authorization: Bearer <token>` header
+1. Read `Authorization: Bearer <token>` header (or `Cookie: home_token=<token>`)
 2. Parse JWT, verify signature and expiration
-3. Extract `user_id` and `device_id` from claims
+3. Extract `user_id`, `device_id`, and `token_version` from claims
 4. Load device row from DB by `device_id`
 5. Check `device.RevokedAt.Valid`:
    - `true` → reject with 401 `device revoked`
    - `false` → proceed
-6. Set `user_id` and `device_id` into Gin context for downstream handlers
+6. Check `token_version` claim against DB:
+   - `JWT.token_version < DB.token_version` → reject with 401 `token version mismatch`
+   - Client detects this and silently re-binds with stored access_key
+7. Set `user_id` and `device_id` into Gin context for downstream handlers
 
 **Revocation is Immediate:**
 
 Once an admin calls `DELETE /api/v1/device/:id`, the next request with that device's JWT receives 401. No need to wait for token expiration.
+
+---
+
+### Server-Side Logout
+
+**Endpoint:**
+
+```
+POST /api/v1/auth/logout
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Behavior:** Clears the HttpOnly `home_token` cookie on the server side by
+setting `Set-Cookie: home_token=; Max-Age=0`. The JWT itself is not invalidated
+(stateless JWT), but the cookie-based auth path is immediately cleared.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": null
+}
+```
+
+**Error Responses:** same 401 auth errors as `/user/me`.
+
+---
+
+### Create Device
+
+**Endpoint:**
+
+```
+POST /api/v1/device
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+Content-Type: application/json
+```
+
+**Request Body:**
+
+```json
+{
+  "device_name": "iPhone-15"
+}
+```
+
+**Response:** creates a new device for the current user and returns the
+plaintext `access_key` (64-char hex). This is the **only** time the
+access_key is returned — it is not stored in plaintext and subsequent
+`GET /device/list` calls do not include it.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "id": 5,
+    "user_id": 1,
+    "device_name": "iPhone-15",
+    "access_key": "e6b9b928fc277d062943a46942c07d85b6a99ef4c4d5bc74d737c9cfd1ff304a",
+    "created_at": "2026-07-31 12:00:00",
+    "updated_at": "2026-07-31 12:00:00"
+  }
+}
+```
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid request body` | Missing/invalid JSON |
+| 400 | `device_name is required` | Empty device name |
+| 401 | auth errors | Same as `/user/me` |
+
+---
+
+### List System Logs
+
+**Endpoint:**
+
+```
+GET /api/v1/system/logs
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Query Parameters:**
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `limit` | int | Max entries to return (default 50) |
+| `offset` | int | Pagination offset (default 0) |
+| `event_type` | string | Filter by event type (e.g. `camera.offline`, `device.online`) |
+| `level` | string | Filter by log level: `critical`, `normal`, `info` |
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "logs": [
+      {
+        "id": 1,
+        "ts": 1784533200,
+        "event_type": "camera.offline",
+        "source": "camera",
+        "message": "摄像头 前门 离线",
+        "level": "critical",
+        "payload": "{\"camera_id\":1}"
+      }
+    ],
+    "total": 150
+  }
+}
+```
+
+**Log level semantics:**
+
+| Level | Retention | Description |
+|-------|-----------|-------------|
+| `critical` | Unlimited | Camera/device offline events (audit trail) |
+| `normal` | Latest 500 | User login/logout, device online events |
+| `info` | Latest 200 | Camera status changes |
+
+---
+
+### Delete System Log
+
+**Endpoint:**
+
+```
+DELETE /api/v1/system/logs/:id
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Authorization:** admin only. Used for "verify and delete" workflow —
+admin reviews a critical offline log entry and removes it once the
+issue is resolved.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": null
+}
+```
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid log id` | `:id` not a valid uint |
+| 401 | auth errors | Same as `/user/me` |
+| 403 | `admin only` | Non-admin user |
+| 404 | `log not found` | No row with that id |
+
+---
+
+### Rotate Device Token (Admin)
+
+**Endpoint:**
+
+```
+POST /api/v1/device/:id/rotate-token
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Authorization:** admin only. Increments the device's `token_version`,
+immediately invalidating all existing JWT tokens for that device.
+
+**Client behavior:** when the client receives a `"token version mismatch"`
+error, it silently re-binds with its stored access_key to obtain a fresh
+JWT, without user intervention.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": {
+    "device_id": 3,
+    "token_version": 2
+  }
+}
+```
+
+**Error Responses:**
+
+| Status | `message` | Scenario |
+|--------|-----------|----------|
+| 400 | `invalid device id` | `:id` not a valid uint |
+| 401 | auth errors | Same as `/user/me` |
+| 403 | `admin only` | Non-admin user |
+| 404 | `device not found` | No row with that id |
+
+---
+
+### Camera Preheat
+
+**Endpoint:**
+
+```
+POST /api/v1/cameras/:id/preheat
+```
+
+**Headers:**
+
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Behavior:** Triggers go2rtc to pre-connect the RTSP source for the
+specified camera. This eliminates the cold-start latency (1-10s) when
+a user first opens the live view after a period of inactivity.
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "success",
+  "data": null
+}
+```
 
 ---
 
@@ -1186,38 +1450,72 @@ Publish `{"status":"offline",...}` to flip it back.
 | Endpoint | Method | Auth | Description |
 |----------|--------|------|-------------|
 | `/health` | GET | No | Health check |
-| `/api/v1/auth/bind` | POST | No | Bind device, obtain JWT |
+| `/api/v1/auth/bind` | POST | No | Bind device, obtain JWT (IP rate-limited) |
 | `/api/v1/auth/verify` | GET | JWT | Used by nginx `auth_request` for `/go2rtc/*` gating; returns 200/401 |
+| `/api/v1/auth/logout` | POST | JWT | Server-side logout, clears HttpOnly `home_token` cookie |
 | `/api/v1/user/me` | GET | JWT | Get current user profile |
 | `/api/v1/user` | GET | JWT+admin | List all users with each user's `device_count` |
-| `/api/v1/user` | POST | JWT+admin | Create a user `{name, is_admin}` (cascades to nothing yet) |
+| `/api/v1/user` | POST | JWT+admin | Create a user `{name, is_admin}` |
 | `/api/v1/user/:id` | GET | JWT+admin | Fetch a single user |
 | `/api/v1/user/:id` | PUT | JWT+admin | Partial update `{name?, is_admin?}` (last-admin + self-demote guards) |
 | `/api/v1/user/:id` | DELETE | JWT+admin | Delete a user + cascade-delete their devices; returns `{deleted_devices:N}` |
-| `/api/v1/device/list` | GET | JWT | List visible devices (admin → all; non-admin → own) |
-| `/api/v1/device/:id` | DELETE | JWT | Revoke a device |
-| `/api/v1/system/status` | GET | JWT | Dashboard metrics |
-| `/api/v1/mqtt/publish` | POST | JWT | Publish within `home-datacenter/` (dashboard admin) |
+| `/api/v1/device/list` | GET | JWT | List visible devices (admin → all; non-admin → own; `?scope=mine\|all`) |
+| `/api/v1/device` | POST | JWT | Create a device, returns plaintext `access_key` |
+| `/api/v1/device/:id` | DELETE | JWT | Revoke a device (soft delete) |
+| `/api/v1/device/:id/hard` | DELETE | JWT+admin | Permanently delete an already-revoked device |
+| `/api/v1/device/:id/rotate-token` | POST | JWT+admin | Increment `token_version`, invalidate all existing JWTs |
+| `/api/v1/system/status` | GET | JWT | Dashboard metrics (MQTT/WS/online devices) |
+| `/api/v1/system/logs` | GET | JWT | Audit log list (supports `limit`, `offset`, `event_type`, `level` filters) |
+| `/api/v1/system/logs/:id` | DELETE | JWT+admin | Delete a single log entry (verify-and-delete workflow) |
+| `/api/v1/mqtt/publish` | POST | JWT+admin | Publish within `home-datacenter/` namespace |
 | `/api/v1/ws` | GET (upgrade) | JWT | WebSocket real-time channel |
 | `/api/v1/cameras` | GET | JWT | List cameras |
 | `/api/v1/cameras` | POST | JWT+admin | Register a camera (encrypts creds, pushes RTSP to go2rtc) |
 | `/api/v1/cameras/:id` | GET | JWT | Fetch one camera + live stream URLs |
 | `/api/v1/cameras/:id` | DELETE | JWT+admin | Unregister a camera (DB + go2rtc) |
-| `/api/v1/cameras/:id/ptz` | POST | JWT+admin | Send ONVIF PTZ command (auto-discovers profile_token) |
+| `/api/v1/cameras/:id/ptz` | POST | JWT | Send ONVIF PTZ command (auto-discovers profile_token; non-admin with read access) |
+| `/api/v1/cameras/:id/preheat` | POST | JWT | Trigger go2rtc to pre-connect RTSP source (eliminate cold-start latency) |
 | `/api/v1/cameras/:id/webrtc` | POST | JWT | SDP exchange proxy → go2rtc (`Content-Type: application/sdp`) |
-| `/api/v1/cameras/ice` | GET | JWT | Browser ICE servers config (STUN/TURN) + `webrtc_base` |
+| `/api/v1/cameras/ice` | GET | JWT | Browser ICE servers config (STUN/TURN) + `webrtc_base` (ETag cached) |
+| `/api/v1/cameras/alerts` | GET | JWT | List global alerts |
+| `/api/v1/cameras/:id/frame` | GET | JWT | Live snapshot JPEG frame |
+| `/api/v1/cameras/:id/stream.mp4` | GET | JWT | fMP4 live stream (for ExoPlayer ProgressiveMediaSource) |
+| `/api/v1/cameras/:id/recordings` | GET | JWT | List recordings per camera |
+| `/api/v1/cameras/:id/recordings/:recId/file` | GET | JWT | Play a specific recording MP4 file |
+| `/api/v1/cameras/:id/motion-ranges` | GET | JWT | Motion-active time ranges within [after, before) |
+| `/api/v1/cameras/:id/recordings/:recId` | DELETE | JWT+admin | Delete a recording segment |
+| `/api/v1/cameras/:id/codec` | PUT | JWT+admin | Update codec (only `"h264"` accepted) |
+| `/api/v1/cameras/:id/audio` | PUT | JWT+admin | Toggle audio transcoding `{enabled: bool}` |
+| `/api/v1/cameras/:id/recording` | PUT | JWT+admin | Set recording plan |
+| `/api/v1/cameras/:id/presets/discover` | GET | JWT | Discover PTZ presets |
+| `/api/v1/cameras/:id/presets/:alias` | PUT | JWT+admin | Set PTZ preset |
+| `/api/v1/cameras/:id/presets/:alias` | DELETE | JWT+admin | Delete PTZ preset |
+| `/api/v1/cameras/:id/preset/:alias` | POST | JWT+admin | Go to PTZ preset |
+| `/api/v1/cameras/:id/shares` | POST | JWT | Share camera with another user (owner or admin) |
+| `/api/v1/cameras/:id/shares/:user_id` | DELETE | JWT | Unshare camera (owner or admin) |
+| `/api/v1/cameras/:id/shares` | GET | JWT | List camera shares (requires read access) |
 | `/api/v1/automation/rules` | GET/POST | JWT+admin | List / create automation rules |
-| `/api/v1/automation/rules/:id` | PUT/DELETE | JWT+admin | Update / delete rule |
+| `/api/v1/automation/rules/:id` | GET/PUT/DELETE | JWT+admin | Fetch / update / delete rule |
 | `/api/v1/automation/rules/:id/test` | POST | JWT+admin | Manually fire a rule (no `fire_count` bump) |
 | `/api/v1/automation/metrics` | GET | JWT+admin | Global engine metrics; `?reset=1` resets counters |
 | `/api/v1/automation/rules/:id/metrics` | GET | JWT+admin | Per-rule metrics |
 | `/api/v1/automation/rules/:id/cooldown` | POST | JWT+admin | Pin `lastFire` to silence a misbehaving rule |
+| `/api/v1/weather` | GET | JWT | Weather data proxy (5-min cache, wttr.in backend) |
+| `/api/v1/network/status` | GET | JWT | Network quality (IPv6/NAT/P2P/Relay) |
+| `/api/v1/network/ipv6` | GET | JWT | NAS outbound IPv6 address + prefix rotation status |
+| `/api/v1/network/p2p/register` | POST | JWT | Register P2P peer endpoint |
+| `/api/v1/network/p2p/register` | DELETE | JWT | Unregister P2P peer |
+| `/api/v1/network/p2p/server-endpoint` | GET | JWT | Server P2P endpoint |
+| `/api/v1/network/p2p/peers/:id` | GET | JWT | Lookup specific peer |
+| `/api/v1/network/p2p/peers` | GET | JWT+admin | List all registered peers |
+| `/api/v1/release/latest` | GET | JWT | Latest app release metadata |
+| `/api/v1/release/latest/apk` | GET | JWT | Download latest APK |
 
 > Camera + Automation endpoints are described in detail in
 > [`docs/platformization.md`](platformization.md) and
 > [`docs/security.md`](security.md) §11–12. The rows above are the
-> authoritative route surface as of Phase 7.
+> authoritative route surface as of Phase 15.
 
 ---
 
-**Document Version:** 2026-07-11 (Phase 7: go2rtc public auth + SDP proxy + camera/automation routes)
+**Document Version:** 2026-08-02 (Phase 15: security hardening, token rotation, liquid glass, new endpoints, CSP headers)

@@ -243,21 +243,219 @@ for ($i=1; $i -le 12; $i++) {
 
 ---
 
+## §14. Phase 15 Security Hardening (2026-08-02)
+
+The following security enhancements were applied in the v1.8.16 security
+hardening pass (Phase 15). These build on the 2026-07-04 baseline.
+
+### 14.1 Content-Security-Policy Header
+
+All API responses now include `Content-Security-Policy: default-src 'self'`
+to mitigate XSS risks. Implemented in `utils.applySecurityHeaders`:
+
+```go
+// internal/utils/response.go
+func applySecurityHeaders(c *gin.Context) {
+    h := c.Writer.Header()
+    h.Set("X-Content-Type-Options", "nosniff")
+    h.Set("X-Frame-Options", "DENY")
+    h.Set("Referrer-Policy", "no-referrer")
+    h.Set("Content-Security-Policy", "default-src 'self'")  // added v1.8.16
+    h.Set("Cache-Control", "no-store")
+}
+```
+
+### 14.2 HttpOnly Cookie for JWT
+
+The `home_token` cookie is now set with the `HttpOnly` flag, preventing
+JavaScript from reading it via `document.cookie`:
+
+```go
+// internal/handler/auth_handler.go
+c.SetCookie(&http.Cookie{
+    Name:     "home_token",
+    Value:    token,
+    Path:     "/",
+    HttpOnly: true,
+    SameSite: http.SameSiteLaxMode,
+    MaxAge:   int(expireIn.Seconds()),
+})
+```
+
+The server-side logout endpoint (`POST /api/v1/auth/logout`) clears the
+cookie with `MaxAge: -1` and keeps the same `HttpOnly: true` flag.
+
+### 14.3 Server Timeouts
+
+`http.Server` configured with strict timeouts to prevent slowloris and
+resource exhaustion attacks:
+
+```go
+// cmd/main.go
+s := &http.Server{
+    Addr:              addr,
+    Handler:           r,
+    ReadTimeout:       15 * time.Second,
+    ReadHeaderTimeout: 10 * time.Second,
+    WriteTimeout:      15 * time.Second,
+    IdleTimeout:       60 * time.Second,
+    MaxHeaderBytes:    1 << 20, // 1MB
+}
+```
+
+### 14.4 Input Size Limiting
+
+`io.LimitReader` applied to request bodies to prevent large payload
+attacks:
+
+```go
+// internal/handler/weather_handler.go
+body, err := io.ReadAll(io.LimitReader(c.Request.Body, 1<<20)) // 1MB limit
+
+// internal/camera/frigate.go
+body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MB limit
+```
+
+A global `http.MaxBytesReader` middleware is also applied to all routes
+in `cmd/main.go`:
+
+```go
+r.Use(func(c *gin.Context) {
+    c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20)
+    c.Next()
+})
+```
+
+### 14.5 WebSocket CheckOrigin Strictification
+
+The WebSocket handler now strictly validates `Origin` headers against
+the configured `server.allowed_origins` allowlist. When `allowed_origins`
+is non-empty, any upgrade request with an `Origin` that doesn't match is
+rejected at the handshake level. This prevents cross-site WebSocket
+hijacking (CSWSH) even if the JWT is somehow leaked into a third-party
+page.
+
+### 14.6 Token Version Validation
+
+JWT middleware now checks `token_version` claim against the database:
+
+```go
+// internal/middleware/jwt.go
+if claims.TokenVersion < device.TokenVersion {
+    c.AbortWithStatusJSON(401, gin.H{"message": "token version mismatch"})
+    return
+}
+```
+
+The `Device` model (`internal/model/device.go`) added a `TokenVersion int`
+field (default 1). The `GenerateToken` function (`internal/utils/jwt.go`)
+includes this claim in every JWT. When an admin calls
+`POST /api/v1/device/:id/rotate-token`, the device's `TokenVersion` is
+incremented, immediately invalidating all existing JWTs for that device.
+
+**Client-side handling**: On receiving a `"token version mismatch"` error,
+the client (both web and Android) silently re-binds with its stored
+`access_key` to obtain a fresh JWT, without user intervention.
+
+### 14.7 Server-Side Logout
+
+New endpoint `POST /api/v1/auth/logout` clears the HttpOnly `home_token`
+cookie on the server side. The JWT itself is stateless and not invalidated,
+but the cookie-based auth path is immediately cleared. This provides a
+clean server-side logout mechanism for the web dashboard.
+
+### 14.8 MQTT Publish Admin Enforcement
+
+The `POST /api/v1/mqtt/publish` endpoint now has explicit `RequireAdmin`
+middleware, preventing non-admin JWT holders from publishing to MQTT topics.
+Previously this was only enforced by the dashboard route guard — a non-admin
+JWT calling the endpoint directly would succeed. This is now fixed.
+
+### 14.9 SetTrustedProxies for Rate Limiter
+
+The Gin router is configured with `SetTrustedProxies` to correctly identify
+client IPs behind Cloudflare Tunnel and nginx reverse proxy. This ensures
+the `/auth/bind` rate limiter (see §13) reads the real client IP from
+`CF-Connecting-IP` or `X-Forwarded-For` headers, preventing IP spoofing
+against the token bucket.
+
+### 14.10 Removed Insecure Default JWT Secret
+
+The placeholder value `PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET` was removed
+from `configs/config.yaml`. The app now refuses to boot with any known
+placeholder (`your-secret-key`, `change-me`,
+`PLEASE_CHANGE_TO_A_LONG_RANDOM_SECRET`). The committed `config.yaml` uses
+an empty string as the default, which is also rejected at startup.
+
+### 14.11 Credential and Secret Git Hygiene
+
+- **Cloudflare Tunnel key** (`deploy/cloudflared/cert.pem`): Added to
+  `.gitignore` and removed from git tracking.
+- **MQTT password file** (`deploy/mosquitto/passwd`): Added to `.gitignore`
+  and removed from git tracking.
+- **Frigate config** (`deploy/frigate/config.yml`): Camera passwords masked
+  with `maskSecret()` utility. The committed config file uses placeholder
+  values; real camera credentials are injected at deploy time.
+- **Repository keys in git history**: Cloudflare Tunnel keys and camera
+  passwords that were previously committed require rotation. The keys
+  have been removed from the working tree and `.gitignore`'d, but the
+  history still contains them. Rotate all affected credentials after
+  deploying the cleaned repository.
+
+### 14.12 Docker Security Hardening
+
+- **Non-root app user**: The `home-api` Dockerfile now creates and runs
+  as a non-root `appuser` (UID 1000), reducing the blast radius of a
+  container escape.
+- **no-new-privileges**: All containers set `security_opt`:
+  `no-new-privileges:true` in `compose.yaml`, preventing privilege
+  escalation via setuid binaries.
+- **cap_drop: ALL**: All containers use `cap_drop: ALL` to remove all
+  Linux capabilities. Exceptions:
+  - `home-mosquitto` and `home-frigate`: Add `cap_add: ["CHOWN", "FOWNER"]`
+    — their init systems need `chown` at startup.
+  - `home-web` (nginx): Add `cap_add: ["CHOWN", "FOWNER"]` — nginx
+    entrypoint script needs to `chown` `/var/cache/nginx/client_temp`.
+- **Port binding**: go2rtc (1984) and Frigate API (5000) are now bound
+  to `127.0.0.1` only, not exposed to the Docker network.
+
+### 14.13 Response Desensitization for Non-Admin Users
+
+Camera list and detail responses (`GET /api/v1/cameras`, `GET /api/v1/cameras/:id`)
+now desensitize the `host` and `port` fields for non-admin users. Non-admin
+callers see `"host": "***"` and `"port": 0` (or similar masked values),
+preventing internal network topology discovery.
+
+### 14.14 Generic Error Messages
+
+All handler error messages that previously exposed internal details
+(e.g., `err.Error()` with SQL or file paths) have been replaced with
+generic messages like `"operation failed"`, `"internal server error"`,
+or `"invalid credentials"`. This prevents information leakage through
+API error responses. 46+ locations were updated.
+
+---
+
 ## Residual Risks (accepted, not yet fixed)
 
 1. **No audit log.** Bind and revoke events are not persisted beyond the
-   device row's `LastLoginAt` / `RevokedAt` timestamps.
+   device row's `LastLoginAt` / `RevokedAt` timestamps. System log entries
+   exist for device/camera lifecycle events but not for auth operations.
 2. **365-day JWTs.** Long-lived; revocation is immediate (per-request DB
-   check on `RevokedAt`), but there is no short-lived + refresh rotation.
-3. **Permissive WebSocket origin in dev.** `allowed_origins: []` accepts
-   any origin — fine on localhost, must be populated for production.
-4. **MQTT publish is admin-by-convention, not enforced server-side.** The
-   `/mqtt/publish` route is JWT-gated but does not itself check `IsAdmin`;
-   admin enforcement lives in the dashboard route guard. If a non-admin
-   JWT calls the endpoint directly it will succeed. Consider adding an
-   `AdminOnly` middleware.
-5. **`core.autocrlf=true`** on Windows means gofmt may locally flag CRLF
+   check on `RevokedAt` and `TokenVersion`), but there is no
+   short-lived-token + refresh-token rotation pattern. Token rotation via
+   `POST /api/v1/device/:id/rotate-token` (admin) is a manual escalation
+   path.
+3. **`core.autocrlf=true`** on Windows means gofmt may locally flag CRLF
    in committed-then-rechecked files; the canonical line ending is LF.
+4. **Rate limiter IP spoofing.** The `SetTrustedProxies` fix mitigates
+   Cloudflare-specific spoofing, but a misconfigured proxy chain could
+   still allow `X-Forwarded-For` injection. The 256-bit keyspace remains
+   the primary defense.
+5. **Git history secrets.** Cloudflare Tunnel keys, MQTT passwords, and
+   camera passwords that were previously committed require rotation after
+   the cleaned repository is deployed. The `git filter-branch` / BFG
+   cleanup has not been performed.
 
 ---
 
@@ -276,7 +474,11 @@ for ($i=1; $i -le 12; $i++) {
       `mqtt connected` and `server started on :8080`
 - [ ] Bind a device, hit `/user/me`, confirm 200
 - [ ] Revoke the device, confirm next request 401s
+- [ ] Rotate any credentials that were previously committed to git history
+      (Cloudflare Tunnel key, camera passwords, MQTT passwords)
+- [ ] Verify `docker compose ps` shows all containers running with
+      `no-new-privileges` and `cap_drop: ALL` policies applied
 
 ---
 
-**Last Updated:** 2026-07-05 (Phase 7: nginx `auth_request` + `/api/v1/auth/verify` + `authedFetch`/`authHeaderFor` to gate `cam.feiyemomo.top/go2rtc/*` behind JWT)
+**Last Updated:** 2026-08-02 (Phase 15: security hardening — CSP, HttpOnly cookie, server timeouts, input size limiting, WebSocket CheckOrigin, token version validation, MQTT admin enforcement, SetTrustedProxies, credential git hygiene, Docker hardening, response desensitization, generic error messages)
