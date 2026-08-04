@@ -582,6 +582,70 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.17 — Web 仪表盘液态玻璃视觉升级 (2026-08-02)
+
+#### 新增
+- **液态玻璃风格**：全局 CSS 升级为暖色调液态玻璃风格（warm cream 背景、琥珀色强调色、增强的毛玻璃效果 with blur + shadows）
+- **统一动画曲线**：使用 `cubic-bezier(0.32, 0.72, 0, 1)` 缓动曲线，优化 hover / 过渡 / 微交互
+- **`prefers-reduced-motion` 支持**：为偏好减少动效的用户禁用或减弱动画
+
+#### 优化
+- **UI 组件升级**：按钮、徽章、卡片、输入框全部更新为液态玻璃样式
+- **布局简化**：Dashboard、Login 等页面布局优化，减少视觉杂乱
+- **状态组件柔和化**：状态指示器、chip、标签等组件使用更柔和的暖色
+
+#### 版本
+- Backend: v1.8.17（无后端改动）
+- Web: v1.8.17
+- Android: v1.7.17 (versionCode 111)
+
+### v1.8.16 — 安全加固 (2026-08-02)
+
+#### 修复
+- **Content-Security-Policy 头**：所有 API 响应添加 `Content-Security-Policy: default-src 'self'`，XSS 缓解
+- **HttpOnly Cookie**：JWT `home_token` cookie 设置为 HttpOnly，防止 JS 读取
+- **服务器超时配置**：`http.Server` 配置 `ReadTimeout=15s`、`ReadHeaderTimeout=10s`、`WriteTimeout=15s`、`IdleTimeout=60s`、`MaxHeaderBytes=1MB`
+- **输入大小限制**：`weather_handler.go` 和 `frigate.go` 的请求体使用 `io.LimitReader` 限制大小
+- **WebSocket CheckOrigin**：严格化 WebSocket 的 Origin 校验
+
+#### 版本
+- Backend: v1.8.16
+- Web: v1.8.16（无改动）
+- Android: v1.7.16（无改动）
+
+### v1.8.15 — 管理员令牌轮换 (2026-08-01)
+
+#### 新增
+- **令牌轮换端点**：`POST /api/v1/device/:id/rotate-token`（管理员 only），递增设备的 `token_version`，立即使该设备的所有现有 JWT 失效
+- **TokenVersion 字段**：`Device` 模型新增 `TokenVersion int` 字段（默认 1），JWT 中携带 `token_version`，中间件验证时若 JWT 中的版本 < DB 中的版本则拒绝并返回 `"token version mismatch"`
+- **客户端无感重连**：客户端检测到 `"token version mismatch"` 后使用 access_key 静默重新绑定获取新令牌，无需用户干预
+
+#### 版本
+- Backend: v1.8.15
+- Web: v1.8.15（无改动）
+- Android: v1.7.15（无改动）
+
+### v1.8.14 — 日志单条删除 (2026-08-01)
+
+#### 新增
+- **日志删除端点**：`DELETE /api/v1/system/logs/:id`（管理员 only），用于"核查并删除"工作流——管理员审核关键离线日志后，确认问题已解决即可删除
+
+#### 版本
+- Backend: v1.8.14
+- Web: v1.8.14（无改动）
+- Android: v1.7.14（无改动）
+
+### v1.8.13 — 日志订阅者清理 (2026-07-31)
+
+#### 优化
+- **日志去重**：`log/subscriber.go` 移除 `TopicDeviceStatus` 订阅——它重复了 `camera.online`/`camera.offline` 的日志（"设备 #N 上线" 与 "摄像头 X 上线" 同时出现），摄像头友好名称的日志足够审计
+- **移除 auth 事件日志**：`user.login`/`user.logout` 不再写入 SystemLog 表——日常认证事件会淹没有意义的设备/摄像头日志
+
+#### 版本
+- Backend: v1.8.13
+- Web: v1.8.13（无改动）
+- Android: v1.7.13（无改动）
+
 ### v1.8.12 — 日志保留 + IPv6 前缀修复 + 摄像头状态显示 (2026-07-31)
 
 #### 修复
@@ -599,9 +663,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
   - WebSocket 收到 `camera.*` 事件时自动刷新快照，确保副标题实时反映最新状态（例如摄像头恢复后，之前的"离线"日志副标题立即变为"当前状态：在线"）。
 
 #### 版本
-- Backend: v1.8.12
-- Web: v1.8.11（无改动）
-- Android: v1.6.37 (versionCode 80)
+- Backend: v1.8.11
+- Web: v1.8.11
+- Android: v1.7.12 (versionCode 104)
 
 ### v1.8.11 — App Experience Optimizations (2026-07-31)
 
