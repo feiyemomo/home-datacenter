@@ -1502,7 +1502,6 @@ Publish `{"status":"offline",...}` to flip it back.
 | `/api/v1/automation/rules/:id/cooldown` | POST | JWT+admin | Pin `lastFire` to silence a misbehaving rule |
 | `/api/v1/weather` | GET | JWT | Weather data proxy (5-min cache, wttr.in backend) |
 | `/api/v1/network/status` | GET | JWT | Network quality (IPv6/NAT/P2P/Relay) |
-| `/api/v1/network/ipv6` | GET | JWT | NAS outbound IPv6 address + prefix rotation status |
 | `/api/v1/network/p2p/register` | POST | JWT | Register P2P peer endpoint |
 | `/api/v1/network/p2p/register` | DELETE | JWT | Unregister P2P peer |
 | `/api/v1/network/p2p/server-endpoint` | GET | JWT | Server P2P endpoint |

@@ -157,7 +157,6 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `POST /api/v1/automation/rules/:id/cooldown` | JWT+admin | Pin `lastFire` to silence a misbehaving rule (body `{seconds}`) |
 | `GET /api/v1/weather` | JWT | Weather data proxy (5-min cache, wttr.in backend) |
 | `GET /api/v1/network/status` | JWT | Network quality (IPv6/NAT/P2P/Relay) |
-| `GET /api/v1/network/ipv6` | JWT | NAS outbound IPv6 address + prefix rotation status |
 | `POST /api/v1/network/p2p/register` | JWT | Register P2P peer endpoint |
 | `DELETE /api/v1/network/p2p/register` | JWT | Unregister P2P peer |
 | `GET /api/v1/network/p2p/server-endpoint` | JWT | Server P2P endpoint |

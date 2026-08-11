@@ -221,13 +221,3 @@ func IPv6PrefixMatches(addr1, addr2 string) bool {
 	}
 	return true
 }
-
-// OutboundIPv6Status is the cached result of the outbound IPv6 address
-// probe. The PrefixWatcher populates this on each check cycle and the
-// /api/v1/network/ipv6 endpoint serves it to the mobile app.
-type OutboundIPv6Status struct {
-	OutboundAddress   string    `json:"outbound_address"`
-	ConfiguredAddress string    `json:"configured_address"`
-	PrefixRotated     bool      `json:"prefix_rotated"`
-	LastChecked       time.Time `json:"last_checked"`
-}
