@@ -60,39 +60,6 @@ func (w *PrefixWatcher) Stop() {
 	close(w.stopCh)
 }
 
-// Status returns the current cached outbound IPv6 status. Thread-safe.
-// If the watcher hasn't run yet, triggers an immediate check.
-func (w *PrefixWatcher) Status() OutboundIPv6Status {
-	w.mu.RLock()
-	if !w.lastChecked.IsZero() {
-		s := OutboundIPv6Status{
-			OutboundAddress:   w.lastOutbound,
-			ConfiguredAddress: w.configuredAddr,
-			PrefixRotated:     !IPv6PrefixMatches(w.lastOutbound, w.configuredAddr),
-			LastChecked:       w.lastChecked,
-		}
-		w.mu.RUnlock()
-		return s
-	}
-	w.mu.RUnlock()
-	// First call — do a synchronous check.
-	w.checkOnce()
-	w.mu.RLock()
-	defer w.mu.RUnlock()
-	return OutboundIPv6Status{
-		OutboundAddress:   w.lastOutbound,
-		ConfiguredAddress: w.configuredAddr,
-		PrefixRotated:     !IPv6PrefixMatches(w.lastOutbound, w.configuredAddr),
-		LastChecked:       w.lastChecked,
-	}
-}
-
-// Refresh forces an immediate probe and returns the fresh status.
-func (w *PrefixWatcher) Refresh() OutboundIPv6Status {
-	w.checkOnce()
-	return w.Status()
-}
-
 func (w *PrefixWatcher) loop() {
 	// Run an immediate check at startup so the endpoint has data right away.
 	w.checkOnce()

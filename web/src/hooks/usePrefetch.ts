@@ -1,13 +1,7 @@
 import { useCallback, useEffect, useRef } from "react";
 
 export interface PrefetchResult {
-    prefetch: <T>(key: string, fetcher: () => Promise<T>) => Promise<void>;
     prefetchOnIdle: <T>(key: string, fetcher: () => Promise<T>, idleMs?: number) => void;
-    prefetchOnVisible: <T>(
-        ref: React.RefObject<HTMLElement | null>,
-        key: string,
-        fetcher: () => Promise<T>,
-    ) => void;
 }
 
 /**
@@ -17,13 +11,11 @@ export interface PrefetchResult {
  * as useCachedFetch, so anything cached by usePrefetch is immediately
  * available to useCachedFetch on the same key.
  *
- * Three strategies:
- *   1. prefetch        — fetch immediately
- *   2. prefetchOnIdle  — defer until the browser is idle
- *   3. prefetchOnVisible — wait until a DOM element scrolls into view
+ * Strategy:
+ *   prefetchOnIdle — defer until the browser is idle
  *
- * Cleanup is automatic: any pending callbacks or observers are
- * cancelled when the component unmounts.
+ * Cleanup is automatic: any pending callbacks are cancelled when the
+ * component unmounts.
  */
 export function usePrefetch(): PrefetchResult {
     // Collect cleanup functions that should run on unmount.
@@ -38,18 +30,6 @@ export function usePrefetch(): PrefetchResult {
             cleanupsRef.current = [];
         };
     }, []);
-
-    const prefetch = useCallback(
-        async <T>(key: string, fetcher: () => Promise<T>): Promise<void> => {
-            const v = await fetcher();
-            try {
-                sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v }));
-            } catch {
-                // private browsing or quota exceeded — silently ignore
-            }
-        },
-        [],
-    );
 
     const prefetchOnIdle = useCallback(
         <T>(key: string, fetcher: () => Promise<T>, idleMs = 1000): void => {
@@ -93,47 +73,5 @@ export function usePrefetch(): PrefetchResult {
         [],
     );
 
-    const prefetchOnVisible = useCallback(
-        <T>(
-            ref: React.RefObject<HTMLElement | null>,
-            key: string,
-            fetcher: () => Promise<T>,
-        ): void => {
-            const el = ref.current;
-            if (!el) return;
-
-            let cancelled = false;
-
-            const observer = new IntersectionObserver(
-                (entries) => {
-                    if (entries[0]?.isIntersecting && !cancelled) {
-                        observer.disconnect();
-                        (async () => {
-                            try {
-                                const v = await fetcher();
-                                if (cancelled) return;
-                                sessionStorage.setItem(
-                                    key,
-                                    JSON.stringify({ t: Date.now(), v }),
-                                );
-                            } catch {
-                                // silently ignore
-                            }
-                        })();
-                    }
-                },
-                { threshold: 0 },
-            );
-
-            observer.observe(el);
-
-            cleanupsRef.current.push(() => {
-                cancelled = true;
-                observer.disconnect();
-            });
-        },
-        [],
-    );
-
-    return { prefetch, prefetchOnIdle, prefetchOnVisible };
+    return { prefetchOnIdle };
 }

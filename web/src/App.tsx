@@ -170,8 +170,3 @@ function SplashScreen() {
         </div>
     );
 }
-
-/** Named export so Suspense/lazy could wrap it later if needed. */
-export function useAuthState() {
-    return useAuth();
-}

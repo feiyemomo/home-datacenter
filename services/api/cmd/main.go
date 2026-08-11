@@ -500,7 +500,6 @@ func main() {
 		netGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
 			netGroup.GET("/status", netHandler.Status)
-			netGroup.GET("/ipv6", netHandler.GetIPv6Status)
 			// P2P signaling endpoints.
 			netGroup.POST("/p2p/register", netHandler.RegisterP2P)
 			netGroup.DELETE("/p2p/register", netHandler.UnregisterP2P)
