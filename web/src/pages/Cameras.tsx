@@ -11,6 +11,7 @@ import { useWebSocket } from "@/hooks/useWebSocket";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { LiveVideo } from "@/components/LiveVideo";
 import { ErrorRetry } from "@/components/ErrorRetry";
+import { Skeleton } from "@/components/Skeleton";
 
 type CodecOption = "passthrough" | "h264" | "h265";
 
@@ -104,27 +105,44 @@ export default function Cameras() {
             <WsBridge>
                 {(onMsg) => (
                     <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 stagger-children">
-                        {(cams ?? []).map((cam) => (
-                            <CamCard
-                                key={cam.id}
-                                cam={cam}
-                                isAdmin={isAdmin}
-                                onDelete={() => remove(cam.id)}
-                                onRefresh={refetch}
-                                onWsMessage={onMsg}
-                                targetTime={(targetCameraId === cam.id) ? targetTime : undefined}
-                            />
-                        ))}
-                        {(cams ?? []).length === 0 && !loading && (
-                            <div className="col-span-full rounded-2xl border border-[rgb(var(--border)/0.2)] p-10 text-center animate-fade-in">
-                                <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.4)]">
-                                    <CameraIcon size={28} className="text-fg-subtle" />
+                        {loading ? (
+                            [0, 1, 2].map((i) => (
+                                <div key={i} className="flex flex-col overflow-hidden glass rounded-2xl">
+                                    <div className="flex items-center justify-between gap-3 px-4 py-2.5">
+                                        <div className="min-w-0 flex-1 space-y-2">
+                                            <Skeleton className="h-4 w-32" />
+                                            <Skeleton className="h-3 w-24" />
+                                        </div>
+                                        <Skeleton className="h-6 w-16 rounded-full" />
+                                    </div>
+                                    <Skeleton className="aspect-video w-full rounded-none" />
                                 </div>
-                                <p className="text-sm font-medium text-fg">暂无注册的摄像头</p>
-                                <p className="mt-1 text-xs text-fg-muted">
-                                    {isAdmin ? "点击右上角「注册」按钮添加第一个摄像头。" : "请联系管理员添加摄像头设备。"}
-                                </p>
-                            </div>
+                            ))
+                        ) : (
+                            <>
+                                {(cams ?? []).map((cam) => (
+                                    <CamCard
+                                        key={cam.id}
+                                        cam={cam}
+                                        isAdmin={isAdmin}
+                                        onDelete={() => remove(cam.id)}
+                                        onRefresh={refetch}
+                                        onWsMessage={onMsg}
+                                        targetTime={(targetCameraId === cam.id) ? targetTime : undefined}
+                                    />
+                                ))}
+                                {(cams ?? []).length === 0 && !loading && (
+                                    <div className="col-span-full rounded-2xl border border-[rgb(var(--border)/0.2)] p-10 text-center animate-fade-in">
+                                        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.4)]">
+                                            <CameraIcon size={28} className="text-fg-subtle" />
+                                        </div>
+                                        <p className="text-sm font-medium text-fg">暂无注册的摄像头</p>
+                                        <p className="mt-1 text-xs text-fg-muted">
+                                            {isAdmin ? "点击右上角「注册」按钮添加第一个摄像头。" : "请联系管理员添加摄像头设备。"}
+                                        </p>
+                                    </div>
+                                )}
+                            </>
                         )}
                     </div>
                 )}

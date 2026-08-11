@@ -35,6 +35,7 @@ import LiveAlertBanner from "@/components/dashboard/LiveAlertBanner";
 import AlertItem from "@/components/dashboard/AlertItem";
 import AlertSnapshotModal from "@/components/dashboard/AlertSnapshotModal";
 import SystemSnapshot from "@/components/dashboard/SystemSnapshot";
+import { Skeleton } from "@/components/Skeleton";
 
 const NAS_DDNS_DOMAIN = "nas.feiyemomo.top";
 
@@ -239,57 +240,72 @@ export default function Dashboard() {
 
             {/* Stat cards grid */}
             <div className="animate-fade-in grid grid-cols-1 gap-5 sm:grid-cols-2 xl:grid-cols-4 stagger-children">
-                <StatCard
-                    label="在线设备"
-                    value={String(onlineCount)}
-                    icon={<Activity size={16} />}
-                    accent="emerald"
-                    hint={
-                        status ? (
-                            <span>
-                                {(status.online_device_ids?.length ?? 0)} 个 ID 在线
-                            </span>
-                        ) : undefined
-                    }
-                />
-                <StatCard
-                    label="MQTT 状态"
-                    value={status ? (status.mqtt_connected ? "已连接" : "中断") : "—"}
-                    icon={
-                        status?.mqtt_connected ? <Wifi size={16} /> : <WifiOff size={16} />
-                    }
-                    accent={status?.mqtt_connected ? "emerald" : "amber"}
-                    hint={
-                        status ? (
-                            <span className="inline-flex items-center gap-1.5">
-                                <span
-                                    className={`pulse-dot inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
-                                />
-                                {status.mqtt_connected ? "代理可达" : "代理离线"}
-                            </span>
-                        ) : undefined
-                    }
-                />
-                <StatCard
-                    label="WS 客户端"
-                    value={status ? String(status.ws_clients) : "—"}
-                    icon={<Radio size={16} />}
-                    accent="sky"
-                    hint="已连接的应用客户端"
-                />
-                <StatCard
-                    label="运行时长"
-                    value={uptime}
-                    icon={<Clock size={16} />}
-                    accent="violet"
-                    hint={
-                        status ? (
-                            <span className="font-mono text-[11px]">
-                                {status.server_time}
-                            </span>
-                        ) : undefined
-                    }
-                />
+                {loading ? (
+                    [0, 1, 2, 3].map((i) => (
+                        <div key={i} className="glass rounded-2xl p-5">
+                            <div className="mb-4 flex items-center justify-between">
+                                <Skeleton className="h-3 w-16" />
+                                <Skeleton className="h-9 w-9 rounded-full" />
+                            </div>
+                            <Skeleton className="h-9 w-20" />
+                            <Skeleton className="mt-3 h-3 w-24" />
+                        </div>
+                    ))
+                ) : (
+                    <>
+                        <StatCard
+                            label="在线设备"
+                            value={String(onlineCount)}
+                            icon={<Activity size={16} />}
+                            accent="emerald"
+                            hint={
+                                status ? (
+                                    <span>
+                                        {(status.online_device_ids?.length ?? 0)} 个 ID 在线
+                                    </span>
+                                ) : undefined
+                            }
+                        />
+                        <StatCard
+                            label="MQTT 状态"
+                            value={status ? (status.mqtt_connected ? "已连接" : "中断") : "—"}
+                            icon={
+                                status?.mqtt_connected ? <Wifi size={16} /> : <WifiOff size={16} />
+                            }
+                            accent={status?.mqtt_connected ? "emerald" : "amber"}
+                            hint={
+                                status ? (
+                                    <span className="inline-flex items-center gap-1.5">
+                                        <span
+                                            className={`pulse-dot inline-block h-2 w-2 rounded-full ${status.mqtt_connected ? "bg-[rgb(var(--accent-success))]" : "bg-[rgb(var(--accent-danger))]"}`}
+                                        />
+                                        {status.mqtt_connected ? "代理可达" : "代理离线"}
+                                    </span>
+                                ) : undefined
+                            }
+                        />
+                        <StatCard
+                            label="WS 客户端"
+                            value={status ? String(status.ws_clients) : "—"}
+                            icon={<Radio size={16} />}
+                            accent="sky"
+                            hint="已连接的应用客户端"
+                        />
+                        <StatCard
+                            label="运行时长"
+                            value={uptime}
+                            icon={<Clock size={16} />}
+                            accent="violet"
+                            hint={
+                                status ? (
+                                    <span className="font-mono text-[11px]">
+                                        {status.server_time}
+                                    </span>
+                                ) : undefined
+                            }
+                        />
+                    </>
+                )}
             </div>
 
             {/* Network + Logs row */}
@@ -435,9 +451,10 @@ export default function Dashboard() {
                 </CardHeader>
                 <CardContent className="relative">
                     {alertsLoading && alerts.length === 0 ? (
-                        <div className="flex items-center justify-center py-8 text-xs text-fg-muted">
-                            <RefreshCw size={14} className="mr-2 animate-spin" />
-                            加载报警记录中…
+                        <div className="space-y-2 py-1">
+                            {[0, 1, 2].map((i) => (
+                                <Skeleton key={i} className="h-[60px] w-full" />
+                            ))}
                         </div>
                     ) : alerts.length === 0 ? (
                         <div className="py-8 text-center">

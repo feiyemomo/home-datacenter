@@ -219,18 +219,102 @@ func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	if err := r.DB.First(&cam, id).Error; err != nil {
 		return err
 	}
+	// Compute the unique Frigate slug BEFORE the hard delete below:
+	// FrigateSlugUnique resolves against the current camera set, and
+	// once the row is gone the fallback would return the base slug
+	// (wrong for cameras whose slug carried a _N suffix).
+	slug := r.FrigateSlugUnique(&cam)
 	if cam.StreamName != "" {
 		_ = r.Go2.RemoveStream(ctx, cam.StreamName)
 	}
 	if err := r.DB.Unscoped().Delete(&cam).Error; err != nil {
 		return err
 	}
+	// Best-effort cleanup of all camera-associated data. Each step
+	// logs on failure but never blocks the delete flow.
+	r.cleanupCameraShares(id)
+	r.cleanupFrigateRecordings(&cam, slug)
+	r.cleanupFrigateEvents(ctx, &cam, slug)
 	if r.Frigate != nil {
 		if err := r.pushFrigateConfig(ctx); err != nil {
 			log.Printf("camera: unregister: frigate config push (non-fatal): %v", err)
 		}
 	}
 	return nil
+}
+
+// cleanupCameraShares removes every camera_shares row referencing the
+// camera. Best-effort: failures are logged, never returned.
+func (r *Registry) cleanupCameraShares(cameraID uint) {
+	if err := r.DB.Where("camera_id = ?", cameraID).Delete(&model.CameraShare{}).Error; err != nil {
+		log.Printf("camera: unregister: cam %d: delete shares: %v", cameraID, err)
+	}
+}
+
+// cleanupFrigateRecordings removes the camera's on-disk recording
+// directory at /media/frigate/recordings/YYYY-MM-DD/HH/<slug> for
+// every date/hour combination present. Best-effort: missing
+// directories are not errors, failures are logged.
+func (r *Registry) cleanupFrigateRecordings(cam *model.Camera, slug string) {
+	if slug == "" {
+		return
+	}
+	root := "/media/frigate/recordings"
+	dateEntries, err := os.ReadDir(root)
+	if err != nil {
+		log.Printf("camera: unregister: cam %d: read recordings root: %v", cam.ID, err)
+		return
+	}
+	for _, dateEntry := range dateEntries {
+		if !dateEntry.IsDir() {
+			continue
+		}
+		hourEntries, err := os.ReadDir(root + "/" + dateEntry.Name())
+		if err != nil {
+			continue
+		}
+		for _, hourEntry := range hourEntries {
+			if !hourEntry.IsDir() {
+				continue
+			}
+			slugDir := fmt.Sprintf("%s/%s/%s/%s", root, dateEntry.Name(), hourEntry.Name(), slug)
+			if err := os.RemoveAll(slugDir); err != nil {
+				log.Printf("camera: unregister: cam %d: remove %s: %v", cam.ID, slugDir, err)
+			}
+		}
+	}
+}
+
+// cleanupFrigateEvents deletes the camera's detection events from
+// Frigate via the REST API. Best-effort: failures are logged, never
+// returned. Events are listed in pages of 100 (newest-first) and
+// deleted as they are found; the loop stops once Frigate returns
+// fewer than 100 events or a full page contained nothing to delete.
+func (r *Registry) cleanupFrigateEvents(ctx context.Context, cam *model.Camera, slug string) {
+	if r.Frigate == nil || slug == "" {
+		return
+	}
+	for {
+		events, err := r.Frigate.ListEvents(ctx, 100, false)
+		if err != nil {
+			log.Printf("camera: unregister: cam %d: list frigate events: %v", cam.ID, err)
+			return
+		}
+		deleted := 0
+		for _, ev := range events {
+			if ev.Camera != slug {
+				continue
+			}
+			if err := r.Frigate.DeleteEvent(ctx, ev.ID); err != nil {
+				log.Printf("camera: unregister: cam %d: delete frigate event %s: %v", cam.ID, ev.ID, err)
+				continue
+			}
+			deleted++
+		}
+		if len(events) < 100 || deleted == 0 {
+			return
+		}
+	}
 }
 
 // CleanupSoftDeleted purges any soft-deleted camera rows left over
@@ -293,17 +377,13 @@ func (r *Registry) PreheatStream(cameraID uint) error {
 }
 
 // LookupByFrigateSlug resolves a Frigate camera slug (e.g.
-// "front_door") back to a home-api camera ID. It scans all cameras
-// and computes each one's Frigate slug until it finds a match.
-// Returns (0, false) if no camera matches.
+// "front_door") back to a home-api camera ID. It computes each
+// camera's unique Frigate slug (same algorithm as pushFrigateConfig)
+// until it finds a match. Returns (0, false) if no camera matches.
 func (r *Registry) LookupByFrigateSlug(slug string) (uint, bool) {
-	var cams []model.Camera
-	if err := r.DB.Find(&cams).Error; err != nil {
-		return 0, false
-	}
-	for _, c := range cams {
-		if r.FrigateSlug(&c) == slug {
-			return c.ID, true
+	for id, s := range r.computeUniqueSlugs() {
+		if s == slug {
+			return id, true
 		}
 	}
 	return 0, false
@@ -410,13 +490,14 @@ func (r *Registry) List() []model.Camera {
 }
 
 // FindByFrigateCamera looks up a camera by its Frigate slug name.
-// Frigate uses ASCII slugs (via slugifyName) while our StreamName
-// keeps the original friendly name. This method iterates all cameras
-// and matches the slugified name.
+// Frigate uses ASCII slugs (via slugifyName + uniqueSlug) while our
+// StreamName keeps the original friendly name. This method iterates
+// all cameras and matches the unique slugified name.
 func (r *Registry) FindByFrigateCamera(frigateName string) (*model.Camera, error) {
 	cams := r.List()
+	slugs := r.computeUniqueSlugs()
 	for i := range cams {
-		if slugifyName(cams[i].StreamName) == frigateName {
+		if slugs[cams[i].ID] == frigateName {
 			return &cams[i], nil
 		}
 	}
@@ -485,6 +566,7 @@ func (r *Registry) SetRecordingEnabled(ctx context.Context, camID uint, enabled 
 // restart (the recorder stops on the next cycle).
 func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam *model.Camera, enabled bool, retentionDays int) error {
 	cams := r.List()
+	slugs := r.computeUniqueSlugs()
 	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
 	go2rtcStreams := make(map[string]string)
 	for _, c := range cams {
@@ -498,7 +580,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 		}
 		go2rtcURL := r.rtspURL(&c, u, p)
 		frigatePath := r.frigateCameraPath(&c, u, p)
-		slug := slugifyName(c.StreamName)
+		slug := slugs[c.ID]
 
 		// Default: recording enabled. Per-camera retention is set
 		// globally via the `record` key in PushConfig.
@@ -539,8 +621,47 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 }
 
 // FrigateSlug returns the ASCII slug Frigate uses for this camera.
+// Kept for backward compatibility; it delegates to FrigateSlugUnique
+// so recording path lookups and config pushes always agree on the
+// same (unique) slug.
 func (r *Registry) FrigateSlug(cam *model.Camera) string {
+	return r.FrigateSlugUnique(cam)
+}
+
+// FrigateSlugUnique returns the unique Frigate slug for this camera,
+// computed against the current set of cameras in the DB with the same
+// algorithm pushFrigateConfig uses (slugifyName + uniqueSlug). Falls
+// back to the plain slugifyName result when the camera is not in the
+// DB (e.g. after its row was deleted).
+func (r *Registry) FrigateSlugUnique(cam *model.Camera) string {
+	if cam == nil {
+		return ""
+	}
+	if slug, ok := r.computeUniqueSlugs()[cam.ID]; ok {
+		return slug
+	}
 	return slugifyName(cam.StreamName)
+}
+
+// computeUniqueSlugs computes the unique Frigate slug for every
+// camera currently in the DB, using the same algorithm as
+// pushFrigateConfig: iterate cameras in List() order and assign each
+// one slugifyName(StreamName) uniquified against the slugs already
+// taken. Returns a map of camera ID → unique slug.
+func (r *Registry) computeUniqueSlugs() map[uint]string {
+	cams := r.List()
+	taken := make(map[string]bool, len(cams))
+	slugs := make(map[uint]string, len(cams))
+	for i := range cams {
+		c := &cams[i]
+		if c.StreamName == "" {
+			continue
+		}
+		slug := uniqueSlug(slugifyName(c.StreamName), taken)
+		taken[slug] = true
+		slugs[c.ID] = slug
+	}
+	return slugs
 }
 
 // RecordingSegmentsForMinute returns the on-disk paths of all 10-second
@@ -565,7 +686,7 @@ func (r *Registry) FrigateSlug(cam *model.Camera) string {
 // individual recording segments — /api/<cam>/recording/<start>/index.mp4
 // 404s. The only way to serve recordings is to read files from disk.
 func (r *Registry) RecordingSegmentsForMinute(cam *model.Camera, minuteStart int64) ([]string, error) {
-	slug := r.FrigateSlug(cam)
+	slug := r.FrigateSlugUnique(cam)
 	// Frigate's recording directory layout is
 	// /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4 where
 	// the timestamp components are in UTC — verified by inspecting
@@ -644,7 +765,7 @@ type RecordingMinute struct {
 // matching the order the Frigate API returned, so the handler can
 // drop-in replace the API call.
 func (r *Registry) ListRecordingMinutesFromDisk(cam *model.Camera, afterUnix, beforeUnix int64) ([]RecordingMinute, error) {
-	slug := r.FrigateSlug(cam)
+	slug := r.FrigateSlugUnique(cam)
 	root := "/media/frigate/recordings"
 
 	// Bucket aggregation: map minute-start-unix -> aggregate.
@@ -1027,6 +1148,7 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 // options but differ only in scheme.
 func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 	cams := r.List()
+	slugs := r.computeUniqueSlugs()
 	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
 	go2rtcStreams := make(map[string]string)
 	for _, c := range cams {
@@ -1042,7 +1164,10 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		frigatePath := r.frigateCameraPath(&c, u, p) // rtsp://...
 
 		// Frigate's name validator: ^[a-zA-Z0-9_-]+$
-		slug := slugifyName(c.StreamName)
+		// The slug is uniquified against the other cameras so two
+		// cameras whose names slugify to the same base (e.g. "前门"
+		// and "Front Door") get distinct Frigate camera names.
+		slug := slugs[c.ID]
 		// Disable offline cameras in Frigate to prevent endless ffmpeg
 		// reconnect attempts and "video stream offline" errors. When the
 		// camera comes back online, the next config push re-enables it.
@@ -1110,6 +1235,22 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 func (r *Registry) frigateCameraPath(cam *model.Camera, user, pass string) string {
 	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+}
+
+// uniqueSlug returns base if it is not yet taken, otherwise the first
+// of base_2, base_3, ... that is not taken. Used on top of slugifyName
+// to guarantee every camera pushed to Frigate gets a globally unique
+// slug even when two friendly names slugify to the same base.
+func uniqueSlug(base string, taken map[string]bool) string {
+	if !taken[base] {
+		return base
+	}
+	for i := 2; ; i++ {
+		candidate := fmt.Sprintf("%s_%d", base, i)
+		if !taken[candidate] {
+			return candidate
+		}
+	}
 }
 
 // slugifyName converts a human-friendly camera name (which may
