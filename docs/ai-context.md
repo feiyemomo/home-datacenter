@@ -1226,4 +1226,42 @@ dashboard's v1.8.7 network-policy fixes. Both clients now:
 
 ---
 
-**Last Updated:** 2026-08-02 (v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. See Phase 15 above. Earlier: v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+## Phase 16 (v1.8.18): Camera Lifecycle Cleanup + Web Animations
+
+### Phase 16 span: v1.8.18 (Backend) + v1.7.18–v1.7.19 (Android)
+
+#### v1.8.18 — Camera Lifecycle Cleanup + Web Animations
+
+**Backend (services/api/internal/camera/):**
+- **Camera deletion full cleanup**: `Unregister` now removes all associated data, not just the DB row:
+  - Deletes `camera_shares` records for the camera
+  - Removes the Frigate recording directory on disk (`/media/frigate/<slug>/`)
+  - Best-effort deletion of Frigate detection events via Frigate API
+- **Slug uniqueness on registration**: `uniqueSlug()` ensures slug global uniqueness by appending a numeric suffix (`-2`, `-3`, ...) when a collision is detected, preventing Frigate config overwrites when two cameras have the same transliterated name.
+- **compose.yaml**: `/media/frigate` mount changed from read-only to read-write so the API container can delete recording directories on camera removal.
+
+**Web (web/src/):**
+- **Route transition animations**: `App.tsx` now wraps route switches with fade/slide transitions using `framer-motion`-style CSS transitions, giving a liquid-glass feel to page navigation.
+- **Splash loading page**: A branded loading splash shows on first load before the SPA hydrates, eliminating the white flash.
+- **Skeleton component**: New `Skeleton.tsx` reusable component for content placeholders during data fetches.
+- **Dashboard / Cameras page refinements**: Layout and interaction polish consistent with the warm liquid-glass theme.
+
+**Android (companion releases):**
+- **v1.7.18**: UI polish (splash screen, fragment slide animations, "全部报警" section in Cameras tab, "全部" button navigation fix).
+- **v1.7.19**: Network probe fast-path-first optimization (LAN/IPv6 switch immediately on success, Tunnel as background fallback) + removal of redundant `/network/ipv6` call (DDNS domain handles prefix rotation).
+
+### Files Changed (Phase 16)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/camera/registry.go` | Camera deletion cleanup (shares + Frigate dir + events), `uniqueSlug()` |
+| `services/api/internal/camera/frigate.go` | Event deletion API call, io.LimitReader |
+| `compose.yaml` | `/media/frigate` mount → read-write |
+| `web/src/App.tsx` | Route transition animations + splash loading |
+| `web/src/pages/Cameras.tsx` | Layout refinements |
+| `web/src/pages/Dashboard.tsx` | Layout refinements |
+| `web/src/components/Skeleton.tsx` | New skeleton placeholder component |
+
+---
+
+**Last Updated:** 2026-08-11 (v1.8.18: Camera lifecycle cleanup + web animations. See Phase 16 above. Earlier: v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

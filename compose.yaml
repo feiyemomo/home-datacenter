@@ -48,12 +48,13 @@ services:
     volumes:
       - ./data/sqlite:/data/sqlite
       - ./data/recordings:/data/recordings
-      # Frigate recordings (read-only) so home-api can serve MP4
-      # segments directly from disk via http.ServeFile. Frigate 0.17
-      # has no REST endpoint for downloading individual recording
-      # segments — they are only available as files on disk at
-      # /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4.
-      - ./data/frigate:/media/frigate:ro
+      # Frigate recordings (read-write) so home-api can serve MP4
+      # segments directly from disk via http.ServeFile AND delete a
+      # camera's recording directory when the camera is unregistered.
+      # Frigate 0.17 has no REST endpoint for downloading individual
+      # recording segments — they are only available as files on disk
+      # at /media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4.
+      - ./data/frigate:/media/frigate
       - ./services/api/configs:/configs:ro
       # v1.6.11: APK releases directory. The host's
       # ./data/releases/ holds app-debug-vX.Y.Z.apk files pushed

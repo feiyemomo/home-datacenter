@@ -582,6 +582,27 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.18 — 摄像头生命周期清理 + Web 动画 (2026-08-11)
+
+#### 后端
+- **摄像头删除全量清理**：`Unregister` 现在删除所有关联数据，而非仅删除 DB 行：
+  - 删除 `camera_shares` 分享记录
+  - 删除 Frigate 磁盘录像目录（`/media/frigate/<slug>/`）
+  - 尽力删除 Frigate 检测事件（通过 Frigate API）
+- **Slug 唯一性**：`uniqueSlug()` 在冲突时追加数字后缀（`-2`、`-3`...），防止同名摄像头转译后覆盖 Frigate 配置
+- **compose.yaml**：`/media/frigate` 挂载由只读改为可读写，以便 API 容器删除录像目录
+
+#### Web
+- **路由切换动画**：`App.tsx` 为路由切换添加淡入/滑动过渡动画，消除白屏闪烁
+- **开屏加载页**：品牌加载页在 SPA 水合前显示
+- **骨架屏组件**：新增 `Skeleton.tsx` 可复用占位组件
+- **Dashboard / Cameras 页面**：布局与交互优化，与液态玻璃暖色主题一致
+
+#### 版本
+- Backend: v1.8.18
+- Web: v1.8.18
+- Android: v1.7.19 (versionCode 113) — 网络探测快速路径先行 + 开屏动画
+
 ### v1.8.17 — Web 仪表盘液态玻璃视觉升级 (2026-08-02)
 
 #### 新增

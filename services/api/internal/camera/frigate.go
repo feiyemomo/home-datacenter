@@ -530,6 +530,28 @@ func (c *FrigateClient) EventThumbnail(ctx context.Context, eventID string) (io.
 	return resp.Body, resp.Header.Get("Content-Type"), nil
 }
 
+// DeleteEvent deletes a single detection event from Frigate via
+// DELETE /api/events/<id>. Used when a camera is unregistered so its
+// detection history is removed along with the camera. Returns an
+// error on non-2xx responses.
+func (c *FrigateClient) DeleteEvent(ctx context.Context, eventID string) error {
+	u := fmt.Sprintf("%s/api/events/%s", c.FrigateBase, url.PathEscape(eventID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("frigate delete event: %s: %s", resp.Status, string(raw))
+	}
+	return nil
+}
+
 // camerasAsMap converts the typed camera config slice to the
 // map[string]any shape Frigate's config save expects (cameras is a
 // map keyed by camera name, not a list).
