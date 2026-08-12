@@ -582,6 +582,19 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.19 — Web 开屏并行预取 (2026-08-11)
+
+#### Web
+- **开屏期间并行预取**：`AuthContext.tsx` 在 `/user/me` 探测飞行期间，并行预取 Dashboard 首屏数据（`cameras.list` / `network.status` / `weather` / `alerts`），写入 `sessionStorage`（key 与 `useCachedFetch` 一致，格式 `{ t, v }`）
+- **超时兜底**：`Promise.race` 与 2000ms 超时先到者触发 `setInitialized(true)`，不阻塞入口
+- **未登录路径不变**：无 token 时不触发预取，直接重定向到 `/login`
+- **效果**：已登录用户进入 Dashboard 时首屏数据从 sessionStorage 秒开，无 loading spinner
+
+#### 版本
+- Backend: v1.8.19
+- Web: v1.8.19
+- Android: v1.7.21 (versionCode 115) — WebRTC + HLS/MP4 并行预 prepare + 开屏预取首屏数据
+
 ### v1.8.18 — 摄像头生命周期清理 + Web 动画 (2026-08-11)
 
 #### 后端
