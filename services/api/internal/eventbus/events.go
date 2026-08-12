@@ -40,6 +40,18 @@ const (
 	TopicUserLogin  = "user.login"
 	TopicUserLogout = "user.logout"
 
+	// --- User management events (v1.8.20) ---
+	// Emitted by the user handler on Create/Update/Delete. Persisted
+	// by the log subscriber so admin actions are auditable.
+	TopicUserCreate = "user.create"
+	TopicUserUpdate = "user.update"
+	TopicUserDelete = "user.delete"
+
+	// --- Camera management events (v1.8.20) ---
+	// Emitted by the camera handler on Delete. Persisted by the log
+	// subscriber so camera removals are auditable.
+	TopicCameraDelete = "camera.delete"
+
 	// --- Automation events (Phase 5) ---
 	TopicAutomationFired = "automation.fired"
 )
@@ -124,4 +136,27 @@ type UserLogoutPayload struct {
 	DeviceID   uint   `json:"device_id"`
 	DeviceName string `json:"device_name"`
 	Ts         int64  `json:"ts"`
+}
+
+// UserManagePayload is the JSON shape for TopicUserCreate / Update /
+// Delete events (v1.8.20). Emitted by the user handler so admin
+// actions are auditable in the system log.
+type UserManagePayload struct {
+	AdminID   uint   `json:"admin_id"`    // the user performing the action
+	AdminName string `json:"admin_name"`  // friendly name of the admin
+	TargetID  uint   `json:"target_id"`   // the user being created/updated/deleted
+	TargetName string `json:"target_name"` // friendly name of the target
+	Action    string `json:"action"`      // "create" | "update" | "delete"
+	IsAdmin   bool   `json:"is_admin"`    // target's admin flag (for update)
+	Ts        int64  `json:"ts"`
+}
+
+// CameraDeletePayload is the JSON shape for TopicCameraDelete events
+// (v1.8.20). Emitted by the camera handler when a camera is removed.
+type CameraDeletePayload struct {
+	AdminID   uint   `json:"admin_id"`
+	AdminName string `json:"admin_name"`
+	CameraID  uint   `json:"camera_id"`
+	CameraName string `json:"camera_name"`
+	Ts        int64  `json:"ts"`
 }

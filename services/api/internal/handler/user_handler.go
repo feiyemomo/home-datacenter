@@ -1,14 +1,17 @@
 package handler
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"home-datacenter-api/internal/device"
+	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
@@ -19,6 +22,7 @@ type UserHandler struct {
 	deviceService *service.DeviceService
 	deviceMgr     *device.Manager
 	deviceRepo    *repository.DeviceRepository
+	bus           *eventbus.Bus
 }
 
 func NewUserHandler(
@@ -26,13 +30,50 @@ func NewUserHandler(
 	deviceService *service.DeviceService,
 	deviceMgr *device.Manager,
 	deviceRepo *repository.DeviceRepository,
+	bus *eventbus.Bus,
 ) *UserHandler {
 	return &UserHandler{
 		userService:   userService,
 		deviceService: deviceService,
 		deviceMgr:     deviceMgr,
 		deviceRepo:    deviceRepo,
+		bus:           bus,
 	}
+}
+
+// publishUserManageEvent emits a user.create / user.update /
+// user.delete event so the log subscriber can persist a
+// human-readable audit entry. TargetName is snapshotted from the
+// model row so a delete event still carries the friendly name
+// after the row is gone. action must be "create" | "update" | "delete".
+func (h *UserHandler) publishUserManageEvent(adminID, targetID uint, targetName, action string, isAdmin bool) {
+	if h.bus == nil {
+		return
+	}
+	var topic string
+	switch action {
+	case "create":
+		topic = eventbus.TopicUserCreate
+	case "update":
+		topic = eventbus.TopicUserUpdate
+	case "delete":
+		topic = eventbus.TopicUserDelete
+	default:
+		return
+	}
+	payload, _ := json.Marshal(eventbus.UserManagePayload{
+		AdminID:    adminID,
+		TargetID:   targetID,
+		TargetName: targetName,
+		Action:     action,
+		IsAdmin:    isAdmin,
+		Ts:         time.Now().Unix(),
+	})
+	h.bus.Publish(eventbus.Event{
+		Topic:   topic,
+		Payload: payload,
+		Source:  eventbus.SourceSystem,
+	})
 }
 
 // userWithCount is the union of model.User + an optional device_count
@@ -150,6 +191,9 @@ func (h *UserHandler) Create(c *gin.Context) {
 	}
 	u := result.User
 
+	// v1.8.20: audit-trail event for user creation.
+	h.publishUserManageEvent(c.GetUint("user_id"), u.ID, u.Name, "create", u.IsAdmin)
+
 	// Create a default device for the new user so they can
 	// immediately bind with the returned access_key.
 	deviceName := fmt.Sprintf("%s-device", u.Name)
@@ -246,6 +290,8 @@ func (h *UserHandler) Update(c *gin.Context) {
 		writeUserServiceError(c, err)
 		return
 	}
+	// v1.8.20: audit-trail event for user update.
+	h.publishUserManageEvent(callerID, u.ID, u.Name, "update", u.IsAdmin)
 	utils.Success(c, gin.H{
 		"id":         u.ID,
 		"name":       u.Name,
@@ -268,11 +314,22 @@ func (h *UserHandler) Delete(c *gin.Context) {
 		return
 	}
 	callerID := c.GetUint("user_id")
+	// v1.8.20: snapshot the target user's name BEFORE the row is
+	// deleted so the audit-log event carries a friendly label
+	// instead of just "#<id>".
+	targetName := ""
+	targetIsAdmin := false
+	if u, err := h.userService.GetByID(id); err == nil {
+		targetName = u.Name
+		targetIsAdmin = u.IsAdmin
+	}
 	deletedDevices, err := h.userService.Delete(id, callerID)
 	if err != nil {
 		writeUserServiceError(c, err)
 		return
 	}
+	// v1.8.20: audit-trail event for user deletion.
+	h.publishUserManageEvent(callerID, id, targetName, "delete", targetIsAdmin)
 	utils.Success(c, gin.H{
 		"deleted_devices": deletedDevices,
 	})

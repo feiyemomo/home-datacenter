@@ -19,13 +19,12 @@ import (
 
 // Subscriber bridges EventBus events into the SystemLog table.
 //
-// On Start it subscribes to a fixed set of topics (device.status,
-// camera.online / offline / status_changed). user.login / logout are
-// intentionally NOT recorded — routine auth events don't carry audit
-// value and only crowd out meaningful device/camera logs. Each event
-// is decoded, turned into a Chinese human-readable message, persisted
-// as a SystemLog row, and re-published on the "system.log" topic so
-// the WS Hub can fan it out to dashboards.
+// On Start it subscribes to a fixed set of topics: camera
+// online/offline/status_changed, user login/logout, and user/camera
+// management events. Each event is decoded, turned into a Chinese
+// human-readable message, persisted as a SystemLog row, and
+// re-published on the "system.log" topic so the WS Hub can fan it
+// out to dashboards.
 type Subscriber struct {
 	db  *gorm.DB
 	bus *eventbus.Bus
@@ -49,10 +48,15 @@ func (s *Subscriber) Start() {
 		eventbus.TopicCameraOnline,
 		eventbus.TopicCameraOffline,
 		eventbus.TopicCameraStatusChanged,
-		// user.login / user.logout are deliberately omitted: routine
-		// auth events would crowd out meaningful device/camera logs
-		// without adding audit value. WS Hub and automation engine
-		// still receive these events directly from the EventBus.
+		// v1.8.20: user login/logout re-added — users requested
+		// these events be visible in the audit log again.
+		eventbus.TopicUserLogin,
+		eventbus.TopicUserLogout,
+		// v1.8.20: user/camera management events for audit trail.
+		eventbus.TopicUserCreate,
+		eventbus.TopicUserUpdate,
+		eventbus.TopicUserDelete,
+		eventbus.TopicCameraDelete,
 	}
 	for _, t := range topics {
 		// Capture the topic in a local variable so the closure
@@ -161,8 +165,8 @@ func (s *Subscriber) pruneSystemLogs() {
 // so the dashboard can surface urgent events (camera offline) above
 // routine ones. See model.Level* constants.
 //
-// v1.8.13: user.login / user.logout branches removed — routine auth
-// events no longer persisted to system_logs.
+// v1.8.20: user login/logout and user/camera management events
+// re-added/added for audit trail.
 func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog {
 	var (
 		message string
@@ -199,6 +203,80 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 			level = model.LevelInfo
 		}
 
+	case eventbus.TopicUserLogin:
+		var p eventbus.UserLoginPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		userLabel := s.userLabel(p.UserID)
+		deviceLabel := p.DeviceName
+		if deviceLabel == "" {
+			deviceLabel = fmt.Sprintf("#%d", p.DeviceID)
+		}
+		message = fmt.Sprintf("用户 %s 登录（设备 %s）", userLabel, deviceLabel)
+		level = model.LevelNormal
+
+	case eventbus.TopicUserLogout:
+		var p eventbus.UserLogoutPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		userLabel := s.userLabel(p.UserID)
+		deviceLabel := p.DeviceName
+		if deviceLabel == "" {
+			deviceLabel = fmt.Sprintf("#%d", p.DeviceID)
+		}
+		message = fmt.Sprintf("用户 %s 登出（设备 %s 已撤销）", userLabel, deviceLabel)
+		level = model.LevelNormal
+
+	case eventbus.TopicUserCreate,
+		eventbus.TopicUserUpdate,
+		eventbus.TopicUserDelete:
+		var p eventbus.UserManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		// Admin name: query from DB (admin row still exists).
+		adminLabel := s.userLabel(p.AdminID)
+		// Target name: prefer payload (snapshotted before delete),
+		// fallback to DB query (for create/update the row exists).
+		targetLabel := p.TargetName
+		if targetLabel == "" {
+			targetLabel = s.userLabel(p.TargetID)
+		}
+		actionVerb := map[string]string{
+			"create": "创建用户",
+			"update": "更新用户",
+			"delete": "删除用户",
+		}[p.Action]
+		if actionVerb == "" {
+			actionVerb = "管理用户"
+		}
+		message = fmt.Sprintf("管理员 %s %s %s", adminLabel, actionVerb, targetLabel)
+		level = model.LevelNormal
+
+	case eventbus.TopicCameraDelete:
+		var p eventbus.CameraDeletePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		// Admin name: prefer payload (when the handler snapshotted
+		// it), fall back to a DB lookup, then "#<id>".
+		adminLabel := p.AdminName
+		if adminLabel == "" {
+			adminLabel = s.userLabel(p.AdminID)
+		}
+		cameraLabel := p.CameraName
+		if cameraLabel == "" {
+			cameraLabel = fmt.Sprintf("#%d", p.CameraID)
+		}
+		message = fmt.Sprintf("管理员 %s 删除摄像头 %s", adminLabel, cameraLabel)
+		level = model.LevelNormal
+
 	default:
 		return nil
 	}
@@ -227,6 +305,16 @@ func (s *Subscriber) cameraLabel(id uint, host string) string {
 	}
 	if host != "" {
 		return host
+	}
+	return fmt.Sprintf("#%d", id)
+}
+
+// userLabel returns the user's friendly Name, falling back to
+// "#<id>" if the row is missing (e.g. deleted user).
+func (s *Subscriber) userLabel(id uint) string {
+	var user model.User
+	if err := s.db.Select("name").First(&user, id).Error; err == nil && user.Name != "" {
+		return user.Name
 	}
 	return fmt.Sprintf("#%d", id)
 }
