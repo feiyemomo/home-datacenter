@@ -143,7 +143,7 @@ func main() {
 	deviceService := service.NewDeviceService(deviceRepo)
 
 	authHandler := handler.NewAuthHandler(authService, bus)
-	userHandler := handler.NewUserHandler(userService, deviceService, deviceMgr, deviceRepo)
+	userHandler := handler.NewUserHandler(userService, deviceService, deviceMgr, deviceRepo, bus)
 	deviceHandler := handler.NewDeviceHandler(deviceService, userService, bus)
 
 	// WebSocket handler. If server.allowed_origins is configured, use
@@ -173,7 +173,7 @@ func main() {
 		Go2:       go2,
 		OutputDir: cfg.Camera.RecordingDir,
 	}
-	camHandler := handler.NewCameraHandler(camReg, camONVIF, camRecorder, cfg.Camera.WebRTCPublicBase, cfg.Camera.ICEServers, userService)
+	camHandler := handler.NewCameraHandler(camReg, camONVIF, camRecorder, cfg.Camera.WebRTCPublicBase, cfg.Camera.ICEServers, userService, bus)
 
 	// Purge any soft-deleted camera rows left over from older
 	// deployments where Unregister performed a soft delete. Those

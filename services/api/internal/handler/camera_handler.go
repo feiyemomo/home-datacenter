@@ -19,6 +19,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"home-datacenter-api/internal/camera"
+	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/utils"
 )
@@ -42,6 +43,7 @@ type CameraHandler struct {
 	PublicBase string // mirrors camera.webrtc_public_base (LAN if blank)
 	RawIce     string // JSON string from camera.ice_servers
 	UserSvc    UserResolver
+	bus        *eventbus.Bus
 	// frameCache holds the most recent JPEG frame per stream name
 	// for up to 2 seconds. The dashboard's camera card polls
 	// /frame on every page mount and sometimes rapid-refreshes;
@@ -69,8 +71,8 @@ type UserResolver interface {
 	GetIsAdmin(userID uint) (bool, error)
 }
 
-func NewCameraHandler(reg *camera.Registry, onvif *camera.ONVIFController, rec *camera.Recorder, publicBase, rawIce string, userSvc UserResolver) *CameraHandler {
-	return &CameraHandler{Reg: reg, ONVIF: onvif, Rec: rec, PublicBase: publicBase, RawIce: rawIce, UserSvc: userSvc}
+func NewCameraHandler(reg *camera.Registry, onvif *camera.ONVIFController, rec *camera.Recorder, publicBase, rawIce string, userSvc UserResolver, bus *eventbus.Bus) *CameraHandler {
+	return &CameraHandler{Reg: reg, ONVIF: onvif, Rec: rec, PublicBase: publicBase, RawIce: rawIce, UserSvc: userSvc, bus: bus}
 }
 
 // callerIsAdmin returns (userID, isAdmin, ok) for the current request.
@@ -1160,12 +1162,36 @@ func (h *CameraHandler) Delete(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
+	// v1.8.20: snapshot the camera name + caller identity BEFORE
+	// Unregister so the audit-log event carries a friendly label
+	// (the row is gone after Unregister).
+	adminID, _, _ := h.callerIsAdmin(c)
+	cameraName := ""
+	if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
+		cameraName = cam.Name
+	}
 	if err := h.Reg.Unregister(c.Request.Context(), uint(id)); err != nil {
 		log.Printf("[handler] failed to unregister camera: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to unregister camera")
 		return
 	}
 	h.ONVIF.Forget(uint(id))
+
+	// v1.8.20: audit-trail event for camera deletion.
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraDeletePayload{
+			AdminID:    adminID,
+			CameraID:   uint(id),
+			CameraName: cameraName,
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraDelete,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
+
 	utils.Success(c, gin.H{"id": id})
 }
 

@@ -582,6 +582,25 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.20 — 审计日志扩展 (2026-08-12)
+
+#### 后端
+- **用户登录/登出日志重新启用**：`subscriber.go` 重新订阅 `user.login` / `user.logout` 事件，记录"用户 X 登录（设备 Y）"/"用户 X 登出（设备 Y 已撤销）"
+- **用户管理审计事件**：新增 `user.create` / `user.update` / `user.delete` 事件
+  - `eventbus/events.go` 新增 `UserManagePayload` 结构体（admin_id / target_id / target_name / action / is_admin）
+  - `user_handler.go` 在 Create / Update / Delete 方法中发布事件，Delete 前快照用户名以保留友好标签
+  - 日志格式："管理员 X 创建/更新/删除用户 Y"
+- **摄像头删除审计事件**：新增 `camera.delete` 事件
+  - `eventbus/events.go` 新增 `CameraDeletePayload` 结构体
+  - `camera_handler.go` 在 Delete 方法中发布事件，删除前快照摄像头名称
+  - 日志格式："管理员 X 删除摄像头 Y"
+- **subscriber 优化**：`CameraDelete` 事件的管理员名称支持 DB 回退查询（与 `UserManage` 一致）
+
+#### 版本
+- Backend: v1.8.20
+- Web: v1.8.20
+- Android: v1.7.24 (versionCode 118) — 日志核查按钮修复 + 审计日志展示
+
 ### v1.8.19 — Web 开屏并行预取 (2026-08-11)
 
 #### Web
