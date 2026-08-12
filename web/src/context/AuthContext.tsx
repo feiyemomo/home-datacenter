@@ -10,8 +10,24 @@ import {
 import { bind as bindApi } from "@/api/auth";
 import { getCurrentUser } from "@/api/system";
 import { clearTokenAndRedirect, getToken, setToken } from "@/api/client";
+import { listCameras, listAlerts } from "@/api/camera";
+import { getNetworkStatus } from "@/api/network";
+import { getWeather } from "@/api/weather";
 import { decodeJwtPayload } from "@/lib/utils";
 import type { JwtClaims, User } from "@/types";
+
+// Prefetch sessionStorage keys — must match useCachedFetch keys exactly
+// so that cached values are immediately available to the consuming pages.
+//   home.cameras.list        — Cameras.tsx
+//   home.network.status      — Network.tsx
+//   home.dashboard.weather   — WeatherCard.tsx (rendered on Dashboard)
+//   home.dashboard.alerts    — Dashboard.tsx
+const PREFETCH_KEYS = {
+    cameras: "home.cameras.list",
+    network: "home.network.status",
+    weather: "home.dashboard.weather",
+    alerts: "home.dashboard.alerts",
+} as const;
 
 interface AuthContextValue {
     token: string | null;
@@ -37,7 +53,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         return decodeJwtPayload<JwtClaims>(token);
     }, [token]);
 
-    // On mount (or when token changes), fetch the user identity.
+    // On mount (or when token changes), fetch the user identity AND
+    // prefetch Dashboard first-screen data in parallel. The prefetch
+    // runs alongside getCurrentUser() so the splash screen overlaps
+    // with real work instead of idling. We wait for everything to
+    // settle (or a 2000ms timeout, whichever comes first) before
+    // flipping `initialized` so the splash doesn't become a blocker.
     useEffect(() => {
         if (!token) {
             setUser(null);
@@ -45,20 +66,60 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             return;
         }
         let cancelled = false;
-        getCurrentUser()
-            .then((u) => {
-                if (!cancelled) {
-                    setUser(u);
-                    setInitialized(true);
+
+        // Best-effort prefetch — each call settles independently and
+        // rejected ones are silently skipped (not written to cache).
+        const prefetchPromise = Promise.allSettled([
+            listCameras(),
+            getNetworkStatus(),
+            getWeather(),
+            listAlerts(),
+        ]).then(([cameras, network, weather, alerts]) => {
+            if (cancelled) return;
+            const now = Date.now();
+            const writeCache = (key: string, v: unknown) => {
+                try {
+                    sessionStorage.setItem(key, JSON.stringify({ t: now, v }));
+                } catch {
+                    // private browsing or quota exceeded — silently ignore
                 }
+            };
+            if (cameras.status === "fulfilled") {
+                writeCache(PREFETCH_KEYS.cameras, cameras.value);
+            }
+            if (network.status === "fulfilled") {
+                writeCache(PREFETCH_KEYS.network, network.value);
+            }
+            if (weather.status === "fulfilled") {
+                writeCache(PREFETCH_KEYS.weather, weather.value);
+            }
+            if (alerts.status === "fulfilled") {
+                writeCache(PREFETCH_KEYS.alerts, alerts.value);
+            }
+        });
+
+        // User identity — 401 is handled by the axios interceptor
+        // (redirect to /login); here we just clear the user and
+        // continue to `initialized` so the splash resolves.
+        const userPromise = getCurrentUser()
+            .then((u) => {
+                if (!cancelled) setUser(u);
             })
             .catch(() => {
-                // 401 path is handled by the axios interceptor (redirect to /login).
-                if (!cancelled) {
-                    setUser(null);
-                    setInitialized(true);
-                }
+                if (!cancelled) setUser(null);
             });
+
+        const timeoutPromise = new Promise<void>((resolve) =>
+            setTimeout(resolve, 2000),
+        );
+
+        Promise.race([
+            Promise.all([userPromise, prefetchPromise]),
+            timeoutPromise,
+        ]).then(() => {
+            if (!cancelled) setInitialized(true);
+        });
+
         return () => {
             cancelled = true;
         };

@@ -1263,4 +1263,40 @@ dashboard's v1.8.7 network-policy fixes. Both clients now:
 
 ---
 
-**Last Updated:** 2026-08-11 (v1.8.18: Camera lifecycle cleanup + web animations. See Phase 16 above. Earlier: v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+## Phase 17 (v1.8.19): Preload Paralleling + Splash Utilization
+
+### Phase 17 span: v1.8.19 (Web) + v1.7.20–v1.7.21 (Android)
+
+#### v1.8.19 — Web Splash Parallel Prefetch
+
+**Web (web/src/):**
+- **Splash parallel prefetch**: `AuthContext.tsx` `useEffect` now runs `Promise.allSettled` for Dashboard first-screen data (`listCameras` / `getNetworkStatus` / `getWeather` / `listAlerts`) in parallel with `getCurrentUser()` during the splash window.
+- **sessionStorage write-through**: Prefetched results are written to `sessionStorage` with keys matching `useCachedFetch` consumption (`home.cameras.list` / `home.network.status` / `home.dashboard.weather` / `home.dashboard.alerts`), format `{ t: Date.now(), v }`.
+- **Timeout backstop**: `Promise.race` between `Promise.all([userPromise, prefetchPromise])` and a 2000ms timeout triggers `setInitialized(true)`, so slow networks don't block the entry.
+- **No-token path unchanged**: Unauthenticated users skip prefetch entirely and redirect to `/login` as before.
+
+#### v1.7.21 — Android WebRTC Parallel Fallback + Splash Prefetch
+
+**Android (companion release):**
+- **WebRTC + HLS/MP4 parallel pre-prepare**: `CameraDetailActivity` now creates a `fallbackPlayer` ExoPlayer with `playWhenReady=false` alongside WebRTC negotiation start. On WebRTC `onConnected`, the fallback player is released. On WebRTC `onError`, the fallback player is promoted to the main player with `playWhenReady=true`, cutting fallback switch latency from 500ms-2s to ~100-300ms.
+- **Splash parallel prefetch**: `SplashActivity` (logged-in path) now parallel-prefetches `dashboard.status` / `dashboard.weather` / `dashboard.alerts` / `cameras.list` into `CacheManager`. `routeToNext` waits `max(900ms animation, +1100ms prefetch)` with a 2000ms hard cap. Unauthenticated path keeps the original 900ms fixed duration.
+
+#### v1.7.20 — Dead Code Cleanup + Redundancy Fix (Companion)
+
+**Android:**
+- Removed `takeWarmWebRtcClient()`, `BaseUrlResolver.switchTo()`, `PrefetchManager.cancelPending()` dead code.
+- Wired `tryAutoRefreshToken()` into `HomeCenterApp.onCreate`.
+- Added `AtomicBoolean` lock to `prefetchIceConfig` to prevent concurrent first-launch duplicate GET.
+- Removed redundant `preheatCamera` call in `CameraDetailActivity.onCreate` (already triggered by `CamerasFragment`).
+
+### Files Changed (Phase 17)
+
+| File | Change |
+|------|--------|
+| `web/src/context/AuthContext.tsx` | Splash parallel prefetch + sessionStorage write-through + 2000ms timeout |
+| Android `CameraDetailActivity.kt` | `fallbackPlayer` field + `prepareFallbackPlayer()` + onConnected/onError lifecycle |
+| Android `SplashActivity.kt` | Parallel prefetch of dashboard data + `routeToNext` wait condition |
+
+---
+
+**Last Updated:** 2026-08-11 (v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. See Phase 17 above. Earlier: v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
