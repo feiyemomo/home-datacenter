@@ -366,6 +366,10 @@ func main() {
 			// where the user reviews a critical offline log and
 			// removes it once the issue is resolved.
 			systemAdmin.DELETE("/logs/:id", systemLogHandler.Delete)
+			// v1.8.21: verify (downgrade) a critical log to normal
+			// level. The log stays in the audit trail but is
+			// removed from the "pending" section.
+			systemAdmin.PATCH("/logs/:id", systemLogHandler.Verify)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so
