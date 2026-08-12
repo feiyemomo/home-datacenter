@@ -52,6 +52,27 @@ const (
 	// subscriber so camera removals are auditable.
 	TopicCameraDelete = "camera.delete"
 
+	// --- Camera management events (v1.8.22) ---
+	// Emitted by the camera handler on Create / Update (codec, audio,
+	// recording plan). Persisted by the log subscriber so admin
+	// actions on cameras are auditable end-to-end.
+	TopicCameraCreate = "camera.create"
+	TopicCameraUpdate = "camera.update"
+
+	// --- Automation rule management events (v1.8.22) ---
+	// Emitted by the automation handler on Create / Update / Delete.
+	// Persisted by the log subscriber so rule changes are auditable.
+	TopicAutomationCreate = "automation.create"
+	TopicAutomationUpdate = "automation.update"
+	TopicAutomationDelete = "automation.delete"
+
+	// --- Device management events (v1.8.22) ---
+	// Emitted by the device handler on hard-delete / token-rotate.
+	// Persisted by the log subscriber so admin actions on devices
+	// are auditable.
+	TopicDeviceHardDelete  = "device.hard_delete"
+	TopicDeviceTokenRotate = "device.token_rotate"
+
 	// --- Automation events (Phase 5) ---
 	TopicAutomationFired = "automation.fired"
 )
@@ -159,4 +180,39 @@ type CameraDeletePayload struct {
 	CameraID  uint   `json:"camera_id"`
 	CameraName string `json:"camera_name"`
 	Ts        int64  `json:"ts"`
+}
+
+// CameraManagePayload is the JSON shape for TopicCameraCreate /
+// TopicCameraUpdate events (v1.8.22). Emitted by the camera handler
+// when a camera is registered or its codec / audio / recording plan
+// is changed, so admin actions are auditable in the system log.
+type CameraManagePayload struct {
+	AdminID    uint   `json:"admin_id"`
+	CameraID   uint   `json:"camera_id"`
+	CameraName string `json:"camera_name"`
+	Action     string `json:"action"` // "create" | "update"
+	Detail     string `json:"detail"` // update scope: "编码" | "音频" | "录制计划"
+	Ts         int64  `json:"ts"`
+}
+
+// AutomationManagePayload is the JSON shape for TopicAutomationCreate /
+// Update / Delete events (v1.8.22). Emitted by the automation handler
+// so rule lifecycle changes are auditable in the system log.
+type AutomationManagePayload struct {
+	AdminID  uint   `json:"admin_id"`
+	RuleID   uint   `json:"rule_id"`
+	RuleName string `json:"rule_name"`
+	Action   string `json:"action"` // "create" | "update" | "delete"
+	Ts       int64  `json:"ts"`
+}
+
+// DeviceManagePayload is the JSON shape for TopicDeviceHardDelete /
+// TopicDeviceTokenRotate events (v1.8.22). Emitted by the device
+// handler so admin actions on devices are auditable in the system log.
+type DeviceManagePayload struct {
+	AdminID    uint   `json:"admin_id"`
+	DeviceID   uint   `json:"device_id"`
+	DeviceName string `json:"device_name"`
+	Action     string `json:"action"` // "hard_delete" | "token_rotate"
+	Ts         int64  `json:"ts"`
 }
