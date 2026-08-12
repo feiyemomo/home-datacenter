@@ -125,6 +125,23 @@ func (h *HealthChecker) probe(ctx context.Context, c model.Camera) {
 				}),
 			})
 
+			// v1.8.22: also publish a generic status_changed event
+			// so the audit log captures every state transition at
+			// info level (online/offline above carry normal/critical
+			// levels). Mirrors the CameraStatusPayload shape the
+			// subscriber decodes for camera.* topics.
+			h.Bus.Publish(eventbus.Event{
+				Topic:    eventbus.TopicCameraStatusChanged,
+				Source:   eventbus.SourceCamera,
+				Severity: eventbus.SeverityInfo,
+				Payload: mustJSON(eventbus.CameraStatusPayload{
+					CameraID: c.ID,
+					Status:   status,
+					Host:     c.Host,
+					TS:       ts,
+				}),
+			})
+
 			// Re-push Frigate config on online<->offline transitions
 			// so that offline cameras are disabled (Enabled: false) in
 			// Frigate, stopping endless ffmpeg reconnect attempts, and

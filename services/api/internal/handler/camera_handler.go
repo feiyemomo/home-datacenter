@@ -216,6 +216,21 @@ func (h *CameraHandler) Register(c *gin.Context) {
 		utils.Fail(c, http.StatusBadGateway, "failed to register camera")
 		return
 	}
+	// v1.8.22: audit-trail event for camera registration.
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   cam.ID,
+			CameraName: cam.Name,
+			Action:     "create",
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraCreate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), true))
 }
 
@@ -346,6 +361,26 @@ func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, "failed to update codec")
 		return
 	}
+	// v1.8.22: audit-trail event for codec change.
+	if h.bus != nil {
+		cameraName := ""
+		if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
+			cameraName = cam.Name
+		}
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: cameraName,
+			Action:     "update",
+			Detail:     "编码",
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, gin.H{"id": id, "codec": body.Codec})
 }
 
@@ -381,6 +416,26 @@ func (h *CameraHandler) UpdateAudio(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, "failed to update audio")
 		return
 	}
+	// v1.8.22: audit-trail event for audio toggle.
+	if h.bus != nil {
+		cameraName := ""
+		if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
+			cameraName = cam.Name
+		}
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: cameraName,
+			Action:     "update",
+			Detail:     "音频",
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, gin.H{"id": id, "audio": body.Enabled})
 }
 
@@ -412,6 +467,26 @@ func (h *CameraHandler) SetRecordingPlan(c *gin.Context) {
 		log.Printf("[handler] failed to set recording plan: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to set recording plan")
 		return
+	}
+	// v1.8.22: audit-trail event for recording plan change.
+	if h.bus != nil {
+		cameraName := ""
+		if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
+			cameraName = cam.Name
+		}
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: cameraName,
+			Action:     "update",
+			Detail:     "录制计划",
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
 	}
 	utils.Success(c, gin.H{
 		"id": id,

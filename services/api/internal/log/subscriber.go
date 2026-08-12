@@ -57,6 +57,17 @@ func (s *Subscriber) Start() {
 		eventbus.TopicUserUpdate,
 		eventbus.TopicUserDelete,
 		eventbus.TopicCameraDelete,
+		// v1.8.22: camera create/update + automation lifecycle +
+		// device hard-delete/token-rotate + motion for audit trail.
+		eventbus.TopicCameraCreate,
+		eventbus.TopicCameraUpdate,
+		eventbus.TopicCameraMotion,
+		eventbus.TopicAutomationFired,
+		eventbus.TopicAutomationCreate,
+		eventbus.TopicAutomationUpdate,
+		eventbus.TopicAutomationDelete,
+		eventbus.TopicDeviceHardDelete,
+		eventbus.TopicDeviceTokenRotate,
 	}
 	for _, t := range topics {
 		// Capture the topic in a local variable so the closure
@@ -276,6 +287,136 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		}
 		message = fmt.Sprintf("管理员 %s 删除摄像头 %s", adminLabel, cameraLabel)
 		level = model.LevelNormal
+
+	case eventbus.TopicCameraCreate:
+		var p eventbus.CameraManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		message = fmt.Sprintf("管理员 %s 注册摄像头 %s", adminLabel, p.CameraName)
+		level = model.LevelNormal
+
+	case eventbus.TopicCameraUpdate:
+		var p eventbus.CameraManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		detail := p.Detail
+		if detail == "" {
+			detail = "配置"
+		}
+		message = fmt.Sprintf("管理员 %s 更新摄像头 %s 的 %s", adminLabel, p.CameraName, detail)
+		level = model.LevelNormal
+
+	case eventbus.TopicAutomationFired:
+		// automation.fired payload is a map[string]any, not a struct.
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if v, ok := p["ts"].(float64); ok {
+			ts = int64(v)
+		}
+		ruleName, _ := p["rule_name"].(string)
+		action, _ := p["action"].(string)
+		ok, _ := p["ok"].(bool)
+		status := "成功"
+		if !ok {
+			status = "失败"
+		}
+		message = fmt.Sprintf("自动化规则 %s 触发，执行 %s 动作（%s）", ruleName, action, status)
+		level = model.LevelInfo
+
+	case eventbus.TopicAutomationCreate:
+		var p eventbus.AutomationManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		message = fmt.Sprintf("管理员 %s 创建自动化规则 %s", adminLabel, p.RuleName)
+		level = model.LevelNormal
+
+	case eventbus.TopicAutomationUpdate:
+		var p eventbus.AutomationManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		message = fmt.Sprintf("管理员 %s 更新自动化规则 %s", adminLabel, p.RuleName)
+		level = model.LevelNormal
+
+	case eventbus.TopicAutomationDelete:
+		var p eventbus.AutomationManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		message = fmt.Sprintf("管理员 %s 删除自动化规则 %s", adminLabel, p.RuleName)
+		level = model.LevelNormal
+
+	case eventbus.TopicDeviceHardDelete:
+		var p eventbus.DeviceManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		deviceLabel := p.DeviceName
+		if deviceLabel == "" {
+			deviceLabel = fmt.Sprintf("#%d", p.DeviceID)
+		}
+		message = fmt.Sprintf("管理员 %s 永久删除设备 %s", adminLabel, deviceLabel)
+		level = model.LevelNormal
+
+	case eventbus.TopicDeviceTokenRotate:
+		var p eventbus.DeviceManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		ts = p.Ts
+		adminLabel := s.userLabel(p.AdminID)
+		deviceLabel := p.DeviceName
+		if deviceLabel == "" {
+			deviceLabel = fmt.Sprintf("#%d", p.DeviceID)
+		}
+		message = fmt.Sprintf("管理员 %s 轮换设备 %s 的访问令牌", adminLabel, deviceLabel)
+		level = model.LevelNormal
+
+	case eventbus.TopicCameraMotion:
+		// camera.motion payload (see mqtt/handler.go handleFrigateEvent):
+		// {event_id, camera_id, type, label, confidence, zones,
+		//  has_snapshot, has_clip, ts}. No camera_name field — look
+		// up via cameraLabel (DB), then fall back to "#<id>".
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if v, ok := p["ts"].(float64); ok {
+			ts = int64(v)
+		}
+		var cameraName string
+		if id, ok := p["camera_id"].(float64); ok {
+			cameraName = s.cameraLabel(uint(id), "")
+		}
+		if cameraName == "" {
+			if name, ok := p["camera_name"].(string); ok {
+				cameraName = name
+			}
+		}
+		if cameraName == "" {
+			if id, ok := p["camera_id"].(float64); ok {
+				cameraName = fmt.Sprintf("#%d", int64(id))
+			}
+		}
+		message = fmt.Sprintf("摄像头 %s 检测到运动", cameraName)
+		level = model.LevelInfo
 
 	default:
 		return nil

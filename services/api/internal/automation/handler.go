@@ -1,6 +1,7 @@
 package automation
 
 import (
+	"encoding/json"
 	"log"
 	"net/http"
 	"net/url"
@@ -145,6 +146,21 @@ func (h *Handler) Create(c *gin.Context) {
 		return
 	}
 	_ = h.Engine.Reload()
+	// v1.8.22: audit-trail event for rule creation.
+	if h.Bus != nil {
+		payload, _ := json.Marshal(eventbus.AutomationManagePayload{
+			AdminID:  c.GetUint("user_id"),
+			RuleID:   r.ID,
+			RuleName: r.Name,
+			Action:   "create",
+			Ts:       time.Now().Unix(),
+		})
+		h.Bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicAutomationCreate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, toResponse(r))
 }
 
@@ -216,6 +232,21 @@ func (h *Handler) Update(c *gin.Context) {
 		return
 	}
 	_ = h.Engine.Reload()
+	// v1.8.22: audit-trail event for rule update.
+	if h.Bus != nil {
+		payload, _ := json.Marshal(eventbus.AutomationManagePayload{
+			AdminID:  c.GetUint("user_id"),
+			RuleID:   r.ID,
+			RuleName: r.Name,
+			Action:   "update",
+			Ts:       time.Now().Unix(),
+		})
+		h.Bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicAutomationUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, toResponse(r))
 }
 
@@ -228,11 +259,31 @@ func (h *Handler) Delete(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
+	// v1.8.22: snapshot the rule name BEFORE the soft-delete so
+	// the audit-log event carries a friendly label (gorm's soft
+	// delete keeps the row, but a future hard-delete would not).
+	var snap model.Rule
+	_ = h.DB.Select("name").First(&snap, id).Error
 	if err := h.DB.Delete(&model.Rule{}, id).Error; err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to delete rule")
 		return
 	}
 	_ = h.Engine.Reload()
+	// v1.8.22: audit-trail event for rule deletion.
+	if h.Bus != nil {
+		payload, _ := json.Marshal(eventbus.AutomationManagePayload{
+			AdminID:  c.GetUint("user_id"),
+			RuleID:   uint(id),
+			RuleName: snap.Name,
+			Action:   "delete",
+			Ts:       time.Now().Unix(),
+		})
+		h.Bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicAutomationDelete,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, gin.H{"id": id, "deleted": true})
 }
 

@@ -300,6 +300,22 @@ func (h *DeviceHandler) RotateToken(c *gin.Context) {
 		return
 	}
 
+	// v1.8.22: audit-trail event for token rotation.
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.DeviceManagePayload{
+			AdminID:    userID,
+			DeviceID:   deviceID,
+			DeviceName: device.DeviceName,
+			Action:     "token_rotate",
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicDeviceTokenRotate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
+
 	utils.Success(c, gin.H{
 		"device_id":     deviceID,
 		"device_name":   device.DeviceName,
@@ -360,6 +376,23 @@ func (h *DeviceHandler) HardDelete(c *gin.Context) {
 	if err := h.deviceService.HardDeleteDevice(deviceID); err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to hard delete device")
 		return
+	}
+
+	// v1.8.22: audit-trail event for permanent device deletion.
+	// DeviceName is snapshotted above (the row is gone now).
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.DeviceManagePayload{
+			AdminID:    userID,
+			DeviceID:   deviceID,
+			DeviceName: device.DeviceName,
+			Action:     "hard_delete",
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicDeviceHardDelete,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
 	}
 
 	utils.Success(c, nil)

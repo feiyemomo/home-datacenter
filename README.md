@@ -582,6 +582,31 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.22 — 审计日志大幅拓展 (2026-08-12)
+
+#### 后端
+- **摄像头管理审计事件**：新增 `camera.create` / `camera.update` 事件
+  - `eventbus/events.go` 新增 `CameraManagePayload` 结构体
+  - `camera_handler.go` 的 `Register` / `UpdateCodec` / `UpdateAudio` / `SetRecordingPlan` 方法发布事件
+  - 日志格式："管理员 X 注册摄像头 Y" / "管理员 X 更新摄像头 Y 的 编码/音频/录制计划"
+- **自动化规则审计事件**：新增 `automation.create` / `update` / `delete` 事件 + 订阅 `automation.fired`
+  - `eventbus/events.go` 新增 `AutomationManagePayload` 结构体
+  - `automation/handler.go` 的 `Create` / `Update` / `Delete` 方法发布事件
+  - 日志格式："自动化规则 X 触发，执行 Y 动作（成功/失败）" / "管理员 X 创建/更新/删除自动化规则 Y"
+- **设备管理审计事件**：新增 `device.hard_delete` / `device.token_rotate` 事件
+  - `eventbus/events.go` 新增 `DeviceManagePayload` 结构体
+  - `device_handler.go` 的 `HardDelete` / `RotateToken` 方法发布事件
+  - 日志格式："管理员 X 永久删除设备 Y" / "管理员 X 轮换设备 Y 的访问令牌"
+- **运动检测报警日志**：subscriber 订阅 `camera.motion` 事件
+  - 日志格式："摄像头 X 检测到运动"（level=info）
+- **修复 dead topic**：`camera.status_changed` 事件之前已被 subscriber 订阅但从未发布
+  - `camera/health.go` 在状态变更时补发 `TopicCameraStatusChanged` 事件
+
+#### 版本
+- Backend: v1.8.22
+- Web: v1.8.22
+- Android: v1.7.26 (versionCode 120) — 核查缓存修复 + 审计日志展示
+
 ### v1.8.21 — 日志核查降级 API + PATCH 路由 (2026-08-12)
 
 #### 后端
