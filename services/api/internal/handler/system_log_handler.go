@@ -137,3 +137,42 @@ func (h *SystemLogHandler) Delete(c *gin.Context) {
 		"id":      id,
 	})
 }
+
+// Verify marks a single system log entry as verified/handled by
+// downgrading its level from "critical" to "normal". The entry is
+// NOT deleted — it stays in the "所有日志" (all logs) section for
+// full audit history, but is removed from the "待处理日志" (pending)
+// section which only shows critical-level entries.
+//
+//	Route: PATCH /api/v1/system/logs/:id
+//
+// v1.8.21: Replaces the old "核查并删除" (verify and delete) workflow.
+// The user reviews a critical log (e.g. camera offline), taps "核查",
+// and the log is downgraded to normal level. This persists across
+// refreshes (unlike the old in-memory mark) while preserving the
+// full audit trail (unlike the old DELETE approach).
+func (h *SystemLogHandler) Verify(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid log id")
+		return
+	}
+
+	res := h.db.Model(&model.SystemLog{}).
+		Where("id = ?", id).
+		Update("level", model.LevelNormal)
+	if res.Error != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to verify log")
+		return
+	}
+	if res.RowsAffected == 0 {
+		utils.Fail(c, http.StatusNotFound, "log not found")
+		return
+	}
+
+	utils.Success(c, gin.H{
+		"verified": true,
+		"id":       id,
+	})
+}

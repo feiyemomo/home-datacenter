@@ -582,6 +582,20 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.21 — 日志核查降级 API + PATCH 路由 (2026-08-12)
+
+#### 后端
+- **新增 `PATCH /api/v1/system/logs/:id` 路由**：将日志级别从 `critical` 降级为 `normal`
+  - `system_log_handler.go` 新增 `Verify` 方法，使用 GORM `Update("level", LevelNormal)` 降级
+  - 路由注册在 `systemAdmin` 组下（管理员专属）
+  - 降级后日志从"待处理日志"栏消失，但保留在"所有日志"栏，审计轨迹完整
+- 替代原 `DELETE /api/v1/system/logs/:id` 的核查工作流（DELETE 路由保留但不再被客户端使用）
+
+#### 版本
+- Backend: v1.8.21
+- Web: v1.8.21
+- Android: v1.7.25 (versionCode 119) — 日志核查降级 + 下拉刷新修复 + 更新流程优化 + 用户列表调整
+
 ### v1.8.20 — 审计日志扩展 (2026-08-12)
 
 #### 后端
