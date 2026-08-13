@@ -29,6 +29,15 @@ import (
 // the operator sees a "client.error" log entry with the message, stack,
 // URL and page context.
 //
+// v1.8.26 aggregation/dedup: a playback retry loop or a noisy page
+// previously flooded the log with N identical rows for the same error.
+// Now reports are deduplicated by (context + message) within a window:
+// the first report creates a row, and repeats bump a count on the
+// existing row instead of inserting N copies. The operator sees one
+// row per error "signature" with a count, not a wall of duplicates.
+// The signature is (context, message) — stack/URL vary with the page
+// and are not part of the key.
+//
 // Route: POST /api/v1/system/client-errors (JWT-protected)
 type ClientErrorHandler struct {
 	db *gorm.DB
@@ -42,11 +51,15 @@ type ClientErrorHandler struct {
 	window    time.Time
 	count     int
 	maxPerMin int
+
+	// dedupeWindow is how far back to look for an identical
+	// (context, message) row to merge a repeat report into.
+	dedupeWindow time.Duration
 }
 
 // NewClientErrorHandler creates a handler bound to the given GORM DB.
 func NewClientErrorHandler(db *gorm.DB) *ClientErrorHandler {
-	return &ClientErrorHandler{db: db, maxPerMin: 60}
+	return &ClientErrorHandler{db: db, maxPerMin: 60, dedupeWindow: 10 * time.Minute}
 }
 
 // reportRequestBody is the JSON body accepted by Report.
@@ -109,12 +122,45 @@ func (h *ClientErrorHandler) Report(c *gin.Context) {
 	if raw, exists := c.Get("user_id"); exists {
 		userID = fmt.Sprintf("%v", raw)
 	}
-	payloadJSON, _ := json.Marshal(map[string]string{
+	payloadMap := map[string]interface{}{
 		"stack":   body.Stack,
 		"url":     body.URL,
 		"context": body.Context,
 		"user_id": userID,
-	})
+		"count":   1,
+	}
+
+	// v1.8.26: dedup — if an identical (context, message) row exists
+	// within the window, bump its count and refresh its timestamp
+	// instead of inserting a duplicate. This keeps a retry loop from
+	// flooding the log with N copies of the same error.
+	if existingID, ok := h.findDuplicate(body.Context, body.Message); ok {
+		payloadJSON, _ := json.Marshal(payloadMap)
+		// Load the existing row's count and increment it.
+		var existing model.SystemLog
+		if err := h.db.First(&existing, existingID).Error; err == nil {
+			var prev map[string]interface{}
+			if json.Unmarshal([]byte(existing.Payload), &prev) == nil {
+				if n, ok := prev["count"].(float64); ok {
+					payloadMap["count"] = int(n) + 1
+				}
+			}
+			payloadJSON, _ = json.Marshal(payloadMap)
+			// Refresh timestamp so the row stays near the top and the
+			// dedup window keeps sliding while the error is recurring.
+			updates := map[string]interface{}{
+				"ts":      time.Now().Unix(),
+				"payload": string(payloadJSON),
+			}
+			if err := h.db.Model(&model.SystemLog{}).Where("id = ?", existingID).Updates(updates).Error; err != nil {
+				log.Printf("[handler] update client error count: %v", err)
+			}
+		}
+		utils.Success(c, gin.H{"accepted": true, "id": existingID, "deduped": true, "count": payloadMap["count"]})
+		return
+	}
+
+	payloadJSON, _ := json.Marshal(payloadMap)
 
 	entry := &model.SystemLog{
 		Ts:        time.Now().Unix(),
@@ -130,6 +176,26 @@ func (h *ClientErrorHandler) Report(c *gin.Context) {
 		return
 	}
 	utils.Success(c, gin.H{"accepted": true, "id": entry.ID})
+}
+
+// findDuplicate looks for an existing client-error row with the same
+// context and message within the dedup window. It returns the row's ID
+// and whether one was found. context is matched via a LIKE on the
+// payload JSON (it is not a column), message is a plain column.
+func (h *ClientErrorHandler) findDuplicate(context, message string) (uint, bool) {
+	cutoff := time.Now().Add(-h.dedupeWindow).Unix()
+	// Escape the context for a JSON string literal so the LIKE pattern
+	// matches the "context":"..." key value pair.
+	ctxJSON, _ := json.Marshal(context)
+	like := "%\"context\":" + string(ctxJSON) + "%"
+	var row model.SystemLog
+	err := h.db.Where("event_type = ? AND source = ? AND message = ? AND ts > ? AND payload LIKE ?",
+		"client.error", "web", message, cutoff, like).
+		Order("ts DESC").First(&row).Error
+	if err != nil {
+		return 0, false
+	}
+	return row.ID, true
 }
 
 // allow returns true if the caller may write a client-error row this

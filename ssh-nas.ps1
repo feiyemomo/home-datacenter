@@ -1,81 +1,77 @@
-# ssh-nas.ps1 — Convenient SSH wrapper for the NAS.
+# ssh-nas.ps1 — Interactive SSH toolbox for the home-datacenter NAS.
 #
-# Solves two pain points vs. raw ssh from PowerShell:
-#   1. Password auth — auto-provides the NAS password via SSH_ASKPASS
-#      (no interactive prompt, no sshpass needed on Windows).
-#   2. Shell quoting — PowerShell mangles bash commands containing
-#      quotes, parentheses, $vars, etc. The -File mode uploads a local
-#      script via scp and executes it remotely, so the script content
-#      is passed verbatim with ZERO escaping issues.
+# A convenient wrapper around ssh/scp for the daily NAS operations that
+# deploy-nas.ps1 doesn't cover: quick command execution, service status,
+# log tailing, container management, and disk usage. It reuses the same
+# SSH options / password-auth mechanism as deploy-nas.ps1 so the two
+# scripts stay consistent.
 #
 # Usage:
-#   .\ssh-nas.ps1 'docker ps'                       # run a simple command
-#   .\ssh-nas.ps1 -File diag.sh                     # upload + run a script
-#   .\ssh-nas.ps1 -File diag.sh -Download out.txt   # download script output
-#   .\ssh-nas.ps1 'uptime' -Password 'xxx'          # override password
-#   .\ssh-nas.ps1 'echo hi' -Host 192.168.1.3       # override host
+#   .\ssh-nas.ps1                    # interactive menu
+#   .\ssh-nas.ps1 -Command "docker ps"   # run one command, print, exit
+#   .\ssh-nas.ps1 -Menu              # force interactive menu (default)
+#   .\ssh-nas.ps1 -Password '@Fnos324'  # password auth (no SSH key)
 #
-# -File mode: the file is scp'd to /tmp/ssh-nas-script.<pid>.sh, executed
-# with `bash`, and deleted afterwards. Use this for anything non-trivial.
-#
-# -Download: captures the remote script's stdout+stderr to a temp file and
-# downloads it to the local path you specify. Useful for grepping long
-# output locally.
+# Interactive menu items:
+#   1) 服务状态      docker compose ps
+#   2) 查看日志      docker compose logs -f api (Ctrl-C 退出)
+#   3) 容器列表      docker ps
+#   4) 磁盘占用      df -h + du of data dir
+#   5) 转码缓存      du of .transcode-cache
+#   6) 清理转码缓存  remove cache older than N days
+#   7) 健康检查      curl API /health
+#   8) 自定义命令    任意 NAS 命令
+#   9) 退出
 
 [CmdletBinding()]
 param(
-    # Inline command to run. Ignored if -File is given. Quote carefully —
-    # for anything beyond a simple `docker ps`, prefer -File.
-    [Parameter(Position = 0)]
     [string]$Command,
-
-    # Local script file to upload and execute remotely. Avoids all
-    # PowerShell→bash escaping issues.
-    [string]$File,
-
-    # Local path to download the remote stdout/stderr to. Optional.
-    [string]$Download,
-
-    [string]$NasHost = "192.168.1.3",
-    [string]$User = "fnos-momo",
-    [int]$Port = 22,
-    [string]$Password = "@Fnos324"
+    [switch]$Menu,
+    # NAS password. Same mechanism as deploy-nas.ps1 (SSH_ASKPASS).
+    [string]$Password
 )
+
+# ============== CONFIG (keep in sync with deploy-nas.ps1) ==============
+$NAS_HOST   = "192.168.31.235"
+$NAS_USER   = "fnos-momo"
+$NAS_PORT   = 22
+$REMOTE_PATH = "/vol1/docker/home-datacenter"
+# =======================================================================
 
 $ErrorActionPreference = "Stop"
 
-# ---- Askpass setup (same mechanism as deploy-nas.ps1) ----
-$askpass = [System.IO.Path]::GetTempFileName() + "-askpass.bat"
-"@echo $Password" | Set-Content $askpass -Encoding ASCII
-$env:SSH_ASKPASS = $askpass
-$env:SSH_ASKPASS_REQUIRE = "force"
-$env:DISPLAY = "1"
-
+# ---- Password auth setup (SSH_ASKPASS) ----
+$script:AskpassFile = ""
+if ($Password) {
+    $script:AskpassFile = [System.IO.Path]::GetTempFileName() + "-askpass.bat"
+    "@echo $Password" | Set-Content $script:AskpassFile -Encoding ASCII
+    $env:SSH_ASKPASS = $script:AskpassFile
+    $env:SSH_ASKPASS_REQUIRE = "force"
+    $env:DISPLAY = "1"
+}
 function Remove-Askpass {
-    if (Test-Path $askpass) { Remove-Item $askpass -ErrorAction SilentlyContinue }
+    if ($script:AskpassFile -and (Test-Path $script:AskpassFile)) {
+        Remove-Item $script:AskpassFile -ErrorAction SilentlyContinue
+    }
 }
 trap { Remove-Askpass; break }
-Register-EngineEvent PowerShell.Exiting -Action { Remove-Item $askpass -ErrorAction SilentlyContinue } | Out-Null
+Register-EngineEvent PowerShell.Exiting -Action { Remove-Askpass } | Out-Null
 
-$sshOpts = @("-p", "$Port",
-             "-o", "StrictHostKeyChecking=no",
-             "-o", "UserKnownHostsFile=NUL",
-             "-o", "ConnectTimeout=10",
-             "-o", "PreferredAuthentications=password",
-             "-o", "PubkeyAuthentication=no",
-             "-o", "NumberOfPasswordPrompts=1")
-$scpOpts = @("-P", "$Port") + $sshOpts[2..($sshOpts.Length - 1)]
-
-function Invoke-SSH {
-    param([string]$RemoteCmd)
+function Invoke-NasSSH {
+    param([Parameter(Mandatory)][string]$RemoteCmd)
+    $sshOpts = @("-p", "$NAS_PORT",
+                 "-o", "StrictHostKeyChecking=no",
+                 "-o", "UserKnownHostsFile=NUL",
+                 "-o", "ConnectTimeout=10")
+    if ($Password) {
+        $sshOpts += @("-o", "PreferredAuthentications=password",
+                      "-o", "PubkeyAuthentication=no",
+                      "-o", "NumberOfPasswordPrompts=1")
+    }
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        # Out-Host is critical: without it, ssh's stderr (e.g. "Warning:
-        # Permanently added ...") pollutes the pipeline and corrupts the
-        # function's return value (PowerShell merges all pipeline output
-        # with the `return` value into the caller's $result).
-        & ssh @sshOpts "$User@$NasHost" $RemoteCmd 2>&1 | Out-Host
+        & ssh @sshOpts "$NAS_USER@$NAS_HOST" $RemoteCmd 2>&1 | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -83,66 +79,58 @@ function Invoke-SSH {
     return $code
 }
 
-function Invoke-SCP {
-    param([string]$LocalPath, [string]$RemoteDest)
-    $prevEAP = $ErrorActionPreference
-    $ErrorActionPreference = "Continue"
-    try {
-        & scp @scpOpts $LocalPath $RemoteDest 2>&1 | Out-Host
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $prevEAP
-    }
-    return $code
+function Show-Menu {
+    Write-Host ""
+    Write-Host "========== NAS SSH 工具箱 ($NAS_HOST) ==========" -ForegroundColor Cyan
+    Write-Host "  1) 服务状态        docker compose ps"
+    Write-Host "  2) 查看日志        docker compose logs -f api"
+    Write-Host "  3) 容器列表        docker ps"
+    Write-Host "  4) 磁盘占用        df -h + data 目录占用"
+    Write-Host "  5) 转码缓存        .transcode-cache 占用"
+    Write-Host "  6) 清理转码缓存    删除 N 天前的缓存"
+    Write-Host "  7) 健康检查        curl API /health"
+    Write-Host "  8) 自定义命令      输入任意 NAS 命令"
+    Write-Host "  9) 退出"
+    Write-Host "================================================" -ForegroundColor Cyan
 }
 
-# ---- Mode: file upload + execute ----
-if ($File) {
-    if (-not (Test-Path $File)) {
-        Write-Error "File not found: $File"
-        Remove-Askpass
-        exit 1
+function Invoke-MenuItem {
+    param([int]$Choice)
+    switch ($Choice) {
+        1 { Invoke-NasSSH "cd '$REMOTE_PATH' && docker compose ps" }
+        2 { Invoke-NasSSH "cd '$REMOTE_PATH' && docker compose logs -f api" }
+        3 { Invoke-NasSSH "docker ps" }
+        4 { Invoke-NasSSH "df -h /vol1; echo '---'; du -sh '$REMOTE_PATH/data' 2>/dev/null; du -sh '$REMOTE_PATH/data/frigate/recordings' 2>/dev/null" }
+        5 { Invoke-NasSSH "du -sh '$REMOTE_PATH/data/recordings/.transcode-cache' 2>/dev/null; echo '---'; find '$REMOTE_PATH/data/recordings/.transcode-cache' -name '*.mp4' 2>/dev/null | wc -l" }
+        6 {
+            $days = Read-Host "删除几天前的缓存 (默认 7)"
+            if ([string]::IsNullOrWhiteSpace($days)) { $days = "7" }
+            Invoke-NasSSH "find '$REMOTE_PATH/data/recordings/.transcode-cache' -name '*.mp4' -mtime +$days -delete 2>/dev/null; echo '清理完成'; du -sh '$REMOTE_PATH/data/recordings/.transcode-cache' 2>/dev/null"
+        }
+        7 { Invoke-NasSSH "curl -s http://localhost:8080/health; echo" }
+        8 {
+            $cmd = Read-Host "输入 NAS 命令"
+            if ($cmd) { Invoke-NasSSH $cmd }
+        }
+        9 { Write-Host "再见" -ForegroundColor Green; exit 0 }
+        default { Write-Host "无效选项" -ForegroundColor Red }
     }
-    $pid_ = $PID
-    $remoteScript = "/tmp/ssh-nas-script.$pid_.sh"
-    $remoteOut = "/tmp/ssh-nas-out.$pid_.txt"
+}
 
-    Write-Host "==> Uploading $File -> $remoteScript" -ForegroundColor Cyan
-    $code = Invoke-SCP -LocalPath $File -RemoteDest "${User}@${NasHost}:$remoteScript"
-    if ($code -ne 0) {
-        Write-Error "scp upload failed."
-        Remove-Askpass
-        exit $code
-    }
-
-    Write-Host "==> Executing remotely..." -ForegroundColor Cyan
-    # bash <script> > <out> 2>&1; then cat the out so it streams to our stdout too.
-    $execCmd = "bash $remoteScript > $remoteOut 2>&1; cat $remoteOut; rm -f $remoteScript $remoteOut"
-    $code = Invoke-SSH -RemoteCmd $execCmd
-    if ($Download) {
-        Write-Host "==> (re-running for -Download capture)" -ForegroundColor Yellow
-        $remoteScript2 = "/tmp/ssh-nas-script2.$pid_.sh"
-        $remoteOut2 = "/tmp/ssh-nas-out2.$pid_.txt"
-        Invoke-SCP -LocalPath $File -RemoteDest "${User}@${NasHost}:$remoteScript2" | Out-Null
-        Invoke-SSH -RemoteCmd "bash $remoteScript2 > $remoteOut2 2>&1; rm -f $remoteScript2" | Out-Null
-        Invoke-SCP -LocalPath "${User}@${NasHost}:$remoteOut2" -RemoteDest $Download | Out-Null
-        Invoke-SSH -RemoteCmd "rm -f $remoteOut2" | Out-Null
-        Write-Host "    Output saved to: $Download" -ForegroundColor Green
-    }
+# ---- Single-shot command mode ----
+if ($Command) {
+    $exitCode = Invoke-NasSSH $Command
     Remove-Askpass
-    exit $code
+    exit $exitCode
 }
 
-# ---- Mode: inline command ----
-if (-not $Command) {
-    Write-Host "Usage: .\ssh-nas.ps1 'command'  |  .\ssh-nas.ps1 -File script.sh" -ForegroundColor Yellow
-    Remove-Askpass
-    exit 1
+# ---- Interactive menu mode ----
+while ($true) {
+    Show-Menu
+    $choice = Read-Host "请选择"
+    if ($choice -match '^\d+$') {
+        Invoke-MenuItem ([int]$choice)
+    } else {
+        Write-Host "请输入数字" -ForegroundColor Red
+    }
 }
-
-# Pass the command directly (same pattern as deploy-nas.ps1). ssh sends
-# it to the remote shell verbatim. For commands containing parentheses,
-# $vars, nested quotes, etc., use -File mode to avoid bash parsing issues.
-$code = Invoke-SSH -RemoteCmd $Command
-Remove-Askpass
-exit $code

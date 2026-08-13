@@ -40,6 +40,17 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    # v1.8.26: VAAPI hardware transcoding. /dev/dri/renderD128 is the
+    # Intel iGPU render node on the NAS (Celeron J4125). Passing it in
+    # lets PlayRecording use h264_vaapi instead of software libx264,
+    # cutting a 60s clip transcode from ~40s to ~3s. group_add 105 =
+    # the render group GID on the NAS; the container's app user (UID
+    # 1000) needs membership to open the device node. camera_handler.go
+    # falls back to libx264 automatically if the device is absent.
+    devices:
+      - /dev/dri/renderD128:/dev/dri/renderD128
+    group_add:
+      - "105"
     # Bind to 0.0.0.0 so LAN devices can reach the API directly.
     # In production behind Cloudflare Tunnel, the tunnel reaches the
     # API by service name (home-api) on the internal network.

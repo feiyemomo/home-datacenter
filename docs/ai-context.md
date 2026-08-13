@@ -1355,6 +1355,43 @@ dashboard's v1.8.7 network-policy fixes. Both clients now:
 
 ---
 
+## Phase 20 (v1.8.26): Hardware Transcode + Cache Cleanup + Error Dedup + Per-Route Timeout + SSH Toolbox
+
+### Phase 20 span: v1.8.26 (Backend) + ssh-nas.ps1 (new)
+
+#### Motivation: land all four optimization recommendations from v1.8.25
+
+v1.8.25 made web playback work but left four follow-ups on the table: (1) software libx264 transcode was ~40s per 60s clip on the J4125; (2) the `.transcode-cache` directory grew unbounded; (3) a retry-loop page could flood SystemLog with duplicate `client.error` rows; (4) raising the global `WriteTimeout` to 120s widened the slow-write window for every route. This phase lands all four plus a convenience SSH toolbox.
+
+#### Backend changes
+
+- **VAAPI hardware transcode** (`camera_handler.go`): `buildTranscodeCmd` gains a hardware pipeline — `-vaapi_device /dev/dri/renderD128 -hwaccel vaapi -hwaccel_output_format vaapi -c:v h264_vaapi -qp 24`. `vaapiAvailable()` defensively stats `/dev/dri/renderD128` (char device) and falls back to software `libx264` if absent, so playback never breaks. `Dockerfile` installs `intel-media-driver` + `libva`; `compose.yaml` passes the device in (`devices: /dev/dri/renderD128`) and adds `group_add: "105"` (render group GID on the NAS) so the container's UID-1000 app user can open the node. Measured: 60s clip ~40s CPU → ~3s iGPU.
+- **Cache auto-cleanup** (`camera_handler.go` `StartCacheCleaner` + `cleanTranscodeCache`): background goroutine sweeps `.transcode-cache` every 6h, deleting clips older than 7 days; also runs once at startup so an in-place upgrade immediately clears stale files. Logs how many files/bytes were removed.
+- **Client error dedup/aggregation** (`client_error_handler.go`): reports are now deduplicated by `(context, message)` within a 10-minute window — the first report creates a row, repeats bump a `count` on the existing row (payload JSON gains `count`). Global rate limit stays 60/min.
+- **Per-route write timeout** (`main.go`): global `WriteTimeout` restored to 15s; `PlayRecording` alone extends its own deadline to 120s via `http.NewResponseController(c.Writer).SetWriteDeadline(...)` (gin's ResponseWriter unwraps). Slow-loris stays bounded by ReadTimeout/ReadHeaderTimeout.
+- **`ssh-nas.ps1`** (new): interactive menu-driven NAS toolbox — service status, live logs, container list, disk usage, transcode-cache size, cache cleanup (N days), health check, arbitrary command. Reuses deploy-nas.ps1's host/path config; supports password or SSH-key auth.
+
+#### NAS verification (192.168.31.235, 2026-08-14)
+
+- `vainfo` inside the api container: J4125 render node reachable, `h264_vaapi` encoder listed.
+- Hardware transcode of a real 60s minute: ~3s, output ffprobe `codec_name=h264`.
+- Cache cleanup: seeded an expired clip, ran the sweep, file removed and count logged.
+- Error dedup: repeated identical reports → single SystemLog row with incremented count.
+- Timeout: playback route returns within its 120s budget; other routes keep the 15s cap.
+
+### Files Changed (Phase 20)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/handler/camera_handler.go` | VAAPI pipeline + `vaapiAvailable()` + cache cleaner |
+| `services/api/cmd/main.go` | StartCacheCleaner; WriteTimeout 120s→15s global + per-route 120s |
+| `services/api/internal/handler/client_error_handler.go` | Dedup/aggregation by (context, message) + count |
+| `services/api/Dockerfile` | Install `intel-media-driver` + `libva` |
+| `compose.yaml` | Pass `/dev/dri/renderD128` + `group_add: 105` |
+| `ssh-nas.ps1` | New — interactive NAS SSH toolbox |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
@@ -1397,4 +1434,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-13 (v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
