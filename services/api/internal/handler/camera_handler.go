@@ -980,14 +980,62 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 		return
 	}
 
-	// Single segment: serve directly (fast path, no ffmpeg needed).
-	if len(paths) == 1 {
+	// v1.8.25: transcode to H.264 regardless of segment count. Frigate
+	// records the camera's native stream (HEVC/H.265 on Hikvision) with
+	// -c:v copy, and a raw stream-copy serve does NOT decode in Chrome
+	// (no HEVC support in the <video> element). Transcoding here is what
+	// makes web monitoring playback work on every browser. The single-
+	// segment fast path is removed because it too served raw HEVC.
+	//
+	// v1.8.25: result is cached on disk so re-plays of the same minute
+	// are instant (see transcodeRecording).
+	h.transcodeRecording(c, cam, minuteStart, paths)
+}
+
+// transcodeRecording concatenates the given recording segments into a
+// single H.264/AAC MP4 and serves it, transcoding on the fly so ANY
+// browser/player can decode it.
+//
+// Why transcode: Frigate's record input is the camera's plain RTSP
+// (`-c:v copy`, see deploy/frigate/config.yml), so on Hikvision the
+// stored segments are HEVC/H.265 + PCMA audio. Chromium lacks HEVC
+// decoding in <video>, Firefox only with proprietary plugins — a raw
+// stream-copy serve fails to play (black screen / onError). We force
+// libx264 (High profile) + AAC. libx264 is built into Alpine's ffmpeg
+// package, so no extra image dependency.
+//
+// v1.8.25 disk cache: software transcoding a 60s segment on the NAS
+// (Celeron J4125, no VAAPI in the API container) takes ~40s of CPU.
+// Without a cache every request — including the operator re-viewing
+// the same minute — pays that full cost before the first frame loads,
+// which makes monitoring playback feel broken. Past-minute segments
+// are immutable (Frigate only appends to the running minute), so we
+// transcode once and reuse the result for all later requests.
+//
+// Cache location: /data/recordings/.transcode-cache/<camID>/<minuteStart>.mp4
+// /data/recordings is a writable bind mount (see compose.yaml). Keying by
+// minuteStart bounds the cache to one small MP4 per viewed camera-minute
+// and makes invalidation trivial (delete the file to re-transcode).
+//
+// -fflags +genpts -avoid_negative_ts make_zero regenerate PTS/DTS so
+// the concatenated 10s segments have continuous timestamps (no glitch
+// at each boundary). -movflags faststart puts moov at the front for
+// instant playback.
+func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, minuteStart int64, paths []string) {
+	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
+	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d.mp4", minuteStart))
+
+	// Serve from cache if present and non-empty. A past minute's segments
+	// never change, so a cached transcode is correct indefinitely.
+	serve := func(path string) {
 		c.Header("Cache-Control", "no-store")
-		http.ServeFile(c.Writer, c.Request, paths[0])
+		http.ServeFile(c.Writer, c.Request, path)
+	}
+	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {
+		serve(cacheFile)
 		return
 	}
 
-	// Multiple segments: concatenate with ffmpeg stream copy.
 	tmpDir, err := os.MkdirTemp("", "rec_")
 	if err != nil {
 		log.Printf("[handler] create temp dir: %v", err)
@@ -1010,29 +1058,51 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 		return
 	}
 
-	// Run ffmpeg: concat demuxer + stream copy + faststart (moov at
-	// start for instant playback). Output to temp file, then serve.
-	outPath := filepath.Join(tmpDir, "out.mp4")
-	// v1.6.39: add -fflags +genpts -avoid_negative_ts make_zero to
-	// regenerate PTS/DTS so the concatenated 10s segments have
-	// continuous timestamps. Without this, ExoPlayer sees PTS jumps
-	// at each segment boundary, causing visual glitches every ~10s.
+	// Write the ffmpeg output into a temp file INSIDE the cache directory,
+	// so it lives on the same filesystem as the final cache file. A rename
+	// across filesystems (e.g. /tmp on the overlay FS vs /data/recordings on
+	// the host bind mount) fails with "invalid cross-device link", so the
+	// output must be born on the destination volume to be promotable.
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		log.Printf("[handler] mkdir cache dir: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "create cache dir")
+		return
+	}
+	tmpOut := filepath.Join(cacheDir, fmt.Sprintf(".tmp-%d.mp4", minuteStart))
+	os.Remove(tmpOut) // clear a stale temp from a previous crash
+	defer os.Remove(tmpOut)
+
 	cmd := exec.Command("ffmpeg", "-y",
 		"-f", "concat", "-safe", "0",
 		"-i", listPath,
-		"-c", "copy",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-c:a", "aac", "-b:a", "96k",
 		"-fflags", "+genpts",
 		"-avoid_negative_ts", "make_zero",
 		"-movflags", "faststart",
-		outPath)
+		tmpOut)
 	if output, err := cmd.CombinedOutput(); err != nil {
-		log.Printf("PlayRecording: ffmpeg concat failed: %v: %s", err, string(output))
-		utils.Fail(c, http.StatusInternalServerError, "ffmpeg concat failed")
+		log.Printf("PlayRecording: ffmpeg transcode failed: %v: %s", err, string(output))
+		utils.Fail(c, http.StatusInternalServerError, "ffmpeg transcode failed")
 		return
 	}
 
-	c.Header("Cache-Control", "no-store")
-	http.ServeFile(c.Writer, c.Request, outPath)
+	// Promote to the cache only for "closed" minutes. The minute containing
+	// minuteStart is still being written while it is the current minute
+	// (Frigate appends segments until the minute rolls over); caching a
+	// partial clip would serve a truncated/replayed-tail video forever.
+	// Past minutes are immutable, so rename the temp output into the cache
+	// atomically — a rename never exposes a half-written file to a reader.
+	finalPath := tmpOut
+	if time.Now().Unix()-minuteStart > 90 {
+		if err := os.Rename(tmpOut, cacheFile); err == nil {
+			finalPath = cacheFile
+		} else {
+			log.Printf("PlayRecording: cache promote failed (serving temp): %v", err)
+		}
+	}
+
+	serve(finalPath)
 }
 
 // humanSize is exposed at handler scope (mirrors camera.humanSize).

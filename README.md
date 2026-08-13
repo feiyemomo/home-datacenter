@@ -605,6 +605,35 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 - Web: v1.8.24（无改动）
 - Android: v1.8.24
 
+### v1.8.25 — Web 回放修复 + 客户端错误上报 + 转码缓存 (2026-08-13)
+
+> **本次修复了 Web 监控回放"看不了"的根因**：之前回放接口转码耗时超过服务器 15s 写超时，连接被强制关闭，浏览器收不到任何响应。详见下方「后端」第 1、2 条。
+
+#### 后端
+- **回放转码为 H.264**：`camera_handler.go` 的 `PlayRecording` 不再直接串流 Frigate 录制的原始码流（海康摄像头为 HEVC/H.265，Chrome `<video>` 无法解码），改为用 ffmpeg 实时转码为 H.264/AAC（libx264 veryfast + crf23 + faststart），任意浏览器均可播放
+- **修复写超时断连**：`main.go` 将 `http.Server.WriteTimeout` 从 15s 提升到 120s。转码约需 40s，旧配置在转码期间超时导致连接被 Go 服务器关闭（回放表现为黑屏/无响应）
+- **转码结果磁盘缓存**：`transcodeRecording` 将转码产物缓存到 `/data/recordings/.transcode-cache/<摄像头ID>/<分钟起始时间戳>.mp4`
+  - 首次播放某分钟约 40s（转码），之后同分钟瞬时播放（<0.2s）
+  - 产物写入缓存目录内临时文件后原子 rename（避免跨文件系统 `invalid cross-device link`）
+  - 仅缓存"已结束"的分钟（minuteStart 早于当前 90s），避免缓存正在写入的片段
+- **客户端错误上报端点**：新增 `POST /api/v1/system/client-errors`（`client_error_handler.go`），接收前端上报的 JS 异常 / 播放失败，写入 SystemLog（`event_type=client.error`），带频率限制（60条/分钟）
+- **API 容器 ffmpeg**：`Dockerfile` 安装 `ffmpeg` + `tzdata`（Alpine 自带 libx264/aac 编码器）
+
+#### Web
+- **全局错误上报**：`main.tsx` 安装 `window.onerror` + `unhandledrejection` 监听，未捕获异常自动上报后端
+- **播放失败上报**：`RecordingTimeline.tsx` 的 `<video>` onError 时上报 `recording.playback`（含 MediaError code 与 URL），便于远程定位回放问题
+- 新增 `lib/errorReport.ts` 上报工具（本地 2s 限流，静默失败不影响业务）
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-13 复验）
+- 首次请求 `GET /cameras/10/recordings/1786617960/file`：HTTP 200，耗时 39.6s，返回 52MB H.264 视频（ffprobe 确认 `codec_name=h264, profile=High, 2560x1440`）
+- 二次请求同 recId：HTTP 200，耗时 0.075s（缓存命中，字节一致）
+- `POST /system/client-errors` 上报成功，SystemLog 中可查询到 `client.error` 记录（`event_type=client.error`）
+
+#### 版本
+- Backend: v1.8.25
+- Web: v1.8.25
+- Android: v1.8.24（无改动）
+
 ### v1.8.22 — 审计日志大幅拓展 (2026-08-12)
 
 #### 后端

@@ -11,6 +11,7 @@ import {
     Gauge,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { reportClientError } from "@/lib/errorReport";
 import { Badge } from "@/components/ui/badge";
 import {
     listRecordings,
@@ -587,7 +588,20 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                             // video element errors (network/decode/src).
                             // Most common causes: JWT cookie missing,
                             // backend 404, or HEVC decode failure.
-                            setPlayError("视频加载失败，请检查网络或浏览器解码能力");
+                            const el = videoRef.current;
+                            const code = el?.error?.code;
+                            const detail = el?.error?.message;
+                            const msg = "视频加载失败，请检查网络或浏览器解码能力";
+                            setPlayError(msg);
+                            // v1.8.25: report to the backend so the
+                            // operator can see playback failures in the
+                            // system log (MediaError code + URL).
+                            reportClientError({
+                                level: "critical",
+                                context: `recording.playback code=${code ?? "?"}`,
+                                message: detail ? `${msg} — ${detail}` : msg,
+                                url: videoUrl ?? undefined,
+                            });
                         }}
                     />
                     {/* Long-press 5x indicator */}
