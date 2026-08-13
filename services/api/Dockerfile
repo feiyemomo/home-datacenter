@@ -20,8 +20,9 @@ FROM alpine:latest
 WORKDIR /
 
 # ffmpeg is used by PlayRecording to concatenate Frigate's 10s
-# recording segments into 60s clips on the fly (stream copy, no
-# re-encoding — sub-second for ~24MB of data).
+# recording segments into 60s clips and transcode HEVC→H.264 on the
+# fly (v1.8.25). Alpine's ffmpeg bundles libx264 + aac, so no extra
+# packages are needed for the browser-compatible h264/aac output.
 # tzdata is required so the TZ=Asia/Shanghai env var (set in
 # compose.yaml) actually takes effect. Without tzdata, Alpine's
 # musl libc has no timezone database — `date` returns UTC and

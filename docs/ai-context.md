@@ -1355,4 +1355,46 @@ dashboard's v1.8.7 network-policy fixes. Both clients now:
 
 ---
 
-**Last Updated:** 2026-08-13 (v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 18 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
+
+### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
+
+#### Problem: Web monitoring playback was broken
+
+Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 10s segments are **HEVC/H.265 + PCMA**. Chromium's HTML5 `<video>` has no HEVC decoder, so a raw stream-copy serve shows a black screen / fires `onError`. Compounding it, the on-the-fly transcode took ~40s but `http.Server.WriteTimeout` was 15s — the server dropped the connection mid-transcode before sending any bytes, so even the transcode path appeared broken.
+
+#### Backend fixes (`camera_handler.go`, `main.go`, `client_error_handler.go`)
+
+- **`PlayRecording` → `transcodeRecording`**: always transcode the minute's segments to H.264/AAC via ffmpeg (`libx264 veryfast + crf23 + aac 96k + faststart + genpts`). Removed the single-segment stream-copy fast path (it too served raw HEVC). Any browser/player can now decode the result.
+- **WriteTimeout 15s → 120s** (`main.go`): the deadline no longer fires during a ~40s software transcode. Slow-loris remains bounded by ReadTimeout/ReadHeaderTimeout.
+- **Disk cache** (`/data/recordings/.transcode-cache/<camID>/<minuteStart>.mp4`): transcode once per past minute, then serve instantly on re-play. Keying by `minuteStart` bounds cache size to one clip per viewed camera-minute. The ffmpeg output temp file is created **inside** the cache dir so the atomic `os.Rename` stays on one filesystem (avoids `invalid cross-device link`). Only "closed" minutes (minuteStart > 90s in the past) are promoted to cache to avoid caching a still-writing clip.
+- **`POST /api/v1/system/client-errors`** (`client_error_handler.go`): ingests fire-and-forget reports from the web UI (JS exceptions, unhandled rejections, failed media playback) and persists them as `event_type=client.error` SystemLog rows with stack/url/context. Global rate limit 60/min to stop a retry-loop page from flooding SQLite.
+- **`Dockerfile`**: installs `ffmpeg` + `tzdata` (Alpine bundles libx264/aac encoders).
+
+#### Web fixes (`main.tsx`, `RecordingTimeline.tsx`, `lib/errorReport.ts`)
+
+- `window.onerror` + `unhandledrejection` listeners forward uncaught errors to the backend.
+- `<video>` onError reports `recording.playback` with the MediaError code and URL.
+- `errorReport.ts` is a defensive sender: local 2s rate limit, swallows all errors (reporting must never break the app), auto-attaches the JWT.
+
+#### NAS verification (192.168.31.235, e2e re-run)
+
+- First `GET /cameras/10/recordings/1786617960/file`: HTTP 200, 52,412,674 bytes, 39.6s (transcode). ffprobe: `codec_name=h264, profile=High, 2560x1440`.
+- Second request, same recId: HTTP 200, 0.075s, byte-identical (cache hit).
+- `POST /system/client-errors` → `{"accepted":true,"id":4297}`; `GET /system/logs?event_type=client.error` returns the persisted row.
+
+### Files Changed (Phase 19)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/handler/camera_handler.go` | `PlayRecording` → `transcodeRecording` (H.264 + disk cache) |
+| `services/api/cmd/main.go` | WriteTimeout 15s→120s; register `/system/client-errors` |
+| `services/api/internal/handler/client_error_handler.go` | New — client error ingest → SystemLog (rate-limited) |
+| `services/api/Dockerfile` | Install `ffmpeg` + `tzdata` |
+| `web/src/main.tsx` | Global `window.onerror` / `unhandledrejection` reporting |
+| `web/src/components/RecordingTimeline.tsx` | `<video>` onError → `recording.playback` report |
+| `web/src/lib/errorReport.ts` | New — fire-and-forget error sender |
+
+---
+
+**Last Updated:** 2026-08-13 (v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

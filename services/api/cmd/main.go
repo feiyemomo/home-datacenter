@@ -182,6 +182,7 @@ func main() {
 	}
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 	systemLogHandler := handler.NewSystemLogHandler(database.DB)
+	clientErrorHandler := handler.NewClientErrorHandler(database.DB)
 
 	// ---- Phase 4: Camera platformization (continued) ----
 	//
@@ -384,6 +385,12 @@ func main() {
 			// subscriber. Newest first; supports limit/offset/
 			// event_type filters (see SystemLogHandler.List).
 			system.GET("/logs", systemLogHandler.List)
+			// v1.8.25: client-side error ingest. The web frontend
+			// fire-and-forgets uncaught JS errors / failed media
+			// playback here; the handler persists them as
+			// "client.error" SystemLog rows so they surface in the
+			// log pane (see ClientErrorHandler).
+			system.POST("/client-errors", clientErrorHandler.Report)
 		}
 		// Admin-only system routes. DELETE /logs/:id requires admin
 		// so a non-admin authenticated user can read audit logs but
@@ -556,9 +563,19 @@ func main() {
 		Handler:           r,
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		WriteTimeout:      15 * time.Second,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20, // 1MB
+		// v1.8.25: WriteTimeout raised from 15s to 120s. PlayRecording
+		// transcodes a 60s HEVC clip to H.264 on the fly (software
+		// libx264, ~40s on the J4125 NAS) BEFORE writing any response
+		// bytes. With the old 15s WriteTimeout the deadline fires during
+		// the transcode and Go closes the connection, so curl/browser
+		// never receive a response — the web playback appeared broken.
+		// 120s covers the transcode + serving a ~60MB clip on LAN with
+		// headroom. Slow-loris is still bounded by ReadTimeout /
+		// ReadHeaderTimeout (request body reads), and IdleTimeout
+		// reaps idle keep-alive connections.
+		WriteTimeout:   120 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
 	if err := s.ListenAndServe(); err != nil {
