@@ -30,9 +30,16 @@ WORKDIR /
 # time.Local (UTC). This caused the "8-hour time offset" bug:
 # RecordingSegmentsForMinute used .In(loc) with loc=UTC instead
 # of Asia/Shanghai, so it looked up recording directories 8 hours
-# behind the real LOCAL date/hour layout that Frigate (with tzdata
+# behind of the real LOCAL date/hour layout that Frigate (with tzdata
 # baked into its Debian-based image) had created.
-RUN apk add --no-cache ffmpeg tzdata
+#
+# v1.8.26: intel-media-driver + libva give ffmpeg access to the Intel
+# iGPU (Celeron J4125 / Gemini Lake) via /dev/dri/renderD128, so
+# PlayRecording can use h264_vaapi instead of software libx264 (~40s →
+# ~3s per 60s clip). The device node is passed in by compose.yaml
+# (devices + group_add render); camera_handler.go falls back to
+# libx264 automatically if the device is absent or the driver errors.
+RUN apk add --no-cache ffmpeg tzdata intel-media-driver libva
 
 COPY --from=builder /app/server .
 COPY --from=builder /app/configs ./configs

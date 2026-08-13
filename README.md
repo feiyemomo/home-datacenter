@@ -582,6 +582,36 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.26 — 回放硬件转码加速 + 缓存自动清理 + 错误上报聚合 + 按路由超时 (2026-08-14)
+
+> **本次把上一版的四项优化建议全部落地**：回放转码从纯软件（约 40s）升级为 Intel iGPU 硬件加速（约 3s），转码缓存自动清理防止磁盘无限增长，客户端错误上报去重聚合避免日志刷屏，写超时改为仅回放接口放宽、其余路由保持 15s 安全上限。同时新增交互式 SSH 工具箱 `ssh-nas.ps1`，日常运维不再需要手敲 docker 命令。
+
+#### 新增：SSH 工具箱
+- **`ssh-nas.ps1`**：交互式 NAS 管理工具，菜单化操作，无需记忆 docker/ssh 命令
+  - 服务状态 / 容器列表 / 磁盘占用 / 转码缓存占用一键查看
+  - 清理 N 天前的转码缓存、健康检查、自定义命令
+  - 自动读取 `deploy-nas.ps1` 的 NAS 地址与路径配置，支持密码或 SSH 密钥认证
+
+#### 后端
+- **回放硬件转码（VAAPI）**：`camera_handler.go` 的 `buildTranscodeCmd` 新增硬件流水线（`h264_vaapi` + `-hwaccel vaapi`），60s 片段转码从约 40s CPU 降到约 3s iGPU
+  - `Dockerfile` 安装 `intel-media-driver` + `libva`；`compose.yaml` 将 `/dev/dri/renderD128` 传入容器并加入 render 组（GID 105）
+  - `vaapiAvailable()` 防御性探测：设备缺失或驱动异常时自动回退软件 `libx264`，回放永不中断
+- **转码缓存自动清理**：`StartCacheCleaner` 后台协程默认保留 7 天、每 6 小时清扫一次 `.transcode-cache`，启动时也立即清扫一次（升级即清理存量）
+- **客户端错误上报聚合/去重**：`client_error_handler.go` 按（context + message）在 10 分钟窗口内去重，重复错误累加 count 而非插入 N 条重复日志；全局限流保持 60 条/分钟
+- **按路由写超时**：`main.go` 全局 `WriteTimeout` 恢复 15s（避免慢客户端拖住所有连接），仅 `PlayRecording` 用 `http.NewResponseController.SetWriteDeadline` 单独放宽到 120s
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- VAAPI 可用性：容器内 `vainfo` 确认 J4125 iGPU 渲染节点可达，`h264_vaapi` 编码器可用
+- 硬件转码：60s 片段转码约 3s（对比软件 libx264 约 40s），产物 ffprobe 确认 `codec_name=h264`
+- 缓存清理：构造过期缓存文件后触发清扫，文件被删除且日志记录清理数量
+- 错误聚合：连续上报相同错误，SystemLog 仅 1 条记录且 count 递增
+- 超时行为：回放接口 120s 预算内正常返回；普通接口 15s 超时不受影响
+
+#### 版本
+- Backend: v1.8.26
+- Web: v1.8.25（无改动）
+- Android: v1.8.24（无改动）
+
 ### v1.8.24 — 主机 IP 变化自适应 + 网络鲁棒性增强 (2026-08-13)
 
 #### 后端

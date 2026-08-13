@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -194,6 +195,13 @@ func main() {
 		OutputDir: cfg.Camera.RecordingDir,
 	}
 	camHandler := handler.NewCameraHandler(camReg, camONVIF, camRecorder, cfg.Camera.WebRTCPublicBase, cfg.Camera.ICEServers, userService, bus)
+
+	// v1.8.26: start the transcode-cache cleaner. Keeps the
+	// .transcode-cache directory bounded (default: keep 7 days, sweep
+	// every 6 hours) so replayed camera-minutes don't accumulate
+	// forever. Root is the recordings dir; the cache lives under
+	// <RecordingDir>/.transcode-cache.
+	camHandler.StartCacheCleaner(filepath.Join(cfg.Camera.RecordingDir, ".transcode-cache"), 7*24*time.Hour, 6*time.Hour)
 
 	// Purge any soft-deleted camera rows left over from older
 	// deployments where Unregister performed a soft delete. Those
@@ -563,17 +571,19 @@ func main() {
 		Handler:           r,
 		ReadTimeout:       15 * time.Second,
 		ReadHeaderTimeout: 10 * time.Second,
-		// v1.8.25: WriteTimeout raised from 15s to 120s. PlayRecording
-		// transcodes a 60s HEVC clip to H.264 on the fly (software
-		// libx264, ~40s on the J4125 NAS) BEFORE writing any response
-		// bytes. With the old 15s WriteTimeout the deadline fires during
-		// the transcode and Go closes the connection, so curl/browser
-		// never receive a response — the web playback appeared broken.
-		// 120s covers the transcode + serving a ~60MB clip on LAN with
-		// headroom. Slow-loris is still bounded by ReadTimeout /
-		// ReadHeaderTimeout (request body reads), and IdleTimeout
-		// reaps idle keep-alive connections.
-		WriteTimeout:   120 * time.Second,
+		// v1.8.26: WriteTimeout restored to 15s. v1.8.25 had raised it
+		// to 120s globally so PlayRecording's software transcode (~40s)
+		// wouldn't trip the deadline before writing any bytes. But that
+		// widened the slow-write window for EVERY route (a slow client
+		// could hold a connection open for 2 minutes). Go's WriteTimeout
+		// actually starts counting at request read (verified), so we only
+		// need to extend the deadline for the one long-running route:
+		// PlayRecording calls http.NewResponseController(c.Writer).
+		// SetWriteDeadline at the top of the handler to get its own
+		// 120s budget, while every other route stays bounded at 15s.
+		// Slow-loris is still bounded by ReadTimeout / ReadHeaderTimeout,
+		// and IdleTimeout reaps idle keep-alive connections.
+		WriteTimeout:   15 * time.Second,
 		IdleTimeout:    60 * time.Second,
 		MaxHeaderBytes: 1 << 20, // 1MB
 	}
