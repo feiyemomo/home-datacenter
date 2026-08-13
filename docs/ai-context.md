@@ -1299,4 +1299,60 @@ dashboard's v1.8.7 network-policy fixes. Both clients now:
 
 ---
 
-**Last Updated:** 2026-08-11 (v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. See Phase 17 above. Earlier: v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+## Phase 18 (v1.8.24): Host IP Change Self-Adaptation + Network Robustness
+
+### Phase 18 span: v1.8.24 (Backend) + v1.8.24 (Android)
+
+#### Backend — LAN IP Auto-Detection & Resilience
+
+**`frigate.go` — `lanIPDetector`:**
+- New `lanIPDetector` struct tracks the NAS LAN IPv4 address by observing incoming HTTP request Host headers.
+- `UpdateFromHost(host)` parses the Host header, accepts only RFC 1918 private IPv4 addresses, stores the detected IP, and fires an async `OnChange` callback when the IP is first detected or changes.
+- `Get()` returns `NAS_LAN_IP` env var if set, else the auto-detected value (explicit operator config wins).
+- `GlobalLanIP` is the package-level singleton injected by `main.go`.
+
+**`main.go` — middleware wiring:**
+- Global Gin middleware calls `camera.GlobalLanIP.UpdateFromHost(c.Request.Host)` on every request (zero overhead on the hot path — the detector short-circuits when the IP hasn't changed).
+- `SetOnChange` callback pushes updated WebRTC candidates to Frigate via `frigate.SetWebRTCCandidates(ctx, ipv6Addr)`, honoring `NAS_IPV6_DISABLED` to blank the IPv6 address.
+
+**`registry.go` — resilience:**
+- ONVIF `profile_token` discovery retry: if registration can't obtain a token, a background loop retries every 30s for up to 10 minutes.
+- Frigate config push retry: up to 3 retries with 2s/4s backoff on register/unregister.
+- go2rtc `#stop=` parameter made configurable via `StopTimeout` (default 30) to avoid stream-reconnect gaps on API restart.
+
+**`health.go` — debounce:**
+- Camera status change transitions debounced to avoid false-offline from transient network jitter.
+
+**`ipv6.go` — disable switch:**
+- `NAS_IPV6_DISABLED` env var (true/1/yes) suppresses IPv6 probing/reporting for LAN-only environments without public IPv6.
+
+#### Android — Configurable LAN URL
+
+**`BaseUrlResolver.kt`:**
+- `setCustomLanUrl(url)` / `getCustomLanUrl()` persist a user-configured LAN URL to SharedPreferences (`custom_lan_url`), overriding the hardcoded `LAN_URL`/`LAN_HOST`/`LAN_PORT`.
+- `applyCustomLanUrl` parses the URL (host + port, default 8088); null/blank reverts to the hardcoded default.
+- Saving forces a re-probe so the new URL takes effect within ~1-2s.
+
+**`SettingsFragment.kt` — new "局域网地址" section:**
+- Shows the currently effective LAN URL, a URL input field, and Save / Reset-to-default buttons.
+- Save validates `http://`/`https://` prefix, calls `setCustomLanUrl`, and shows a toast; Reset clears the custom URL and restores the default.
+
+**Workflow after NAS IP change:** enter the new address in Settings → 局域网地址 → Save. The app re-probes and switches within seconds; the backend auto-detects the new LAN IP from the first request and pushes updated WebRTC candidates to Frigate — no recompile or manual `NAS_LAN_IP` needed.
+
+### Files Changed (Phase 18)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/camera/frigate.go` | `lanIPDetector` + `GlobalLanIP` + `UpdateFromHost`/`Get`/`SetOnChange` |
+| `services/api/cmd/main.go` | Global Host-header middleware + LAN IP change callback → WebRTC candidates push |
+| `services/api/internal/camera/registry.go` | profile_token retry, config push retry, configurable `#stop=` |
+| `services/api/internal/camera/health.go` | Status change debounce |
+| `services/api/internal/network/ipv6.go` | `NAS_IPV6_DISABLED` support |
+| `compose.yaml` / `.env.example` | `NAS_LAN_IP` / `NAS_IPV6_DISABLED` env vars |
+| Android `BaseUrlResolver.kt` | Custom LAN URL persistence + re-probe |
+| Android `SettingsFragment.kt` + `fragment_settings.xml` | LAN URL config UI |
+| `deploy-nas.ps1` | NAS host updated to 192.168.31.235 |
+
+---
+
+**Last Updated:** 2026-08-13 (v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 18 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

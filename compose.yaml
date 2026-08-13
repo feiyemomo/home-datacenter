@@ -91,6 +91,17 @@ services:
       # rotates the IPv6 prefix (find via: ip -6 addr show enp4s0 |
       # grep "scope global" | grep -v temporary).
       - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37a8:80c0:62be:b4ff:fe08:bd09}
+      # v1.8.24: NAS LAN IPv4 address. The container runs on a Docker
+      # bridge (172.x.x.x) and cannot infer the host's physical LAN IP.
+      # This value is used by SetWebRTCCandidates() to build the go2rtc
+      # webrtc.candidates list — without it, WebRTC is unreachable from
+      # LAN clients. Update when the NAS IP changes.
+      - NAS_LAN_IP=${NAS_LAN_IP:-192.168.31.235}
+      # v1.8.24: Set to "true" in offline LAN environments (no Internet)
+      # to disable IPv6 reporting. Without this, NAS_IPV6_ADDRESS above
+      # would cause CheckIPv6() to report reachable=true, making the
+      # mobile app waste time on IPv6 direct mode that can never succeed.
+      - NAS_IPV6_DISABLED=${NAS_IPV6_DISABLED:-false}
     networks:
       - home-net
 

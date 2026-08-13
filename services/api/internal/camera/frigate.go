@@ -7,13 +7,88 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"sort"
 	"strconv"
 	"sync"
 	"time"
 )
+
+// lanIPDetector tracks the NAS's LAN IPv4 address by observing
+// incoming HTTP requests. When a client connects from the LAN,
+// the Host header contains the NAS's LAN IP (e.g. 192.168.31.235).
+// This allows the system to auto-adapt when the NAS IP changes
+// without requiring NAS_LAN_IP to be manually updated.
+//
+// Priority:
+//  1. NAS_LAN_IP env var (explicit operator configuration)
+//  2. Auto-detected from HTTP request Host headers
+//
+// When the auto-detected IP changes, the OnChange callback is
+// invoked asynchronously so the caller can push updated WebRTC
+// candidates to Frigate without blocking the request.
+type lanIPDetector struct {
+	mu       sync.RWMutex
+	detected string
+	onChange func(newIP string)
+}
+
+// GlobalLanIP is the package-level instance, updated by the HTTP
+// middleware in main.go on every request.
+var GlobalLanIP = &lanIPDetector{}
+
+// UpdateFromHost extracts a private IPv4 address from an HTTP Host
+// header and stores it as the detected LAN IP. Non-private addresses
+// (public IPs, loopback, link-local) are ignored. When the detected
+// IP changes, OnChange is called asynchronously.
+func (d *lanIPDetector) UpdateFromHost(host string) {
+	h, _, err := net.SplitHostPort(host)
+	if err != nil {
+		h = host // no port
+	}
+	ip := net.ParseIP(h)
+	if ip == nil || ip.To4() == nil {
+		return
+	}
+	if !ip.IsPrivate() {
+		return // only accept RFC 1918 private addresses
+	}
+	d.mu.Lock()
+	prev := d.detected
+	if prev == h {
+		d.mu.Unlock()
+		return
+	}
+	d.detected = h
+	cb := d.onChange
+	d.mu.Unlock()
+	log.Printf("frigate: LAN IP auto-detected from request Host: %s", h)
+	if cb != nil {
+		go cb(h) // async — don't block the HTTP request
+	}
+}
+
+// Get returns the current LAN IP, preferring the NAS_LAN_IP env var
+// over the auto-detected value.
+func (d *lanIPDetector) Get() string {
+	if env := os.Getenv("NAS_LAN_IP"); env != "" {
+		return env
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.detected
+}
+
+// SetOnChange registers a callback invoked when the auto-detected
+// LAN IP changes. Called asynchronously from UpdateFromHost.
+func (d *lanIPDetector) SetOnChange(cb func(newIP string)) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.onChange = cb
+}
 
 // FrigateClient is the HTTP client for the Frigate NVR service.
 //
@@ -306,6 +381,14 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 	return nil
 }
 
+// detectLANIP returns the host's LAN IPv4 address. It checks the
+// NAS_LAN_IP env var first (explicit operator configuration), then
+// falls back to the auto-detected value from HTTP request Host headers
+// (see GlobalLanIP). Returns "" if neither source has a value.
+func detectLANIP() string {
+	return GlobalLanIP.Get()
+}
+
 // SetWebRTCCandidates pushes an updated go2rtc webrtc.candidates list
 // to Frigate via PUT /api/config/set. Used by the PrefixWatcher when
 // the ISP rotates the IPv6 prefix — the new outbound address becomes
@@ -316,17 +399,29 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 // mqtt, detectors, etc.). Frigate applies the new candidates to the
 // running go2rtc subsystem without a restart.
 //
+// The candidate list is built dynamically from:
+//   - 127.0.0.1 (loopback, for same-host browser access)
+//   - NAS_LAN_IP env var (host's physical LAN IPv4, e.g. 192.168.31.235)
+//   - ipv6Addr parameter (host's public IPv6, if provided)
+//
+// If NAS_LAN_IP is unset, only loopback + IPv6 are advertised and a
+// warning is logged — WebRTC will not work from LAN clients until the
+// operator sets the env var. This is far better than the previous
+// behavior which hardcoded a stale IP (192.168.1.3) that silently broke
+// WebRTC after any NAS IP change.
+//
 // Returns an error if the Frigate API call fails. The caller
-// (PrefixWatcher) logs the error but doesn't block subsequent checks.
+// (PrefixWatcher, BootReplay) logs the error but doesn't block subsequent checks.
 func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string) error {
-	// Build the candidate list: loopback + LAN IPv4 + IPv6 (if provided).
-	// We deliberately include 127.0.0.1 and the LAN IPv4 to keep the
-	// local/LAN paths working — sending only the IPv6 candidate would
-	// break LAN WebRTC.
-	candidates := []string{
-		"127.0.0.1:8555",
-		"192.168.1.3:8555",
+	candidates := []string{"127.0.0.1:8555"}
+
+	lanIP := detectLANIP()
+	if lanIP != "" {
+		candidates = append(candidates, lanIP+":8555")
+	} else {
+		log.Printf("frigate: SetWebRTCCandidates: NAS_LAN_IP env var not set; WebRTC will not work from LAN clients")
 	}
+
 	if ipv6Addr != "" {
 		candidates = append(candidates, fmt.Sprintf("[%s]:8555", ipv6Addr))
 	}
