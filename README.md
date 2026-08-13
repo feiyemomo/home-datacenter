@@ -582,6 +582,29 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.24 — 主机 IP 变化自适应 + 网络鲁棒性增强 (2026-08-13)
+
+#### 后端
+- **LAN IP 自动检测**：`frigate.go` 新增 `lanIPDetector`，从每个 HTTP 请求的 Host 头自动提取 NAS 局域网 IPv4 地址（仅接受 RFC 1918 私有地址）
+  - `main.go` 新增全局中间件，将请求 Host 头喂给 `camera.GlobalLanIP`（热路径零开销，IP 未变化时短路）
+  - IP 首次检测或变化时，异步回调推送更新后的 WebRTC candidates 到 Frigate，无需手动配置 `NAS_LAN_IP`
+  - 优先级：`NAS_LAN_IP` 环境变量 > HTTP 请求自动检测
+- **ONVIF profile_token 自动重试**：`registry.go` 摄像头注册时若未发现 profile_token，后台每 30 秒重试一次，持续 10 分钟，网络抖动后自动恢复
+- **健康检查去抖**：`health.go` 状态变更增加去抖机制，避免瞬时网络波动导致误判离线
+- **Frigate 配置推送重试**：`registry.go` 摄像头注册/注销后的 config push 增加 3 次重试（2s/4s 退避），应对 Frigate 瞬时负载
+- **go2rtc stop 参数可配置**：`registry.go` 摄像头流 `#stop=` 参数改为可配置，配合 `compose.yaml` 环境变量，避免 API 重启导致的流重连间隙
+- **IPv6 上报开关**：`ipv6.go` 支持 `NAS_IPV6_DISABLED` 环境变量，无外网 IPv6 的局域网环境可关闭 IPv6 探测，避免误导性网络检测
+
+#### Android
+- **自定义局域网地址**：`BaseUrlResolver` 支持用户在「设置 → 局域网地址」中配置自定义 NAS 地址，持久化到 SharedPreferences，IP 变更后无需重新编译
+  - `SettingsFragment` 新增配置 UI：显示当前地址、输入框、保存/恢复默认按钮
+  - 保存后立即触发重新探测，切换网络路径
+
+#### 版本
+- Backend: v1.8.24
+- Web: v1.8.24（无改动）
+- Android: v1.8.24
+
 ### v1.8.22 — 审计日志大幅拓展 (2026-08-12)
 
 #### 后端

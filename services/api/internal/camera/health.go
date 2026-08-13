@@ -27,9 +27,16 @@ type HealthChecker struct {
 	Bus      *eventbus.Bus
 	Interval time.Duration
 	Timeout  time.Duration
+	// FailThreshold is the number of consecutive failed probes
+	// before a camera is marked offline. Default 3. This prevents
+	// transient network blips (WiFi interference, AC controller
+	// hiccups, ARP cache misses) from causing false offline→online
+	// flapping that triggers unnecessary Frigate config pushes.
+	FailThreshold int
 
 	mu         sync.RWMutex
 	prevStatus map[uint]string // camera ID -> last known status
+	failCount  map[uint]int    // camera ID -> consecutive failure count
 }
 
 // Run blocks until ctx is cancelled. Pass the API's root context.
@@ -40,8 +47,14 @@ func (h *HealthChecker) Run(ctx context.Context) {
 	if h.Timeout == 0 {
 		h.Timeout = 3 * time.Second
 	}
+	if h.FailThreshold == 0 {
+		h.FailThreshold = 3
+	}
 	if h.prevStatus == nil {
 		h.prevStatus = make(map[uint]string)
+	}
+	if h.failCount == nil {
+		h.failCount = make(map[uint]int)
 	}
 	t := time.NewTicker(h.Interval)
 	defer t.Stop()
@@ -72,9 +85,19 @@ func (h *HealthChecker) probe(ctx context.Context, c model.Camera) {
 	now := time.Now()
 	if err != nil {
 		conn = nil
+		// Debounce: require FailThreshold consecutive failures
+		// before marking offline. This prevents transient network
+		// blips (WiFi interference, AC controller hiccups, ARP
+		// cache misses) from causing false offline→online flapping
+		// that triggers unnecessary Frigate config pushes.
+		fails := h.incFailCount(c.ID)
+		if fails < h.FailThreshold {
+			return // skip this tick, camera still considered online
+		}
 		status = "offline"
 	} else {
 		_ = conn.Close()
+		h.resetFailCount(c.ID)
 	}
 	h.Registry.UpdateStatus(c.ID, status, &now)
 
@@ -170,4 +193,17 @@ func (h *HealthChecker) setPrevStatus(id uint, status string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.prevStatus[id] = status
+}
+
+func (h *HealthChecker) incFailCount(id uint) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.failCount[id]++
+	return h.failCount[id]
+}
+
+func (h *HealthChecker) resetFailCount(id uint) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.failCount, id)
 }

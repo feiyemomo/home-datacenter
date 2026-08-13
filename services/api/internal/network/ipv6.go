@@ -52,6 +52,18 @@ type IPv6Status struct {
 func CheckIPv6() IPv6Status {
 	status := IPv6Status{CheckedAt: time.Now()}
 
+	// v1.8.24: allow operators to explicitly disable IPv6 reporting.
+	// In environments without Internet (e.g. offline LAN deployment),
+	// the NAS_IPV6_ADDRESS env var may still be set from a previous
+	// online configuration. Without this override, CheckIPv6 would
+	// report reachable=true and the mobile app would waste time
+	// trying IPv6 direct mode that can never succeed. Setting
+	// NAS_IPV6_DISABLED=true in compose.yaml makes CheckIPv6 return
+	// enabled=false immediately, so the app falls back to LAN mode.
+	if d := os.Getenv("NAS_IPV6_DISABLED"); d == "true" || d == "1" || d == "yes" {
+		return status // enabled=false, reachable=false (zero values)
+	}
+
 	// v1.6.22: short-circuit — if NAS_IPV6_ADDRESS env var is set,
 	// trust it as the authoritative IPv6 address. The home-api
 	// container runs on the home-net docker bridge which has no IPv6

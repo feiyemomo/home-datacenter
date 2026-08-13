@@ -34,10 +34,16 @@ type Registry struct {
 	Box       *utils.SecretBox
 	ONVIF     *ONVIFController
 	WebRTCURL string // optional public base, e.g. https://cam.feiyemomo.top
+	// StopTimeout is the go2rtc producer idle timeout in seconds.
+	// When no consumer is watching, go2rtc keeps the RTSP source
+	// connection alive for this many seconds before tearing it down.
+	// Default 30. Increase for environments with flaky RTSP where
+	// frequent reconnections cause HLS stalls.
+	StopTimeout int
 }
 
 func NewRegistry(db *gorm.DB, g *Go2RTCClient, fr *FrigateClient, box *utils.SecretBox, onvif *ONVIFController, webRTCURL string) *Registry {
-	return &Registry{DB: db, Go2: g, Frigate: fr, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL}
+	return &Registry{DB: db, Go2: g, Frigate: fr, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL, StopTimeout: 30}
 }
 
 // RegisterInput is the wire format for POST /api/v1/cameras.
@@ -190,12 +196,57 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		}
 	}
 
+	// If profile_token discovery failed during registration (ONVIF
+	// service temporarily unavailable, camera still booting, network
+	// settling after IP change), start a background retry loop. We
+	// retry every 30s for up to 10 minutes, persisting the token on
+	// first success. Without this, cameras registered during a
+	// transient ONVIF failure would permanently lack a profile_token,
+	// breaking PTZ and stream management until manually re-registered.
+	if profile == "" && r.ONVIF != nil {
+		go r.retryProfileDiscovery(cam.ID, in.Host, in.ONVIFPort, in.Username, in.Password)
+	}
+
 	if err := r.DB.Model(cam).Updates(map[string]any{
 		"updated_at": time.Now(),
 	}).Error; err != nil {
 		return nil, err
 	}
 	return cam, nil
+}
+
+// retryProfileDiscovery attempts to discover the ONVIF profile_token
+// for a camera that was registered without one. It retries every 30s
+// for up to 10 minutes (20 attempts). On first success it persists
+// the token to the database and logs the recovery. This is a
+// fire-and-forget goroutine started by Register when the initial
+// DiscoverProfiles call fails.
+func (r *Registry) retryProfileDiscovery(camID uint, host string, onvifPort int, user, pass string) {
+	const maxAttempts = 20
+	const interval = 30 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		time.Sleep(interval)
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		ps, err := r.ONVIF.DiscoverProfiles(ctx, host, onvifPort, user, pass)
+		cancel()
+
+		if err == nil && len(ps) > 0 {
+			if err := r.DB.Model(&model.Camera{}).Where("id = ?", camID).
+				Update("onvif_profile_token", ps[0].Token).Error; err != nil {
+				log.Printf("camera: profile retry cam %d: discovered token but failed to persist: %v", camID, err)
+				return
+			}
+			log.Printf("camera: profile retry cam %d: discovered profile_token=%s on attempt %d/%d",
+				camID, ps[0].Token, attempt, maxAttempts)
+			return
+		}
+
+		log.Printf("camera: profile retry cam %d: attempt %d/%d failed: %v",
+			camID, attempt, maxAttempts, err)
+	}
+	log.Printf("camera: profile retry cam %d: exhausted %d attempts, giving up", camID, maxAttempts)
 }
 
 // Unregister removes the row and asks go2rtc to drop the stream.
@@ -1109,6 +1160,19 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 
 		if failed == 0 {
 			log.Printf("camera: boot replay: %d camera(s) registered with go2rtc", len(cams))
+
+			// Push WebRTC candidates on boot so they're always in sync
+			// with the current NAS_LAN_IP / IPv6 address. This catches
+			// cases where the NAS IP changed since the last run — the
+			// stale candidates in config.yml would silently break
+			// WebRTC until the next PrefixWatcher tick (5 min).
+			if r.Frigate != nil {
+				ipv6Addr := os.Getenv("NAS_IPV6_ADDRESS")
+				if err := r.Frigate.SetWebRTCCandidates(ctx, ipv6Addr); err != nil {
+					log.Printf("camera: boot replay: webrtc candidates push (non-fatal): %v", err)
+				}
+			}
+
 			return nil
 		}
 
@@ -1204,7 +1268,28 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 	// (boot replay, camera register/unregister). UpdateCodec does NOT
 	// call this function — it only updates the go2rtc stream URL via
 	// AddStream (hot-reload, no Frigate restart needed).
-	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, true)
+	//
+	// v1.8.24: retry up to 3 times with 2s/4s backoff. Frigate may
+	// return 500 during startup (nginx not yet ready) or under
+	// transient load. The retry is safe because a failed PushConfig
+	// does not trigger a Frigate restart — only a successful one does.
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		err := r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, true)
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt < 3 {
+			log.Printf("camera: frigate config push attempt %d/3 failed: %v", attempt, err)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(1<<(attempt-1)) * 2 * time.Second):
+			}
+		}
+	}
+	return lastErr
 }
 
 // frigateCameraPath builds the URL Frigate's OWN ffmpeg child
@@ -1467,6 +1552,10 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 	codec := effectiveCodec(cam)
 	audioOn := cameraHasAudio(cam)
+	stopFrag := "#stop=30"
+	if r.StopTimeout > 0 {
+		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
+	}
 	if codec == "passthrough" {
 		if audioOn {
 			// Audio requested but we're on the passthrough path —
@@ -1475,7 +1564,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 			// + audio=aac (transcode audio only). Adds ~5% CPU
 			// for the AAC encoder but preserves the camera's
 			// native video codec (no quality loss).
-			return "ffmpeg:" + raw + "#video=copy#audio=aac#stop=30"
+			return "ffmpeg:" + raw + "#video=copy#audio=aac" + stopFrag
 		}
 		// Native path: no ffmpeg, no transcode. Camera
 		// delivers whatever codec it has (H.264 / H.265)
@@ -1487,7 +1576,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 		// tells go2rtc to drop the camera's PCMA track
 		// from the SDP — go2rtc exposes a PCMU/PCMA
 		// audio track that the browser cannot decode.
-		return raw + "#audio=0#stop=30"
+		return raw + "#audio=0" + stopFrag
 	}
 	// Transcode path: route through go2rtc's ffmpeg
 	// pipeline. `video=<codec>` selects a go2rtc ffmpeg
@@ -1516,9 +1605,9 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 		audioFrag = "#audio=aac"
 	}
 	if codec == "h265" {
-		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + "#stop=30"
+		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + stopFrag
 	}
-	return "ffmpeg:" + raw + "#video=h264#width=1280#hardware=vaapi" + audioFrag + "#stop=30"
+	return "ffmpeg:" + raw + "#video=h264#width=1280#hardware=vaapi" + audioFrag + stopFrag
 }
 
 // boxCredentials encrypts the user/pass pair and packages them into

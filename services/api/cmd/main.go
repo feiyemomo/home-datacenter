@@ -100,6 +100,25 @@ func main() {
 	prefixWatcher.Start()
 	defer prefixWatcher.Stop()
 
+	// v1.8.24: auto-detect NAS LAN IP from incoming HTTP requests.
+	// When a client connects from the LAN, the Host header contains
+	// the NAS's LAN IP. This callback fires on the first detection
+	// (or when the IP changes) and pushes updated WebRTC candidates
+	// to Frigate — no manual NAS_LAN_IP configuration needed.
+	camera.GlobalLanIP.SetOnChange(func(newIP string) {
+		ipv6Addr := os.Getenv("NAS_IPV6_ADDRESS")
+		if d := os.Getenv("NAS_IPV6_DISABLED"); d == "true" || d == "1" || d == "yes" {
+			ipv6Addr = ""
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := frigate.SetWebRTCCandidates(ctx, ipv6Addr); err != nil {
+			log.Printf("main: LAN IP changed to %s but WebRTC candidates update failed: %v", newIP, err)
+		} else {
+			log.Printf("main: LAN IP changed to %s, WebRTC candidates updated", newIP)
+		}
+	})
+
 	camONVIF := camera.NewONVIFController()
 	camReg := camera.NewRegistry(database.DB, go2, frigate, box, camONVIF, cfg.Camera.WebRTCPublicBase)
 
@@ -242,6 +261,17 @@ func main() {
 	// handler. No such routes exist today.
 	r.Use(func(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 1<<20) // 1MB limit
+		c.Next()
+	})
+
+	// v1.8.24: auto-detect NAS LAN IP from the Host header of every
+	// incoming request. When a LAN client hits http://192.168.31.235:8088/,
+	// the Host header is "192.168.31.235:8088" — we extract the IP and
+	// feed it to GlobalLanIP, which triggers WebRTC candidates update on
+	// first detection or IP change. Zero overhead on the hot path: the
+	// detector short-circuits when the IP hasn't changed.
+	r.Use(func(c *gin.Context) {
+		camera.GlobalLanIP.UpdateFromHost(c.Request.Host)
 		c.Next()
 	})
 

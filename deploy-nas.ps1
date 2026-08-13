@@ -57,7 +57,9 @@ param(
 )
 
 # ============== CONFIG (edit to match your NAS) ==============
-$NAS_HOST   = "192.168.1.3"
+# v1.8.24: NAS migrated back to 192.168.31.235 (single NIC on the AC
+# router). Keep this in sync with compose.yaml NAS_LAN_IP.
+$NAS_HOST   = "192.168.31.235"
 $NAS_USER   = "fnos-momo"
 $NAS_PORT   = 22
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
