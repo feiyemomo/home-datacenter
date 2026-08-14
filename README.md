@@ -611,12 +611,13 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
-### v1.8.42 — 后台保持 + 预加载加固 (2026-08-14)
+### v1.8.42 — 后台保持 + 预加载加固 + Android 端同步 (2026-08-14)
 
 > **背景**：审查发现两个短板——① **后台 WebRTC 保持"未生效"**：全工程无任何 `visibilitychange` 处理，完全依赖
 > 浏览器默认；切后台时 ICE 8s 误判定时器照跑，网络一抖回来就被切到 HLS 或报"播放失败"。② **预取可能"旧盖新"**：
 > `usePrefetch` 与 `useCachedFetch` 双写同一 sessionStorage key 无版本控制，异步预取可能用旧快照覆盖正在显示的最新
-> 数据。
+> 数据。同时把 Web 这轮的"上报 + 网络韧性 + 后台保持"能力同步到了 Android 参考客户端（Android 无视频播放器，
+> 同步的是错误上报 / WS 韧性 / 前台服务后台保活三类）。
 
 **后台保持**（`web`）：
 - **useWebRTCStream**（`hooks/useWebRTCStream.ts`）：`document.hidden` 时**挂起 ICE 8s 误判定时器**（后台节流 +
@@ -633,14 +634,24 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 - **splash 并行预取**（`App.tsx`）：等待 `/user/me` 的 splash 空转期间，并行预取 `home.cameras.list`，Dashboard 与
   Cameras 页首帧都能从缓存渲染、零闪烁。
 
+**Android 客户端**（`deploy/android/HomeDatacenterClient.kt`，参考客户端）：
+- **错误上报**：新增 `POST /api/v1/system/client-errors` 接口 + `ClientErrorReport` 数据模型 + `ClientErrorReporter`
+  （2s 全局限流 + 60s 去重折叠 count + 协程后台上报，永不抛异常）；WS `onFailure` 接入上报（context
+  "android.ws"），失败会出现在 Dashboard 日志面板。
+- **WS 网络韧性**：新增 `NetworkMonitor`（ConnectivityManager 网络回调）——网络恢复（WiFi↔蜂窝切换、飞行模式
+  关闭）时 `onNetworkAvailable()` 立即重连，不等退避定时器跑完；指数退避重连 + 订阅重放沿用既有实现。
+- **后台保活**：新增 `HomeCenterService` 前台服务（`START_STICKY` + 通知 + `FOREGROUND_SERVICE_CONNECTED_DEVICE`
+  类型），后台时 WS 不被系统回收；`NetworkMonitor` 触发即时重连；文档化所需 manifest 权限。
+
 #### 验证
 - `web`：`npx tsc -b` 零错误 + `npm run build` 成功，已部署 NAS（web 镜像重建，JS 哈希 `index-DpLpzBnB.js`）。
 - 后端无改动（`home-api` 未重建，healthy）。
+- Android：参考客户端源码更新（仓库无 Gradle 工程，不打 APK）。
 
 #### 版本
 - Backend: v1.8.42（无代码改动）
 - Web: v1.8.42（WebRTC/预览帧/HLS 后台保持 + 预取新鲜度守卫/失败上报 + splash 并行预取）
-- Android: v1.8.42（无改动）
+- Android: v1.8.42（客户端错误上报 + WS 网络韧性 + 前台服务后台保活）
 
 ### v1.8.41 — 稳定性 × 纠错 × 上报三件套 (2026-08-14)
 
