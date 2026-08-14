@@ -1591,6 +1591,56 @@ Confirmed on the NAS (192.168.31.235):
 
 ---
 
+## Phase 26 (v1.8.32): Recording Quota → Auto-Shorten Retention + WebRTC Candidate Restart-Aware Push
+
+### Phase 26 span: v1.8.32 (Backend)
+
+#### Problem 1: recordings could silently fill a small disk
+
+The existing `RecordingSizeMonitor` only emitted size alerts (warn/crit) — nothing automated. On a 466G data volume, continuous 24/7 recording could creep toward full, and the operator would only learn from a disk alert after the fact.
+
+#### Design 1: quota edge-triggered retention adjustment
+
+- `RecordingSizeMonitor` gains a **quota** threshold (`recording_quota_bytes`). When the recordings tree total crosses it, `OnQuotaExceeded` fires; when it drops back below, `OnQuotaRecovered` fires. Edge-triggered (no repeated alerts). Default 0 = disabled (still size-alerted only).
+- `FrigateClient.PushRecordRetention(ctx, days)` — a partial `record.continuous.days` / `record.motion.days` update via `PUT /api/config/set` with `requires_restart=0`. No restart needed: Frigate's periodic cleanup job deletes footage beyond the new window on its next run. Deep-merge preserves everything else.
+- `FrigateClient` retention is now configurable (`SetRetentionDays`) instead of hardcoded 7; `PushConfig` uses it. `main.go` sets it from `recording_retention_days` (default 7) and wires quota callbacks to push `recording_reduced_retention_days` (default 3) on exceed / `recording_retention_days` on recover.
+- On this NAS: quota = 300 GiB (322122547200, ≈65% of the 466G volume), normal retention 7d, reduced 3d.
+
+#### Problem 2: WebRTC candidate push raced the Frigate restart it triggered (technical debt)
+
+The old flow pushed `go2rtc.webrtc.candidates` **after** `pushFrigateConfig` (which restarts Frigate via `requires_restart=true`), so a single-shot push hit "connection refused". A `pushWebRTCCandidatesWithRetry` (wait + retry) was added, but a deeper issue surfaced on deploy: the push returned **400 `No configuration data provided`**.
+
+Root cause: `SetWebRTCCandidates` sent the partial config **bare** (`{go2rtc:{...}}`), but Frigate's `/api/config/set` requires the `{config_data:{...}}` envelope. So **every** candidate push (BootReplay AND the PrefixWatcher fallback) had been silently failing — candidates were never actually updated.
+
+#### Design 2: restart-aware ordering + correct envelope
+
+- `SetWebRTCCandidates` now wraps the payload in the same `{requires_restart:0, update_topic, config_data}` envelope `PushRecordRetention` uses.
+- `BootReplay` reordered: **push candidates first**, then the full config push. Because the candidate update is a deep-merge partial that persists to `config.yml` before the restart, the restarted Frigate loads the candidates from the file — no race window at all. `pushWebRTCCandidatesWithRetry` only absorbs the boot-up window (Frigate REST 5000 comes up slower than go2rtc 1984).
+
+#### NAS verification (192.168.31.235)
+
+- api log: `camera: webrtc candidates pushed after boot replay` (previously `400 No configuration data provided`).
+- Runtime `config.yml` candidates = `127.0.0.1:8555`, `192.168.31.235:8555`, `[IPv6]:8555`; survive `docker restart home-frigate` (container healthy).
+- Frigate retention currently `continuous.days: 7` / `motion.days: 7`; recordings at 738M, far below the 300GiB quota, so the quota action does not fire (expected).
+- Quota monitor runs with the maintenance loops, watches `/media/frigate/recordings`, 1h sampling.
+
+#### Notes / follow-ups
+- The api's own service monitor printed transient "Web 前端 / Mosquitto 不可达" on the first tick after an api restart (startup DNS race). Containers are `(healthy)`; not a regression from this change.
+
+### Files Changed (Phase 26)
+
+| File | Change |
+|------|--------|
+| `internal/config/config.go` | Add `RecordingQuotaBytes` / `RecordingRetentionDays` / `RecordingReducedRetentionDays` + defaults |
+| `configs/config.yaml` | Set quota 300GiB, retention 7d / reduced 3d |
+| `internal/camera/frigate.go` | `retentionDays` field, `SetRetentionDays`, `PushRecordRetention`; fix `SetWebRTCCandidates` `config_data` envelope |
+| `internal/camera/registry.go` | Reorder BootReplay (push candidates before config push); `pushWebRTCCandidatesWithRetry` |
+| `internal/maintenance/recordings_size.go` | Quota edge detection + `OnQuotaExceeded`/`OnQuotaRecovered` |
+| `internal/maintenance/maintenance.go` | Plumb quota config + callbacks |
+| `cmd/main.go` | Set retention days; wire quota callbacks to Frigate pushes |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)

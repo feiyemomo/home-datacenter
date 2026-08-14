@@ -94,6 +94,11 @@ func main() {
 	go2 := camera.NewGo2RTCClient(cfg.Go2RTC.BaseURL)
 	frigate := camera.NewFrigateClient(cfg.Frigate.BaseURL, cfg.Go2RTC.BaseURL)
 
+	// v1.8.32: honour the configured normal retention window so the
+	// full config push no longer hardcodes 7 days. The recording-quota
+	// monitor later restores this value after a quota-driven reduction.
+	frigate.SetRetentionDays(cfg.Maintenance.RecordingRetentionDays)
+
 	// PrefixWatcher probes the outbound IPv6 address every 5 minutes and
 	// auto-detects ISP DHCPv6-PD prefix rotations. On rotation it publishes
 	// an event and pushes updated go2rtc webrtc.candidates to Frigate so
@@ -284,6 +289,28 @@ func main() {
 		RecordingSizeInterval:  time.Duration(cfg.Maintenance.RecordingSizeIntervalHours) * time.Hour,
 		RecordingSizeWarnBytes: cfg.Maintenance.RecordingSizeWarnBytes,
 		RecordingSizeCritBytes: cfg.Maintenance.RecordingSizeCritBytes,
+		// v1.8.32: recording quota → auto-shorten Frigate retention.
+		// When the recordings tree exceeds the quota, push a shorter
+		// retain window to Frigate so old footage is dropped on the
+		// next cleanup cycle; when it drops back below, restore the
+		// normal window. Both pushes are best-effort (no restart), so
+		// live streams stay up. The quota monitor runs on the same
+		// interval as the size walk (default 1h).
+		RecordingQuotaBytes: cfg.Maintenance.RecordingQuotaBytes,
+		OnQuotaExceeded: func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := frigate.PushRecordRetention(ctx, cfg.Maintenance.RecordingReducedRetentionDays); err != nil {
+				log.Printf("maintenance: recording quota exceeded but frigate retention reduction failed: %v", err)
+			}
+		},
+		OnQuotaRecovered: func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if err := frigate.PushRecordRetention(ctx, cfg.Maintenance.RecordingRetentionDays); err != nil {
+				log.Printf("maintenance: recording quota recovered but frigate retention restore failed: %v", err)
+			}
+		},
 		SysResourceInterval:    time.Duration(cfg.Maintenance.SysResourceIntervalMinutes) * time.Minute,
 		CPUWarnPct:             cfg.Maintenance.CPUWarnPct,
 		CPUCritPct:             cfg.Maintenance.CPUCritPct,

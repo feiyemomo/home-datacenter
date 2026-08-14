@@ -159,6 +159,19 @@ maintenance:
   # level. Example: warn at 400 GiB, crit at 450 GiB.
   recording_size_warn_bytes: 0
   recording_size_crit_bytes: 0
+  # v1.8.32: recording quota → auto-shorten Frigate retention.
+  # When the recordings tree total size exceeds recording_quota_bytes,
+  # home-api pushes a shorter retain window to Frigate (old footage is
+  # then deleted on Frigate's next cleanup cycle) and logs an alert.
+  # When it drops back below, normal retention is restored.
+  # 0 disables the automatic action (the tree is still size-alerted).
+  # Set to 300 GiB (≈65% of the 466G data volume) so recordings can't
+  # silently fill the disk; on crossing, retention drops 7→3 days.
+  recording_quota_bytes: 322122547200
+  # Normal retention (days) applied by the full config push.
+  recording_retention_days: 7
+  # Retention (days) applied while over quota. Must be < normal.
+  recording_reduced_retention_days: 3
 
   # Frigate's own SQLite database, backed up daily alongside app.db.
   # The api container sees it at /media/frigate/config/frigate.db.

@@ -245,6 +245,21 @@ type MaintenanceConfig struct {
 	// thresholds for the recordings tree. 0 disables that level.
 	RecordingSizeWarnBytes uint64 `mapstructure:"recording_size_warn_bytes"`
 	RecordingSizeCritBytes uint64 `mapstructure:"recording_size_crit_bytes"`
+	// RecordingQuotaBytes is the soft quota for the recordings tree
+	// (v1.8.32). When the total size crosses it, the quota monitor
+	// invokes OnQuotaExceeded (e.g. to shorten Frigate retention so
+	// old footage is deleted on the next cleanup cycle); when it drops
+	// back below, OnQuotaRecovered restores normal retention. 0 disables
+	// the automatic action (the tree is still monitored/alerts only).
+	RecordingQuotaBytes uint64 `mapstructure:"recording_quota_bytes"`
+	// RecordingRetentionDays is the normal Frigate record retention
+	// (record.continuous.days / record.motion.days) applied by the full
+	// config push. Default 7.
+	RecordingRetentionDays int `mapstructure:"recording_retention_days"`
+	// RecordingReducedRetentionDays is the retention (days) applied while
+	// the recordings tree is over quota. Must be < RecordingRetentionDays.
+	// Default 3.
+	RecordingReducedRetentionDays int `mapstructure:"recording_reduced_retention_days"`
 
 	// FrigateDBPath is Frigate's own SQLite database (frigate.db),
 	// backed up daily alongside app.db. Empty disables.
@@ -378,6 +393,9 @@ func Load(path string) error {
 	v.SetDefault("maintenance.recording_size_interval_hours", 1)
 	v.SetDefault("maintenance.recording_size_warn_bytes", 0)
 	v.SetDefault("maintenance.recording_size_crit_bytes", 0)
+	v.SetDefault("maintenance.recording_quota_bytes", 0)
+	v.SetDefault("maintenance.recording_retention_days", 7)
+	v.SetDefault("maintenance.recording_reduced_retention_days", 3)
 	v.SetDefault("maintenance.frigate_db_path", "")
 	v.SetDefault("maintenance.sys_resource_interval_minutes", 5)
 	v.SetDefault("maintenance.cpu_warn_pct", 80)

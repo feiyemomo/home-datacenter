@@ -30,6 +30,13 @@ import (
 // Alerts are edge-triggered (normal → warn → crit → back to normal).
 // The size walk is a full recursive stat of the recordings dir; run it
 // on an interval (default 1h) to bound the cost.
+//
+// v1.8.32: a separate "quota" threshold triggers an automatic action
+// (via OnQuotaExceeded / OnQuotaRecovered — e.g. shorten Frigate's
+// retention) when the recordings tree crosses it. This is how the
+// system keeps a small NAS disk from filling up: once recordings hit
+// the quota, old footage is dropped (shorter retention) instead of the
+// operator only learning about it from a disk-full alert afterwards.
 type RecordingSizeMonitor struct {
 	db        *gorm.DB
 	bus       *eventbus.Bus
@@ -38,18 +45,27 @@ type RecordingSizeMonitor struct {
 	warnBytes uint64
 	critBytes uint64
 
+	// v1.8.32: quota + action callbacks.
+	quotaBytes uint64
+	onExceed   func()
+	onRecover  func()
+	quotaActive bool
+
 	lastLevel string
 }
 
 // NewRecordingSizeMonitor creates a monitor for the recordings tree.
-func NewRecordingSizeMonitor(db *gorm.DB, bus *eventbus.Bus, root string, interval time.Duration, warnBytes, critBytes uint64) *RecordingSizeMonitor {
+func NewRecordingSizeMonitor(db *gorm.DB, bus *eventbus.Bus, root string, interval time.Duration, warnBytes, critBytes uint64, quotaBytes uint64, onExceed, onRecover func()) *RecordingSizeMonitor {
 	return &RecordingSizeMonitor{
-		db:        db,
-		bus:       bus,
-		root:      root,
-		interval:  interval,
-		warnBytes: warnBytes,
-		critBytes: critBytes,
+		db:         db,
+		bus:        bus,
+		root:       root,
+		interval:   interval,
+		warnBytes:  warnBytes,
+		critBytes:  critBytes,
+		quotaBytes: quotaBytes,
+		onExceed:   onExceed,
+		onRecover:  onRecover,
 	}
 }
 
@@ -72,10 +88,37 @@ func (m *RecordingSizeMonitor) sample() {
 		// error worth alerting on.
 		if os.IsNotExist(err) {
 			m.lastLevel = ""
+			m.quotaActive = false
 			return
 		}
 		log.Printf("maintenance: recordings size walk failed: %v", err)
 		return
+	}
+
+	// v1.8.32: quota edge detection. When the recordings tree crosses
+	// the quota, fire OnQuotaExceeded (typically shortens Frigate's
+	// retention so old footage is deleted); when it drops back below,
+	// fire OnQuotaRecovered (restores normal retention). Callbacks run
+	// synchronously — the interval is long (1h) so a brief HTTP push
+	// (bounded by the caller's context timeout) won't stall anything.
+	// The callback closure is responsible for its own cancellation.
+	if m.quotaBytes > 0 {
+		over := size >= m.quotaBytes
+		if over && !m.quotaActive {
+			m.quotaActive = true
+			if m.onExceed != nil {
+				log.Printf("maintenance: recordings size %s over quota %s — triggering retention reduction",
+					humanBytes(size), humanBytes(m.quotaBytes))
+				m.onExceed()
+			}
+		} else if !over && m.quotaActive {
+			m.quotaActive = false
+			if m.onRecover != nil {
+				log.Printf("maintenance: recordings size back under quota %s — restoring normal retention",
+					humanBytes(m.quotaBytes))
+				m.onRecover()
+			}
+		}
 	}
 
 	level := ""

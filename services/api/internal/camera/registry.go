@@ -1148,10 +1148,33 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 			}(c.StreamName)
 		}
 
+		// Push WebRTC candidates FIRST, before the full config push.
+		// SetWebRTCCandidates is a deep-merge partial update that
+		// persists go2rtc.webrtc.candidates to Frigate's config.yml;
+		// the full config push that follows triggers a restart
+		// (requires_restart=true), and that restart loads the
+		// candidates straight from config.yml. So the candidates are
+		// in place BEFORE the reboot — there is no race window at all.
+		//
+		// v1.8.32 (restart-aware fix): the old code pushed candidates
+		// after the config push, racing the very restart it triggered —
+		// a single-shot SetWebRTCCandidates then hit "connection
+		// refused" and left go2rtc's candidates stale until the next
+		// PrefixWatcher tick (up to 5 min). Ordering the push before
+		// the restart eliminates the race entirely; the wait+retry in
+		// pushWebRTCCandidatesWithRetry only has to absorb the boot-up
+		// window (Frigate may not be alive yet when go2rtc already is).
+		if r.Frigate != nil {
+			if err := r.pushWebRTCCandidatesWithRetry(ctx); err != nil {
+				log.Printf("camera: boot replay: webrtc candidates push (non-fatal): %v", err)
+			}
+		}
+
 		// Push the full config to Frigate so its AI detection and
-		// recording pipelines pick up every camera. Best-effort:
-		// if Frigate's REST API is down, the go2rtc streams are
-		// still live and video works.
+		// recording pipelines pick up every camera. Its restart
+		// now picks up the just-written candidates from config.yml.
+		// Best-effort: if Frigate's REST API is down, the go2rtc
+		// streams are still live and video works.
 		if r.Frigate != nil {
 			if err := r.pushFrigateConfig(ctx); err != nil {
 				log.Printf("camera: boot replay: frigate config push (non-fatal): %v", err)
@@ -1160,19 +1183,6 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 
 		if failed == 0 {
 			log.Printf("camera: boot replay: %d camera(s) registered with go2rtc", len(cams))
-
-			// Push WebRTC candidates on boot so they're always in sync
-			// with the current NAS_LAN_IP / IPv6 address. This catches
-			// cases where the NAS IP changed since the last run — the
-			// stale candidates in config.yml would silently break
-			// WebRTC until the next PrefixWatcher tick (5 min).
-			if r.Frigate != nil {
-				ipv6Addr := os.Getenv("NAS_IPV6_ADDRESS")
-				if err := r.Frigate.SetWebRTCCandidates(ctx, ipv6Addr); err != nil {
-					log.Printf("camera: boot replay: webrtc candidates push (non-fatal): %v", err)
-				}
-			}
-
 			return nil
 		}
 
@@ -1187,6 +1197,66 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("boot replay: go2rtc not ready after %d attempts", maxAttempts)
+}
+
+// pushWebRTCCandidatesWithRetry pushes the current WebRTC candidates
+// to Frigate, waiting for Frigate's REST API to be reachable first
+// (v1.8.32).
+//
+// Ordering: BootReplay calls this BEFORE pushFrigateConfig. Because
+// SetWebRTCCandidates is a deep-merge partial update that persists
+// go2rtc.webrtc.candidates to config.yml, the candidates survive the
+// restart that pushFrigateConfig triggers (requires_restart=true) —
+// the new Frigate process loads them from config.yml. Pushing first
+// removes the race entirely: the old code pushed after the config
+// push, so a single-shot SetWebRTCCandidates raced the reboot and
+// failed with "connection refused", leaving go2rtc's candidates stale
+// until the next PrefixWatcher tick (up to 5 min).
+//
+// The wait here only has to absorb the boot-up window: at boot Frigate
+// (REST 5000) may not be alive yet when go2rtc (1984) already is. The
+// candidates carry the NAS_LAN_IP / IPv6 address, so WebRTC stays
+// routable after the NAS IP changes. NAS_IPV6_DISABLED is honoured so
+// the harmless extra IPv6 candidate isn't advertised on non-broadband
+// installs.
+func (r *Registry) pushWebRTCCandidatesWithRetry(ctx context.Context) error {
+	ipv6Addr := os.Getenv("NAS_IPV6_ADDRESS")
+	if d := os.Getenv("NAS_IPV6_DISABLED"); d == "true" || d == "1" || d == "yes" {
+		ipv6Addr = ""
+	}
+
+	// Wait (bounded) for Frigate's REST API to be reachable again after
+	// the restart triggered by pushFrigateConfig. go2rtc (1984) comes up
+	// faster than the Frigate REST front (5000), so this is the exact
+	// window the old single-shot push could fail in.
+	const maxWaitTries = 10
+	for i := 0; i < maxWaitTries; i++ {
+		if r.Frigate.Alive(ctx) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(3 * time.Second):
+		}
+	}
+
+	// Retry the push to absorb a transient connection refused.
+	var lastErr error
+	for attempt := 1; attempt <= 3; attempt++ {
+		if err := r.Frigate.SetWebRTCCandidates(ctx, ipv6Addr); err == nil {
+			log.Printf("camera: webrtc candidates pushed after boot replay")
+			return nil
+		} else {
+			lastErr = err
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(2 * time.Second):
+			}
+		}
+	}
+	return lastErr
 }
 
 // pushFrigateConfig generates the full Frigate camera config from the

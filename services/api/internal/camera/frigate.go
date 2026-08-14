@@ -131,6 +131,11 @@ type FrigateClient struct {
 	// outnumber writes (cache misses).
 	motionCache   map[string]motionCacheEntry
 	motionCacheMu sync.RWMutex
+	// v1.8.32: global record retention (days) applied by PushConfig's
+	// record block. Default 7; override via SetRetentionDays so the
+	// recording-quota monitor can restore the normal window after a
+	// reduction.
+	retentionDays int
 }
 
 // NewFrigateClient returns a client with a 30s timeout (config save
@@ -138,10 +143,22 @@ type FrigateClient struct {
 // changed cameras; under load, slower).
 func NewFrigateClient(frigateBase, go2rtcBase string) *FrigateClient {
 	return &FrigateClient{
-		FrigateBase: frigateBase,
-		Go2rtcBase:  go2rtcBase,
-		HC:          &http.Client{Timeout: 30 * time.Second},
+		FrigateBase:   frigateBase,
+		Go2rtcBase:    go2rtcBase,
+		HC:            &http.Client{Timeout: 30 * time.Second},
+		retentionDays: 7,
 	}
+}
+
+// SetRetentionDays overrides the normal record retention window (days)
+// used by PushConfig. The recording-quota monitor restores this value
+// when the recordings tree drops back under quota (v1.8.32). Values
+// below 1 are clamped back to the 7-day default.
+func (c *FrigateClient) SetRetentionDays(days int) {
+	if days < 1 {
+		days = 7
+	}
+	c.retentionDays = days
 }
 
 // Alive reports whether the Frigate REST API is reachable. Used by
@@ -290,13 +307,17 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 		//   - record.detections.retain.days/mode: keep detection segments
 		// `record.retain` is NOT a valid key in Frigate 0.17 — the
 		// Pydantic validator rejects it as extra_forbidden, causing 400.
+		//
+		// v1.8.32: the retention window is configurable (c.retentionDays,
+		// default 7) instead of hardcoded, so the recording-quota monitor
+		// can shorten it and restore it later.
 		"record": map[string]any{
 			"enabled": true,
 			"continuous": map[string]any{
-				"days": 7,
+				"days": c.retentionDays,
 			},
 			"motion": map[string]any{
-				"days": 7,
+				"days": c.retentionDays,
 			},
 		},
 		// Enable snapshots globally so Frigate captures a still JPEG
@@ -434,7 +455,20 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 		},
 	}
 
-	body, err := json.Marshal(partial)
+	// v1.8.32: wrap the partial in the same envelope PushRecordRetention
+	// uses. Frigate's PUT /api/config/set rejects a bare config object
+	// with 400 {"message":"No configuration data provided"} — it expects
+	// the config under `config_data`. The old code sent `partial` raw,
+	// so every candidate push (BootReplay AND the PrefixWatcher tick)
+	// was silently failing with this 400, leaving go2rtc's webrtc
+	// candidates stale forever. requires_restart=0 (no reboot needed) and
+	// go2rtc.webrtc.candidates is a deep-merge update, so the other
+	// config blocks are preserved.
+	body, err := json.Marshal(map[string]any{
+		"requires_restart": 0,
+		"update_topic":     "config/webrtc-candidates",
+		"config_data":      partial,
+	})
 	if err != nil {
 		return fmt.Errorf("marshal candidates config: %w", err)
 	}
@@ -458,6 +492,63 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 		return fmt.Errorf("frigate returned %d: %s", resp.StatusCode, string(respBody))
 	}
 
+	return nil
+}
+
+// PushRecordRetention updates Frigate's global record retention policy
+// (record.continuous.days / record.motion.days) via PUT /api/config/set
+// (v1.8.32). Used by the recording-quota monitor to shorten retention
+// when the recordings tree exceeds its quota, and to restore the normal
+// window once it drops back below.
+//
+// No requires_restart / dedicated restart is needed: Frigate's periodic
+// cleanup job deletes footage beyond the new window on its next run, so
+// the change takes effect without interrupting live streams. The push is
+// a partial config update (only the record block), so Frigate's
+// deep-merge preserves cameras, snapshots, go2rtc, etc.
+func (c *FrigateClient) PushRecordRetention(ctx context.Context, days int) error {
+	if days < 1 {
+		days = 1
+	}
+	partial := map[string]any{
+		"record": map[string]any{
+			"enabled": true,
+			"continuous": map[string]any{
+				"days": days,
+			},
+			"motion": map[string]any{
+				"days": days,
+			},
+		},
+	}
+	body, err := json.Marshal(map[string]any{
+		"requires_restart": 0,
+		"update_topic":     "config/record-retention",
+		"config_data":      partial,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal record retention config: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut,
+		c.FrigateBase+"/api/config/set", bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return fmt.Errorf("frigate record retention set: %s: %s", resp.Status, string(raw))
+	}
+
+	log.Printf("frigate: record retention set to %d days", days)
 	return nil
 }
 
