@@ -42,6 +42,19 @@
 
 package com.example.homecenter
 
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCallback
+import android.os.Build
+import android.os.IBinder
 import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
@@ -163,6 +176,32 @@ data class WsMessage(
     val ts: Long = 0
 )
 
+/**
+ * Client-side error report posted to /api/v1/system/client-errors.
+ *
+ * Field shapes mirror the backend SystemLog "client.error" writer (see
+ * services/api/internal/handler/client_error_handler.go): the backend
+ * rate-limits per user/IP and dedups on (context + message), so callers
+ * SHOULD NOT spam — but a light client-side limiter/dedup is still
+ * applied in [ClientErrorReporter] to be safe.
+ *
+ *   message  short human-readable description (server caps at 500)
+ *   stack    optional stack trace (server caps at 2000)
+ *   url      app context identifier (defaults to "android")
+ *   level    "critical" | "normal" | "info"
+ *   context  free-form tag for categorization, e.g. "android.ws"
+ *   count    dedup counter (server merges identical reports)
+ */
+@Serializable
+data class ClientErrorReport(
+    val message: String,
+    val stack: String = "",
+    val url: String = "android",
+    val level: String = "normal",
+    val context: String = "android",
+    val count: Int = 1
+)
+
 // =====================================================================================
 // 2. REST API (Retrofit)
 // =====================================================================================
@@ -190,6 +229,18 @@ interface HomeCenterApi {
     suspend fun revokeDevice(
         @Header("Authorization") auth: String,
         @Path("id") id: Long
+    ): ApiResponse
+
+    /**
+     * POST /api/v1/system/client-errors — server-side error reporting.
+     * Backend persists the row as a SystemLog "client.error" entry with
+     * per-user/IP rate limiting + dedup, so the app's own failures show up
+     * in the dashboard log pane. (v1.8.42: Android client-side reporting.)
+     */
+    @POST("api/v1/system/client-errors")
+    suspend fun reportClientError(
+        @Header("Authorization") auth: String,
+        @Body report: ClientErrorReport
     ): ApiResponse
 }
 
@@ -233,6 +284,20 @@ class HomeCenterRepository(private val api: HomeCenterApi) {
         val resp = api.revokeDevice(bearer(token), deviceId)
         ensureSuccess(resp)
         // data is null on success — nothing to decode.
+    }
+
+    /**
+     * Report a client-side error to the server. Best-effort: never throws.
+     * The backend applies its own rate limiting + dedup, so repeated
+     * identical reports collapse into one SystemLog row. (v1.8.42)
+     */
+    suspend fun reportError(token: String, report: ClientErrorReport) {
+        try {
+            api.reportClientError(bearer(token), report)
+        } catch (t: Throwable) {
+            // Reporting must never break the app or the WS reconnect loop.
+            Log.w(TAG, "client error report failed: ${t.message}")
+        }
     }
 
     private fun bearer(token: String): String = "Bearer $token"
@@ -291,6 +356,81 @@ object HomeCenterFactory {
 }
 
 // =====================================================================================
+// 4.5 Client error reporter — rate-limited, deduped, background-safe
+// =====================================================================================
+
+/**
+ * Client-side error reporter (v1.8.42).
+ *
+ * Mirrors the web reporter (web/src/lib/errorReport.ts): a thin, defensive,
+ * fire-and-forget sender that pushes app/WS failures to
+ * /api/v1/system/client-errors. The backend already rate-limits per
+ * user/IP and dedups on (context+message), so this comparator only ADDS:
+ *   - a global minimum interval (2s) so a reconnect storm can't flood,
+ *   - a 60s in-memory dedup window that folds identical reports into one
+ *     with an incremented `count` (belt-and-braces before the server),
+ *   - coroutine dispatch on a caller-provided scope (reporting never
+ *     throws and never blocks the caller).
+ *
+ * Usage from an Activity/Service:
+ *   val reporter = ClientErrorReporter(token, repo, scope)
+ *   reporter.report("android.ws", "ws failed: ${t.message}", level = "critical", stack = t.stackTraceToString())
+ */
+class ClientErrorReporter(
+    private val token: String,
+    private val repo: HomeCenterRepository,
+    private val scope: CoroutineScope
+) {
+    private val MIN_INTERVAL_MS = 2_000L
+    private val DEDUP_WINDOW_MS = 60_000L
+
+    @Volatile private var lastSentAt = 0L
+    private val recent = HashMap<String, MutableList<Long>>() // key -> send timestamps
+
+    /**
+     * Report an error. Never throws. [context] should be a stable tag
+     * (e.g. "android.ws", "android.render") so the backend can group.
+     * [stack] is truncated to 2000 chars to match the server cap.
+     */
+    fun report(
+        context: String,
+        message: String,
+        level: String = "normal",
+        stack: String? = null
+    ) {
+        val now = System.currentTimeMillis()
+        synchronized(this) {
+            if (now - lastSentAt < MIN_INTERVAL_MS) return
+            lastSentAt = now
+        }
+
+        val key = "$context|$message"
+        val keyTs = synchronized(recent) {
+            val list = recent[key]
+            if (list != null) recent[key] = list.filter { now - it < DEDUP_WINDOW_MS }
+            when {
+                list == null -> { recent[key] = mutableListOf(now); 1 }
+                else -> { list.add(now); list.size }
+            }
+        }
+
+        scope.launch {
+            repo.reportError(
+                token,
+                ClientErrorReport(
+                    message = message.take(500),
+                    stack = stack?.take(2000) ?: "",
+                    url = "android",
+                    level = level,
+                    context = context.take(64),
+                    count = keyTs
+                )
+            )
+        }
+    }
+}
+
+// =====================================================================================
 // 5. WebSocket client (OkHttp + coroutines)
 // =====================================================================================
 
@@ -337,7 +477,13 @@ class HomeCenterWebSocket(
     private val token: String,
     private val listener: WsEventListener,
     private val scope: CoroutineScope,
-    private val heartbeatIntervalMs: Long = 30_000L
+    private val heartbeatIntervalMs: Long = 30_000L,
+    /**
+     * Optional callback invoked on transport failure ([onFailure]) BEFORE a
+     * reconnect is scheduled. Wire this to a [ClientErrorReporter] so WS
+     * failures surface in the dashboard log pane (v1.8.42).
+     */
+    private val onErrorReport: ((Throwable) -> Unit)? = null
 ) {
 
     @Volatile private var webSocket: WebSocket? = null
@@ -350,6 +496,9 @@ class HomeCenterWebSocket(
 
     /** Topics that should be re-applied after every reconnect. */
     private val activeSubscriptions: MutableSet<String> = LinkedHashSet()
+
+    /** Whether the socket is currently open. Thread-safe. */
+    fun isConnected(): Boolean = isConnected
 
     /** Start the connection. Safe to call multiple times. */
     fun connect() {
@@ -364,6 +513,23 @@ class HomeCenterWebSocket(
             .build()
 
         webSocket = client.newWebSocket(request, WsListener())
+    }
+
+    /**
+     * Called when connectivity returns (e.g. WiFi↔cellular switch detected
+     * by a ConnectivityManager NetworkCallback). If the socket isn't
+     * connected, cancel any pending backoff timer and reconnect immediately
+     * instead of waiting out the remaining delay. (v1.8.42)
+     */
+    fun onNetworkAvailable() {
+        if (isConnected) return
+        reconnectJob?.cancel()
+        reconnectJob = null
+        if (shouldReconnect) {
+            Log.i(TAG, "network available — reconnecting immediately")
+            webSocket = null
+            connect()
+        }
     }
 
     /** Gracefully close and stop auto-reconnect. Idempotent. */
@@ -500,6 +666,9 @@ class HomeCenterWebSocket(
             stopHeartbeat()
             this@HomeCenterWebSocket.webSocket = null
             listener.onError(t, reconnectAttempt + 1)
+            // v1.8.42: surface transport failures to the backend before the
+            // reconnect loop buries them under retries.
+            onErrorReport?.invoke(t)
             if (shouldReconnect) scheduleReconnect()
         }
     }
@@ -511,6 +680,188 @@ class HomeCenterWebSocket(
 
         // 1000 = normal closure. Sent by the client in disconnect().
         private const val NORMAL_CLOSURE = 1000
+    }
+}
+
+// =====================================================================================
+// 5.5 Network monitor — reconnect on connectivity changes
+// =====================================================================================
+
+/**
+ * Wraps [ConnectivityManager] to observe network availability and surface
+ * connectivity recovery to the WebSocket. (v1.8.42)
+ *
+ * WiFi↔cellular handoffs and airplane-mode toggles tear down the current
+ * socket but don't always fire OkHttp's onFailure promptly enough; hopping
+ * on [onAvailable] lets the WS reconnect immediately instead of waiting out
+ * its backoff timer. Requires android.permission.ACCESS_NETWORK_STATE.
+ */
+class NetworkMonitor(
+    context: Context,
+    private val onAvailable: () -> Unit
+) : NetworkCallback() {
+
+    private val connectivityManager =
+        context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+    private var registered = false
+
+    /** Register the default-network callback. Safe to call once. */
+    fun register() {
+        if (registered) return
+        registered = true
+        connectivityManager.registerDefaultNetworkCallback(this)
+    }
+
+    /** Unregister. Safe to call once. */
+    fun unregister() {
+        if (!registered) return
+        registered = false
+        connectivityManager.unregisterNetworkCallback(this)
+    }
+
+    override fun onAvailable(network: Network) {
+        onAvailable()
+    }
+}
+
+// =====================================================================================
+// 5.6 Foreground service — keep the WS alive in the background
+// =====================================================================================
+
+/**
+ * Foreground service that hosts the WebSocket so the realtime channel
+ * survives the app being backgrounded (Android can otherwise kill a
+ * backgrounded process — the WS drops and the dashboard stops updating).
+ * (v1.8.42)
+ *
+ * Start via `startForegroundService(intent)`. The service shows a
+ * persistent notification; on API 34+ (U) it additionally requires the
+ * FOREGROUND_SERVICE_CONNECTED_DEVICE or FOREGROUND_SERVICE_DATA_SYNC
+ * foreground-service type declared in the manifest.
+ *
+ * Required manifest additions:
+ *   <uses-permission android:name="android.permission.INTERNET"/>
+ *   <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+ *   <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+ *   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+ *   <uses-permission
+ *       android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"/>
+ *   <service android:name=".HomeCenterService"
+ *            android:foregroundServiceType="connectedDevice"
+ *            android:exported="false"/>
+ *
+ * The WebSocket is created lazily on [onCreate] and torn down on [onDestroy];
+ * the [NetworkMonitor] triggers an immediate reconnect on connectivity
+ * recovery. Error reporting is wired via [ClientErrorReporter] so service-
+ * level WS failures still reach the dashboard log pane.
+ */
+class HomeCenterService : Service() {
+
+    private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var okHttp: OkHttpClient? = null
+    private var webSocket: HomeCenterWebSocket? = null
+    private var networkMonitor: NetworkMonitor? = null
+    private var errorReporter: ClientErrorReporter? = null
+
+    override fun onCreate() {
+        super.onCreate()
+        startAsForeground()
+        startRealtime()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // START_STICKY: if the system kills the service, restart it with a
+        // null intent (and an empty command) so the WS comes back up.
+        return START_STICKY
+    }
+
+    override fun onDestroy() {
+        networkMonitor?.unregister()
+        networkMonitor = null
+        webSocket?.disconnect()
+        webSocket = null
+        ioScope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startAsForeground() {
+        val channel = NotificationChannel(
+            CHANNEL_ID,
+            "Home Datacenter",
+            NotificationManager.IMPORTANCE_LOW
+        ).apply { setShowBadge(false) }
+        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+
+        val notification: Notification = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle("Home Datacenter")
+            .setContentText("实时连接保持中")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)
+            .setOngoing(true)
+            .build()
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
+        } else {
+            startForeground(NOTIFICATION_ID, notification, 0)
+        }
+    }
+
+    private fun startRealtime() {
+        // Base URL / WS URL must come from real config (constants here are
+        // placeholders mirroring the Activity sample).
+        val baseUrl = "http://10.0.2.2:8080/"
+        val wsUrl = "ws://10.0.2.2:8080/api/v1/ws"
+
+        okHttp = HomeCenterFactory.okHttpClient(enableVerboseLogging = false)
+        val client = okHttp ?: return
+        val api = HomeCenterFactory.createApi(baseUrl, client)
+        val repo = HomeCenterRepository(api)
+
+        // NOTE: persist the token in EncryptedSharedPreferences and load it
+        // here instead of re-binding on every service start.
+        val token = "LOAD_FROM_STORAGE"
+
+        errorReporter = ClientErrorReporter(token, repo, ioScope)
+
+        val ws = HomeCenterWebSocket(
+            client = client,
+            wsUrl = wsUrl,
+            token = token,
+            scope = ioScope,
+            listener = object : WsEventListener {
+                override fun onConnected() { /* re-subscribe to topics here */ }
+                override fun onMessage(message: WsMessage) { /* dispatch */ }
+                override fun onDisconnected(code: Int, reason: String?) { /* optional */ }
+                override fun onError(throwable: Throwable, reconnectAttempt: Int) {
+                    errorReporter?.report(
+                        context = "android.ws",
+                        message = "service ws error: ${throwable.message}",
+                        level = "critical",
+                        stack = throwable.stackTraceToString()
+                    )
+                }
+            },
+            onErrorReport = { t ->
+                errorReporter?.report(
+                    context = "android.ws",
+                    message = "service ws failure: ${t.message}",
+                    level = "critical",
+                    stack = t.stackTraceToString()
+                )
+            }
+        )
+        webSocket = ws
+        ws.connect()
+
+        networkMonitor = NetworkMonitor(this) { ws.onNetworkAvailable() }
+        networkMonitor?.register()
+    }
+
+    companion object {
+        private const val CHANNEL_ID = "home_datacenter"
+        private const val NOTIFICATION_ID = 1001
     }
 }
 
