@@ -623,10 +623,19 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 - 容器内对真实录像做 6 段（整分钟）多段拼接转码：写到 `/tmp` 成功（faststart 正常），复制到 btrfs 缓存卷后 `cmp` 字节完全一致。
 - Go 主程序编译 + `go vet ./internal/handler/` 通过。
 
+#### 录像配额上调至 400 GiB（同日）
+- `configs/config.yaml`：`recording_quota_bytes` 由 300 GiB（322122547200）上调至 **400 GiB（429496729600）**——约为 466G 数据卷的 86%。超限时保留自动从 7 天降到 3 天，回落时恢复 7 天。
+- 已 scp 到 NAS 并重启 `home-api`，容器内 `/configs/config.yaml` 确认生效，`/health` 返回 `{"status":"ok"}`。
+
+#### Android：录像进度条按实际覆盖跨度显示（v1.8.37 / versionCode 123）
+> **问题**：录不满一天的录像（如摄像头定时/离线只录了几小时），进度条仍按固定的 24h 排布，几个小时的录像和红色告警段被压缩到进度条一小段里，看起来"进度条还是按 24h 来的"。
+- `RecordingsDialog.kt`：`dayTotalMs` 从恒定的 24h 改为**实际录像覆盖跨度**（第一段录像开始 → 最后一段录像结束，`最后结束 = 最后一段 startAt + durationSeconds`）。SeekBar max、告警 overlay max、clip 偏移 clamp、时长标签（不再跨到次日）全部随之取实际窗口；满一天录像仍 ≈24h，行为不变。
+- 已 `gradlew :app:compileDebugKotlin` 编译通过。
+
 #### 版本
-- Backend: v1.8.37
+- Backend: v1.8.37（含 v1.8.37 转码修复 + 配额 400 GiB）
 - Web: v1.8.37（无前端改动）
-- Android: v1.8.37（无前端改动）
+- Android: v1.8.37（progress bar 修复）
 
 ### v1.8.36 — 配额告警落地为 warning 事件 + Android 管理员专用琥珀横幅 (2026-08-14)
 

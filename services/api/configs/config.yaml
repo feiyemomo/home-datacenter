@@ -169,9 +169,9 @@ maintenance:
   # then deleted on Frigate's next cleanup cycle) and logs an alert.
   # When it drops back below, normal retention is restored.
   # 0 disables the automatic action (the tree is still size-alerted).
-  # Set to 300 GiB (≈65% of the 466G data volume) so recordings can't
+  # Set to 400 GiB (≈86% of the 466G data volume) so recordings can't
   # silently fill the disk; on crossing, retention drops 7→3 days.
-  recording_quota_bytes: 322122547200
+  recording_quota_bytes: 429496729600
   # Normal retention (days) applied by the full config push.
   recording_retention_days: 7
   # Retention (days) applied while over quota. Must be < normal.
