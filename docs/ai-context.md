@@ -1509,6 +1509,88 @@ v1.8.27 made daily SQLite snapshots (app + frigate) to `data/sqlite/backups`, bu
 
 ---
 
+## Phase 24 (v1.8.30): Restore Drill + Backup Health & Retention Monitoring
+
+### Phase 24 span: v1.8.30 (Backend + compose + scripts)
+
+#### Problem: the off-NAS backup was invisible and unverifiable
+
+v1.8.29 shipped the Bitiful sync, but three gaps remained: (1) there was no way to prove the bucket copy was actually recoverable without hand-running rclone; (2) a failed or stalled sync only landed in the backup container's logs — invisible to the dashboard; (3) the bucket could silently outgrow the free tier (50 GB) with no signal.
+
+#### Design: a shared status file bridging the two containers
+
+The backup container now writes an atomic JSON status after every sync; the API's new `BackupMonitor` reads it (read-only) and raises alerts. This keeps the backup container egress-only (it never calls the API) and the API a passive reader (it never writes the state the backup loop owns).
+
+- **`deploy/backup/entrypoint.sh`**:
+  - After each `rclone sync`, runs `rclone size` on the remote and writes `data/backup-state/last.json` (temp+rename for atomicity): `{"ts":..., "ok":true|false, "error":"...", "remote_files":N, "remote_bytes":N}`.
+  - `ok` is a JSON boolean (the API unmarshals into a Go `bool`). `remote_bytes` is parsed from the parenthesized exact byte count of rclone's `Total size: 700 KiB (716800 Byte)` line.
+  - `ONCE=1` runs a single sync + status write then exits (used by the restore drill / manual triggers).
+- **`compose.yaml`**:
+  - `backup` gains a writable `./data/backup-state:/state` mount.
+  - `api` gains a read-only `./data/backup-state:/data/backup-state:ro` mount.
+- **`internal/maintenance/backup.go`** — new `BackupMonitor` (edge-triggered, matching the other monitors):
+  - **Failure/staleness** (`system.backup`, critical): when the state says `ok:false`, or the file is older than `backup_stale_after_minutes` (the backup loop stopped writing), or a previously-healthy state file disappears.
+  - **Retention** (`system.backup`): when `remote_files` / `remote_bytes` cross `backup_warn_files` / `backup_crit_files` / `backup_warn_bytes` / `backup_crit_bytes` (0 = disabled).
+  - Writes `SystemLog` + re-publishes on `system.log`, so the dashboard WS hub broadcasts it live.
+- **`internal/config/config.go` / `configs/config.yaml` / `cmd/main.go`**: new `backup_state_path`, `backup_monitor_interval_minutes` (5), `backup_stale_after_minutes` (720 = 2× the 6h sync), and the four retention thresholds.
+- **`scripts/restore-dry-run.sh`** — new restore-drill script: lists the bucket via the backup container, pulls the newest `app-*.db`, copies it out of the container, runs `PRAGMA integrity_check` + key-table counts via python3, prints `RESTORE OK`, and cleans up. Run on the NAS (`sh scripts/restore-dry-run.sh`) or remotely (`NAS=host sh ...`).
+
+#### NAS verification (192.168.31.235, e2e)
+
+- Backup container restart writes a correct state file: `{"ok":true,"remote_files":1,"remote_bytes":716800}` (byte count matches the verified snapshot).
+- Failure alert: wrote `ok:false` → api emitted `system.backup critical 异地备份失败：rclone sync failed`; row persisted in `system_logs` with full payload.
+- Recovery: restored `ok:true` → api re-check produced no new alert (edge-triggered self-heal).
+- Retention alert: with `backup_warn_files:1` (bucket has 1 object) → api emitted `system.backup warning 异地备份容量告警（warning）：bucket 内 1 个对象 / 700.0 KiB`. Thresholds then restored to 0 (disabled).
+- Restore drill: `sh scripts/restore-dry-run.sh` → pulled `app-20260814-110103.db` (716800 B), `integrity: ok`, `users: 4 cameras: 2`, `RESTORE OK`.
+- Test rows cleaned up; production state healthy (`ok:true`, 0 residual `system.backup` rows).
+
+### Files Changed (Phase 24)
+
+| File | Change |
+|------|--------|
+| `deploy/backup/entrypoint.sh` | Write atomic `last.json` status after each sync; `rclone size` object/byte reporting; `ONCE=1` single-run mode |
+| `compose.yaml` | `backup` gains writable `/state`; `api` gains read-only `/data/backup-state:ro` |
+| `services/api/internal/maintenance/backup.go` | New — `BackupMonitor` (failure/staleness + retention alerts) |
+| `services/api/internal/config/config.go` | New `BackupStatePath` + backup monitor/threshold fields |
+| `services/api/configs/config.yaml` | New `backup_state_path` / monitor / threshold config |
+| `services/api/cmd/main.go` | Wire `BackupMonitor` into `maintenance.StartAll` |
+| `scripts/restore-dry-run.sh` | New — off-NAS restore drill (pull + integrity check + cleanup) |
+
+---
+
+## Phase 25 (v1.8.31): Fix Android "All 3 attempts failed for /api/v1/user" 502 Root Cause
+
+### Phase 25 span: v1.8.31 (compose only)
+
+#### Problem: every api redeploy broke the nginx proxy → Android 502
+
+The Android app reported "加载失败：All 3 attempts failed for /api/v1/user". Crucially, that message is **only** produced by `RetryInterceptor` after 3 consecutive **5xx** responses — a 403 (admin-only) would be returned immediately without retry (the interceptor explicitly skips 4xx). So this was NOT a permission issue; the backend was returning 502.
+
+Confirmed on the NAS (192.168.31.235):
+- `curl :8088/api/v1/user` → **502 Bad Gateway** (nginx upstream failure).
+- api container `:8080/health` direct → 200; from inside `home-web`, `wget api:8080/health` → 200.
+- Diagnosis: nginx's `upstream api_backend { server api:8080; }` resolves the `api` hostname **once at nginx startup** and caches that IP. The api container had been recreated 42 min earlier (new IP), while `home-web` had been up 3 hours with a stale cached IP — so every `/api/*` request proxied to a dead address.
+
+#### Design: pin the api container to a static IP in an explicit subnet
+
+- `compose.yaml` `home-net` now declares an explicit `172.18.0.0/24` subnet (required for static assignment).
+- `api` service pins `ipv4_address: 172.18.0.10`. Because the IP is stable across container recreates, nginx's one-time upstream resolution never goes stale — no web restart needed after future api redeploys.
+- The network (and all containers) are recreated once on roll-out; named access to other services (`home-frigate`, `mosquitto`, etc.) is unaffected since they are reached by DNS name.
+
+#### NAS verification (192.168.31.235, e2e)
+
+- After roll-out all containers healthy; `home-api` IP = `172.18.0.10`.
+- `GET /api/v1/user` via nginx → 200, `users` count 4.
+- Self-heal proof: `docker compose up -d --no-deps --force-recreate api` (recreate api, **leave web up**) → api still `172.18.0.10`, `home-web` not restarted (StartedAt unchanged) → `/api/v1/user` via nginx still 200. Future api recreates will no longer trigger the 502.
+
+### Files Changed (Phase 25)
+
+| File | Change |
+|------|--------|
+| `compose.yaml` | Declare `home-net` `/24` subnet; pin `api` to static `172.18.0.10` |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)

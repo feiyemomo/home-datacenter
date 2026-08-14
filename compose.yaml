@@ -90,6 +90,10 @@ services:
       # matching "app-debug-vX.Y.Z.apk" are ever deleted — matched
       # strictly by listAll), keeping the directory bounded.
       - ./data/releases:/data/releases
+      # v1.8.29: off-NAS backup status file, written by the backup
+      # container and read (read-only) by the api's BackupMonitor to
+      # alert on failed/stalled syncs and bucket retention.
+      - ./data/backup-state:/data/backup-state:ro
     depends_on:
       mosquitto:
         condition: service_started
@@ -138,8 +142,20 @@ services:
       # would cause CheckIPv6() to report reachable=true, making the
       # mobile app waste time on IPv6 direct mode that can never succeed.
       - NAS_IPV6_DISABLED=${NAS_IPV6_DISABLED:-false}
+    # v1.8.31: static IP for the api service. nginx's
+    # `upstream api_backend { server api:8080; }` in web/nginx.conf
+    # resolves the `api` hostname ONCE at nginx startup and keeps
+    # that IP cached for the lifetime of the web container. When the
+    # api container is recreated on a redeploy, Docker gives it a NEW
+    # IP, so the running web container keeps proxying to a dead IP and
+    # every /api/* request returns 502 — the Android app then reports
+    # "All 3 attempts failed for /api/v1/user". Pinning api to a fixed
+    # address in home-net makes its IP stable across recreates, so the
+    # nginx upstream never goes stale. The subnet must be declared in
+    # the network block below for the static assignment to work.
     networks:
-      - home-net
+      home-net:
+        ipv4_address: 172.18.0.10
 
   mosquitto:
     image: eclipse-mosquitto:2
@@ -428,6 +444,7 @@ services:
     volumes:
       # Read-only: the backup container consumes, never mutates.
       - ./data/sqlite/backups:/backups:ro
+      - ./data/backup-state:/state
       - ./deploy/backup/entrypoint.sh:/entrypoint.sh:ro
     entrypoint: [ "sh", "/entrypoint.sh" ]
     environment:
@@ -442,5 +459,12 @@ services:
       - home-net
 
 networks:
+  # v1.8.31: explicit /24 subnet so the api service can be pinned to a
+  # static address (172.18.0.10). Without a declared subnet, Docker's
+  # embedded DNS hands every container a fresh IP on each recreate and
+  # nginx's one-time upstream resolution (web container) goes stale → 502.
   home-net:
     driver: bridge
+    ipam:
+      config:
+        - subnet: 172.18.0.0/24
