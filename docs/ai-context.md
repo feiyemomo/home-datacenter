@@ -1776,6 +1776,54 @@ Activating the quota previously only shortened Frigate's retention (`PushRecordR
 
 ---
 
+## Phase 31 (v1.8.37): Fix Recording Playback Intermittent Transcode Failure Pegging the CPU
+
+### Phase 31 span: v1.8.37 (Backend)
+
+#### Symptom
+"一看录像 CPU 就占满" — ffmpeg pegs the CPU whenever a camera recording is viewed, and the recording sometimes fails to play.
+
+#### Investigation (what was ruled out)
+- **Playback transcode is NOT slow when it works**: running the exact `buildTranscodeCmd` VAAPI pipeline in the api container on a real 8s segment completes in 1.44s (`speed=5.5x`), ~1s total CPU. `/dev/dri/renderD128` is mounted (`group_add 105`, `uid 1000` in group 105), `ffmpeg -encoders` lists `h264_vaapi`. So the hardware path is healthy.
+- **go2rtc live preview** has `#hardware=vaapi`, which routes encode through `h264_vaapi` (frames uploaded via `hwupload`). Not the CPU source.
+- **Cameras were down** during the incident (both `192.168.31.100`/`.101` unreachable, `No route to host` in go2rtc logs) — a separate operational issue.
+
+#### Root cause
+The api log showed repeated failures on the **real** multi-segment (full-minute) transcode:
+
+```
+[mp4 @ 0x...] Unable to re-open .../.transcode-cache/12/.tmp-<ts>.mp4 output file for shifting data
+PlayRecording: VAAPI failed, retrying with software libx264
+PlayRecording: ffmpeg software transcode failed: exit status 254
+```
+
+`-movflags faststart` writes the whole file then does a **second pass that re-opens the output read-write** to shift the `moov` atom to the front. `transcodeRecording` wrote the output **directly onto the btrfs bind mount** (`/data/recordings/.transcode-cache`). On btrfs this re-open **intermittently fails** (reproduced: single-segment and multi-segment runs both succeed on some attempts, fail on others — non-deterministic). The failure happens **after the full encode**, so the hardware work was wasted; the software `libx264` fallback used the same flags+path, failed the same way, and burned ~40s of CPU on the J4125. The operator's retries repeated this per minute viewed → CPU pegged + playback 500.
+
+#### Fix
+`internal/handler/camera_handler.go`:
+- Transcode output now goes to the container's **overlay FS** (`tmpDir` from `os.MkdirTemp`, i.e. `/tmp`) where the faststart re-open is reliable.
+- New `copyToCache(src, dst)`: writes a `.stage-*` temp sibling on the cache volume then `os.Rename`s (same-fs atomic promotion). Copy is required because the transcode temp (overlay) and cache volume (btrfs) are different filesystems — a rename would `EXDEV`.
+- Software fallback inherits the same `/tmp` output, so it also no longer hits the btrfs re-open failure.
+
+This removes the btrfs faststart re-open from the critical path entirely.
+
+#### NAS verification (192.168.31.235, 2026-08-14)
+- In-container multi-segment (6-segment full minute) transcode to `/tmp`: succeeds, faststart second pass completes.
+- `cp /tmp/*.mp4` → cache volume + `cmp` → bytes identical.
+- Before fix, api log showed the `Unable to re-open ... for shifting data` failures on the real path.
+
+#### Notes / follow-ups
+- The cameras were offline during diagnostic (ping + :554 unreachable from host and all containers). Once they're back, live previews resume; unrelated to this fix.
+- btrfs re-open flakiness is environmental; the fix makes playback robust regardless by never faststart-re-opening on btrfs.
+
+### Files Changed (Phase 31)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/handler/camera_handler.go` | `transcodeRecording` writes output to container `/tmp` (overlay FS) instead of the btrfs cache volume; added `copyToCache` for atomic copy-promotion; updated comments |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)

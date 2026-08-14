@@ -1075,19 +1075,25 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 		return
 	}
 
-	// Write the ffmpeg output into a temp file INSIDE the cache directory,
-	// so it lives on the same filesystem as the final cache file. A rename
-	// across filesystems (e.g. /tmp on the overlay FS vs /data/recordings on
-	// the host bind mount) fails with "invalid cross-device link", so the
-	// output must be born on the destination volume to be promotable.
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		log.Printf("[handler] mkdir cache dir: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "create cache dir")
 		return
 	}
-	tmpOut := filepath.Join(cacheDir, fmt.Sprintf(".tmp-%d.mp4", minuteStart))
-	os.Remove(tmpOut) // clear a stale temp from a previous crash
-	defer os.Remove(tmpOut)
+	// v1.8.37: transcode into the container's overlay FS (/tmp under
+	// tmpDir), NOT directly onto the btrfs bind mount. ffmpeg's
+	// `-movflags faststart` must re-open the output file for a second
+	// pass to shift the moov atom to the front; on the btrfs cache
+	// volume this re-open intermittently fails with "Unable to re-open
+	// output file for shifting data" (reproduced on the NAS), aborting
+	// the transcode AFTER the full encode ran. The software fallback
+	// then repeated the same failure and burned ~40s of CPU, so
+	// recording playback returned 500 and the operator's retries kept
+	// pegging the CPU. On the overlay FS the re-open is reliable. We
+	// then promote the finished file onto the cache volume by copy
+	// (a cross-filesystem rename would fail with EXDEV), keyed by
+	// minuteStart as before.
+	tmpOut := filepath.Join(tmpDir, fmt.Sprintf("%d.mp4", minuteStart))
 
 	cmd := buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -1113,11 +1119,13 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	// minuteStart is still being written while it is the current minute
 	// (Frigate appends segments until the minute rolls over); caching a
 	// partial clip would serve a truncated/replayed-tail video forever.
-	// Past minutes are immutable, so rename the temp output into the cache
-	// atomically — a rename never exposes a half-written file to a reader.
+	// Past minutes are immutable, so promote the finished transcode
+	// into the cache atomically (copyToCache writes a temp sibling on
+	// the cache volume then renames) — a reader never sees a half-
+	// written file.
 	finalPath := tmpOut
 	if time.Now().Unix()-minuteStart > 90 {
-		if err := os.Rename(tmpOut, cacheFile); err == nil {
+		if err := copyToCache(tmpOut, cacheFile); err == nil {
 			finalPath = cacheFile
 		} else {
 			log.Printf("PlayRecording: cache promote failed (serving temp): %v", err)
@@ -1125,6 +1133,41 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	}
 
 	serve(finalPath)
+}
+
+// copyToCache copies a finished transcode into the cache volume
+// atomically: write to a temp sibling on the same filesystem, then
+// rename (a same-fs rename is atomic, so readers never see a half-
+// written file). We copy rather than rename the transcode result
+// because the temp now lives on the container's overlay FS (/tmp)
+// while the cache volume is a btrfs bind mount — a cross-filesystem
+// rename would fail with EXDEV. Copying a fully-written local file is
+// cheap and safe.
+func copyToCache(src, dst string) error {
+	stage, err := os.CreateTemp(filepath.Dir(dst), ".stage-*")
+	if err != nil {
+		return err
+	}
+	sname := stage.Name()
+	defer os.Remove(sname) // no-op after a successful rename
+	in, err := os.Open(src)
+	if err != nil {
+		stage.Close()
+		return err
+	}
+	if _, err := io.Copy(stage, in); err != nil {
+		in.Close()
+		stage.Close()
+		return err
+	}
+	if err := in.Close(); err != nil {
+		stage.Close()
+		return err
+	}
+	if err := stage.Close(); err != nil {
+		return err
+	}
+	return os.Rename(sname, dst)
 }
 
 // vaapiAvailable reports whether the Intel iGPU render node is
