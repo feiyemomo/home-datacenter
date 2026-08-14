@@ -171,6 +171,14 @@ docker compose up -d --build
 - Mosquitto 默认 **不**绑定主机端口。如果需要本地物理设备连入测试，取消 `compose.yaml` 第 49 行附近的注释，并设置 `MQTT_BIND_PORT` 环境变量。
 - 所有服务都在 `home-net` bridge 网络中通过服务名互通：`api → mosquitto:1883`、`web → api:8080`。
 
+### 持久化与运维（v1.8.27）
+
+- **Frigate 事件库持久化**：`./data/frigate/config` 挂载到 Frigate 的 `/config`，`frigate.db`、`.jwt_secret`、模型缓存等随容器重建不再丢失。录像本身仍在 `./data/frigate`（`/media/frigate`）。
+- **SQLite 自维护**：API 每 6 小时对 `app.db` 执行一次 WAL checkpoint（`TRUNCATE`），每日用 `VACUUM INTO` 生成一份一致快照到 `./data/sqlite/backups`，保留最近 7 份。参数见 `configs/config.yaml` 的 `maintenance:` 段。
+- **磁盘空间告警**：API 每 10 分钟采样数据盘使用率，跨过 80%（warn）/ 90%（crit）阈值时写入一条 `system.disk` 系统日志并实时推送到仪表盘，避免磁盘写满导致 Frigate 静默停止录像。
+- **容器日志轮转**：所有服务统一使用 `json-file` 驱动，单文件上限 10MB、最多保留 3 份，日志不会无限增长。
+- **旧 APK 清理**：`data/releases` 只保留最新 5 个 APK，启动时和每天各清理一次，防止发布目录无限膨胀。
+
 ---
 
 ## 部署步骤（详细版）
