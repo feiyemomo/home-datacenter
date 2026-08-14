@@ -153,21 +153,42 @@ export function useHLSStream(
         // fatal error before the timer fires, the error handler
         // below will surface it immediately.
         const stallTimeoutMs = 15_000;
-        const stallTimer = window.setTimeout(() => {
-            if (cancelled) return;
-            setState((cur) => {
-                if (cur === "playing") return cur;
-                const msg = "HLS stream stalled: no new segments arrived in time (check that the go2rtc HLS session is alive)";
-                setError(msg);
-                // v1.8.41: report the stall to the backend.
-                reportClientError({
-                    level: "critical",
-                    context: "playback.hls.stall",
-                    message: msg.slice(0, 500),
+        let stallTimer: number | null = null;
+        const armStallWatchdog = () => {
+            if (stallTimer !== null) if (stallTimer !== null) window.clearTimeout(stallTimer);
+            stallTimer = window.setTimeout(() => {
+                stallTimer = null;
+                if (cancelled) return;
+                // v1.8.42: background hold — a backgrounded tab has its
+                // timers and XHRs throttled, so hls.js may legitimately
+                // not reach "playing" while hidden. Don't trip the stall
+                // watchdog on that; the visibilitychange handler below
+                // re-arms the watchdog when the tab returns.
+                if (document.hidden) return;
+                setState((cur) => {
+                    if (cur === "playing") return cur;
+                    const msg = "HLS stream stalled: no new segments arrived in time (check that the go2rtc HLS session is alive)";
+                    setError(msg);
+                    // v1.8.41: report the stall to the backend.
+                    reportClientError({
+                        level: "critical",
+                        context: "playback.hls.stall",
+                        message: msg.slice(0, 500),
+                    });
+                    return "error";
                 });
-                return "error";
-            });
-        }, stallTimeoutMs);
+            }, stallTimeoutMs);
+        };
+        armStallWatchdog();
+
+        // v1.8.42: when the tab returns to the foreground, re-arm the
+        // stall watchdog so a stream that was backgrounded while still
+        // not "playing" gets a fresh 15s window to start/buffer.
+        const onVisibility = () => {
+            if (document.hidden) return;
+            armStallWatchdog();
+        };
+        document.addEventListener("visibilitychange", onVisibility);
 
         // Probe HEVC decode support *before* handing off to hls.js.
         // go2rtc's HLS passthrough ships the camera's native HEVC
@@ -206,7 +227,8 @@ export function useHLSStream(
             && typeof MediaSource.isTypeSupported === "function"
             && MediaSource.isTypeSupported(hevcProbe);
         if (!canPlayHEVC || !mseSupportsHEVC) {
-            window.clearTimeout(stallTimer);
+            if (stallTimer !== null) window.clearTimeout(stallTimer);
+            document.removeEventListener("visibilitychange", onVisibility);
             v.removeEventListener("playing", onPlaying);
             v.removeEventListener("error", onError);
             v.removeEventListener("waiting", onWaiting);
@@ -251,7 +273,8 @@ export function useHLSStream(
                 v.play().catch(() => { /* handled by onError / stall watchdog */ });
                 return () => {
                     cancelled = true;
-                    window.clearTimeout(stallTimer);
+                    if (stallTimer !== null) window.clearTimeout(stallTimer);
+                    document.removeEventListener("visibilitychange", onVisibility);
                     v.removeEventListener("playing", onPlaying);
                     v.removeEventListener("error", onError);
                     v.removeEventListener("waiting", onWaiting);
@@ -260,7 +283,8 @@ export function useHLSStream(
             }
 
             // No HLS path at all — neither hls.js nor native.
-            window.clearTimeout(stallTimer);
+            if (stallTimer !== null) window.clearTimeout(stallTimer);
+            document.removeEventListener("visibilitychange", onVisibility);
             v.removeEventListener("playing", onPlaying);
             v.removeEventListener("error", onError);
             v.removeEventListener("waiting", onWaiting);
@@ -396,7 +420,8 @@ export function useHLSStream(
 
         return () => {
             cancelled = true;
-            window.clearTimeout(stallTimer);
+            if (stallTimer !== null) window.clearTimeout(stallTimer);
+            document.removeEventListener("visibilitychange", onVisibility);
             v.removeEventListener("playing", onPlaying);
             v.removeEventListener("error", onError);
             v.removeEventListener("waiting", onWaiting);

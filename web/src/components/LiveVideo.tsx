@@ -811,12 +811,40 @@ function PreviewFrame({
     // buster so the browser fetches a fresh frame instead of serving
     // a stale one from the HTTP cache. Cleared on unmount (which
     // happens when the parent switches to live/playback mode).
+    //
+    // v1.8.42: background hold — the 10s poll is paused while the tab
+    // is hidden (backgrounded timers are throttled anyway, and polling
+    // a camera JPEG nobody is looking at is pure waste). When the tab
+    // returns to the foreground we repoll immediately for a fresh
+    // frame, then resume the cadence.
     useEffect(() => {
         if (isOffline) return;
-        const interval = window.setInterval(() => {
-            setRefreshCounter((c) => c + 1);
-        }, 10_000);
-        return () => window.clearInterval(interval);
+        let interval: number | null = null;
+        const arm = () => {
+            if (interval !== null) return;
+            interval = window.setInterval(() => setRefreshCounter((c) => c + 1), 10_000);
+        };
+        const disarm = () => {
+            if (interval !== null) {
+                window.clearInterval(interval);
+                interval = null;
+            }
+        };
+        const onVisibility = () => {
+            if (document.hidden) {
+                disarm();
+            } else {
+                // Repoll immediately, then resume the cadence.
+                setRefreshCounter((c) => c + 1);
+                arm();
+            }
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+        if (!document.hidden) arm();
+        return () => {
+            document.removeEventListener("visibilitychange", onVisibility);
+            disarm();
+        };
     }, [isOffline]);
 
     return (
