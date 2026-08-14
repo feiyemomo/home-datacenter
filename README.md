@@ -611,6 +611,23 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.37 — 修复录像回放间歇性转码失败导致的 CPU 占满 (2026-08-14)
+
+> **"一看录像 CPU 就占满"的根因**：录像回放的 ffmpeg 转码输出直接写到 btrfs 绑定挂载的缓存卷（`/data/recordings/.transcode-cache`）。`-movflags faststart` 需要在写完后**重开输出文件**做第二遍扫描把 moov 移到文件头；在 btrfs 上这个重开**间歇性失败**（报 `Unable to re-open output file for shifting data`），此时**完整编码已经跑完**却最终失败。代码原有的软件兜底（libx264）用同样的参数/路径重转，**同样失败**，并在 J4125 上又烧掉约 40 秒 CPU——用户看到的是"录像打不开 + CPU 被占满"，重试会反复触发，症状持续。
+
+**改动**：
+- `internal/handler/camera_handler.go`：转码输出改写到容器 **overlay 文件系统（/tmp）**——faststart 重开在其上稳定可靠；转码完成后用新增的 `copyToCache` 把成品**复制**进缓存卷（同文件系统临时文件 + 原子 rename，读者永远看不到半成品）。跨文件系统不能 rename（EXDEV），故用复制而非移动。
+- 效果：btrfs 的 faststart 重开问题从关键路径上消除，VAAPI 硬件转码一次成功、低 CPU；软件兜底同样受益。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- 容器内对真实录像做 6 段（整分钟）多段拼接转码：写到 `/tmp` 成功（faststart 正常），复制到 btrfs 缓存卷后 `cmp` 字节完全一致。
+- Go 主程序编译 + `go vet ./internal/handler/` 通过。
+
+#### 版本
+- Backend: v1.8.37
+- Web: v1.8.37（无前端改动）
+- Android: v1.8.37（无前端改动）
+
 ### v1.8.36 — 配额告警落地为 warning 事件 + Android 管理员专用琥珀横幅 (2026-08-14)
 
 > **补齐配额功能"最后一块拼图"**：此前配额超限时后端只缩短 Frigate 留存（`PushRecordRetention`），**不发布任何 `system.recordings_size` 事件**；而配额本身的告警阈值（`recording_size_warn_bytes` / `recording_size_crit_bytes`）为 0（禁用）。结果是**配额用尽时前端（Dashboard / Android）完全感知不到**，只有留存被悄悄缩短。本次让配额超限/恢复也发布事件，并在 Android 端以管理员专属横幅呈现。
