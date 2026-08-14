@@ -1467,6 +1467,8 @@ Publish `{"status":"offline",...}` to flip it back.
 | `/api/v1/system/status` | GET | JWT | Dashboard metrics (MQTT/WS/online devices) |
 | `/api/v1/system/logs` | GET | JWT | Audit log list (supports `limit`, `offset`, `event_type`, `level` filters) |
 | `/api/v1/system/logs/:id` | DELETE | JWT+admin | Delete a single log entry (verify-and-delete workflow) |
+| `/api/v1/system/logs/:id` | PATCH | JWT+admin | Verify/downgrade a critical log to `normal` level (stays in audit trail, leaves "pending" section) |
+| `/api/v1/system/client-errors` | POST | JWT | Client-side error ingest (web frontend fire-and-forget; rate-limited, deduped, persists as `client.error` rows) |
 | `/api/v1/mqtt/publish` | POST | JWT+admin | Publish within `home-datacenter/` namespace |
 | `/api/v1/ws` | GET (upgrade) | JWT | WebSocket real-time channel |
 | `/api/v1/cameras` | GET | JWT | List cameras |
@@ -1517,4 +1519,4 @@ Publish `{"status":"offline",...}` to flip it back.
 
 ---
 
-**Document Version:** 2026-08-02 (Phase 15: security hardening, token rotation, liquid glass, new endpoints, CSP headers)
+**Document Version:** 2026-08-14 (sync: added `PATCH /system/logs/:id` verify + `POST /system/client-errors` client-error ingest to the route table)
