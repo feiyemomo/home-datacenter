@@ -297,19 +297,17 @@ func main() {
 		// live streams stay up. The quota monitor runs on the same
 		// interval as the size walk (default 1h).
 		RecordingQuotaBytes: cfg.Maintenance.RecordingQuotaBytes,
-		OnQuotaExceeded: func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := frigate.PushRecordRetention(ctx, cfg.Maintenance.RecordingReducedRetentionDays); err != nil {
-				log.Printf("maintenance: recording quota exceeded but frigate retention reduction failed: %v", err)
-			}
+		OnQuotaExceeded: func() error {
+			// v1.8.34: retry to ride out the transient Frigate restart
+			// that BootReplay triggers at api boot. The first size sample
+			// can fire while Frigate is still reloading config, and
+			// /api/config/set then returns 400 "Error parsing config".
+			// Retry over a ~3min window; Frigate's restart completes in
+			// ~2min, so the action usually lands on the 2nd or 3rd try.
+			return pushRetentionWithRetry(cfg.Maintenance.RecordingReducedRetentionDays, frigate)
 		},
-		OnQuotaRecovered: func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if err := frigate.PushRecordRetention(ctx, cfg.Maintenance.RecordingRetentionDays); err != nil {
-				log.Printf("maintenance: recording quota recovered but frigate retention restore failed: %v", err)
-			}
+		OnQuotaRecovered: func() error {
+			return pushRetentionWithRetry(cfg.Maintenance.RecordingRetentionDays, frigate)
 		},
 		SysResourceInterval:    time.Duration(cfg.Maintenance.SysResourceIntervalMinutes) * time.Minute,
 		CPUWarnPct:             cfg.Maintenance.CPUWarnPct,
@@ -739,4 +737,32 @@ func main() {
 	if err := s.ListenAndServe(); err != nil {
 		log.Fatalf("failed to start server: %v", err)
 	}
+}
+
+// pushRetentionWithRetry pushes a Frigate record-retention update with
+// retries (v1.8.34). The quota monitor can fire its first action while
+// the Frigate container is still reloading config after the api boot
+// restart (BootReplay pushes requires_restart=1), and /api/config/set
+// then returns a transient 400 "Error parsing config". Retrying over a
+// ~3min window rides out the restart; Frigate's own cleanup job applies
+// the new window on its next run. Returns the last error if it never
+// succeeds, so the quota monitor leaves the state un-derived and retries
+// on a later sample.
+func pushRetentionWithRetry(days int, frigate *camera.FrigateClient) error {
+	const attempts = 6
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := frigate.PushRecordRetention(ctx, days)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		log.Printf("maintenance: frigate retention push (%d days) attempt %d/%d failed: %v", days, i+1, attempts, err)
+		select {
+		case <-time.After(30 * time.Second):
+		}
+	}
+	return lastErr
 }
