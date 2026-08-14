@@ -1690,6 +1690,57 @@ Verified from inside the api container: `getent hosts web` fails, `home-web`/`ho
 
 ---
 
+## Phase 28 (v1.8.34): Recording Quota Action Backoff-Retry
+
+### Phase 28 span: v1.8.34 (Backend)
+
+#### Problem
+The recording-quota monitor samples once immediately on start (`Run()` first line), racing the `BootReplay` Frigate restart. When the first sample fires the quota action during that restart, `/api/config/set` returns a transient 400/500/connection-refused. The old code committed the crossed state (`quotaActive=true`) *before* running the action, so a failed push was never retried — the retention reduction silently never happened.
+
+#### Design
+- **Callbacks return error**: `OnQuotaExceeded` / `OnQuotaRecovered` now return `error` (`maintenance.go`). The monitor only commits `quotaActive` after the action succeeds (`recordings_size.go`); a failure logs and keeps the previous state so the next sample retries.
+- **`pushRetentionWithRetry`** (`cmd/main.go`): 6 attempts, 30s apart (~3min window) to ride out the Frigate restart (~2min). Frigate's own cleanup job applies the new window on its next run.
+
+#### NAS verification (192.168.31.235)
+Retry chain observed end-to-end: attempt 1/6 connection refused → 2/6 connection refused → 3/6 500 → 4/6 `record retention set to 3 days`.
+
+### Files Changed (Phase 28)
+
+| File | Change |
+|------|--------|
+| `cmd/main.go` | `pushRetentionWithRetry`; callbacks wired to it |
+| `internal/maintenance/maintenance.go` | `OnQuotaExceeded`/`OnQuotaRecovered` → `func() error` |
+| `internal/maintenance/recordings_size.go` | Commit `quotaActive` only after action success |
+
+---
+
+## Phase 29 (v1.8.35): Startup Race — Quota Reduction Clobbered by Full Config Push
+
+### Phase 29 span: v1.8.35 (Backend)
+
+#### Symptom (found while verifying the quota trigger chain)
+With quota set low (100M) and recordings at ~737M, after a clean api restart the retention was reduced to 3 days, but a **subsequent full-config push set it back to 7 days** — and because `quotaActive=true` was already committed, the monitor never re-reduced it. The recordings stayed over quota with retention stuck at 7 days.
+
+#### Root cause
+At api boot, `RecordingSizeMonitor.Run()` samples immediately (goroutine) while `BootReplay` pushes the full config (`requires_restart=1`) (main goroutine). Whichever push lands last wins. If the quota action (3 days) lands first, the full config push reads `c.retentionDays` — still the boot-time normal value (7) — and overwrites it back to 7. The quota action "succeeded", so `quotaActive=true` and no retry fires.
+
+#### Design: make the current retention a single shared authority
+- `PushRecordRetention` writes the target days back to `c.retentionDays` under a new `retentionMu` lock (`internal/camera/frigate.go`).
+- `PushConfig` snapshots `c.retentionDays` under the same lock.
+- Now both goroutine orderings converge to the reduced retention (3 days) — the full config push picks up the quota-adjusted value instead of the stale normal value.
+
+#### NAS verification (192.168.31.235, 2026-08-14)
+- Quota 100M + recreate api: full retry chain (attempt 1/2/3 transient failures → attempt 4 success); read-back `/api/config` = `continuous.days=3.0`, `motion.days=3.0` (previously clobbered back to 7.0).
+- Restore quota 300GiB + recreate api: retention back to `continuous.days=7.0`, `motion.days=7.0`.
+
+### Files Changed (Phase 29)
+
+| File | Change |
+|------|--------|
+| `internal/camera/frigate.go` | `retentionMu` lock; `PushRecordRetention` writes `c.retentionDays`; `PushConfig` snapshots under lock; `CurrentRetention()` helper |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)

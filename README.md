@@ -611,6 +611,38 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.35 — 修复启动竞态：配额缩减不再被全量配置推送覆盖 (2026-08-14)
+
+> **实测配额触发链路时揪出的真实 bug**：api 启动时，`RecordingSizeMonitor` 会**立即采样一次**（`Run()` 首行），与 `BootReplay` 的全量配置推送（`requires_restart=1`）**并发**执行。两个 goroutine 谁后落地谁生效——若配额动作先发出（把留存缩到 3 天）而全量配置推送随后用正常值（7 天）覆盖，则**最终停留在 7 天**；而配额推送本身已"成功"，`quotaActive=true`，监控不再重试——**超配额却永远不缩减留存**，配额功能形同虚设。
+
+**修复思路（让"当前留存值"成为共享权威）**：
+- `FrigateClient.PushRecordRetention` 成功前先把目标天数写回共享字段 `c.retentionDays`（新增 `retentionMu` 锁保护，见 `internal/camera/frigate.go`）。
+- `PushConfig`（全量推送 / 相机增删）在锁内快照 `c.retentionDays` 作为留存值。
+- 效果：无论 goroutine 顺序如何，最终留存都等于配额最近一次设定的值——两种顺序下都收敛到 3 天，不再被覆盖。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- 配额 100M 下重建 api：日志完整走通**重试链路**——attempt 1/6 连接拒绝（Frigate 重启中）→ attempt 2/6 连接拒绝 → attempt 3/6 500（Frigate 加载中）→ attempt 4/6 成功 `record retention set to 3 days`。
+- 读回 Frigate `/api/config`：`continuous.days=3.0`、`motion.days=3.0`（此前实测会被全量推送覆盖回 7.0）。
+- 恢复配额 300GiB 重建 api：留存回到 `continuous.days=7.0`、`motion.days=7.0`。
+
+#### 版本
+- Backend: v1.8.35
+- Web: v1.8.35（无前端改动）
+- Android: v1.8.24（无改动）
+
+### v1.8.34 — 录像配额动作带回退重试机制 (2026-08-14)
+
+> **前序问题的加固**：配额监控首次采样（api 启动即触发）可能与 BootReplay 触发的 Frigate 重启重叠，此时 `/api/config/set` 返回瞬态 400/500/连接拒绝。若动作失败就被永久跳过（`quotaActive` 提前置真），配额缩减永远不生效。
+
+**修复内容**：
+- **回调返回 error**（`internal/maintenance/maintenance.go` + `recordings_size.go`）：`OnQuotaExceeded` / `OnQuotaRecovered` 改为返回 `error`，监控**仅在动作成功后才**提交跨越状态（`quotaActive`）。失败记录日志并保持原状态，下次采样重试。
+- **`pushRetentionWithRetry`**（`cmd/main.go`）：6 次尝试、间隔 30s（约 3 分钟窗口），覆盖 Frigate 重启（约 2 分钟完成）；Frigate 自身清理任务在下次运行时应用新窗口。
+
+#### 版本
+- Backend: v1.8.34
+- Web: v1.8.34（无前端改动）
+- Android: v1.8.24（无改动）
+
 ### v1.8.33 — 修复服务监控"不可达"误报 + 打通被静默禁用的 MQTT 链路 (2026-08-14)
 
 > **根因不是"启动竞态"，而是主机名写错**：compose 为容器设置了 `container_name`（`home-web` / `home-mosquitto`），Docker 只注册**容器名**为网络别名，裸服务名 `web` / `mosquitto` 根本不可解析。从 v1.8.28 起服务监控用 `web` / `mosquitto` 探测——**每次探测都因 "bad address" 失败**，对每个服务都报了假"不可达"；同时 api 的 MQTT broker 和 Frigate 的 MQTT host 也用了 `mosquitto`，导致**整个 MQTT 实时链路（api 订阅 + Frigate 检测事件上报）自始就未连通**。
