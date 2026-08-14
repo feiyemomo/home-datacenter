@@ -611,6 +611,43 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.44 — 三端一键编排 + Release 正式签名 + 后端识别 release 命名 (2026-08-15)
+
+> **背景**：此前三端（Android / Go 后端 / Web）各自独立构建，发布靠手动逐个执行。本轮新增顶层编排脚本把三端
+> 串成一条命令，并给 Android 配置正式 Release 签名（keystore），让发布版携带稳定、可验证、可升级的官方身份。
+
+**新增 `build-all.ps1`（顶层三端编排）**：
+- Android（Gradle，本地构建）→ 可选推送 APK → Go 后端 + Web（打包经 `deploy-nas.ps1`，在 NAS 的 Dockerfile 内构建）。
+- 三端保持独立工具链，Gradle 只负责 Android；编排脚本按序执行、出错即停。
+- 参数：`-Flavor debug|release`、`-PushApk`、`-Notes`、`-Password`、`-SkipAndroid`、`-SkipDeploy`、`-DryRun`。
+- 全链 `-DryRun` 验证通过（Android → push-apk → deploy-nas）。
+
+**Android 正式 Release 签名**（`android/` 工程）：
+- 生成正式 keystore `app/keystore/home-release.jks`（gitignore，`keystore.properties` 存凭据，绝不入库）。
+- `app/build.gradle.kts` 新增 `releaseSigning` 签名配置，release 构建用正式私钥签名（V1/V2/V3）。
+- release APK 已用 `keytool` 验证：SHA1/SHA256 指纹与正式 keystore 完全一致。
+- debug 继续用工程内置 `projectDebug` keystore（多人多机构建同一签名，可覆盖安装）。
+
+**`push-apk.ps1` 支持双 flavor**：
+- 新增 `-Flavor debug|release`、`-Password`、`-DryRun`；按 flavor 选择 APK 路径与远程命名 `app-{flavor}-vX.Y.Z.apk`。
+- 用哈希表 splat 传参，修复数组 splat 传 switch 跨脚本失效的问题。
+
+**后端识别 release 命名**（`services/api/internal/handler/release_handler.go`）：
+- `listAll` 同时匹配 `app-debug-v` 与 `app-release-v` 前缀，flavor 不参与版本比较。
+- release APK 推上去后 `/api/v1/release/latest` 正确返回 `app-release-vX.Y.Z.apk`。
+
+#### 验证
+- `go build ./internal/... ./cmd/...` 与 `go vet ./internal/handler/` 通过。
+- `build-all.ps1 -DryRun -Flavor debug -PushApk` 全链 dry-run 通过。
+- Release APK（v1.8.44）签名指纹与正式 keystore 一致。
+- `build-all.ps1 -Flavor release -PushApk -Password ...` 端到端发布成功：APK 推送至 NAS、
+  `home-api` 重建重启，`/api/v1/release/latest` 返回 `app-release-v1.8.44.apk`（version_code 10844，release_notes 已挂载）。
+
+#### 版本
+- Backend: v1.8.44（release_handler 支持 `app-release-` 前缀）
+- Web: v1.8.44（无前端改动）
+- Android: v1.8.44（正式 Release 签名 + push-apk 双 flavor）
+
 ### v1.8.43 — Android 整理为 Gradle 工程并成功构建 APK (2026-08-14)
 
 > **背景**：参考客户端此前是单文件 `deploy/android/HomeDatacenterClient.kt`，无法真正构建、调试、lint 或打 APK。

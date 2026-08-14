@@ -747,6 +747,57 @@ Files changed (Android only):
 
 ---
 
+## Phase 12 (v1.8.44): Multi-Tier Orchestration + Android Release Signing
+
+### Problem
+Three tiers (Android Gradle, Go backend, Web frontend) each build with
+their own toolchain and were published by hand, one command at a time.
+Android release builds were unsigned (only the fixed `projectDebug`
+keystore existed), so there was no stable official app identity: no
+guaranteed upgrade path, no tamper/verifiability story, no store-ready
+signature. The backend's `release_handler.go` also only recognized the
+`app-debug-` filename prefix, so a formally-signed `app-release-*` APK
+would never surface as the latest release.
+
+### Solution
+- **`build-all.ps1`** (repo root) — thin orchestrator, NOT a cross-compiler:
+  Tier 1 Android (Gradle in `D:\Projects\Android`) → optional APK push →
+  Tier 2 Go backend + Tier 3 Web (packaged by `deploy-nas.ps1`, built inside
+  the NAS Dockerfiles). Each tier keeps its own build system; the script runs
+  them in order and fails fast. Flags: `-Flavor`, `-PushApk`, `-Notes`,
+  `-Password`, `-SkipAndroid`, `-SkipDeploy`, `-DryRun`.
+- **Official release keystore** (`android/`): generated `app/keystore/home-release.jks`
+  (gitignored; `keystore.properties` holds store/key passwords, never committed).
+  `app/build.gradle.kts` adds a `releaseSigning` signingConfig (V1/V2/V3) so
+  `assembleRelease` produces a formally-signed APK. Debug continues to use the
+  committed `projectDebug` keystore.
+- **`push-apk.ps1` dual flavor** — new `-Flavor debug|release`, `-Password`,
+  `-DryRun`; picks the APK path and remote name `app-{flavor}-vX.Y.Z.apk` per
+  flavor. Uses **hashtable splatting** to pass switches across the script call
+  boundary (array splatting silently drops switch params — a real bug found here).
+- **Backend `release_handler.go`** — `listAll` now matches both `app-debug-v`
+  and `app-release-v` prefixes; flavor is not part of version comparison.
+  Release APKs are now discoverable as the latest release.
+
+### Verification
+- `go build ./internal/... ./cmd/...` and `go vet ./internal/handler/` pass.
+- `build-all.ps1 -DryRun -Flavor debug -PushApk` full-chain dry run passes.
+- `keytool -printcert` on the release APK matches the official keystore
+  fingerprint (SHA256 `B9:45:17:E9:A9:15:...:54`).
+- End-to-end `build-all.ps1 -Flavor release -PushApk` succeeded: APK pushed to
+  NAS `data/releases/app-release-v1.8.44.apk`, `home-api` recreated, and
+  `GET /api/v1/release/latest` returns `app-release-v1.8.44.apk`
+  (version_code 10844) with release_notes attached.
+
+### Files Changed
+- `build-all.ps1` — new top-level three-tier orchestrator
+- `android/push-apk.ps1` — `-Flavor`/`-Password`/`-DryRun`, per-flavor naming, hashtable splat
+- `android/app/build.gradle.kts` — `releaseSigning` config; versionCode 124, versionName 1.8.44
+- `services/api/internal/handler/release_handler.go` — accept `app-{debug|release}-` prefixes
+- `README.md` — v1.8.44 changelog entry
+
+---
+
 ## Developer Workflow
 
 **Run locally:**
