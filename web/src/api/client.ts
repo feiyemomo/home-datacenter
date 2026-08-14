@@ -4,14 +4,33 @@ import type { ApiEnvelope } from "@/types";
 /** localStorage key for the JWT issued by /auth/bind. */
 export const TOKEN_KEY = "hd_token";
 
-/** Read the stored JWT, or null if absent. */
+/**
+ * Read the stored JWT, or null if absent.
+ *
+ * v1.8.41: localStorage access can throw in private-browsing / storage-
+ * blocked contexts (Safari private, some WebViews, security policies).
+ * A throw here used to crash the axios request interceptor and take
+ * down the whole app. All token access now degrades to "no token" —
+ * the user simply sees a 401 and is redirected to /login, which is
+ * strictly better than a blank screen.
+ */
 export function getToken(): string | null {
-    return localStorage.getItem(TOKEN_KEY);
+    try {
+        return localStorage.getItem(TOKEN_KEY);
+    } catch {
+        return null;
+    }
 }
 
-/** Persist the JWT. */
+/** Persist the JWT. Best-effort; never throws. */
 export function setToken(token: string): void {
-    localStorage.setItem(TOKEN_KEY, token);
+    try {
+        localStorage.setItem(TOKEN_KEY, token);
+    } catch {
+        // Storage unavailable — token lives only in memory for this
+        // session. The app still works; the user just re-logs in after
+        // a reload.
+    }
 }
 
 /** Remove the JWT and bounce to /login. */
@@ -25,8 +44,16 @@ export async function clearTokenAndRedirect(): Promise<void> {
     } catch {
         // Ignore errors — proceed with local cleanup anyway.
     }
-    localStorage.removeItem(TOKEN_KEY);
-    document.cookie = "home_token=; Max-Age=0; path=/; SameSite=Lax";
+    try {
+        localStorage.removeItem(TOKEN_KEY);
+    } catch {
+        // fall through — cookie cleanup below still runs
+    }
+    try {
+        document.cookie = "home_token=; Max-Age=0; path=/; SameSite=Lax";
+    } catch {
+        // ignore
+    }
     if (window.location.pathname !== "/login") {
         window.location.assign("/login");
     }
@@ -58,7 +85,51 @@ client.interceptors.request.use(
     (error) => Promise.reject(error),
 );
 
-// ---- Response interceptor: unwrap envelope, handle 401 ----
+// ---- Retry policy (v1.8.41) ----------------------------------------
+//
+// Transient failures — network drops, 502/503/504 from the origin —
+// are retried with exponential backoff for IDEMPOTENT methods only
+// (GET, HEAD, OPTIONS, PUT, DELETE). POST is never auto-retried: we
+// cannot know whether the first attempt was committed server-side
+// (e.g. a PTZ command applied but the response lost on the wire), so
+// retrying risks applying the side effect twice. Callers that need
+// retry semantics for POSTs should implement their own idempotency key.
+const MAX_RETRIES = 2;
+const RETRY_BASE_MS = 1000;
+const RETRY_MAX_MS = 4000;
+
+/** Methods that are safe to retry without risking double side effects. */
+function isIdempotent(method: string | undefined): boolean {
+    switch ((method ?? "GET").toUpperCase()) {
+        case "GET":
+        case "HEAD":
+        case "OPTIONS":
+        case "PUT":
+        case "DELETE":
+            return true;
+        default:
+            return false;
+    }
+}
+
+/** Whether the failure is likely transient and worth a retry. */
+function isTransient(status: number): boolean {
+    // 0 = network error / timeout (no HTTP response received).
+    return status === 0 || status >= 500;
+}
+
+/** Custom per-request field so the interceptor can count retries. */
+declare module "axios" {
+    interface InternalAxiosRequestConfig {
+        __retryCount?: number;
+    }
+}
+
+function sleepMs(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// ---- Response interceptor: unwrap envelope, handle 401, retry ----
 client.interceptors.response.use(
     (response: AxiosResponse<ApiEnvelope<unknown>>) => {
         const envelope = response.data;
@@ -75,13 +146,29 @@ client.interceptors.response.use(
         }
         return response;
     },
-    (error: AxiosError<ApiEnvelope<unknown>>) => {
+    async (error: AxiosError<ApiEnvelope<unknown>>) => {
         const status = error.response?.status ?? 0;
         const message =
             error.response?.data?.message ?? error.message ?? "request failed";
 
+        // 401 is terminal — the token is bad/expired; retrying won't help.
         if (status === 401) {
             clearTokenAndRedirect();
+            return Promise.reject(new ApiError(status, message));
+        }
+
+        // v1.8.41: idempotent retry with exponential backoff. Only retry
+        // idempotent methods on transient failures, and only up to
+        // MAX_RETRIES times, so a permanently-dead backend isn't hammered.
+        const config = error.config;
+        if (config && isIdempotent(config.method) && isTransient(status)) {
+            const attempt = config.__retryCount ?? 0;
+            if (attempt < MAX_RETRIES) {
+                config.__retryCount = attempt + 1;
+                const delay = Math.min(RETRY_BASE_MS * 2 ** attempt, RETRY_MAX_MS);
+                await sleepMs(delay);
+                return client.request(config);
+            }
         }
 
         return Promise.reject(new ApiError(status, message));

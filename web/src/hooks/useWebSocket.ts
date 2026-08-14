@@ -18,15 +18,24 @@ interface UseWebSocketResult {
 }
 
 const MAX_RETRIES = 5;
-const RECONNECT_DELAY_MS = 3000;
+const RECONNECT_BASE_MS = 1000;
+const RECONNECT_MAX_MS = 15000;
 const HEARTBEAT_INTERVAL_MS = 25000;
+
+// Small jitter (±20%) so multiple tabs on the same host don't reconnect
+// in lockstep and thundering-herd the server.
+function jitter(ms: number): number {
+    return Math.round(ms * (0.8 + Math.random() * 0.4));
+}
 
 /**
  * WebSocket hook with auto-reconnect and heartbeat.
  *
  * - Connects on mount if a token exists; passes the JWT via the
  *   Sec-WebSocket-Protocol subprotocol ("bearer.<jwt>")
- * - Auto-reconnects on close (3s delay, max 5 retries)
+ * - Auto-reconnects on close with exponential backoff + jitter
+ *   (1s → 15s cap, max 5 retries) and re-sends persisted
+ *   subscriptions on every (re)open
  * - Sends a heartbeat every 25s to keep the server's pong timer happy
  * - Parses incoming JSON into the WsMessage envelope
  *
@@ -43,6 +52,12 @@ export function useWebSocket(autoConnect = true): UseWebSocketResult {
     const reconnectTimerRef = useRef<number | null>(null);
     const heartbeatTimerRef = useRef<number | null>(null);
     const manualCloseRef = useRef(false);
+    // v1.8.41: subscriptions are server-connection state. When the socket
+    // drops and reconnects, the new connection starts with an empty
+    // subscription set — so we track the topics here and re-send them on
+    // every (re)open. Without this, a non-admin tab that reconnects would
+    // silently stop receiving events forever.
+    const subscriptionsRef = useRef<Set<string>>(new Set());
 
     const clearTimers = useCallback(() => {
         if (reconnectTimerRef.current !== null) {
@@ -97,6 +112,14 @@ export function useWebSocket(autoConnect = true): UseWebSocketResult {
             setReconnectCount(0);
             setIsConnected(true);
             startHeartbeat();
+            // v1.8.41: re-send every persisted subscription so the new
+            // connection regains its topic filter. The socket is OPEN
+            // here, so direct send is safe.
+            subscriptionsRef.current.forEach((topic) => {
+                try {
+                    socket.send(JSON.stringify({ type: "subscribe", topic }));
+                } catch { /* socket raced to closed — ignore */ }
+            });
         };
 
         socket.onmessage = (event) => {
@@ -128,10 +151,16 @@ export function useWebSocket(autoConnect = true): UseWebSocketResult {
         if (reconnectTimerRef.current !== null) return;
         retriesRef.current += 1;
         setReconnectCount(retriesRef.current);
+        // v1.8.41: exponential backoff (1s → 2s → 4s → 8s → 15s cap) with
+        // jitter. The old fixed 3s retried too aggressively on a multi-
+        // second outage (hammering the server) and too slowly right after
+        // a brief blip. Backoff lets a short drop recover fast while a
+        // longer outage stops piling up reconnect attempts.
+        const delay = Math.min(RECONNECT_BASE_MS * 2 ** (retriesRef.current - 1), RECONNECT_MAX_MS);
         reconnectTimerRef.current = window.setTimeout(() => {
             reconnectTimerRef.current = null;
             connect();
-        }, RECONNECT_DELAY_MS);
+        }, jitter(delay));
     }, [connect]);
 
     const sendMessage = useCallback(
@@ -145,12 +174,18 @@ export function useWebSocket(autoConnect = true): UseWebSocketResult {
     );
 
     const subscribe = useCallback(
-        (topic: string) => sendMessage({ type: "subscribe", topic }),
+        (topic: string) => {
+            subscriptionsRef.current.add(topic);
+            sendMessage({ type: "subscribe", topic });
+        },
         [sendMessage],
     );
 
     const unsubscribe = useCallback(
-        (topic: string) => sendMessage({ type: "unsubscribe", topic }),
+        (topic: string) => {
+            subscriptionsRef.current.delete(topic);
+            sendMessage({ type: "unsubscribe", topic });
+        },
         [sendMessage],
     );
 

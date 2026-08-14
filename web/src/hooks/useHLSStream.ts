@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Hls, { type ErrorData } from "hls.js";
 import { authHeaderFor } from "@/api/client";
+import { reportClientError } from "@/lib/errorReport";
 
 /**
  * useHLSStream — single-camera HLS viewer.
@@ -156,7 +157,14 @@ export function useHLSStream(
             if (cancelled) return;
             setState((cur) => {
                 if (cur === "playing") return cur;
-                setError("HLS stream stalled: no new segments arrived in time (check that the go2rtc HLS session is alive)");
+                const msg = "HLS stream stalled: no new segments arrived in time (check that the go2rtc HLS session is alive)";
+                setError(msg);
+                // v1.8.41: report the stall to the backend.
+                reportClientError({
+                    level: "critical",
+                    context: "playback.hls.stall",
+                    message: msg.slice(0, 500),
+                });
                 return "error";
             });
         }, stallTimeoutMs);
@@ -369,6 +377,15 @@ export function useHLSStream(
                 }
                 setState("error");
                 setError(msg);
+                // v1.8.41: surface fatal HLS failures to the backend so
+                // the operator sees playback problems in the log pane
+                // (context "playback.hls"). The reporter dedups repeats.
+                reportClientError({
+                    level: "critical",
+                    context: "playback.hls",
+                    message: msg.slice(0, 500),
+                    stack: `hls.js ${data.type}/${data.details}`,
+                });
                 hls.destroy();
                 hlsRef.current = null;
             }

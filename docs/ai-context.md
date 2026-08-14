@@ -1975,6 +1975,87 @@ built individually as `go run scripts/<file>.go`, not as a package.)
 
 ---
 
+## Phase 36 (v1.8.41): Stability × Error-Recovery × Server Error Reporting
+
+### Phase 36 span: v1.8.41 (Backend + Web) — no Android code change
+
+#### Scope
+Harden the full chain — backend core, web playback, web network resilience, and
+client error reporting — so the process survives faults, failures are visible in
+SystemLog instead of silent, network blips self-heal, and report floods neither spam
+the server nor get lost.
+
+#### Backend (`services/api`)
+- **Graceful shutdown** (`cmd/main.go`): SIGTERM/SIGINT → `s.Shutdown` (10s drain) →
+  stop audit-log subscriber → close event bus; components exit cleanly via the defer
+  stack instead of Docker SIGKILL.
+- **Custom Recovery middleware** (`internal/middleware/recovery.go`): replaces gin's
+  default; captures panics → writes a critical `server.panic` SystemLog row + live
+  broadcast → returns a unified `{code:500,data:null}` envelope (not an empty body).
+- **5xx error-log middleware** (`internal/middleware/errorlog.go`): persists every
+  >=500 response as `server.error` SystemLog with a 60/min window rate limit + 10 min
+  in-memory dedup, so an error storm can't flood the log.
+- **Error utils** (`internal/utils/errors.go`): sentinel errors + `APIError` +
+  `error → HTTP status` mapping. **Retry util** (`internal/utils/retry.go`): generic
+  exponential backoff + jitter; `pushRetentionWithRetry` switched from fixed 30s to
+  5s→40s backoff.
+- **Readiness probe**: new `/health/ready` (DB ping gates readiness; MQTT optional),
+  complementing the existing liveness `/health`.
+- **Client-error reporting hardening** (`internal/handler/client_error_handler.go` +
+  `model/system_log.go`): per-user/IP keyed rate limiter (60/min/key, bounding the
+  global-map with idle eviction) so one user can't starve everyone; dedup now matches
+  on the indexed `context` column instead of a fragile payload-JSON LIKE;
+  `LevelWarning` added to the pruning caps (200).
+
+#### Web (`web`)
+- **ErrorBoundary** (new `components/ErrorBoundary.tsx`): class boundary catching
+  render/lifecycle errors (which window `error` misses), reporting `render.error.*`,
+  rendering a retry card; wrapped around the route tree in `App.tsx`.
+- **Playback failure reporting**: `hooks/useHLSStream.ts` reports hls.js fatal errors
+  (`playback.hls`) and 15s stall watchdog trips (`playback.hls.stall`);
+  `hooks/useWebRTCStream.ts` reports SDP/connection failures, 8s ICE timeouts,
+  `connectionState failed`, and video-element decode errors 3/4 (`playback.webrtc(.decode)`).
+- **Token defense** (`api/client.ts`): `getToken/setToken/clearTokenAndRedirect` all
+  wrapped in try/catch so blocked/private storage degrades to "no token → 401 → login"
+  instead of crashing the app.
+- **axios idempotent retry** (`api/client.ts`): network errors (status 0) and 5xx are
+  retried with exponential backoff (1s→4s, ≤2 retries) for idempotent methods
+  (GET/HEAD/OPTIONS/PUT/DELETE); POST is never auto-retried (double side-effect risk).
+- **WS exponential backoff + reconnect refresh** (`hooks/useWebSocket.ts`): fixed 3s →
+  1s→15s capped backoff with ±20% jitter (multi-tab thundering herd); subscriptions are
+  persisted and re-sent on every (re)open so non-admin tabs don't silently lose events.
+- **Reporter queue + dedup** (`lib/errorReport.ts`): in-memory queue buffers reports
+  while offline (8s backoff retry, ≤5 attempts then shed), 60s in-tab dedup collapses
+  identical (context+message) reports with a counter, queue capped at 50 to bound memory.
+
+#### Verification
+- `go test ./internal/... ./cmd/... ./tools/...` — all pass.
+- Web: `npx tsc -b` zero errors + `npm run build` succeeds. (Top-level `scripts`
+  package remains a known pre-existing multi-`main` build break, unrelated.)
+
+### Files Changed (Phase 36)
+
+| File | Change |
+|------|--------|
+| `services/api/cmd/main.go` | Graceful shutdown; gin.New + custom Recovery; ErrorLogMiddleware; /health/ready; pushRetentionWithRetry → utils.Retry |
+| `services/api/internal/middleware/recovery.go` | New — panic→SystemLog+envelope recovery middleware |
+| `services/api/internal/middleware/errorlog.go` | New — >=500 → SystemLog with rate limit + dedup |
+| `services/api/internal/utils/errors.go` | New — sentinel errors + APIError + status mapping |
+| `services/api/internal/utils/retry.go` | New — generic exponential-backoff retry util |
+| `services/api/internal/model/system_log.go` | Add indexed `Context` column |
+| `services/api/internal/handler/client_error_handler.go` | Per-user/IP rate limit; context-column dedup |
+| `services/api/internal/log/subscriber.go` | Add `Stop()` + LevelWarning pruning cap |
+| `web/src/components/ErrorBoundary.tsx` | New — render-error boundary + reporting |
+| `web/src/App.tsx` | Wrap route tree in ErrorBoundary |
+| `web/src/hooks/useHLSStream.ts` | Report fatal + stall errors (`playback.hls`) |
+| `web/src/hooks/useWebRTCStream.ts` | Report connection/ICE/decode errors (`playback.webrtc`) |
+| `web/src/api/client.ts` | Token try/catch defense + axios idempotent retry |
+| `web/src/hooks/useWebSocket.ts` | Exponential backoff + persisted-subscription refresh |
+| `web/src/lib/errorReport.ts` | Queue + offline buffer + tab dedup + cap |
+| `README.md` | v1.8.41 changelog entry |
+
+---
+
 ## Phase 32 (v1.8.37): Recording Quota 400 GiB + Android Progress Bar Uses Actual Coverage
 
 ### Phase 32 span: v1.8.37 (Backend config) + v1.8.37 (Android)
@@ -2044,4 +2125,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.40: Wave-2 unit-test expansion — automation engine runtime tests (handleEvent / throttle / reload / notify / mqtt / webhook + SSRF & retry policy), WS hub fan-out tests (Broadcast / SendToUser / SendToAdmins / routeDeviceEvent / onEvent), GORM repository tests (Device / User on in-memory SQLite with freed-ID reuse); fixed a real bug — missing `fallthrough` in the WS hub's `user.notification` parse-error path. See Phase 35. Earlier: v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.41: Stability × error-recovery × server error reporting — backend graceful shutdown (SIGTERM/SIGINT drain), custom panic Recovery → `server.panic` SystemLog, `>=500` ErrorLogMiddleware (rate-limited + deduped), sentinel/APIError utils + generic exponential-backoff Retry util, `/health/ready` readiness probe, client-error per-user/IP rate limiting + indexed-`context` dedup; web ErrorBoundary (`render.error.*`), HLS (`playback.hls(.stall)`) + WebRTC (`playback.webrtc(.decode)`) playback-failure reporting, token try/catch defense, axios idempotent retry, WS exponential backoff + persisted-subscription refresh, reporter queue + offline buffer + tab dedup. See Phase 36. Earlier: v1.8.40: Wave-2 unit-test expansion — automation engine runtime tests (handleEvent / throttle / reload / notify / mqtt / webhook + SSRF & retry policy), WS hub fan-out tests (Broadcast / SendToUser / SendToAdmins / routeDeviceEvent / onEvent), GORM repository tests (Device / User on in-memory SQLite with freed-ID reuse); fixed a real bug — missing `fallthrough` in the WS hub's `user.notification` parse-error path. See Phase 35. Earlier: v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

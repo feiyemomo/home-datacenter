@@ -20,7 +20,6 @@ import (
 // uncaught JS exceptions, unhandled promise rejections, and failed
 // media playback — and persists them as SystemLog rows so they surface
 // in the dashboard's log pane.
-//
 // Why this exists: before v1.8.25 the system log only captured backend
 // events (device/camera/user). Client-side failures ("视频加载失败",
 // a JS null deref, a 404 fetch) were invisible to the server, so remote
@@ -38,19 +37,17 @@ import (
 // The signature is (context, message) — stack/URL vary with the page
 // and are not part of the key.
 //
+// v1.8.41: rate limiting is now per-source (user_id, falling back to
+// client IP) instead of a global quota, so one misbehaving user/tab
+// cannot consume the whole budget. Dedup matches on the indexed
+// `context` column instead of scanning payload JSON.
+//
 // Route: POST /api/v1/system/client-errors (JWT-protected)
 type ClientErrorHandler struct {
 	db *gorm.DB
 
-	// mu guards the rate-limit window below.
-	mu sync.Mutex
-	// window is the start of the current rolling minute; count is the
-	// number of client-error rows accepted in it. This is a simple
-	// global limiter that stops a misbehaving page (e.g. a playback
-	// retry loop) from flooding SQLite. Default cap: 60/min.
-	window    time.Time
-	count     int
-	maxPerMin int
+	// limiter is a per-source keyed rate limiter (default 60/min per key).
+	limiter *keyedLimiter
 
 	// dedupeWindow is how far back to look for an identical
 	// (context, message) row to merge a repeat report into.
@@ -59,7 +56,11 @@ type ClientErrorHandler struct {
 
 // NewClientErrorHandler creates a handler bound to the given GORM DB.
 func NewClientErrorHandler(db *gorm.DB) *ClientErrorHandler {
-	return &ClientErrorHandler{db: db, maxPerMin: 60, dedupeWindow: 10 * time.Minute}
+	return &ClientErrorHandler{
+		db:           db,
+		limiter:      newKeyedLimiter(60),
+		dedupeWindow: 10 * time.Minute,
+	}
 }
 
 // reportRequestBody is the JSON body accepted by Report.
@@ -109,7 +110,7 @@ func (h *ClientErrorHandler) Report(c *gin.Context) {
 		level = model.LevelInfo
 	}
 
-	if !h.allow() {
+	if !h.limiter.allow(h.sourceKey(c)) {
 		// Rate-limited: still return 2xx with a flag so the client
 		// doesn't treat a flood of reports as a new error to retry.
 		utils.Success(c, gin.H{"accepted": false, "reason": "rate_limited"})
@@ -167,6 +168,7 @@ func (h *ClientErrorHandler) Report(c *gin.Context) {
 		EventType: "client.error",
 		Level:     level,
 		Source:    "web",
+		Context:   body.Context,
 		Message:   body.Message,
 		Payload:   string(payloadJSON),
 	}
@@ -180,17 +182,14 @@ func (h *ClientErrorHandler) Report(c *gin.Context) {
 
 // findDuplicate looks for an existing client-error row with the same
 // context and message within the dedup window. It returns the row's ID
-// and whether one was found. context is matched via a LIKE on the
-// payload JSON (it is not a column), message is a plain column.
+// and whether one was found. Since v1.8.41, context is a real indexed
+// column, so this is a plain column comparison instead of a fragile
+// LIKE over the payload JSON.
 func (h *ClientErrorHandler) findDuplicate(context, message string) (uint, bool) {
 	cutoff := time.Now().Add(-h.dedupeWindow).Unix()
-	// Escape the context for a JSON string literal so the LIKE pattern
-	// matches the "context":"..." key value pair.
-	ctxJSON, _ := json.Marshal(context)
-	like := "%\"context\":" + string(ctxJSON) + "%"
 	var row model.SystemLog
-	err := h.db.Where("event_type = ? AND source = ? AND message = ? AND ts > ? AND payload LIKE ?",
-		"client.error", "web", message, cutoff, like).
+	err := h.db.Where("event_type = ? AND source = ? AND message = ? AND context = ? AND ts > ?",
+		"client.error", "web", message, context, cutoff).
 		Order("ts DESC").First(&row).Error
 	if err != nil {
 		return 0, false
@@ -198,19 +197,60 @@ func (h *ClientErrorHandler) findDuplicate(context, message string) (uint, bool)
 	return row.ID, true
 }
 
-// allow returns true if the caller may write a client-error row this
-// minute. It enforces maxPerMin accepted rows per rolling minute.
-func (h *ClientErrorHandler) allow() bool {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	now := time.Now()
-	if now.Sub(h.window) >= time.Minute {
-		h.window = now
-		h.count = 0
+// sourceKey buckets rate limits by the authenticated user, falling back
+// to the client IP (for e.g. unauthenticated or token-refresh windows).
+func (h *ClientErrorHandler) sourceKey(c *gin.Context) string {
+	if raw, exists := c.Get("user_id"); exists && raw != nil {
+		return "user:" + fmt.Sprintf("%v", raw)
 	}
-	if h.count >= h.maxPerMin {
+	return "ip:" + c.ClientIP()
+}
+
+// keyLimiterState is the rolling-minute state for one rate-limit key.
+type keyLimiterState struct {
+	window time.Time
+	count  int
+}
+
+// keyedLimiter rate-limits per key (default 60/min each). Unlike a
+// global quota, a single noisy source can't starve every other client.
+type keyedLimiter struct {
+	mu        sync.Mutex
+	maxPerMin int
+	states    map[string]*keyLimiterState
+}
+
+func newKeyedLimiter(maxPerMin int) *keyedLimiter {
+	return &keyedLimiter{maxPerMin: maxPerMin, states: make(map[string]*keyLimiterState)}
+}
+
+// allow reports whether the key may proceed this minute. It lazily
+// evicts keys idle for >2 windows to keep the map bounded.
+func (l *keyedLimiter) allow(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+
+	if len(l.states) > 256 {
+		for k, s := range l.states {
+			if now.Sub(s.window) > 2*time.Minute {
+				delete(l.states, k)
+			}
+		}
+	}
+
+	s, ok := l.states[key]
+	if !ok {
+		s = &keyLimiterState{window: now}
+		l.states[key] = s
+	}
+	if now.Sub(s.window) >= time.Minute {
+		s.window = now
+		s.count = 0
+	}
+	if s.count >= l.maxPerMin {
 		return false
 	}
-	h.count++
+	s.count++
 	return true
 }

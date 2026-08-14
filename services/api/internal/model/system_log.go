@@ -44,6 +44,12 @@ type SystemLog struct {
 	// event ("mqtt" | "ws" | "system" | "camera" | "automation").
 	Source string `json:"source"`
 
+	// Context is an optional free-form tag set on client.error / server
+	// error rows (e.g. "window.onerror", "recording.playback"). Indexed
+	// so client-error dedup can match on it directly instead of scanning
+	// payload JSON (v1.8.41).
+	Context string `gorm:"index" json:"context"`
+
 	// Message is a human-readable summary in Chinese, e.g.
 	// "设备 #3 上线" / "用户 admin 登录" / "摄像头 前门 上线".
 	Message string `json:"message"`

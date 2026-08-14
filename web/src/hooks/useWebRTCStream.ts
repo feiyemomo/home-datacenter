@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getIceConfig } from "@/api/camera";
 import { authedFetch } from "@/api/client";
+import { reportClientError } from "@/lib/errorReport";
 import type { IceConfig } from "@/types";
 
 /**
@@ -208,6 +209,13 @@ export function useWebRTCStream(
                                 );
                                 setState("error");
                                 setError(`ice ${cur} (8s timeout)`);
+                                // v1.8.41: report persistent ICE failure to
+                                // the backend (context "playback.webrtc").
+                                reportClientError({
+                                    level: "critical",
+                                    context: "playback.webrtc",
+                                    message: `WebRTC ICE ${cur} (8s timeout)`,
+                                });
                             }
                         }, 8_000);
                     } else if (st === "connected" || st === "completed") {
@@ -227,6 +235,11 @@ export function useWebRTCStream(
                         pc.connectionState === "closed") {
                         setState("error");
                         setError(`connection ${pc.connectionState}`);
+                        reportClientError({
+                            level: "critical",
+                            context: "playback.webrtc",
+                            message: `WebRTC connection ${pc.connectionState}`,
+                        });
                     }
                 };
 
@@ -319,8 +332,15 @@ export function useWebRTCStream(
                 // covered above.
             } catch (e) {
                 if (cancelled) return;
+                const msg = e instanceof Error ? e.message : String(e);
                 setState("error");
-                setError(e instanceof Error ? e.message : String(e));
+                setError(msg);
+                reportClientError({
+                    level: "critical",
+                    context: "playback.webrtc",
+                    message: msg.slice(0, 500),
+                    stack: e instanceof Error ? e.stack : undefined,
+                });
                 teardown();
             }
         })();
@@ -382,6 +402,11 @@ export function useWebRTCStream(
                 const label = code === 4 ? "SRC_NOT_SUPPORTED" : "DECODE";
                 setState("error");
                 setError(`video element error: ${code} (${label})`);
+                reportClientError({
+                    level: "critical",
+                    context: "playback.webrtc.decode",
+                    message: `WebRTC video element error: ${label} (code ${code})`,
+                });
                 teardown();
             }
         };

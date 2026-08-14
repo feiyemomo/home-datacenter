@@ -2,6 +2,7 @@ import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { Loader2, Server } from "lucide-react";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Layout } from "@/components/Layout";
 import OfflineBanner from "@/components/OfflineBanner";
 import Login from "@/pages/Login";
@@ -51,97 +52,99 @@ function AppRoutes() {
     }
 
     return (
-        <div key={location.pathname} className="animate-slide-up">
-            <OfflineBanner />
-            <Routes>
-                <Route path="/login" element={<Login />} />
+        <ErrorBoundary context="app">
+            <div key={location.pathname} className="animate-slide-up">
+                <OfflineBanner />
+                <Routes>
+                    <Route path="/login" element={<Login />} />
 
-                <Route
-                    path="/dashboard"
-                    element={
-                        <ProtectedRoute>
-                            <Layout>
-                                <Dashboard />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/cameras"
-                    element={
-                        <ProtectedRoute>
-                            <Layout>
-                                <Cameras />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/network"
-                    element={
-                        <ProtectedRoute>
-                            <Layout>
-                                <Network />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/logs"
-                    element={
-                        <ProtectedRoute adminOnly>
-                            <Layout>
-                                <Logs />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/cameras/new"
-                    element={
-                        <ProtectedRoute adminOnly>
-                            <Layout>
-                                <DeviceCreate />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/users"
-                    element={
-                        <ProtectedRoute adminOnly>
-                            <Layout>
-                                <Users />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/mqtt"
-                    element={
-                        <ProtectedRoute adminOnly>
-                            <Layout>
-                                <MqttDebug />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
-                <Route
-                    path="/profile"
-                    element={
-                        <ProtectedRoute>
-                            <Layout>
-                                <Profile />
-                            </Layout>
-                        </ProtectedRoute>
-                    }
-                />
+                    <Route
+                        path="/dashboard"
+                        element={
+                            <ProtectedRoute>
+                                <Layout>
+                                    <Dashboard />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/cameras"
+                        element={
+                            <ProtectedRoute>
+                                <Layout>
+                                    <Cameras />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/network"
+                        element={
+                            <ProtectedRoute>
+                                <Layout>
+                                    <Network />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/logs"
+                        element={
+                            <ProtectedRoute adminOnly>
+                                <Layout>
+                                    <Logs />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/cameras/new"
+                        element={
+                            <ProtectedRoute adminOnly>
+                                <Layout>
+                                    <DeviceCreate />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/users"
+                        element={
+                            <ProtectedRoute adminOnly>
+                                <Layout>
+                                    <Users />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/mqtt"
+                        element={
+                            <ProtectedRoute adminOnly>
+                                <Layout>
+                                    <MqttDebug />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
+                    <Route
+                        path="/profile"
+                        element={
+                            <ProtectedRoute>
+                                <Layout>
+                                    <Profile />
+                                </Layout>
+                            </ProtectedRoute>
+                        }
+                    />
 
-                {/* Default redirects */}
-                <Route path="/" element={<Navigate to="/dashboard" replace />} />
-                <Route path="*" element={<Navigate to="/dashboard" replace />} />
-            </Routes>
-        </div>
+                    {/* Default redirects */}
+                    <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                    <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                </Routes>
+            </div>
+        </ErrorBoundary>
     );
 }
 
