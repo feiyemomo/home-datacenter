@@ -395,6 +395,52 @@ services:
   #     networks:
   #       - home-net
 
+  # backup — off-NAS offsite backup (v1.8.29). Syncs the daily SQLite
+  # snapshots (data/sqlite/backups: app-*.db + frigate-*.db produced by
+  # the api maintenance loop) to a Bitiful (亿安云) S3-compatible bucket
+  # every BITIFUL_SYNC_INTERVAL. This is the "second copy" that survives
+  # a NAS disk failure — the maintenance backups alone sit on the same
+  # disk as the live DB.
+  #
+  # Why rclone: it's the standard S3-compatible sync tool, stable, and
+  # configured here entirely via environment variables so no rclone.conf
+  # (with embedded credentials) is committed to the repo.
+  #
+  # The source dir is mounted READ-ONLY (:ro) — the backup container
+  # must never modify the maintenance backups, only read+push them.
+  # `rclone sync` also acts as a remote mirror: locally-pruned files
+  # are deleted remotely too, keeping the bucket bounded.
+  #
+  # Disable by leaving BITIFUL_ACCESS_KEY / BITIFUL_SECRET_KEY empty in
+  # .env — the entrypoint exits 1 and the container just stays in
+  # "exited" state (restart: unless-stopped won't retry a clean exit).
+  backup:
+    image: rclone/rclone:1.68
+    container_name: home-backup
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    # No published ports — the container is egress-only (pushes to
+    # Bitiful over HTTPS). It never listens.
+    volumes:
+      # Read-only: the backup container consumes, never mutates.
+      - ./data/sqlite/backups:/backups:ro
+      - ./deploy/backup/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: [ "sh", "/entrypoint.sh" ]
+    environment:
+      - TZ=Asia/Shanghai
+      - BITIFUL_ENDPOINT=${BITIFUL_ENDPOINT:-https://s3.bitiful.net}
+      - BITIFUL_REGION=${BITIFUL_REGION:-cn-east-1}
+      - BITIFUL_BUCKET=${BITIFUL_BUCKET:-nas-data}
+      - BITIFUL_ACCESS_KEY=${BITIFUL_ACCESS_KEY:-}
+      - BITIFUL_SECRET_KEY=${BITIFUL_SECRET_KEY:-}
+      - BITIFUL_SYNC_INTERVAL=${BITIFUL_SYNC_INTERVAL:-21600}
+    networks:
+      - home-net
+
 networks:
   home-net:
     driver: bridge

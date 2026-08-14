@@ -1476,6 +1476,39 @@ The existing camera health check is only an RTSP TCP probe — it reports "onlin
 
 ---
 
+## Phase 23 (v1.8.29): Off-NAS Offsite Backup — Bitiful (亿安云) S3
+
+### Phase 23 span: v1.8.29 (compose) + deploy/backup
+
+#### Problem: the maintenance backups sit on the same disk as the live DB
+
+v1.8.27 made daily SQLite snapshots (app + frigate) to `data/sqlite/backups`, but those live on the same NAS disk as the live DB. A disk failure silently destroys both the live database and its only copies. With no spare NAS and no cloud storage, the "second copy" that survives a disk failure was missing.
+
+#### Solution: an egress-only `backup` container mirroring the snapshots to Bitiful via rclone
+
+- **`deploy/backup/entrypoint.sh`**: an infinite `rclone sync` loop (not `copy`) that mirrors `data/sqlite/backups` (`/backups`, mounted read-only) to `s3://<bucket>/home-datacenter/sqlite`. `sync` mirrors the local dir — locally-pruned backups are also deleted remotely, keeping the bucket bounded. rclone is configured entirely via CLI flags (no committed `rclone.conf`), and credentials come from `.env` via the compose `environment:` block, so nothing secret is in the repo.
+- **`compose.yaml` backup service**: `rclone/rclone:1.68`, no published ports (egress-only), `cap_drop: ALL` + `no-new-privileges`, standard log rotation, read-only source mount. `restart: unless-stopped`; if credentials are empty the entrypoint exits 1 and the container stays "exited" (so disabling is just leaving the keys blank — no separate toggle).
+- **`.env` / `.env.example`**: `BITIFUL_ENDPOINT` (https://s3.bitiful.net), `BITIFUL_REGION` (cn-east-1), `BITIFUL_BUCKET` (nas-data), `BITIFUL_ACCESS_KEY`, `BITIFUL_SECRET_KEY`, `BITIFUL_SYNC_INTERVAL` (default 21600s = 6h). Leaving the keys empty disables the backup container.
+
+#### NAS verification (192.168.31.235, e2e)
+
+- Appended the BITIFUL block to the NAS's `.env` (the deploy tarball excludes `.env`, so the NAS copy is updated in place).
+- `docker compose up -d backup` pulled `rclone/rclone:1.68` and started `home-backup`; logs show `rclone backup loop started (interval 21600s, source /backups, dest s3://nas-data/home-datacenter/sqlite)`.
+- First sync on an empty backups dir: `There was nothing to transfer` (S3 auth + bucket access confirmed).
+- Placed a real `app-20260814-110103.db` (700 KiB) snapshot in the backups dir, `docker restart home-backup` → log `app-20260814-110103.db: Copied (new)`, `Transferred: 1 / 1`, `sync OK`.
+- Read-back via `rclone lsl` from inside the container: `716800 2026-08-14 11:01:03 app-20260814-110103.db` — object confirmed present in the Bitiful bucket (byte count matches the local snapshot).
+
+### Files Changed (Phase 23)
+
+| File | Change |
+|------|--------|
+| `compose.yaml` | New `backup` service (rclone/rclone:1.68, egress-only, read-only source mount) |
+| `deploy/backup/entrypoint.sh` | New — infinite `rclone sync` loop to Bitiful bucket |
+| `.env.example` | New `BITIFUL_*` block documenting the offsite backup config |
+| `.env` | (local, gitignored) BITIFUL credentials |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
