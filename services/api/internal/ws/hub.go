@@ -154,7 +154,9 @@ func (h *Hub) onEvent(e eventbus.Event) {
 			h.SendToUser(p.UserID, msg)
 			return
 		}
-		// fallthrough to broadcast on parse error
+		// Fall through to broadcast on parse error (Go switch has no
+		// implicit fallthrough, so the keyword is required here).
+		fallthrough
 	case eventbus.TopicSystemBroadcast,
 		eventbus.TopicSystemLog:
 		// System-wide: the audit log is shown on every dashboard,
