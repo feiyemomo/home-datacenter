@@ -1906,6 +1906,75 @@ requires on-site power + cabling inspection.
 
 ---
 
+## Phase 35 (v1.8.40): Wave-2 Unit Test Expansion (automation / ws hub / gorm repositories)
+
+### Phase 35 span: v1.8.40 (Backend) — no web / Android / runtime behavior change beyond one WS fallback fix
+
+#### Scope
+Wave 2 of the test-coverage drive. The existing suites were pure-function tests
+(`triggerMatches`, `timeInRange`, `conditionMatches`, mqtt payload parsing); this phase
+adds **runtime-path** tests that exercise the engine's stateful hot path, the WS hub's
+fan-out routing, and the GORM repository layer against an in-memory SQLite DB.
+
+#### 1. Automation engine (`internal/automation/engine_runtime_test.go`)
+- `TestHandleEvent_MQTTActionAndCooldown` — a real `handleEvent` → `fire` → mock MQTT
+  publish, then a second event within `cooldown_s` dropped by throttle (asserts
+  `metrics.Fires` / `Dropped` / `EventsSeen`).
+- `TestHandleEvent_ConditionGatesAction` — payload condition fails → no action, no
+  drop; matches → action fires.
+- `TestThrottleAllows` / `TestDedupKey` / `TestRecordFire` — cooldown, rate_per_min
+  sliding window, dedup, and runtime-state mutation.
+- `TestReload_LoadsOnlyEnabledAndPrunes` / `TestReload_KeepsRuntimeForSurvivingRule` —
+  enabled filtering + runtime pruning, and preserving in-flight cooldown across reload.
+- `TestPinCooldown` — admin escape hatch + unknown-rule error.
+- `TestActionMQTT` (topic namespace guard, default QoS 1, nil-handler), `TestActionNotify`
+  (EventBus publish + default title/body), `TestExecuteAction_UnknownType`.
+- `TestActionWebhook_SSRFGuard` — loopback / private / link-local / bad-scheme / missing-host
+  all rejected; `TestActionWebhook_Success` / `_RetryOn5xx` / `_NoRetryOn4xx` use an
+  injected `roundTripFunc` transport (no real network) to verify the retry policy.
+
+#### 2. WS hub (`internal/ws/hub_test.go`)
+- `TestHubBroadcast` / `TestHubSendToUser` / `TestHubSendToAdmins` /
+  `TestHubRouteDeviceEvent` / `TestClientMatchesSubscription` — fan-out routing to
+  admins / targeted users / topic subscribers.
+- `TestHubOnEvent` — user.notification target, system.broadcast to all, device-event
+  routing; `TestHubOnEvent_MalformedNotificationFallsBackToBroadcast` — see bug below.
+- `TestRegisterUnregister` / `TestHubCloseEmpty`.
+- Test clients are built directly (buffered `send` channel, no real `*websocket.Conn`),
+  since the hub fan-out methods only marshal into the channel.
+
+**Bug fixed (real, surfaced by the new test):** in `hub.go` `onEvent`, the
+`user.notification` case intended to fall through to broadcast on a payload-parse error,
+but Go switch statements have **no implicit fallthrough** — the missing `fallthrough`
+keyword meant malformed notifications were silently dropped. Added `fallthrough`.
+
+#### 3. GORM repositories (`internal/repository/` — device_repository_test.go, user_repository_test.go)
+- `setupRepoDB` opens `:memory:` via glebarez/sqlite with `SetMaxOpenConns(1)` (so the
+  in-memory store is shared) and migrates Device + User.
+- Device: Create / GetByID / GetByUserID / GetAll / GetByAccessKeyHash / GetByUserIDAndHash /
+  Update / Revoke / IsRevoked / IncrementTokenVersion / UpdateLastSeen / Delete /
+  DeleteByUser cascade, plus **freed-ID reuse** (delete id 1 → next create reuses 1).
+- User: Create / GetByID / GetByName / List / Update / Delete / CountAdmins /
+  CountDevicesByUser, ID reuse, and the unique-name constraint.
+
+#### Verification
+`go test ./internal/... ./cmd/... ./tools/...` — all pass. (The top-level `scripts`
+package is a known pre-existing build break — it holds multiple `main` files and is
+built individually as `go run scripts/<file>.go`, not as a package.)
+
+### Files Changed (Phase 35)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/automation/engine_runtime_test.go` | New — engine runtime-path tests |
+| `services/api/internal/ws/hub_test.go` | New — hub fan-out / routing tests |
+| `services/api/internal/repository/device_repository_test.go` | New — Device repo tests (in-memory SQLite, ID reuse) |
+| `services/api/internal/repository/user_repository_test.go` | New — User repo tests |
+| `services/api/internal/ws/hub.go` | Add missing `fallthrough` on user.notification parse-error path |
+| `README.md` | v1.8.40 changelog entry |
+
+---
+
 ## Phase 32 (v1.8.37): Recording Quota 400 GiB + Android Progress Bar Uses Actual Coverage
 
 ### Phase 32 span: v1.8.37 (Backend config) + v1.8.37 (Android)
@@ -1975,4 +2044,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.40: Wave-2 unit-test expansion — automation engine runtime tests (handleEvent / throttle / reload / notify / mqtt / webhook + SSRF & retry policy), WS hub fan-out tests (Broadcast / SendToUser / SendToAdmins / routeDeviceEvent / onEvent), GORM repository tests (Device / User on in-memory SQLite with freed-ID reuse); fixed a real bug — missing `fallthrough` in the WS hub's `user.notification` parse-error path. See Phase 35. Earlier: v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

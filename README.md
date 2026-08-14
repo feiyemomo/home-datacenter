@@ -611,6 +611,44 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.40 — 波次2 单元测试扩展：自动化引擎 / WS hub / gorm 仓储 (2026-08-14)
+
+> **背景**：测试覆盖计划第 2 波。此前仓内单测基本都是纯函数测试（`triggerMatches`、
+> `timeInRange`、`conditionMatches`、MQTT 载荷解析），本次补齐**运行时路径**测试，覆盖引擎有状态
+> 热路径、WS hub 扇出路由、以及基于 in-memory SQLite 的 GORM 仓储层。
+
+**1. 自动化引擎**（`internal/automation/engine_runtime_test.go`）：
+- `handleEvent` 全链路（真事件 → mock MQTT 发布 → `cooldown_s` 节流丢弃，断言 `Fires`/`Dropped`/`EventsSeen`）；
+  条件不匹配 → 不触发也不丢弃。
+- `throttleAllows`（cooldown / rate_per_min 滑窗 / dedup）、`dedupKey`、`recordFire`。
+- `Reload` 只载入启用规则 + 运行时剪枝、存活规则保留在线冷却；`PinCooldown`（含未知规则报错）。
+- Action：`mqtt`（命名空间白名单、默认 QoS1、nil handler）、`notify`（EventBus 发布 + 默认标题/正文）、未知类型。
+- Webhook：SSRF 防护（loopback/私网/link-local/坏 scheme/缺 host 全拒）+ 注入 `roundTripFunc` 传输层
+  （不触网）验证成功、5xx 重试、4xx 不重试。
+
+**2. WS hub**（`internal/ws/hub_test.go`）：
+- `Broadcast` / `SendToUser` / `SendToAdmins` / `routeDeviceEvent` / `matchesSubscription` 扇出路由；
+  `onEvent` 的目标通知、全量广播、设备事件路由；`Register`/`Unregister`/`Close`。
+- 测试直接构造 Client（缓冲 `send` 通道，无真实 `*websocket.Conn`），因 hub 扇出只写入通道。
+
+**修复一个真实 bug**（由新测试暴露）：`hub.go::onEvent` 的 `user.notification` 分支本意在载荷解析失败时
+回退到广播，但 Go 的 switch **没有隐式 fallthrough**，缺 `fallthrough` 关键字导致畸形通知被静默丢弃。已补上。
+
+**3. gorm 仓储**（`internal/repository/`）：
+- `:memory:` SQLite + `SetMaxOpenConns(1)`（保证共享同一内存库）+ 迁移 Device / User。
+- Device：Create / GetByID / GetByUserID / GetAll / GetByAccessKeyHash / GetByUserIDAndHash / Update /
+  Revoke / IsRevoked / IncrementTokenVersion / UpdateLastSeen / Delete / DeleteByUser 级联 + **释放 ID 复用**。
+- User：Create / GetByID / GetByName / List / Update / Delete / CountAdmins / CountDevicesByUser + ID 复用 + 唯一名约束。
+
+#### 验证
+`go test ./internal/... ./cmd/... ./tools/...` 全部通过。（顶层 `scripts` 包为历史遗留构建问题——
+内含多个 `main` 文件，按 `go run scripts/<file>.go` 单个运行，非按包编译，与本次无关。）
+
+#### 版本
+- Backend: v1.8.40（波次2 单测 + hub fallthrough 修复）
+- Web: v1.8.40（无前端改动）
+- Android: v1.8.40（无改动）
+
 ### v1.8.39 — 环境诊断：NAS IPv6 曾被整体禁用 + ddns 指向已断开的 enp4s0 (2026-08-14)
 
 > **背景**：用户反馈"当前环境没有 IPv6、摄像头不在线"。排查发现两个与 v1.8.38 前缀同步**无关但更根本**的问题，
