@@ -50,3 +50,11 @@ build_*.log
 # Live JWT for ad-hoc curl tests. NEVER commit — rotate immediately
 # if this file leaks (see docs/security.md).
 .token.txt
+
+# ---- Android / Gradle ----
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/*.log
+android/app/build/
+android/build/

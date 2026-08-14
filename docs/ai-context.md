@@ -264,7 +264,15 @@ deploy/
 ├── frigate/config.yml            // Frigate base config (detectors, mqtt, go2rtc, record retention)
 ├── cloudflared/config.yml        // dashboard + api + cam hostnames
 ├── go2rtc/{Dockerfile,go2rtc.yaml} // RTSP→WebRTC/HLS bridge (legacy; now bundled in Frigate)
-└── android/HomeDatacenterClient.kt
+├── android/                      // Gradle project (v1.8.43+)
+│   ├── app/
+│   │   └── src/main/java/com/example/homecenter/
+│   │       ├── HomeCenterClient.kt      // protocol layer: models, API, WS, NetworkMonitor, error reporter
+│   │       ├── HomeCenterService.kt     // foreground service for background WS keepalive
+│   │       ├── TokenStore.kt            // token / URL persistence (SharedPreferences)
+│   │       └── MainActivity.kt          // binder + service control UI
+│   ├── build.gradle.kts, settings.gradle.kts, gradlew, ...
+│   └── deploy/android/HomeDatacenterClient.kt  // legacy single-file reference client
 ```
 
 ---
