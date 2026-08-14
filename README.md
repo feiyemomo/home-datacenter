@@ -611,6 +611,35 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.39 — 环境诊断：NAS IPv6 曾被整体禁用 + ddns 指向已断开的 enp4s0 (2026-08-14)
+
+> **背景**：用户反馈"当前环境没有 IPv6、摄像头不在线"。排查发现两个与 v1.8.38 前缀同步**无关但更根本**的问题，
+> 均属**运维/物理层**，代码无需改动。
+
+**问题 1 — NAS IPv6 被 NetworkManager 整体禁用（已修复）**：
+- NAS 活跃口 `eno1` 在 NetworkManager 连接 `Wired connection 1` 上 `ipv6.method=disabled`，且内核
+  `net.ipv6.conf.eno1.disable_ipv6=1`、`accept_ra=0` → NAS 完全没有 IPv6（连 link-local 都没有）。
+- 已执行：`nmcli connection modify "Wired connection 1" ipv6.method auto` + `nmcli connection up`，
+  并 `echo 0 > /proc/sys/net/ipv6/conf/eno1/disable_ipv6`。恢复后 `eno1` 获得 VLAN 全局地址
+  `2409:8a70:37ad:6870::e43`、SLAAC `...bd08` 及默认路由（经网关 `fe80::a6a9:30ff:fe91:3b25`），
+  LAN 内 `http://[...bd08]:8088/` 返回 200。
+
+**问题 2 — ddns `nas.feiyemomo.top` 指向已物理断开的 enp4s0（待用户处理）**：
+- ddns 解析到 `2409:8a70:37ad:6870:62be:b4ff:fe08:bd09`，这是 NAS **另一网卡 enp4s0** 的 EUI-64 稳定地址。
+- 实测 `enp4s0` 到网关 100% 丢包、ARP 邻居表全空、carrier 虽 up 但无法上联 → **该口网线/端口物理断开**，
+  `...bd09` 收不到包，ddns 当前不可达。系统已有 `ipv6-stable-addr.service` 在 enp4s0 上维护该地址，
+  本次已将其内旧前缀 `2409:8a70:37a3:99d0` 更新为当前 `2409:8a70:37ad:6870`。
+- 恢复路径二选一：① 接好 enp4s0 网线（ddns 按现状即可用，代码零改动）；② 把 ddns / 代码三处
+  （compose、frigate、Android）改指活跃口 `...bd08`。**待用户确认方向后处理。**
+
+**摄像头（前门 / 院子）**：`192.168.31.100` / `.101` 仍物理离线（ARP FAILED、554/80 全关），
+与 v1.8.38 结论一致，需现场检查电源与网线。
+
+#### 版本
+- Backend: v1.8.39（无代码改动，运维+文档）
+- Web: v1.8.39（无前端改动）
+- Android: v1.8.39（无改动）
+
 ### v1.8.38 — IPv6 前缀轮换：配置同步到 ddns 当前前缀 + 摄像头离线排查 (2026-08-14)
 
 > **背景**：运营商 DHCPv6-PD 再次轮换 /64 前缀，IPv6 ddns `nas.feiyemomo.top` 已自动更新到新前缀
