@@ -122,6 +122,11 @@ func (m *RecordingSizeMonitor) sample() {
 					log.Printf("maintenance: quota exceeded action failed, will retry next sample: %v", err)
 				} else {
 					m.quotaActive = true
+					// v1.8.36: publish a warning SystemLog so connected
+					// dashboards and the Android admin quota banner can
+					// surface "disk quota reached" to the operator.
+					m.emitQuotaEvent(model.LevelWarning, eventbus.SeverityWarn,
+						fmt.Sprintf("录像配额已用尽 %s（已自动缩短录像保留天数）", humanBytes(size)))
 				}
 			} else {
 				m.quotaActive = true
@@ -134,6 +139,10 @@ func (m *RecordingSizeMonitor) sample() {
 					log.Printf("maintenance: quota recovered action failed, will retry next sample: %v", err)
 				} else {
 					m.quotaActive = false
+					// v1.8.36: publish a normal SystemLog so clients can
+					// dismiss the quota banner once space frees up.
+					m.emitQuotaEvent(model.LevelNormal, eventbus.SeverityInfo,
+						fmt.Sprintf("录像配额已释放，恢复 %s（正常）", humanBytes(size)))
 				}
 			} else {
 				m.quotaActive = false
@@ -153,12 +162,43 @@ func (m *RecordingSizeMonitor) sample() {
 	m.lastLevel = level
 
 	if level == "" {
+		// v1.8.36: emit a recovery SystemLog so connected dashboards
+		// (and the Android quota banner) can dismiss the alert once
+		// the recordings tree drops back under quota. Previously this
+		// branch only logged without publishing, leaving any client
+		// banner stuck visible forever.
 		log.Printf("maintenance: recordings size back to normal: %s", humanBytes(size))
+		msg := fmt.Sprintf("录像目录大小恢复至 %s（正常）", humanBytes(size))
+		payload, _ := json.Marshal(map[string]any{
+			"path":       m.root,
+			"size_bytes": size,
+			"files":      fileCount,
+			"level":      "",
+		})
+		entry := &model.SystemLog{
+			Ts:        time.Now().Unix(),
+			EventType: "system.recordings_size",
+			Level:     model.LevelNormal,
+			Source:    "system",
+			Message:   msg,
+			Payload:   string(payload),
+		}
+		if err := m.db.Create(entry).Error; err != nil {
+			log.Printf("maintenance: recordings size recovery persist failed: %v", err)
+			return
+		}
+		raw, _ := json.Marshal(entry)
+		m.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicSystemLog,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityInfo,
+			Payload:  raw,
+		})
 		return
 	}
 
 	levelName := "warning"
-	sev := model.LevelNormal
+	sev := model.LevelWarning
 	busSev := eventbus.SeverityWarn
 	if level == "crit" {
 		levelName = "critical"
@@ -192,6 +232,36 @@ func (m *RecordingSizeMonitor) sample() {
 		Payload:  raw,
 	})
 	log.Printf("maintenance: %s", msg)
+}
+
+// emitQuotaEvent persists a system.recordings_size SystemLog with the
+// given level/severity and publishes it on the event bus so connected
+// dashboards (and the Android admin quota banner) react to it.
+func (m *RecordingSizeMonitor) emitQuotaEvent(level, busSev string, msg string) {
+	payload, _ := json.Marshal(map[string]any{
+		"path":        m.root,
+		"quota_bytes": m.quotaBytes,
+		"level":       level,
+	})
+	entry := &model.SystemLog{
+		Ts:        time.Now().Unix(),
+		EventType: "system.recordings_size",
+		Level:     level,
+		Source:    "maintenance",
+		Message:   msg,
+		Payload:   string(payload),
+	}
+	if err := m.db.Create(entry).Error; err != nil {
+		log.Printf("maintenance: quota event persist failed: %v", err)
+		return
+	}
+	raw, _ := json.Marshal(entry)
+	m.bus.Publish(eventbus.Event{
+		Topic:    eventbus.TopicSystemLog,
+		Source:   eventbus.SourceSystem,
+		Severity: busSev,
+		Payload:  raw,
+	})
 }
 
 // dirSize recursively sums the sizes of all regular files under root.

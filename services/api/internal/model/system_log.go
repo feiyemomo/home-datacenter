@@ -5,6 +5,9 @@ package model
 // routine ones (user login). The three levels map 1:1 to UI badges:
 //
 //   - critical: red badge — camera offline, device offline
+//   - warning:  amber badge — recordings quota / disk / backup thresholds
+//               crossed (v1.8.36). Sits above routine "normal" entries so
+//               the operator can spot a filling disk or shrunken retention.
 //   - normal:   blue badge — user login/logout, device/camera online
 //   - info:     grey badge — camera status_changed (codec/quality)
 //
@@ -12,6 +15,7 @@ package model
 // "normal" by the UI for backward compatibility.
 const (
 	LevelCritical = "critical"
+	LevelWarning  = "warning"
 	LevelNormal   = "normal"
 	LevelInfo     = "info"
 )
