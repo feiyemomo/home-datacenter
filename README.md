@@ -638,11 +638,12 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 #### 验证
 - `./gradlew assembleDebug` 构建成功，产出 `app/build/outputs/apk/debug/app-debug.apk`（约 6.3 MB）。
+- APK 已推送至 NAS `data/releases/app-debug-v1.8.43.apk`（versionCode 124, versionName 1.8.43），可直接安装。
 
 #### 版本
 - Backend: v1.8.43（无代码改动）
 - Web: v1.8.43（无前端改动）
-- Android: v1.8.43（整理为 Gradle 工程，构建出可安装 debug APK）
+- Android: v1.8.43（整理为 Gradle 工程，构建并推送可安装 debug APK）
 
 ### v1.8.42 — 后台保持 + 预加载加固 + Android 端同步 (2026-08-14)
 

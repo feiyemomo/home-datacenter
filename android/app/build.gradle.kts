@@ -12,8 +12,8 @@ android {
         applicationId = "com.example.homecenter"
         minSdk = 24
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.8.42"
+        versionCode = 124
+        versionName = "1.8.43"
 
         // Build-time config baked into BuildConfig for easy wiring.
         buildConfigField("String", "DEFAULT_BASE_URL", "\"http://192.168.31.235:8080/\"")
