@@ -99,6 +99,17 @@ type Config struct {
 	// thresholds for the recordings tree. 0 disables that level.
 	RecordingSizeWarnBytes uint64
 	RecordingSizeCritBytes uint64
+	// RecordingQuotaBytes is the soft quota for the recordings tree
+	// (v1.8.32). When the total size crosses it, OnQuotaExceeded fires
+	// (e.g. shorten Frigate retention); when it drops back below,
+	// OnQuotaRecovered restores normal retention. 0 disables the
+	// automatic action.
+	RecordingQuotaBytes uint64
+	// OnQuotaExceeded / OnQuotaRecovered are invoked on quota edge
+	// transitions. Nil callbacks are silently skipped (monitor still
+	// runs; alerts unaffected).
+	OnQuotaExceeded  func()
+	OnQuotaRecovered func()
 
 	// SysResourceInterval is how often CPU + memory are sampled.
 	// 0 disables the resource monitor.
@@ -141,7 +152,7 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 		go NewRecordingMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingStaleAfter, cfg.RecordingCheckInterval, cfg.RecordingTargets).Run()
 	}
 	if cfg.RecordingsRoot != "" && cfg.RecordingSizeInterval > 0 {
-		go NewRecordingSizeMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingSizeInterval, cfg.RecordingSizeWarnBytes, cfg.RecordingSizeCritBytes).Run()
+		go NewRecordingSizeMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingSizeInterval, cfg.RecordingSizeWarnBytes, cfg.RecordingSizeCritBytes, cfg.RecordingQuotaBytes, cfg.OnQuotaExceeded, cfg.OnQuotaRecovered).Run()
 	}
 	if cfg.SysResourceInterval > 0 {
 		go NewSysResourceMonitor(db, bus, cfg.SysResourceInterval, cfg.CPUWarnPct, cfg.CPUCritPct, cfg.MemWarnPct, cfg.MemCritPct).Run()

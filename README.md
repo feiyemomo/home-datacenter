@@ -611,6 +611,31 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.32 — 录像配额自动缩短留存 + WebRTC 候选重启感知推送 (2026-08-14)
+
+> **两块能力补全**：① 录像配额监控——录像总占用超阈值时**自动**把 Frigate 留存从 7 天缩短到 3 天（旧片在下一个清理周期被删），回落后自动恢复 7 天，避免小磁盘被录像悄悄撑满；② 修复 WebRTC `candidates` 推送的重启竞态——顺带揪出真正的根因是 API 载荷格式错误（一直 400），重构为"重启前推送 + 深合并持久化"，重启后候选不再丢失。
+
+**录像配额自动缩短留存**：
+- **`RecordingSizeMonitor` 新增配额边沿检测**（`internal/maintenance/recordings_size.go`）：`recording_quota_bytes` 非 0 时，录像总占用跨越配额即触发 `OnQuotaExceeded`（推送缩短留存），回落触发 `OnQuotaRecovered`（恢复正常留存）。边沿触发，不重复告警。
+- **`FrigateClient.PushRecordRetention`**（`internal/camera/frigate.go`）：`PUT /api/config/set` 只发 `record.continuous.days` / `record.motion.days` 部分配置，`requires_restart=0` 无需重启，Frigate 下次清理周期即删超出窗口的旧片。
+- **留存可配置**：`PushConfig` 的 retention 不再硬编码 7 天，`SetRetentionDays` 由 `recording_retention_days` 控制（默认 7）。
+- **配置**（`config.yaml`）：`recording_quota_bytes`（默认 0 关闭，本机设 300GiB≈466G 盘的 65%）/ `recording_retention_days`（7） / `recording_reduced_retention_days`（3，必须 < 正常值）。
+
+**WebRTC 候选重启感知推送**（修复遗留技术债）：
+- **根因**：`SetWebRTCCandidates` 把方案裸发 `{go2rtc:...}`，而 Frigate `/api/config/set` 要求 `{config_data:...}` 包裹——所以**每次**候选推送（BootReplay 和 PrefixWatcher 兜底）都返回 400 `No configuration data provided`，候选一直没真正更新过。已改为与 `PushRecordRetention` 相同的 `config_data` 包裹格式。
+- **重启感知**：`BootReplay` 改为**先推送候选、再推全量配置**（全量配置触发重启）。候选是深合并部分更新，先持久化进 `config.yml`，随后重启从文件加载——彻底消除"先重启后推送撞上 connection refused"的竞态。`pushWebRTCCandidatesWithRetry` 只吸收启动窗口（Frigate REST 5000 比 go2rtc 1984 慢）。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- api 日志：`camera: webrtc candidates pushed after boot replay`（此前是 `400 No configuration data provided`）。
+- 运行时 `config.yml` 候选为 `127.0.0.1:8555` + `192.168.31.235:8555` + `[IPv6]:8555` 三个；`docker restart home-frigate` 后三者完整保留、容器 healthy。
+- Frigate 留存当前 `continuous.days: 7` / `motion.days: 7`（正常值）；录像当前 738M，远低于 300GiB 配额，配额动作不触发（符合预期）。
+- 配额监控已随维护循环运行，指向 `/media/frigate/recordings`，1h 采样。
+
+#### 版本
+- Backend: v1.8.32
+- Web: v1.8.32（无前端改动）
+- Android: v1.8.24（无改动）
+
 ### v1.8.30 — 异地备份恢复演练 + 备份健康/留存监控 (2026-08-14)
 
 > **把 v1.8.29 的异地备份从"能推上去"补全到"能验证、能告警、能恢复"**：新增一键恢复演练脚本证明 bucket 可恢复；新增 `BackupMonitor`，同步失败/停滞会写 `system.backup` 严重告警触达 dashboard；bucket 对象/容量超阈值告警，防止免费额度悄悄被撑爆。
