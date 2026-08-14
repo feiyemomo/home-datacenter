@@ -1,6 +1,6 @@
 # Home Datacenter
 
-家庭数据中心 / 家庭管理应用 — 一个包含 **API（Go）**、**Web（Vue SPA）** 和 **MQTT Broker（Mosquitto）** 三件套的全栈项目，本仓库提供完整的 Docker 一键部署方案。
+家庭数据中心 / 家庭管理应用 — 一个包含 **API（Go）**、**Web（React SPA）**、**MQTT Broker（Mosquitto）** 与 **NVR（Frigate）** 的全栈项目，本仓库提供完整的 Docker 一键部署方案。
 
 ---
 

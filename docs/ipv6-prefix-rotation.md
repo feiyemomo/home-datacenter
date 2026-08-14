@@ -290,6 +290,14 @@ force the watcher to skip its cache and probe immediately — useful
 right after the operator updates `NAS_IPV6_ADDRESS` and wants to
 verify the new value takes effect.
 
+> **Implementation note (current)**: the dedicated `GET /api/v1/network/ipv6`
+> route was never shipped as a standalone endpoint. The NAS's live
+> outbound IPv6 address is instead returned as the `ipv6` field of
+> **`GET /api/v1/network/p2p/server-endpoint`** (and surfaced in the
+> `status.IPv6` block of `GET /api/v1/network/status`). The `PrefixWatcher`
+> described above still runs and drives `SetWebRTCCandidates()` + the
+> dynamic URL; only the REST surface differs from the design below.
+
 ### 4.4 Backend: `FrigateClient.SetWebRTCCandidates()`
 
 ```go
