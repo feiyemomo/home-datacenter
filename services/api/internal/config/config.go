@@ -12,23 +12,25 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/viper"
 )
 
 // Config is the root configuration object.
 type Config struct {
-	Server    ServerConfig    `mapstructure:"server"`
-	Database  DatabaseConfig  `mapstructure:"database"`
-	JWT       JWTConfig       `mapstructure:"jwt"`
-	Auth      AuthConfig      `mapstructure:"auth"`
-	MQTT      MQTTConfig      `mapstructure:"mqtt"`
-	WebSocket WebSocketConfig `mapstructure:"websocket"`
-	Go2RTC    Go2RTCConfig    `mapstructure:"go2rtc"`
-	Frigate   FrigateConfig   `mapstructure:"frigate"`
-	Camera    CameraConfig    `mapstructure:"camera"`
-	Network   NetworkConfig   `mapstructure:"network"`
-	Releases  ReleasesConfig  `mapstructure:"releases"`
+	Server      ServerConfig      `mapstructure:"server"`
+	Database    DatabaseConfig    `mapstructure:"database"`
+	JWT         JWTConfig         `mapstructure:"jwt"`
+	Auth        AuthConfig        `mapstructure:"auth"`
+	MQTT        MQTTConfig        `mapstructure:"mqtt"`
+	WebSocket   WebSocketConfig   `mapstructure:"websocket"`
+	Go2RTC      Go2RTCConfig      `mapstructure:"go2rtc"`
+	Frigate     FrigateConfig     `mapstructure:"frigate"`
+	Camera      CameraConfig      `mapstructure:"camera"`
+	Network     NetworkConfig     `mapstructure:"network"`
+	Releases    ReleasesConfig    `mapstructure:"releases"`
+	Maintenance MaintenanceConfig `mapstructure:"maintenance"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -194,6 +196,38 @@ type ReleasesConfig struct {
 	Dir string `mapstructure:"dir"`
 }
 
+// MaintenanceConfig holds the background maintenance loop settings
+// (v1.8.27): SQLite WAL checkpoint / daily backup and disk-space
+// monitoring. Every field has a sane default applied in Load(); the
+// operator only needs to override what their deployment differs on.
+type MaintenanceConfig struct {
+	// SQLiteDBPath is the SQLite database file path. Used by the
+	// maintenance loop for VACUUM/backup bookkeeping. Empty falls
+	// back to database.path.
+	SQLiteDBPath string `mapstructure:"sqlite_db_path"`
+	// BackupDir is where daily SQLite snapshots are written.
+	// Default: <db dir>/backups (e.g. /data/sqlite/backups).
+	BackupDir string `mapstructure:"backup_dir"`
+	// BackupKeep is how many daily backups to retain. Default 7.
+	BackupKeep int `mapstructure:"backup_keep"`
+	// CheckpointIntervalMinutes is how often the WAL is checkpointed
+	// and truncated. Default 360 (every 6h).
+	CheckpointIntervalMinutes int `mapstructure:"checkpoint_interval_minutes"`
+	// BackupIntervalHours is how often a full DB backup is taken.
+	// Default 24 (daily). 0 disables backups.
+	BackupIntervalHours int `mapstructure:"backup_interval_hours"`
+	// DiskPath is the directory whose filesystem is monitored for
+	// free space. Default: the database directory's filesystem.
+	DiskPath string `mapstructure:"disk_path"`
+	// DiskWarnPct / DiskCritPct are the usage thresholds (0-100).
+	// Default 80 / 90.
+	DiskWarnPct uint64 `mapstructure:"disk_warn_pct"`
+	DiskCritPct uint64 `mapstructure:"disk_crit_pct"`
+	// DiskIntervalMinutes is how often the disk monitor samples.
+	// Default 10.
+	DiskIntervalMinutes int `mapstructure:"disk_interval_minutes"`
+}
+
 // AppConfig is the globally accessible configuration instance,
 // populated by Load(). It is safe to read after Load returns nil.
 var AppConfig *Config
@@ -264,6 +298,21 @@ func Load(path string) error {
 	// highest version to the Android in-app updater.
 	v.SetDefault("releases.dir", "/data/releases")
 
+	// v1.8.27: background maintenance loops. Defaults keep the box
+	// healthy with zero config: checkpoint the WAL every 6h, back up
+	// the DB daily (keep 7), alert on disk at 80%/90%, sample every
+	// 10m. The disk path and sqlite path fall back to the database
+	// directory below (after the config file is read).
+	v.SetDefault("maintenance.sqlite_db_path", "")
+	v.SetDefault("maintenance.backup_dir", "")
+	v.SetDefault("maintenance.backup_keep", 7)
+	v.SetDefault("maintenance.checkpoint_interval_minutes", 360)
+	v.SetDefault("maintenance.backup_interval_hours", 24)
+	v.SetDefault("maintenance.disk_path", "")
+	v.SetDefault("maintenance.disk_warn_pct", 80)
+	v.SetDefault("maintenance.disk_crit_pct", 90)
+	v.SetDefault("maintenance.disk_interval_minutes", 10)
+
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /
 	// .env): the value never lands in the committed config file.
@@ -297,6 +346,22 @@ func Load(path string) error {
 	cfg := &Config{}
 	if err := v.Unmarshal(cfg); err != nil {
 		return fmt.Errorf("parse config %q: %w", path, err)
+	}
+
+	// v1.8.27: resolve maintenance path fallbacks. Empty values fall
+	// back to the database directory so the loops work with zero
+	// config. The disk monitor targets the filesystem that holds the
+	// database (which is also where recordings/cache live on the
+	// shared /data volume).
+	dbDir := filepath.Dir(cfg.Database.Path)
+	if cfg.Maintenance.SQLiteDBPath == "" {
+		cfg.Maintenance.SQLiteDBPath = cfg.Database.Path
+	}
+	if cfg.Maintenance.BackupDir == "" {
+		cfg.Maintenance.BackupDir = filepath.Join(dbDir, "backups")
+	}
+	if cfg.Maintenance.DiskPath == "" {
+		cfg.Maintenance.DiskPath = dbDir
 	}
 
 	// Refuse to boot with an insecure JWT secret. An empty or

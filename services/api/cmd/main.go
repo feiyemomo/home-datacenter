@@ -19,6 +19,7 @@ import (
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/handler"
 	logpkg "home-datacenter-api/internal/log"
+	"home-datacenter-api/internal/maintenance"
 	"home-datacenter-api/internal/middleware"
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
@@ -202,6 +203,24 @@ func main() {
 	// forever. Root is the recordings dir; the cache lives under
 	// <RecordingDir>/.transcode-cache.
 	camHandler.StartCacheCleaner(filepath.Join(cfg.Camera.RecordingDir, ".transcode-cache"), 7*24*time.Hour, 6*time.Hour)
+
+	// v1.8.27: background maintenance loops — SQLite WAL checkpoint +
+	// daily backup, and disk-space monitoring with SystemLog alerts.
+	// These keep the box healthy on long-running deployments: the WAL
+	// file stays bounded, the DB is backed up daily, and a filling
+	// disk surfaces in the dashboard before Frigate silently stops
+	// recording. See internal/maintenance for details.
+	maintenance.StartAll(database.DB, bus, maintenance.Config{
+		DBPath:             cfg.Maintenance.SQLiteDBPath,
+		BackupDir:          cfg.Maintenance.BackupDir,
+		BackupKeep:         cfg.Maintenance.BackupKeep,
+		CheckpointInterval: time.Duration(cfg.Maintenance.CheckpointIntervalMinutes) * time.Minute,
+		BackupInterval:     time.Duration(cfg.Maintenance.BackupIntervalHours) * time.Hour,
+		DiskPath:           cfg.Maintenance.DiskPath,
+		DiskWarnPct:        cfg.Maintenance.DiskWarnPct,
+		DiskCritPct:        cfg.Maintenance.DiskCritPct,
+		DiskInterval:       time.Duration(cfg.Maintenance.DiskIntervalMinutes) * time.Minute,
+	})
 
 	// Purge any soft-deleted camera rows left over from older
 	// deployments where Unregister performed a soft delete. Those
@@ -433,6 +452,19 @@ func main() {
 			releaseGroup.GET("/latest", releaseHandler.Latest)
 			releaseGroup.GET("/latest/apk", releaseHandler.Download)
 		}
+
+		// v1.8.27: keep only the newest 5 APK releases on disk. Old
+		// versions accumulated ~5GB while the in-app updater only ever
+		// needs the latest. Runs once at startup (so an in-place
+		// upgrade immediately reclaims space) then daily.
+		go func() {
+			releaseHandler.CleanupOldReleases(5)
+			ticker := time.NewTicker(24 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				releaseHandler.CleanupOldReleases(5)
+			}
+		}()
 
 		// Weather proxy: serves cached wttr.in JSON so the Android
 		// app can show current weather on the dashboard. JWT-protected

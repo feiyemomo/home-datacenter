@@ -1392,6 +1392,47 @@ v1.8.25 made web playback work but left four follow-ups on the table: (1) softwa
 
 ---
 
+## Phase 21 (v1.8.27): Persistent-Operation Hardening — Frigate DB Persistence + SQLite Maintenance + Log Rotation + Disk Alerts + Release Cleanup
+
+### Phase 21 span: v1.8.27 (Backend) + v1.8.27 (compose)
+
+#### Problem: long-running deployment slowly accumulated cruft and could lose state
+
+A healthy box that runs for months should not slowly grow WAL files, accumulated APKs, unbounded container logs, and — worst of all — silently lose Frigate's event database on a container recreate. Audit found: Frigate's `frigate.db` lived in the container's writable layer (lost on every rebuild), `app.db-wal` had grown to 17.4MB while `app.db` was ~700KB, `mosquitto` logs had reached 84MB and `frigate` 44MB with no cap, `data/releases` held 5.1GB of APKs when the in-app updater only ever needs the newest, and there was no disk-space alert to catch a filling disk before Frigate silently stopped recording.
+
+#### Fixes
+
+- **Frigate `/config` persistence** (`compose.yaml`): mount `./data/frigate/config:/config` so `frigate.db`, `backup.db`, `.jwt_secret`, `model_cache/` survive container recreate/upgrade. The repo's `config.yml` is still overlaid as a single-file mount on top, so config pushes work as before. Recordings already survived via `/media/frigate`; now the event timeline/search index does too.
+- **SQLite maintenance** (`internal/maintenance/sqlite.go`): periodic `PRAGMA wal_checkpoint(TRUNCATE)` (default every 6h, plus once at startup) folds the WAL back into `app.db` and truncates it to ~0; daily `VACUUM INTO` snapshot to `<db dir>/backups` retained to newest 7. `VACUUM INTO` is safe against a live WAL DB — consistent, compacted, non-blocking.
+- **Disk-space monitor** (`internal/maintenance/disk.go`): samples the data filesystem every 10m; on warn (80%) / crit (90%) crossing it writes a `event_type=system.disk` SystemLog row and publishes a live `system.log` event so the dashboard sees the alert before recordings die. Edge-triggered — only logs on transitions.
+- **Docker log rotation** (`compose.yaml`): global `json-file` driver with `max-size: 10m` + `max-file: 3` applied to every service via an anchor, so chatty logs can never fill the disk.
+- **Release cleanup** (`release_handler.go`): `CleanupOldReleases(5)` runs at startup and daily, deleting all but the newest 5 APKs (strictly matched `app-debug-vX.Y.Z.apk/**`) plus sibling release-notes. Same run shrank `data/releases` from ~5.1GB to ~428MB.
+- **Startup wiring** (`main.go`): `maintenance.StartAll(...)` after DB/EventBus ready; release cleanup goroutine.
+
+#### NAS verification (192.168.31.235, e2e)
+
+- `GET /health` → `{"status":"ok"}`; `maintenance: background loops started` + `maintenance: sqlite WAL checkpointed (TRUNCATE)` in api logs.
+- `data/frigate/config/` on host now holds `frigate.db` (3.3MB), `backup.db`, `.jwt_secret`, `model_cache/` — persisted across container lifecycle.
+- `docker inspect` confirms every service LogConfig = `{"Type":"json-file","Config":{"max-file":"3","max-size":"10m"}}`.
+- `data/releases/` holds exactly 5 newest APKs (v1.7.23…v1.8.24); disk `/vol1` at 12% (below warn threshold, so no alert is expected).
+- `backups/` dir writable by app user; `VACUUM INTO` mechanism verified with the same `glebarez/sqlite` driver (`BACKUP_OK size=143360`). First daily backup lands 24h post-deploy.
+
+### Files Changed (Phase 21)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/maintenance/sqlite.go` | New — WAL checkpoint + daily `VACUUM INTO` backup + prune |
+| `services/api/internal/maintenance/disk.go` | New — disk-space monitor (warn/crit SystemLog alerts) |
+| `services/api/internal/maintenance/disk_linux.go` / `disk_other.go` | New — platform disk-usage impl (statfs / stub) |
+| `services/api/internal/maintenance/maintenance.go` | New — `StartAll` bootstraps both loops |
+| `services/api/internal/config/config.go` | `MaintenanceConfig` section |
+| `services/api/configs/config.yaml` | `maintenance:` block (checkpoint 6h, backup 24h keep 7, warn 80 / crit 90) |
+| `services/api/cmd/main.go` | Start maintenance loops; release cleanup goroutine |
+| `services/api/internal/handler/release_handler.go` | `CleanupOldReleases(keep)` |
+| `compose.yaml` | Frigate `/config` volume; global log rotation; releases `:ro`→`rw` |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
@@ -1434,4 +1475,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

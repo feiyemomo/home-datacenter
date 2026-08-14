@@ -117,3 +117,28 @@ network:
 # directory on every request and returns the highest version found.
 releases:
   dir: /data/releases
+
+# v1.8.27: background maintenance loops — SQLite WAL checkpoint /
+# daily backup and disk-space monitoring. All values have sane
+# defaults; override only what your deployment differs on.
+#   - sqlite_db_path: empty → database.path
+#   - backup_dir:     empty → <db dir>/backups
+#   - disk_path:      empty → <db dir> (the filesystem holding /data)
+maintenance:
+  # SQLite database path for VACUUM/backup bookkeeping.
+  sqlite_db_path: /data/sqlite/app.db
+  # Where daily SQLite snapshots are written.
+  backup_dir: /data/sqlite/backups
+  # How many daily backups to retain.
+  backup_keep: 7
+  # WAL checkpoint interval (minutes). 360 = every 6 hours.
+  checkpoint_interval_minutes: 360
+  # Full DB backup interval (hours). 24 = daily. 0 disables backups.
+  backup_interval_hours: 24
+  # Filesystem to monitor for free space. Empty = database dir.
+  disk_path: /data
+  # Usage thresholds: warn at 80%, critical at 90%.
+  disk_warn_pct: 80
+  disk_crit_pct: 90
+  # Disk sampling interval (minutes).
+  disk_interval_minutes: 10

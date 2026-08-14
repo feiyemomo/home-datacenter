@@ -140,6 +140,29 @@ func (h *ReleaseHandler) Download(c *gin.Context) {
 // error if the directory doesn't exist, is empty, or contains no
 // matching files.
 func (h *ReleaseHandler) findLatest() (*apkFile, error) {
+	apks, err := h.listAll()
+	if err != nil {
+		return nil, err
+	}
+	latest := &apks[0]
+
+	// Read optional release notes from a sibling text file named
+	// release-notes-v{version}.txt. Missing file = empty string.
+	// This lets the publisher attach a changelog per release by
+	// simply dropping a .txt file alongside the APK — no DB, no
+	// config edit. The Android app renders this as the "版本特点"
+	// section in the update dialog.
+	notesPath := filepath.Join(h.releasesDir, "release-notes-v"+latest.VersionName+".txt")
+	notes, _ := os.ReadFile(notesPath)
+	latest.ReleaseNotes = string(notes)
+	return latest, nil
+}
+
+// listAll scans the releases directory and returns every APK matching
+// the "app-debug-vX.Y.Z.apk" convention, sorted by version_code
+// descending (newest first). Returns os.ErrNotExist if the directory
+// is empty or has no matching files.
+func (h *ReleaseHandler) listAll() ([]apkFile, error) {
 	if h.releasesDir == "" {
 		return nil, os.ErrNotExist
 	}
@@ -170,22 +193,12 @@ func (h *ReleaseHandler) findLatest() (*apkFile, error) {
 			continue
 		}
 
-		// Read optional release notes from a sibling text file named
-		// release-notes-v{version}.txt. Missing file = empty string.
-		// This lets the publisher attach a changelog per release by
-		// simply dropping a .txt file alongside the APK — no DB, no
-		// config edit. The Android app renders this as the "版本特点"
-		// section in the update dialog.
-		notesPath := filepath.Join(h.releasesDir, "release-notes-v"+verStr+".txt")
-		notes, _ := os.ReadFile(notesPath)
-
 		apks = append(apks, apkFile{
-			Path:         filepath.Join(h.releasesDir, name),
-			VersionName:  verStr,
-			VersionCode:  code,
-			SizeBytes:    info.Size(),
-			FileName:     name,
-			ReleaseNotes: string(notes),
+			Path:        filepath.Join(h.releasesDir, name),
+			VersionName: verStr,
+			VersionCode: code,
+			SizeBytes:   info.Size(),
+			FileName:    name,
 		})
 	}
 
@@ -198,7 +211,48 @@ func (h *ReleaseHandler) findLatest() (*apkFile, error) {
 		return apks[i].VersionCode > apks[j].VersionCode
 	})
 
-	return &apks[0], nil
+	return apks, nil
+}
+
+// CleanupOldReleases deletes all but the newest `keep` APK files in
+// the releases directory, along with their sibling release-notes
+// files. Returns the number of APKs removed. Safe to call repeatedly:
+// it is a no-op when there are already ≤ keep releases.
+//
+// v1.8.27: the releases directory previously accumulated one ~90MB
+// APK per published version forever (5.1GB at last check) while the
+// in-app updater only ever needs the latest. This is the automatic
+// counterpart to the manual cleanup the operator used to do by hand.
+func (h *ReleaseHandler) CleanupOldReleases(keep int) (int, error) {
+	if h.releasesDir == "" || keep <= 0 {
+		return 0, nil
+	}
+	apks, err := h.listAll()
+	if err != nil {
+		// os.ErrNotExist (empty dir) is not an error worth logging.
+		if err == os.ErrNotExist {
+			return 0, nil
+		}
+		return 0, err
+	}
+	if len(apks) <= keep {
+		return 0, nil
+	}
+	removed := 0
+	for _, apk := range apks[keep:] {
+		if err := os.Remove(apk.Path); err != nil {
+			log.Printf("[handler] release cleanup: remove %s failed: %v", apk.Path, err)
+			continue
+		}
+		// Also remove the sibling release-notes file if present.
+		notesPath := filepath.Join(h.releasesDir, "release-notes-v"+apk.VersionName+".txt")
+		_ = os.Remove(notesPath)
+		removed++
+	}
+	if removed > 0 {
+		log.Printf("[handler] release cleanup: removed %d old release(s), keeping newest %d", removed, keep)
+	}
+	return removed, nil
 }
 
 // parseVersionCode converts "1.6.10" to 10000 + 6*100 + 10 = 10610.

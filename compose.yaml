@@ -30,12 +30,24 @@
 #     127.0.0.1 — no internal service needs them via the host; all
 #     reach Frigate on the Docker network as home-frigate:5000/1984.
 
+# v1.8.27: global container log rotation. Without this, every service
+# used Docker's default json-file driver with NO size cap — mosquitto
+# had grown to 84M and frigate to 44M, growing forever. max-size caps
+# each log file at 10MB and max-file keeps only 3, so a chatty service
+# can never fill the disk. Applied to every service via the anchor.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   api:
     build:
       context: ./services/api
     container_name: home-api
     restart: unless-stopped
+    logging: *default-logging
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -72,9 +84,12 @@ services:
       # here by push-apk.ps1 (or any other deploy tool). The api
       # container scans this directory and serves the highest
       # version via GET /api/v1/release/latest and
-      # GET /api/v1/release/latest/apk. Read-only — the API never
-      # writes here, deploy tools do.
-      - ./data/releases:/data/releases:ro
+      # GET /api/v1/release/latest/apk.
+      # v1.8.27: read-write (was :ro) so the startup/daily
+      # CleanupOldReleases loop can prune old versions (only files
+      # matching "app-debug-vX.Y.Z.apk" are ever deleted — matched
+      # strictly by listAll), keeping the directory bounded.
+      - ./data/releases:/data/releases
     depends_on:
       mosquitto:
         condition: service_started
@@ -120,6 +135,7 @@ services:
     image: eclipse-mosquitto:2
     container_name: home-mosquitto
     restart: unless-stopped
+    logging: *default-logging
     security_opt:
       - no-new-privileges:true
     # cap_drop: ALL is not set here — the official entrypoint needs
@@ -144,6 +160,7 @@ services:
       context: ./web
     container_name: home-web
     restart: unless-stopped
+    logging: *default-logging
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -202,6 +219,7 @@ services:
     image: ghcr.io/blakeblackshear/frigate:stable
     container_name: home-frigate
     restart: unless-stopped
+    logging: *default-logging
     security_opt:
       - no-new-privileges:true
     # cap_drop: ALL is not set here — Frigate's s6-overlay init
@@ -244,6 +262,15 @@ services:
       - "8555:8555"
       - "8555:8555/udp"
     volumes:
+      # v1.8.27: persist Frigate's /config directory (frigate.db,
+      # backup.db, .jwt_secret, ...) on the host. Previously only
+      # config.yml was mounted (read-only from the repo), so the
+      # event database lived in the container's writable layer and
+      # was LOST on every container recreate/upgrade — recordings
+      # survived but the event timeline/search index did not. The
+      # file mount below overlays the repo's config.yml on top of
+      # this directory, so config pushes still work as before.
+      - ./data/frigate/config:/config
       - ./deploy/frigate/config.yml:/config/config.yml
       - ./data/frigate:/media/frigate
       - ./data/recordings:/data/recordings
@@ -287,6 +314,7 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: home-cloudflared
     restart: unless-stopped
+    logging: *default-logging
     security_opt:
       - no-new-privileges:true
     cap_drop:
