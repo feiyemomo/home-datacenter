@@ -1868,6 +1868,44 @@ candidates require an IP:port, not a hostname).
 
 ---
 
+## Phase 34 (v1.8.39): Environment Diagnosis — NAS IPv6 Was Wholly Disabled + DDNS Points at Disconnected enp4s0
+
+### Phase 34 span: v1.8.39 (ops + docs) — no web / backend / Android code change
+
+#### Background
+Operator reported "no IPv6 in the environment" and "cameras offline". Root-cause surfaced two issues **deeper than** the
+Phase 33 prefix sync — both are **operational / physical-layer**, no code change required.
+
+#### Issue 1 — NAS IPv6 was wholly disabled at the NetworkManager level (FIXED)
+- The active uplink `eno1` had `ipv6.method=disabled` on its NetworkManager connection `Wired connection 1`, plus kernel
+  `net.ipv6.conf.eno1.disable_ipv6=1` and `accept_ra=0` → the NAS had **zero** IPv6 (not even link-local).
+- Fix (executed on NAS): `nmcli connection modify "Wired connection 1" ipv6.method auto` + `nmcli connection up`, and
+  `echo 0 > /proc/sys/net/ipv6/conf/eno1/disable_ipv6`. After recovery `eno1` gained DHCPv6 `2409:8a70:37ad:6870::e43`,
+  SLAAC `...bd08`, and a default route via gateway `fe80::a6a9:30ff:fe91:3b25`; LAN `http://[...bd08]:8088/` returns 200.
+
+#### Issue 2 — DDNS `nas.feiyemomo.top` resolves to a physically-disconnected enp4s0 (AWAITING OPERATOR)
+- The AAAA record resolves to `2409:8a70:37ad:6870:62be:b4ff:fe08:bd09`, the EUI-64 stable address of NAS NIC **enp4s0**.
+- Measured: `enp4s0` has 100% packet loss to the gateway, empty ARP neighbour table, carrier UP but no upstream →
+  the port's cable/link is physically down; `...bd09` receives no packets, so the DDNS is currently unreachable.
+- The `ipv6-stable-addr.service` systemd unit maintains this address on `enp4s0`; its stale prefix `2409:8a70:37a3:99d0`
+  was updated to the current `2409:8a70:37ad:6870` so it re-applies correctly once the port is reconnected.
+- Recovery is one of: ① reconnect the enp4s0 cable (DDNS works as-is, zero code change); ② repoint DDNS + the three
+  code sites (compose / frigate / Android) to the live `...bd08`. Awaiting operator direction.
+
+#### Cameras (前门 / 院子)
+`192.168.31.100` / `.101` remain physically offline (ARP FAILED, RTSP:554 / ONVIF:80 closed) — same as Phase 33;
+requires on-site power + cabling inspection.
+
+### Files Changed (Phase 34)
+
+| File | Change |
+|------|--------|
+| NAS NetworkManager `Wired connection 1` | `ipv6.method` disabled → auto (persistent) |
+| NAS `/etc/systemd/system/ipv6-stable-addr.service` | stale prefix → current `2409:8a70:37ad:6870` |
+| `README.md` | v1.8.39 changelog entry |
+
+---
+
 ## Phase 32 (v1.8.37): Recording Quota 400 GiB + Android Progress Bar Uses Actual Coverage
 
 ### Phase 32 span: v1.8.37 (Backend config) + v1.8.37 (Android)
@@ -1937,4 +1975,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
