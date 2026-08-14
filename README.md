@@ -178,6 +178,7 @@ docker compose up -d --build
 - **磁盘空间告警**：API 每 10 分钟采样数据盘使用率，跨过 80%（warn）/ 90%（crit）阈值时写入一条 `system.disk` 系统日志并实时推送到仪表盘，避免磁盘写满导致 Frigate 静默停止录像。
 - **容器日志轮转**：所有服务统一使用 `json-file` 驱动，单文件上限 10MB、最多保留 3 份，日志不会无限增长。
 - **旧 APK 清理**：`data/releases` 只保留最新 5 个 APK，启动时和每天各清理一次，防止发布目录无限膨胀。
+- **异地备份（亿安云 Bitiful）**（v1.8.29）：新增 `backup` 容器，用 rclone 把 SQLite 每日快照同步到亿安云 S3 bucket（`s3://nas-data/home-datacenter/sqlite`），NAS 磁盘故障时数据仍可恢复。凭据放在 `.env`（`BITIFUL_*`），不落入仓库；置空即禁用。
 
 ---
 
@@ -504,6 +505,7 @@ curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
 |---|---|---|
 | SQLite WAL checkpoint | 周期性把 `app.db-wal` 折回 `app.db` 并截断，防止 WAL 无限增长 | 每 6 小时 + 启动时各一次 |
 | SQLite 每日备份 | `VACUUM INTO` 一致性快照（含 `app.db` 与 `frigate.db`）到 `data/sqlite/backups/` | 每日 1 次，保留最新 7 份 |
+| 异地备份（亿安云） | `backup` 容器用 rclone 把 `data/sqlite/backups/` 同步到亿安云 S3 bucket（v1.8.29） | 每 6 小时；`sync` 镜像（远端随本地清理） |
 | Docker 日志轮转 | 所有容器 `json-file` 上限，防止日志撑满磁盘 | `max-size: 10m` + `max-file: 3` |
 | 磁盘监控 | 数据盘使用率告警，写 `system.disk` 并实时推送 dashboard | 每 10 分钟；80% 告警 / 90% 严重 |
 | 录像活性监控 | 检测"在线但录像片段停滞"的摄像头，写 `system.recording` 告警 | 默认停滞 10 分钟判定 |
@@ -607,6 +609,26 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 ---
 
 ## 更新日志
+
+### v1.8.29 — 异地备份：SQLite 每日快照同步到亿安云（Bitiful）S3 (2026-08-14)
+
+> **解决了"数据库只有一份、且和主库同盘"的最后一块短板**：v1.8.27 的每日快照存在本 NAS 磁盘上，磁盘故障时主库和备份一起没。新增 `backup` 容器，用 rclone 把 `data/sqlite/backups/` 镜像到亿安云（Bitiful）S3 bucket，实现真正的异地第二副本。
+
+- **新增 `backup` 容器**（`compose.yaml` `rclone/rclone:1.68`，无对外端口、仅出站、`cap_drop: ALL` + `no-new-privileges`）
+- **`deploy/backup/entrypoint.sh`**：无限 `rclone sync` 循环，把 `data/sqlite/backups`（只读挂载）同步到 `s3://nas-data/home-datacenter/sqlite`。用 `sync`（镜像）而非 `copy`——本地清理掉的备份远端也删，bucket 不再膨胀
+- **凭据走 `.env`**（`BITIFUL_ENDPOINT` / `BITIFUL_REGION` / `BITIFUL_BUCKET` / `BITIFUL_ACCESS_KEY` / `BITIFUL_SECRET_KEY` / `BITIFUL_SYNC_INTERVAL`），rclone 用 CLI 参数内联配置，仓库里不落任何密钥；置空即禁用（入口 exit 1，容器停在 exited）
+- **NAS `.env` 单独补写**：部署 tarball 排除 `.env`，故在 NAS 上原位追加 BITIFUL 块
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- `docker compose up -d backup` 拉取镜像并启动，日志 `rclone backup loop started (interval 21600s, source /backups, dest s3://nas-data/home-datacenter/sqlite)`
+- 空目录首测：`There was nothing to transfer`（确认 S3 认证 + bucket 可访问）
+- 放入真实快照 `app-20260814-110103.db`（700KiB），重启容器 → `Copied (new)`、`Transferred: 1 / 1`、`sync OK`
+- 容器内 `rclone lsl` 回读：`716800 2026-08-14 11:01:03 app-20260814-110103.db`，字节数与本地一致，远端对象确认存在
+
+#### 版本
+- Backend: v1.8.29（无代码改动）
+- Web: v1.8.29（无前端改动）
+- Android: v1.8.24（无改动）
 
 ### v1.8.28 — 主动监控增强：录像活性/服务存活/录像容量/CPU内存 + 全容器健康检查 (2026-08-14)
 
