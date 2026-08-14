@@ -250,6 +250,25 @@ type MaintenanceConfig struct {
 	// backed up daily alongside app.db. Empty disables.
 	FrigateDBPath string `mapstructure:"frigate_db_path"`
 
+	// BackupStatePath is the host path of the off-NAS backup status
+	// file (data/backup-state/last.json) mounted read-only into the
+	// API container (v1.8.29). Empty disables the backup monitor.
+	BackupStatePath string `mapstructure:"backup_state_path"`
+	// BackupMonitorIntervalMinutes is how often the backup status file
+	// is polled. Default 5.
+	BackupMonitorIntervalMinutes int `mapstructure:"backup_monitor_interval_minutes"`
+	// BackupStaleAfterMinutes is how old the last sync must be before
+	// the backup is considered stalled. Default 2x sync interval.
+	BackupStaleAfterMinutes int `mapstructure:"backup_stale_after_minutes"`
+	// BackupWarnFiles / BackupCritFiles are bucket object-count
+	// thresholds for the retention alert. 0 disables that level.
+	BackupWarnFiles int64 `mapstructure:"backup_warn_files"`
+	BackupCritFiles int64 `mapstructure:"backup_crit_files"`
+	// BackupWarnBytes / BackupCritBytes are bucket total-size
+	// thresholds for the retention alert. 0 disables that level.
+	BackupWarnBytes int64 `mapstructure:"backup_warn_bytes"`
+	BackupCritBytes int64 `mapstructure:"backup_crit_bytes"`
+
 	// SysResourceIntervalMinutes is how often CPU + memory are
 	// sampled. Default 5. 0 disables the resource monitor.
 	SysResourceIntervalMinutes int `mapstructure:"sys_resource_interval_minutes"`

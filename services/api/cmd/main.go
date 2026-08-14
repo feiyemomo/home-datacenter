@@ -261,7 +261,18 @@ func main() {
 		CheckpointInterval: time.Duration(cfg.Maintenance.CheckpointIntervalMinutes) * time.Minute,
 		BackupInterval:     time.Duration(cfg.Maintenance.BackupIntervalHours) * time.Hour,
 		FrigateDBPath:      cfg.Maintenance.FrigateDBPath,
-		DiskPath:           cfg.Maintenance.DiskPath,
+		// v1.8.29: monitor the off-NAS (Bitiful) backup by reading the
+		// state file written by the backup container. `sync` mirrors
+		// the local dir, so the bucket shouldn't grow — but a failed or
+		// stalled sync must surface in the dashboard.
+		BackupStatePath:        cfg.Maintenance.BackupStatePath,
+		BackupMonitorInterval:  time.Duration(cfg.Maintenance.BackupMonitorIntervalMinutes) * time.Minute,
+		BackupStaleAfter:       time.Duration(cfg.Maintenance.BackupStaleAfterMinutes) * time.Minute,
+		BackupWarnFiles:        cfg.Maintenance.BackupWarnFiles,
+		BackupCritFiles:        cfg.Maintenance.BackupCritFiles,
+		BackupWarnBytes:        cfg.Maintenance.BackupWarnBytes,
+		BackupCritBytes:        cfg.Maintenance.BackupCritBytes,
+		DiskPath:               cfg.Maintenance.DiskPath,
 		DiskWarnPct:        cfg.Maintenance.DiskWarnPct,
 		DiskCritPct:        cfg.Maintenance.DiskCritPct,
 		DiskInterval:       time.Duration(cfg.Maintenance.DiskIntervalMinutes) * time.Minute,
