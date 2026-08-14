@@ -49,6 +49,25 @@ type Config struct {
 	// disables the extra backup.
 	FrigateDBPath string
 
+	// BackupStatePath is the host path of the off-NAS backup status
+	// file (data/backup-state/last.json) mounted read-only into the
+	// API container (v1.8.29). Empty disables the backup monitor.
+	BackupStatePath string
+	// BackupMonitorInterval is how often the backup status file is
+	// polled. Default 5m.
+	BackupMonitorInterval time.Duration
+	// BackupStaleAfter is how old the last sync must be before the
+	// backup is considered stalled. Default 2x the sync interval.
+	BackupStaleAfter time.Duration
+	// BackupWarnFiles / BackupCritFiles are bucket object-count
+	// thresholds for the retention alert. 0 disables that level.
+	BackupWarnFiles int64
+	BackupCritFiles int64
+	// BackupWarnBytes / BackupCritBytes are bucket total-size
+	// thresholds for the retention alert. 0 disables that level.
+	BackupWarnBytes int64
+	BackupCritBytes int64
+
 	// DiskPath is the directory whose filesystem is monitored for
 	// free space. Empty disables the disk monitor.
 	DiskPath string
@@ -114,6 +133,9 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 			sm.SetFrigateDBPath(cfg.FrigateDBPath)
 		}
 		go sm.Run()
+	}
+	if cfg.BackupStatePath != "" && cfg.BackupMonitorInterval > 0 {
+		go NewBackupMonitor(db, bus, cfg.BackupStatePath, cfg.BackupMonitorInterval, cfg.BackupStaleAfter, cfg.BackupWarnFiles, cfg.BackupCritFiles, cfg.BackupWarnBytes, cfg.BackupCritBytes).Run()
 	}
 	if cfg.RecordingsRoot != "" && cfg.RecordingCheckInterval > 0 && cfg.RecordingTargets != nil {
 		go NewRecordingMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingStaleAfter, cfg.RecordingCheckInterval, cfg.RecordingTargets).Run()

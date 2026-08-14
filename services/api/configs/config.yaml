@@ -164,6 +164,22 @@ maintenance:
   # The api container sees it at /media/frigate/config/frigate.db.
   frigate_db_path: /media/frigate/config/frigate.db
 
+  # v1.8.29: off-NAS (Bitiful) backup monitor. Reads the status file
+  # written by the backup container, mounted read-only at this path.
+  # Empty path disables the monitor.
+  backup_state_path: /data/backup-state/last.json
+  # How often the backup status file is polled (minutes).
+  backup_monitor_interval_minutes: 5
+  # How old the last sync must be before the backup is considered
+  # stalled (minutes). Default sync interval is 6h = 360m.
+  backup_stale_after_minutes: 720
+  # Bucket retention thresholds (object count / total bytes).
+  # 0 disables that level. Example: warn at 1000 objects or 40 GiB.
+  backup_warn_files: 0
+  backup_crit_files: 0
+  backup_warn_bytes: 0
+  backup_crit_bytes: 0
+
   # v1.8.28: host CPU + memory monitor.
   sys_resource_interval_minutes: 5
   cpu_warn_pct: 80
