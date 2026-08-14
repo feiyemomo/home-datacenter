@@ -506,6 +506,7 @@ curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
 | SQLite WAL checkpoint | 周期性把 `app.db-wal` 折回 `app.db` 并截断，防止 WAL 无限增长 | 每 6 小时 + 启动时各一次 |
 | SQLite 每日备份 | `VACUUM INTO` 一致性快照（含 `app.db` 与 `frigate.db`）到 `data/sqlite/backups/` | 每日 1 次，保留最新 7 份 |
 | 异地备份（亿安云） | `backup` 容器用 rclone 把 `data/sqlite/backups/` 同步到亿安云 S3 bucket（v1.8.29） | 每 6 小时；`sync` 镜像（远端随本地清理） |
+| 异地备份健康/留存监控 | `BackupMonitor` 读取 backup 状态文件，同步失败或停滞写 `system.backup` 严重告警；bucket 对象/容量超阈值告警（v1.8.30） | 每 5 分钟；停滞 12h；阈值默认关闭 |
 | Docker 日志轮转 | 所有容器 `json-file` 上限，防止日志撑满磁盘 | `max-size: 10m` + `max-file: 3` |
 | 磁盘监控 | 数据盘使用率告警，写 `system.disk` 并实时推送 dashboard | 每 10 分钟；80% 告警 / 90% 严重 |
 | 录像活性监控 | 检测"在线但录像片段停滞"的摄像头，写 `system.recording` 告警 | 默认停滞 10 分钟判定 |
@@ -609,6 +610,57 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 ---
 
 ## 更新日志
+
+### v1.8.30 — 异地备份恢复演练 + 备份健康/留存监控 (2026-08-14)
+
+> **把 v1.8.29 的异地备份从"能推上去"补全到"能验证、能告警、能恢复"**：新增一键恢复演练脚本证明 bucket 可恢复；新增 `BackupMonitor`，同步失败/停滞会写 `system.backup` 严重告警触达 dashboard；bucket 对象/容量超阈值告警，防止免费额度悄悄被撑爆。
+
+**新增/修改**：
+- **`scripts/restore-dry-run.sh`**（恢复演练 SOP）：从亿安云拉取最新快照 → `PRAGMA integrity_check` + 关键表计数校验 → 打印 `RESTORE OK` → 清理。NAS 上跑 `sh scripts/restore-dry-run.sh`。
+- **`BackupMonitor`**（`internal/maintenance/backup.go`）：边沿触发，两路告警——
+  - **失败/停滞**：状态文件 `ok:false`、或超过 `backup_stale_after_minutes` 未同步、或健康状态文件丢失 → `system.backup` critical。
+  - **留存/容量**：bucket 对象数或总字节超 `backup_warn/crit_files` / `backup_warn/crit_bytes` → `system.backup` warn/crit。
+- **`deploy/backup/entrypoint.sh`**：每次 sync 后用 `rclone size` 统计远端对象/字节，原子写入 `data/backup-state/last.json`（`ok` 为 JSON 布尔）；新增 `ONCE=1` 单次执行模式。
+- **`compose.yaml`**：`backup` 加可写 `/state` 挂载；`api` 加只读 `/data/backup-state:ro` 挂载。
+- **配置**：`backup_state_path` / `backup_monitor_interval_minutes`(5) / `backup_stale_after_minutes`(720) / 四个留存阈值（默认 0 关闭）。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- backup 重启后状态文件正确：`{"ok":true,"remote_files":1,"remote_bytes":716800}`
+- 失败告警：置 `ok:false` → api 写 `system.backup critical 异地备份失败：rclone sync failed`，落库完整
+- 自愈：恢复 `ok:true` → 不再告警（边沿触发）
+- 容量告警：`backup_warn_files:1` → api 写 `system.backup warning 异地备份容量告警`，测后恢复 0
+- 恢复演练：`sh scripts/restore-dry-run.sh` → `app-20260814-110103.db` integrity ok、users 4 / cameras 2、`RESTORE OK`
+- 测试告警已清理，生产状态健康（`ok:true`，0 条残留）
+
+#### 版本
+- Backend: v1.8.30
+- Web: v1.8.30（无前端改动）
+- Android: v1.8.24（无改动）
+
+### v1.8.31 — 修复安卓端 "All 3 attempts failed for /api/v1/user" 502 根因 (2026-08-14)
+
+> **解决了一个会反复复发的部署级故障**：安卓 app 报"加载失败：All 3 attempts failed for /api/v1/user"。根因不是权限，而是 nginx 的 `upstream api_backend` 只在启动时解析一次 `api` 域名并缓存 IP——每次 redeploy 重建 api 容器换新 IP 后，运行中的 web/nginx 仍指向旧 IP，所有 `/api/*` 请求返回 502，安卓端 `RetryInterceptor` 连续 3 次收到 5xx 后抛出该报错。
+
+**根因定位**（`RetryInterceptor.kt` 逻辑推导）：
+- 该报错**只在连续 3 次收到 5xx 服务端错误时**触发；若是权限 403，Interceptor 会直接返回（4xx 不重试），报错会是 `HTTP 403` 而非这个文案。
+- NAS 实测：`curl :8088/api/v1/user` 返回 **502 Bad Gateway**（nginx），而 api 容器 `:8080/health` 直连 200 正常；从 web 容器内 `wget api:8080/health` 也 200。
+- 判定：web/nginx 缓存的 `api` 容器旧 IP 已失效（api 42 分钟前被重建，web 已运行 3 小时）。
+- 瞬时修复：重启 web 容器 → `/api/v1/user` 立即恢复 200。
+
+**永久修复**（`compose.yaml`）：
+- **`home-net` 显式声明 `/24` 子网**（`172.18.0.0/24`），使容器可分配静态地址。
+- **api 服务固定 `ipv4_address: 172.18.0.10`**：api 重建后 IP 不变，nginx 缓存的 upstream 永远有效，web 不再需要重启。
+- 网络重建一次性完成（全部容器重启，数据卷不受影响）。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- 部署后全部容器 healthy，api IP = `172.18.0.10`。
+- `/api/v1/user` 经 nginx 返回 200，`users` 4 个。
+- **自愈验证**：`docker compose up -d --no-deps --force-recreate api`（重建 api，**不动 web**）→ api 仍为 `172.18.0.10`，web 未重启（StartedAt 不变）→ `/api/v1/user` 经 nginx 仍 200。证明后续每次 api 重建都不会再触发 502。
+
+#### 版本
+- Backend: v1.8.31（无代码改动）
+- Web: v1.8.31（无前端改动，仅 compose 网络配置）
+- Android: v1.8.24（无改动）
 
 ### v1.8.29 — 异地备份：SQLite 每日快照同步到亿安云（Bitiful）S3 (2026-08-14)
 
