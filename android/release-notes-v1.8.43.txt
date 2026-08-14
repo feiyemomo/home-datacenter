@@ -1,0 +1,11 @@
+v1.8.43 (versionCode 124)
+
+Android 参考客户端整理为 Gradle 工程，可构建出可直接安装的 debug APK。
+
+新内容：
+- 后台保活：前台服务 HomeCenterService（START_STICKY + 通知），后台不被系统回收
+- WS 网络韧性：NetworkMonitor 网络回调，网络恢复即时重连，指数退避 + 订阅重放
+- 错误上报：ClientErrorReporter（2s 限流 + 60s 去重折叠），WS 失败上报 Dashboard 日志面板
+- 绑定 UI：MainActivity 输入 baseUrl / userId / AccessKey，绑定后持久化 token
+
+说明：本 APK 为精简参考客户端（约 6.3MB），聚焦后台保活 / WS 韧性 / 错误上报，不含视频播放器。
