@@ -159,9 +159,13 @@ func (h *ReleaseHandler) findLatest() (*apkFile, error) {
 }
 
 // listAll scans the releases directory and returns every APK matching
-// the "app-debug-vX.Y.Z.apk" convention, sorted by version_code
-// descending (newest first). Returns os.ErrNotExist if the directory
-// is empty or has no matching files.
+// the "app-{flavor}-vX.Y.Z.apk" convention (flavor in {debug, release}),
+// sorted by version_code descending (newest first). Returns os.ErrNotExist
+// if the directory is empty or has no matching files.
+//
+// v1.8.44: release APKs (signed with the official keystore) are now published
+// under the "app-release-" prefix alongside the long-standing "app-debug-"
+// prefix. Both are parsed identically; the flavor is not part of the version.
 func (h *ReleaseHandler) listAll() ([]apkFile, error) {
 	if h.releasesDir == "" {
 		return nil, os.ErrNotExist
@@ -172,17 +176,30 @@ func (h *ReleaseHandler) listAll() ([]apkFile, error) {
 		return nil, err
 	}
 
+	const (
+		debugPrefix   = "app-debug-v"
+		releasePrefix = "app-release-v"
+	)
+
 	var apks []apkFile
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
 		}
 		name := entry.Name()
-		if !strings.HasPrefix(name, "app-debug-v") || !strings.HasSuffix(name, ".apk") {
+		if !strings.HasSuffix(name, ".apk") {
 			continue
 		}
-		// Strip "app-debug-v" prefix and ".apk" suffix → "1.6.10"
-		verStr := strings.TrimSuffix(strings.TrimPrefix(name, "app-debug-v"), ".apk")
+		// Strip the recognized prefix and ".apk" suffix → "1.6.10"
+		var verStr string
+		switch {
+		case strings.HasPrefix(name, debugPrefix):
+			verStr = strings.TrimSuffix(strings.TrimPrefix(name, debugPrefix), ".apk")
+		case strings.HasPrefix(name, releasePrefix):
+			verStr = strings.TrimSuffix(strings.TrimPrefix(name, releasePrefix), ".apk")
+		default:
+			continue
+		}
 		code, ok := parseVersionCode(verStr)
 		if !ok {
 			continue
