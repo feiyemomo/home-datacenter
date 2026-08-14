@@ -123,7 +123,7 @@ func (m *SysResourceMonitor) emitMem(pct float64, total, available uint64) {
 		return
 	}
 	levelName := "warning"
-	sev := model.LevelNormal
+	sev := model.LevelWarning
 	busSev := eventbus.SeverityWarn
 	if level == "crit" {
 		levelName = "critical"
@@ -158,7 +158,7 @@ func (m *SysResourceMonitor) emitCPU(pct float64) {
 		return
 	}
 	levelName := "warning"
-	sev := model.LevelNormal
+	sev := model.LevelWarning
 	busSev := eventbus.SeverityWarn
 	if level == "crit" {
 		levelName = "critical"

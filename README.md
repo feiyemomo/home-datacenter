@@ -611,6 +611,25 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.36 — 配额告警落地为 warning 事件 + Android 管理员专用琥珀横幅 (2026-08-14)
+
+> **补齐配额功能"最后一块拼图"**：此前配额超限时后端只缩短 Frigate 留存（`PushRecordRetention`），**不发布任何 `system.recordings_size` 事件**；而配额本身的告警阈值（`recording_size_warn_bytes` / `recording_size_crit_bytes`）为 0（禁用）。结果是**配额用尽时前端（Dashboard / Android）完全感知不到**，只有留存被悄悄缩短。本次让配额超限/恢复也发布事件，并在 Android 端以管理员专属横幅呈现。
+
+**改动**：
+- **后端**（`internal/maintenance/recordings_size.go`）：配额超限时发布 `system.recordings_size` 事件（`level=warning`，消息"录像配额已用尽…已自动缩短录像保留天数"）；配额恢复时发布 `level=normal` 恢复事件。新增 `emitQuotaEvent` 辅助方法，与既有磁盘/备份/资源告警统一走 LevelWarning。
+- **后端告警级别统一**：磁盘、备份容量、内存/CPU 等监控的 warn 档均从 `LevelNormal` 改为 `LevelWarning`（`disk.go` / `backup.go` / `sysres.go`，见 `internal/model/system_log.go` 新增 `LevelWarning`）。
+- **Android**（v1.8.36 / versionCode 122）：`SystemLogLevel.WARNING` + 两个日志 adapter 琥珀色渲染；Dashboard 新增**配额告警专用横幅**（`quotaAlertBanner`），仅在 `system.log` WebSocket 分支的 **admin 门控**内调用 `handleQuotaAlert`——非 admin 用户收不到也看不到；收到 `level=normal` 恢复事件自动隐藏；点击横幅跳转日志页。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- 临时降配额至 10M 并重建 api（录像 ~737M > 10M）：日志落库 `id=4331 level=warning type=system.recordings_size msg=录像配额已用尽 736.9 MiB（已自动缩短录像保留天数）`。
+- 恢复配额 300GiB + 重建 api：容器 healthy，Frigate 留存回到 7 天。
+- Android APK `app-debug-v1.8.36.apk` 构建成功并推送至 NAS `data/releases`，`/api/v1/release/latest` 返回最新版本。
+
+#### 版本
+- Backend: v1.8.36
+- Web: v1.8.36（无前端改动）
+- Android: v1.8.36
+
 ### v1.8.35 — 修复启动竞态：配额缩减不再被全量配置推送覆盖 (2026-08-14)
 
 > **实测配额触发链路时揪出的真实 bug**：api 启动时，`RecordingSizeMonitor` 会**立即采样一次**（`Run()` 首行），与 `BootReplay` 的全量配置推送（`requires_restart=1`）**并发**执行。两个 goroutine 谁后落地谁生效——若配额动作先发出（把留存缩到 3 天）而全量配置推送随后用正常值（7 天）覆盖，则**最终停留在 7 天**；而配额推送本身已"成功"，`quotaActive=true`，监控不再重试——**超配额却永远不缩减留存**，配额功能形同虚设。

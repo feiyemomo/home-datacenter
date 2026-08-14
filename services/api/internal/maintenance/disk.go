@@ -93,7 +93,7 @@ func (m *DiskMonitor) sample() {
 	// Build a human-readable SystemLog row + push it to the bus so
 	// connected dashboards see it live.
 	levelName := "warning"
-	sev := model.LevelNormal
+	sev := model.LevelWarning
 	busSev := eventbus.SeverityWarn
 	if level == "crit" {
 		levelName = "critical"

@@ -183,7 +183,7 @@ func (m *BackupMonitor) check() {
 			return
 		}
 		levelName := "warning"
-		sev := model.LevelNormal
+		sev := model.LevelWarning
 		busSev := eventbus.SeverityWarn
 		if capLevel == "crit" {
 			levelName = "critical"

@@ -1741,6 +1741,41 @@ At api boot, `RecordingSizeMonitor.Run()` samples immediately (goroutine) while 
 
 ---
 
+## Phase 30 (v1.8.36): Quota Alert → warning SystemLog + Android Admin-Only Amber Banner
+
+### Phase 30 span: v1.8.36 (Backend) + v1.8.36 (Android)
+
+#### Symptom (gap found while verifying the quota chain)
+Activating the quota previously only shortened Frigate's retention (`PushRecordRetention`) — it **never published a `system.recordings_size` event**. And the quota's own alert thresholds (`recording_size_warn_bytes` / `recording_size_crit_bytes`) are 0 (disabled). Net effect: when recordings exceed quota, the frontend (Dashboard / Android) had **no signal at all** — retention was silently shortened and the operator never learned about it.
+
+#### Solution
+- **Backend** (`internal/maintenance/recordings_size.go`): in the quota edge-detection block, after a successful `onExceed()` publish a `system.recordings_size` event with `level=warning` (message "录像配额已用尽…已自动缩短录像保留天数"); after a successful `onRecover()` publish `level=normal` (dismiss signal). New `emitQuotaEvent` helper persists the SystemLog and publishes on the EventBus; the size/retention payload is set on the event.
+- **Backend level normalization**: disk (`disk.go`), backup capacity (`backup.go`), and CPU/memory (`sysres.go`) warn tiers all changed from `LevelNormal` to `LevelWarning`; `model.SystemLog.LevelWarning` added (`internal/model/system_log.go`).
+- **Android** (v1.8.36 / versionCode 122): `SystemLogLevel.WARNING`; `RecentLogAdapter` + `ServiceLogAdapter` render amber for warning; `DashboardFragment` `handleQuotaAlert` shows a dedicated `quotaAlertBanner` (amber, tapping opens the logs tab), dismisses on a `level=normal` recovery event. The banner is only reachable from the **admin-gated** `system.log` WebSocket branch, so non-admin users never see it.
+
+#### NAS verification (192.168.31.235, 2026-08-14)
+- Temporarily lowered quota to 10M and recreated api (recordings ~737M > 10M): database row `id=4331 level=warning type=system.recordings_size msg=录像配额已用尽 736.9 MiB（已自动缩短录像保留天数）`.
+- Restored quota 300GiB + recreated api: api healthy, Frigate retention back to 7 days.
+- Android `app-debug-v1.8.36.apk` built and pushed to `data/releases`; `/api/v1/release/latest` serves the new version.
+
+### Files Changed (Phase 30)
+
+| File | Change |
+|------|--------|
+| `internal/model/system_log.go` | Added `LevelWarning = "warning"` |
+| `internal/maintenance/recordings_size.go` | Quota exceed/recover now publish `system.recordings_size` events; `emitQuotaEvent` helper |
+| `internal/maintenance/disk.go` | warn tier `LevelNormal` → `LevelWarning` |
+| `internal/maintenance/backup.go` | warn tier `LevelNormal` → `LevelWarning` |
+| `internal/maintenance/sysres.go` | warn tier `LevelNormal` → `LevelWarning` |
+| `tools/qlog/` | Go SQLite query tool used to verify log levels on NAS |
+| `Android/.../data/model/SystemLog.kt` | `SystemLogLevel.WARNING` |
+| `Android/.../ui/dashboard/RecentLogAdapter.kt` | amber tint for warning |
+| `Android/.../ui/logs/ServiceLogAdapter.kt` | amber tint for warning |
+| `Android/.../ui/dashboard/DashboardFragment.kt` | admin-gated `handleQuotaAlert` + banner logic |
+| `Android/.../res/layout/fragment_dashboard.xml` | `quotaAlertBanner` layout |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
