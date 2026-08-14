@@ -1,5 +1,5 @@
 // Package maintenance hosts the background "keep the box healthy on
-// long-running deployments" loops (v1.8.27):
+// long-running deployments" loops (v1.8.27, v1.8.28):
 //
 //   - DiskMonitor: samples free space on the data filesystem and
 //     writes a SystemLog alert when usage crosses warn/critical
@@ -8,8 +8,14 @@
 //   - SQLiteMaintenance: periodically checkpoints the WAL (folding
 //     app.db-wal back into app.db and truncating it) and takes a
 //     consistent daily backup via VACUUM INTO.
+//   - RecordingMonitor: detects cameras that are expected to record
+//     but whose newest on-disk segment is stale (v1.8.28).
+//   - RecordingSizeMonitor: tracks the recordings tree's total size
+//     and alerts on warn/crit thresholds (v1.8.28).
+//   - SysResourceMonitor: samples host CPU + memory usage and alerts
+//     on thresholds (v1.8.28).
 //
-// Both loops are edge-triggered / self-healing: they log and continue
+// All loops are edge-triggered / self-healing: they log and continue
 // on error, never panic, and are safe to run for months unattended.
 package maintenance
 
@@ -38,6 +44,10 @@ type Config struct {
 	// BackupInterval is how often a full DB backup is taken.
 	// Default 24h. Zero disables backups (checkpoint still runs).
 	BackupInterval time.Duration
+	// FrigateDBPath is Frigate's own SQLite database (frigate.db),
+	// snapshotted daily into the same backup dir (v1.8.28). Empty
+	// disables the extra backup.
+	FrigateDBPath string
 
 	// DiskPath is the directory whose filesystem is monitored for
 	// free space. Empty disables the disk monitor.
@@ -49,6 +59,46 @@ type Config struct {
 	// DiskInterval is how often the disk monitor samples usage.
 	// Default 10m.
 	DiskInterval time.Duration
+
+	// RecordingsRoot is Frigate's recording directory root (e.g.
+	// /media/frigate/recordings). Empty disables the recording
+	// health + size monitors.
+	RecordingsRoot string
+	// RecordingStaleAfter is how old the newest segment must be
+	// before a camera is flagged as recording-stalled. Default 10m.
+	RecordingStaleAfter time.Duration
+	// RecordingCheckInterval is how often the recording health scan
+	// runs. Default 5m.
+	RecordingCheckInterval time.Duration
+	// RecordingTargets returns the cameras expected to record
+	// (slug + friendly name). Nil disables the health scan.
+	RecordingTargets func() []RecordingTarget
+	// RecordingSizeInterval is how often the recordings tree size is
+	// walked. Default 1h.
+	RecordingSizeInterval time.Duration
+	// RecordingSizeWarnBytes / RecordingSizeCritBytes are size
+	// thresholds for the recordings tree. 0 disables that level.
+	RecordingSizeWarnBytes uint64
+	RecordingSizeCritBytes uint64
+
+	// SysResourceInterval is how often CPU + memory are sampled.
+	// 0 disables the resource monitor.
+	SysResourceInterval time.Duration
+	// CPUWarnPct / CPUCritPct are CPU usage thresholds (0-100).
+	CPUWarnPct uint64
+	CPUCritPct uint64
+	// MemWarnPct / MemCritPct are memory usage thresholds (0-100).
+	MemWarnPct uint64
+	MemCritPct uint64
+
+	// ServiceProbes are the sibling services to probe for liveness
+	// (v1.8.28). Empty disables the service monitor.
+	ServiceProbes []ServiceProbe
+	// ServiceInterval is how often the service probes run.
+	ServiceInterval time.Duration
+	// ServiceFails is how many consecutive failures flag a service
+	// as down. Default 3.
+	ServiceFails int
 }
 
 // StartAll launches every background maintenance loop in its own
@@ -59,7 +109,23 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 		go NewDiskMonitor(db, bus, cfg.DiskPath, cfg.DiskWarnPct, cfg.DiskCritPct, cfg.DiskInterval).Run()
 	}
 	if cfg.CheckpointInterval > 0 && cfg.DBPath != "" {
-		go NewSQLiteMaintenance(db, cfg.DBPath, cfg.BackupDir, cfg.CheckpointInterval, cfg.BackupInterval, cfg.BackupKeep).Run()
+		sm := NewSQLiteMaintenance(db, cfg.DBPath, cfg.BackupDir, cfg.CheckpointInterval, cfg.BackupInterval, cfg.BackupKeep)
+		if cfg.FrigateDBPath != "" {
+			sm.SetFrigateDBPath(cfg.FrigateDBPath)
+		}
+		go sm.Run()
+	}
+	if cfg.RecordingsRoot != "" && cfg.RecordingCheckInterval > 0 && cfg.RecordingTargets != nil {
+		go NewRecordingMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingStaleAfter, cfg.RecordingCheckInterval, cfg.RecordingTargets).Run()
+	}
+	if cfg.RecordingsRoot != "" && cfg.RecordingSizeInterval > 0 {
+		go NewRecordingSizeMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingSizeInterval, cfg.RecordingSizeWarnBytes, cfg.RecordingSizeCritBytes).Run()
+	}
+	if cfg.SysResourceInterval > 0 {
+		go NewSysResourceMonitor(db, bus, cfg.SysResourceInterval, cfg.CPUWarnPct, cfg.CPUCritPct, cfg.MemWarnPct, cfg.MemCritPct).Run()
+	}
+	if cfg.ServiceInterval > 0 && len(cfg.ServiceProbes) > 0 {
+		go NewServiceMonitor(db, bus, cfg.ServiceProbes, cfg.ServiceInterval, cfg.ServiceFails).Run()
 	}
 	log.Println("maintenance: background loops started")
 }

@@ -1433,6 +1433,49 @@ A healthy box that runs for months should not slowly grow WAL files, accumulated
 
 ---
 
+## Phase 22 (v1.8.28): Recording / Service / Resource Monitoring + Healthchecks
+
+### Phase 22 span: v1.8.28 (Backend) + v1.8.28 (compose)
+
+#### Problem: cameras can be "online" while recording silently stops, and a dead sibling service was invisible
+
+The existing camera health check is only an RTSP TCP probe — it reports "online" when the RTSP port accepts a connection, but says nothing about whether Frigate's recording pipeline is actually writing files. A failed FFmpeg decode, a detached stream, or a broken record pipeline leaves the camera "online" while recordings silently stop, and the operator only discovers it when replaying a missing minute days later. Likewise, the web front-end and MQTT broker could die without anything surfacing that to the dashboard. This phase adds active recording-health, service-liveness, recording-size, and CPU/memory monitors, plus compose healthchecks for every service.
+
+#### Fixes
+
+- **Recording health monitor** (`internal/maintenance/recording.go`): every N minutes, for each camera expected to record (online + recording not disabled), walks the recordings tree for that camera's slug and checks the newest segment's mtime. If it's older than `stale_after` (default 10m), writes a `event_type=system.recording` alert and marks the camera stalled; edge-triggered so it only fires on transitions, and self-heals when segments resume.
+  - Offline cameras are excluded from targets (they legitimately write nothing; `camera.offline` covers them) — this fixed a false-positive where an offline camera in the stale set triggered a `system.recording` alert.
+- **Service liveness monitor** (`internal/maintenance/service.go`): probes sibling services (web front-end over HTTP `http://web/`, mosquitto over TCP `mosquitto:1883`) every 30s; after 3 consecutive failures writes a `event_type=system.service` critical alert. Edge-triggered on down/up transitions.
+- **Recording size monitor** (`internal/maintenance/recordings_size.go`): walks the recordings tree and reports its total size, alerting on warn/crit byte thresholds (edge-triggered). Frigate retains by TIME, not size, so a 1080p farm can fill the disk before the generic 80%/90% filesystem alert fires — this surfaces recording growth specifically.
+- **CPU/memory monitor** (`internal/maintenance/sysres.go` + `sysres_linux.go`/`sysres_other.go`): samples `/proc/stat` + `/proc/meminfo` (Linux) and alerts on warn/crit thresholds for CPU and memory. Cross-platform via build tags.
+- **Compose healthchecks** (`compose.yaml`): every service now has a `healthcheck` (api probes `/health`, web probes nginx root, mosquitto `pgrep`, frigate probes `:5000/api/config`), so `docker ps` and `depends_on` react to a dead container instead of a merely-started one.
+  - web healthcheck uses `http://127.0.0.1/` NOT `localhost`: nginx:alpine's `/etc/hosts` maps `::1 localhost ip6-loopback`, and busybox wget resolves `localhost` to IPv6 `::1` first while nginx only listens on IPv4 `0.0.0.0:80` — the probe was `Connection refused` against a healthy server. Switched to `127.0.0.1` fixed it.
+- **Startup wiring** (`main.go`): `recordingTargets` closure resolves expected-to-record cameras from the registry each tick (skips offline + recording-disabled); `maintenance.StartAll` gains `RecordingsRoot`, `RecordingStaleAfter`, `ServiceProbes`, `SysResource`, and recording-size config.
+
+#### NAS verification (192.168.31.235, e2e)
+
+- `docker compose ps`: all five services `(healthy)` — api, web, mosquitto, frigate healthy; cloudflared runs without a healthcheck (no documented endpoint).
+- `GET /health` → `{"status":"ok"}`; api logs show `maintenance: background loops started` + `maintenance: sqlite WAL checkpointed (TRUNCATE)`.
+- No `system.recording` false positives after the offline-camera exclusion; SystemLog back to normal event stream (login/motion).
+- Recordings root `/media/frigate/recordings/2026-08-13` present; SQLite WAL active (`app.db-wal` folding normally).
+
+### Files Changed (Phase 22)
+
+| File | Change |
+|------|--------|
+| `services/api/internal/maintenance/recording.go` | New — recording-health monitor (stale segment detection) |
+| `services/api/internal/maintenance/service.go` | New — sibling-service liveness probe + alert |
+| `services/api/internal/maintenance/recordings_size.go` | New — recordings-tree size monitor |
+| `services/api/internal/maintenance/sysres.go` / `sysres_linux.go` / `sysres_other.go` | New — CPU/memory monitor (cross-platform) |
+| `services/api/internal/maintenance/disk.go` | (existing) unchanged |
+| `services/api/internal/maintenance/maintenance.go` | `Config` + `StartAll` gains recording/service/resource loops + frigate.db backup |
+| `services/api/internal/config/config.go` | `MaintenanceConfig` recording/service/resource fields |
+| `services/api/configs/config.yaml` | `maintenance:` recording + service + sysresource blocks |
+| `services/api/cmd/main.go` | `recordingTargets` closure (skip offline/disabled); `FrigateDBPath`; wire new config |
+| `compose.yaml` | healthcheck for api/web/mosquitto/frigate; web probe `127.0.0.1` |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)

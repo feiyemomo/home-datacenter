@@ -142,3 +142,31 @@ maintenance:
   disk_crit_pct: 90
   # Disk sampling interval (minutes).
   disk_interval_minutes: 10
+
+  # v1.8.28: recording health + size monitors.
+  # Frigate's recording root. The api container bind-mounts
+  # ./data/frigate to /media/frigate, so recordings live at
+  # /media/frigate/recordings.
+  recordings_root: /media/frigate/recordings
+  # A camera is flagged as recording-stalled when its newest on-disk
+  # segment is older than this (minutes).
+  recording_stale_after_minutes: 10
+  # Recording health scan interval (minutes).
+  recording_check_interval_minutes: 5
+  # Recording tree size walk interval (hours). 0 disables.
+  recording_size_interval_hours: 1
+  # Size thresholds for the recordings tree (bytes). 0 disables that
+  # level. Example: warn at 400 GiB, crit at 450 GiB.
+  recording_size_warn_bytes: 0
+  recording_size_crit_bytes: 0
+
+  # Frigate's own SQLite database, backed up daily alongside app.db.
+  # The api container sees it at /media/frigate/config/frigate.db.
+  frigate_db_path: /media/frigate/config/frigate.db
+
+  # v1.8.28: host CPU + memory monitor.
+  sys_resource_interval_minutes: 5
+  cpu_warn_pct: 80
+  cpu_crit_pct: 95
+  mem_warn_pct: 80
+  mem_crit_pct: 90

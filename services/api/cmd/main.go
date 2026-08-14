@@ -210,16 +210,84 @@ func main() {
 	// file stays bounded, the DB is backed up daily, and a filling
 	// disk surfaces in the dashboard before Frigate silently stops
 	// recording. See internal/maintenance for details.
+	//
+	// v1.8.28: added a recording-health monitor (detects cameras that
+	// are expected to record but whose newest on-disk segment is
+	// stale), a recordings-tree size monitor, a host CPU/memory
+	// monitor, and daily backup of Frigate's own frigate.db.
+	//
+	// RecordingTargets resolves "which cameras should be recording"
+	// from the registry each tick. A camera is expected to record when
+	// BOTH:
+	//   1. it is ONLINE (Frigate sets camera Enabled = Status !=
+	//      "offline", and disables the capture/record pipeline for
+	//      offline cameras — so an offline camera legitimately writes
+	//      nothing), AND
+	//   2. recording has not been explicitly disabled on the dashboard
+	//      (Meta.recording.enabled == false).
+	// With both conditions true, a stale segment means "online but
+	// silently stopped recording" — the exact failure this monitor
+	// exists to catch. Offline cameras are left to the existing
+	// camera.offline health alert instead.
+	recordingTargets := func() []maintenance.RecordingTarget {
+		var out []maintenance.RecordingTarget
+		for _, cam := range camReg.List() {
+			if cam.StreamName == "" {
+				continue
+			}
+			// Offline cameras are disabled in Frigate (no recording
+			// pipeline) — skip; the camera.offline alert covers it.
+			if cam.Status == "offline" {
+				continue
+			}
+			// Explicit "recording off" (dashboard toggle) → skip.
+			if rec, ok := cam.Meta["recording"].(map[string]any); ok {
+				if en, ok := rec["enabled"].(bool); ok && !en {
+					continue
+				}
+			}
+			out = append(out, maintenance.RecordingTarget{
+				Slug: camReg.FrigateSlugUnique(&cam),
+				Name: cam.Name,
+			})
+		}
+		return out
+	}
+
 	maintenance.StartAll(database.DB, bus, maintenance.Config{
 		DBPath:             cfg.Maintenance.SQLiteDBPath,
 		BackupDir:          cfg.Maintenance.BackupDir,
 		BackupKeep:         cfg.Maintenance.BackupKeep,
 		CheckpointInterval: time.Duration(cfg.Maintenance.CheckpointIntervalMinutes) * time.Minute,
 		BackupInterval:     time.Duration(cfg.Maintenance.BackupIntervalHours) * time.Hour,
+		FrigateDBPath:      cfg.Maintenance.FrigateDBPath,
 		DiskPath:           cfg.Maintenance.DiskPath,
 		DiskWarnPct:        cfg.Maintenance.DiskWarnPct,
 		DiskCritPct:        cfg.Maintenance.DiskCritPct,
 		DiskInterval:       time.Duration(cfg.Maintenance.DiskIntervalMinutes) * time.Minute,
+
+		RecordingsRoot:         cfg.Maintenance.RecordingsRoot,
+		RecordingStaleAfter:    time.Duration(cfg.Maintenance.RecordingStaleAfterMinutes) * time.Minute,
+		RecordingCheckInterval: time.Duration(cfg.Maintenance.RecordingCheckIntervalMinutes) * time.Minute,
+		RecordingTargets:       recordingTargets,
+		RecordingSizeInterval:  time.Duration(cfg.Maintenance.RecordingSizeIntervalHours) * time.Hour,
+		RecordingSizeWarnBytes: cfg.Maintenance.RecordingSizeWarnBytes,
+		RecordingSizeCritBytes: cfg.Maintenance.RecordingSizeCritBytes,
+		SysResourceInterval:    time.Duration(cfg.Maintenance.SysResourceIntervalMinutes) * time.Minute,
+		CPUWarnPct:             cfg.Maintenance.CPUWarnPct,
+		CPUCritPct:             cfg.Maintenance.CPUCritPct,
+		MemWarnPct:             cfg.Maintenance.MemWarnPct,
+		MemCritPct:             cfg.Maintenance.MemCritPct,
+		// v1.8.28: probe the sibling services the dashboard depends
+		// on. The api container is on the home-net bridge, so it
+		// reaches them by service name (no host port needed). The
+		// web front-end is probed over HTTP; mosquitto over TCP:1883.
+		ServiceProbes: []maintenance.ServiceProbe{
+			{Name: "Web 前端", URL: "http://web/"},
+			{Name: "Mosquitto", NetworkAddr: "mosquitto:1883"},
+		},
+		ServiceInterval: 30 * time.Second,
+		ServiceFails:    3,
 	})
 
 	// Purge any soft-deleted camera rows left over from older

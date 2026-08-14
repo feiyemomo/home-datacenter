@@ -496,6 +496,24 @@ curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
 
 > 注：go2rtc 现在内置在 Frigate 容器中，不再使用独立的 `home-go2rtc` 容器。摄像头配置由 home-api 通过 `PUT /api/config/set` 推送给 Frigate，不要手动编辑 config.yml 中的 cameras 段（会被覆盖）。
 
+### 自动备份与主动监控（v1.8.27 / v1.8.28）
+
+系统内置了面向"长时间无人值守运行"的自维护能力：
+
+| 能力 | 说明 | 默认参数 |
+|---|---|---|
+| SQLite WAL checkpoint | 周期性把 `app.db-wal` 折回 `app.db` 并截断，防止 WAL 无限增长 | 每 6 小时 + 启动时各一次 |
+| SQLite 每日备份 | `VACUUM INTO` 一致性快照（含 `app.db` 与 `frigate.db`）到 `data/sqlite/backups/` | 每日 1 次，保留最新 7 份 |
+| Docker 日志轮转 | 所有容器 `json-file` 上限，防止日志撑满磁盘 | `max-size: 10m` + `max-file: 3` |
+| 磁盘监控 | 数据盘使用率告警，写 `system.disk` 并实时推送 dashboard | 每 10 分钟；80% 告警 / 90% 严重 |
+| 录像活性监控 | 检测"在线但录像片段停滞"的摄像头，写 `system.recording` 告警 | 默认停滞 10 分钟判定 |
+| 服务存活监控 | 探测 web/MQTT 从属服务，连续失败写 `system.service` 告警 | 每 30s；连续 3 次判定宕机 |
+| 录像容量监控 | 统计录像目录总大小，超阈值告警（先于通用磁盘告警） | 每小时；warn/crit 字节阈值 |
+| CPU/内存监控 | 采样主机 CPU/内存，超阈值告警 | 每 5 分钟；warn/crit 百分比 |
+| 旧包清理 | `data/releases` 只留最新 5 个 APK，含启动 + 每日清理 | 保留 5 个 |
+
+所有监控均为**边缘触发**（只在状态切换时记录，不反复刷屏），并在异常恢复后自愈清除告警状态。原始参数在 `services/api/configs/config.yaml` 的 `maintenance:` 段可调。
+
 ### 备份建议
 
 ```bash
@@ -589,6 +607,53 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 ---
 
 ## 更新日志
+
+### v1.8.28 — 主动监控增强：录像活性/服务存活/录像容量/CPU内存 + 全容器健康检查 (2026-08-14)
+
+> **本次把"长时间运行如何自愈"落到监控层**：摄像头 RTSP 探活只能证明端口通，证明不了 Frigate 录像流水线真的在写盘。新增录像活性监控（在线但片段停滞即告警）、从属服务存活探针（web/MQTT 挂掉即告警）、录像目录容量监控（Frigate 按时间而非大小留存，1080p 集群可能先撑满盘）、CPU/内存监控，并为所有容器补齐 `healthcheck`。
+
+#### 后端（v1.8.28）
+- **录像活性监控**（`maintenance/recording.go`）：按周期扫描每台"应录像"摄像头的录像目录，最新片段 mtime 超过阈值（默认 10 分钟）即写 `system.recording` 告警并标记停滞；边缘触发、自愈（片段恢复后自动清除）
+  - 离线摄像头排除在目标集外（离线本就不写盘，由 `camera.offline` 覆盖）——修掉了离线相机被误判为录像停滞的假告警
+- **服务存活监控**（`maintenance/service.go`）：每 30s 探测 web（HTTP）与 mosquitto（TCP:1883），连续 3 次失败写 `system.service` 严重告警；边缘触发
+- **录像容量监控**（`maintenance/recordings_size.go`）：统计录像目录总大小，超过 warn/crit 字节阈值即告警（在通用磁盘 80%/90% 告警之前先暴露录像自身增长）
+- **CPU/内存监控**（`maintenance/sysres.go` + 平台实现）：采样 `/proc/stat` + `/proc/meminfo`，CPU/内存超阈值告警；build tag 跨平台
+- **frigate.db 纳入每日备份**（`maintenance/sqlite.go`）：`SetFrigateDBPath` 让 Frigate 事件库也做每日 `VACUUM INTO` 快照到备份目录
+
+#### 运维（compose.yaml）
+- **全容器 healthcheck**：api 探 `/health`、web 探 nginx 根、mosquitto `pgrep`、frigate 探 `:5000/api/config`，`docker ps` 与 `depends_on` 能对死容器做出反应
+- **web 探针用 `127.0.0.1` 而非 `localhost`**：nginx:alpine 的 `/etc/hosts` 把 `localhost` 映射到 IPv6 `::1`，且 nginx 只监听 IPv4 `0.0.0.0:80`，busybox wget 解析 `localhost` 先走 `::1` 导致对健康服务也 `Connection refused`——改用 `127.0.0.1` 修复
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- `docker compose ps`：api / web / mosquitto / frigate 全部 `(healthy)`；cloudflared 无文档化健康端点故不设探针
+- `GET /health` → `{"status":"ok"}`；api 日志含 `maintenance: background loops started` + `sqlite WAL checkpointed (TRUNCATE)`
+- 离线相机排除后无 `system.recording` 假告警，SystemLog 恢复正常事件流
+
+#### 版本
+- Backend: v1.8.28
+- Web: v1.8.28（无前端改动）
+- Android: v1.8.24（无改动）
+
+### v1.8.27 — 持久化运行加固：Frigate 数据库持久化 + SQLite 维护 + 日志轮转 + 磁盘告警 + 旧包清理 (2026-08-14)
+
+> **针对"长时间运行会不会慢慢烂掉"的审计整改**：Frigate 事件库此前存在容器可写层、容器重建即丢；`app.db-wal` 涨到 17.4MB 而主库仅 ~700KB；容器日志无上限；`data/releases` 囤了 5.1GB 旧 APK；磁盘将满时没有任何告警。
+
+- **Frigate `/config` 持久化**（`compose.yaml`）：挂载 `./data/frigate/config:/config`，`frigate.db`、`backup.db`、`.jwt_secret`、`model_cache/` 在容器重建/升级后仍保留
+- **SQLite 维护**（`maintenance/sqlite.go`）：周期性 `wal_checkpoint(TRUNCATE)`（默认 6h + 启动时一次）把 WAL 折回 `app.db` 并截断；每日 `VACUUM INTO` 快照到 `backups/`，保留最新 7 份
+- **磁盘监控**（`maintenance/disk.go`）：每 10 分钟采样数据盘，80% 告警 / 90% 严重告警，写 `system.disk` 并实时推送 dashboard
+- **Docker 日志轮转**（`compose.yaml`）：全局 `json-file`，`max-size: 10m` + `max-file: 3`，闲聊日志撑不死磁盘
+- **旧包清理**（`release_handler.go`）：启动 + 每日清理，只留最新 5 个 APK（`data/releases` 从 5.1GB 缩到 428MB）
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- `data/frigate/config/` 已含 `frigate.db`（3.3MB）、`backup.db`、`.jwt_secret`、`model_cache/`，跨容器生命周期保留
+- `docker inspect` 确认所有服务 LogConfig = `json-file / max-file:3 / max-size:10m`
+- `data/releases/` 恰留 5 个最新 APK；`/vol1` 磁盘 12%（低于告警阈值故无告警，符合预期）
+- `backups/` 目录 app 用户可写，`VACUUM INTO` 机制验证通过（`BACKUP_OK size=143360`）
+
+#### 版本
+- Backend: v1.8.27
+- Web: v1.8.27（无前端改动）
+- Android: v1.8.24（无改动）
 
 ### v1.8.26 — 回放硬件转码加速 + 缓存自动清理 + 错误上报聚合 + 按路由超时 (2026-08-14)
 
