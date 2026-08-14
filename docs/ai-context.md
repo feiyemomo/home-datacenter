@@ -1824,6 +1824,33 @@ This removes the btrfs faststart re-open from the critical path entirely.
 
 ---
 
+## Phase 32 (v1.8.37): Recording Quota 400 GiB + Android Progress Bar Uses Actual Coverage
+
+### Phase 32 span: v1.8.37 (Backend config) + v1.8.37 (Android)
+
+#### 1. Recording quota raised to 400 GiB (operational config)
+- `services/api/configs/config.yaml`: `recording_quota_bytes` `322122547200` (300 GiB) → `429496729600` (**400 GiB** ≈ 86% of the 466G data volume). Reads from `maintenance.recording_quota_bytes`; on crossing, Frigate retention auto-drops 7→3 days, restored on recovery.
+- Deployed by scp-ing the bind-mounted config to `/vol1/docker/home-datacenter/services/api/configs/config.yaml` and `docker restart home-api`. Verified `docker exec home-api grep recording_quota_bytes /configs/config.yaml` → 429496729600 and `/health` → `{"status":"ok"}`.
+
+#### 2. Android: recording progress bar spans actual coverage, not a fixed 24h
+**Problem**: for a day with only a few hours of footage (camera offline / scheduled), the full-day scrub bar was still laid out across a fixed 24h window, compressing the clips + red alert ranges into a small fraction of the track.
+
+**Fix** (`Android/.../ui/cameras/RecordingsDialog.kt`):
+- `dayTotalMs` (SeekBar max + alert-overlay max + clip-offset clamp + duration label) is no longer a constant `24h`. `playDayAsPlaylist` now computes the window as **first recording start → last recording end** (`last.StartAt + last.durationSeconds`, falling back to `last.endAt`). Clamped to ≥ one clip.
+- SeekBar max, `AlertRangeOverlay.max`, `clipStartOffsets` clamp, alert-seek clamp, and the duration label (which no longer wraps past midnight) all consistently use the real window. Full-day recordings keep ≈24h, unchanged.
+- Verified `gradlew :app:compileDebugKotlin` passes; version bumped to v1.8.37 / versionCode 123; APK `app-debug-v1.8.37.apk` + `release-notes-v1.8.37.txt` pushed to NAS `data/releases`.
+
+### Files Changed (Phase 32)
+
+| File | Change |
+|------|--------|
+| `services/api/configs/config.yaml` | `recording_quota_bytes` 300 GiB → 400 GiB |
+| `Android/.../ui/cameras/RecordingsDialog.kt` | `dayTotalMs` dynamic = actual recording coverage window |
+| `Android/app/build.gradle.kts` | versionCode 122 → 123, versionName 1.8.36 → 1.8.37 |
+| `Android/release-notes-v1.8.37.txt` | new release notes |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
