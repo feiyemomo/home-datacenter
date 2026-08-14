@@ -197,6 +197,16 @@ export function useWebRTCStream(
                         if (iceDisconnectTimer) {
                             window.clearTimeout(iceDisconnectTimer);
                         }
+                        // v1.8.42: background hold. When the tab is hidden,
+                        // browsers throttle timers and may briefly report
+                        // 'disconnected' while the network path idles. We
+                        // must NOT arm the 8s error timer in the background —
+                        // a backgrounded tab returning to a healthy stream
+                        // would otherwise find itself flipped to HLS with a
+                        // spurious "8s timeout" error. We skip arming the
+                        // timer entirely; the visibilitychange handler below
+                        // re-evaluates on foreground.
+                        if (document.hidden) return;
                         iceDisconnectTimer = window.setTimeout(() => {
                             if (cancelled) return;
                             // Re-check state in case ICE recovered
@@ -357,6 +367,31 @@ export function useWebRTCStream(
         // on mount and should not re-trigger the effect.
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [opts.cameraId, opts.streamName, opts.webrtcUrl, opts.sdpUrlOverride, nonce, teardown]);
+
+    // v1.8.42: background hold — visibilitychange handler. When the tab
+    // returns to the foreground, give the backgrounded WebRTC connection
+    // one chance to recover before we decide it's dead. If ICE is still
+    // wandering (disconnected/failed) or the aggregate connection state
+    // is terminal, drop the stale PC and renegotiate a fresh one via
+    // retry() — the user gets a live view immediately instead of an
+    // already-stale "8s timeout" HLS fallback they didn't see happen.
+    useEffect(() => {
+        const onVisibility = () => {
+            if (document.hidden) return;
+            const pc = pcRef.current;
+            if (!pc) return;
+            const ice = pc.iceConnectionState;
+            const conn = pc.connectionState;
+            if (
+                ice === "disconnected" || ice === "failed" ||
+                conn === "failed" || conn === "closed"
+            ) {
+                setNonce((n) => n + 1);
+            }
+        };
+        document.addEventListener("visibilitychange", onVisibility);
+        return () => document.removeEventListener("visibilitychange", onVisibility);
+    }, []);
 
     const retry = useCallback(() => setNonce((n) => n + 1), []);
     const stop = useCallback(() => teardown(), [teardown]);

@@ -2056,6 +2056,56 @@ the server nor get lost.
 
 ---
 
+## Phase 37 (v1.8.42): Background Hold + Prefetch Hardening
+
+### Phase 37 span: v1.8.42 (Web only) — no backend/Android code change
+
+#### Scope
+Close two gaps found in review: (1) background WebRTC "hold" was not in
+effect at all — no `visibilitychange` handling anywhere, so a backgrounded
+tab could have its ICE 8s error timer trip on a throttle-jitter blip and
+return to a spurious HLS fallback / error; (2) prefetch could overwrite
+fresh data with a stale snapshot because `usePrefetch` and `useCachedFetch`
+both write the same sessionStorage key with no freshness guard.
+
+#### Web (`web`)
+- **Background hold**:
+  - `hooks/useWebRTCStream.ts`: when `document.hidden`, skip arming the ICE
+    8s error timer (background throttle / idle network must not flip to HLS).
+    New `visibilitychange` handler: on return to foreground, if ICE is still
+    `disconnected`/`failed` or `connectionState` is `failed`/`closed`, drop the
+    stale PC and renegotiate (retry) so the user returns to a live view.
+  - `components/LiveVideo.tsx` (PreviewFrame): pause the 10s preview-frame poll
+    while hidden; repoll immediately on foreground then resume.
+  - `hooks/useHLSStream.ts`: don't trip the stall watchdog while hidden;
+    re-arm the 15s watchdog on foreground for a fresh buffering window.
+- **Prefetch hardening**:
+  - `hooks/usePrefetch.ts`: freshness guard — write the prefetched result only
+    when the cache entry is missing or older than 30s (never clobber fresh,
+    WS-driven data — fixes "screen going backwards"); report prefetch failures
+    to the backend (context "prefetch") instead of swallowing them.
+  - `App.tsx`: during the splash wait (`token && !initialized`), prefetch
+    `home.cameras.list` in parallel so Dashboard and Cameras first frames come
+    from cache with no loading flash.
+
+#### Verification
+- `web`: `npx tsc -b` zero errors + `npm run build` succeeds; deployed to NAS
+  (web image rebuilt, JS hash `index-DpLpzBnB.js`).
+- Backend unchanged (`home-api` not rebuilt, healthy).
+
+### Files Changed (Phase 37)
+
+| File | Change |
+|------|--------|
+| `web/src/hooks/useWebRTCStream.ts` | Background hold: skip ICE error timer when hidden + visibilitychange reconnect |
+| `web/src/components/LiveVideo.tsx` | PreviewFrame: pause/resume 10s preview poll on hidden/visible |
+| `web/src/hooks/useHLSStream.ts` | Background hold: stall watchdog re-armable, skip when hidden |
+| `web/src/hooks/usePrefetch.ts` | Freshness (30s TTL) guard + prefetch failure reporting |
+| `web/src/App.tsx` | Splash parallel prefetch of home.cameras.list |
+| `README.md` | v1.8.42 changelog entry |
+
+---
+
 ## Phase 32 (v1.8.37): Recording Quota 400 GiB + Android Progress Bar Uses Actual Coverage
 
 ### Phase 32 span: v1.8.37 (Backend config) + v1.8.37 (Android)
@@ -2125,4 +2175,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.41: Stability × error-recovery × server error reporting — backend graceful shutdown (SIGTERM/SIGINT drain), custom panic Recovery → `server.panic` SystemLog, `>=500` ErrorLogMiddleware (rate-limited + deduped), sentinel/APIError utils + generic exponential-backoff Retry util, `/health/ready` readiness probe, client-error per-user/IP rate limiting + indexed-`context` dedup; web ErrorBoundary (`render.error.*`), HLS (`playback.hls(.stall)`) + WebRTC (`playback.webrtc(.decode)`) playback-failure reporting, token try/catch defense, axios idempotent retry, WS exponential backoff + persisted-subscription refresh, reporter queue + offline buffer + tab dedup. See Phase 36. Earlier: v1.8.40: Wave-2 unit-test expansion — automation engine runtime tests (handleEvent / throttle / reload / notify / mqtt / webhook + SSRF & retry policy), WS hub fan-out tests (Broadcast / SendToUser / SendToAdmins / routeDeviceEvent / onEvent), GORM repository tests (Device / User on in-memory SQLite with freed-ID reuse); fixed a real bug — missing `fallthrough` in the WS hub's `user.notification` parse-error path. See Phase 35. Earlier: v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.42: Background hold + prefetch hardening — WebRTC ICE error timer suspended while `document.hidden` + `visibilitychange` reconnect on foreground; preview-frame 10s poll paused in background; HLS stall watchdog re-armable/skipped when hidden; `usePrefetch` 30s freshness guard (never clobber fresh WS-driven data) + prefetch failure reporting; splash parallel prefetch of `home.cameras.list`. See Phase 37. Earlier: v1.8.41: Stability × error-recovery × server error reporting — backend graceful shutdown (SIGTERM/SIGINT drain), custom panic Recovery → `server.panic` SystemLog, `>=500` ErrorLogMiddleware (rate-limited + deduped), sentinel/APIError utils + generic exponential-backoff Retry util, `/health/ready` readiness probe, client-error per-user/IP rate limiting + indexed-`context` dedup; web ErrorBoundary (`render.error.*`), HLS (`playback.hls(.stall)`) + WebRTC (`playback.webrtc(.decode)`) playback-failure reporting, token try/catch defense, axios idempotent retry, WS exponential backoff + persisted-subscription refresh, reporter queue + offline buffer + tab dedup. See Phase 36. Earlier: v1.8.40: Wave-2 unit-test expansion — automation engine runtime tests (handleEvent / throttle / reload / notify / mqtt / webhook + SSRF & retry policy), WS hub fan-out tests (Broadcast / SendToUser / SendToAdmins / routeDeviceEvent / onEvent), GORM repository tests (Device / User on in-memory SQLite with freed-ID reuse); fixed a real bug — missing `fallthrough` in the WS hub's `user.notification` parse-error path. See Phase 35. Earlier: v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

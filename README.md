@@ -611,6 +611,37 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.42 — 后台保持 + 预加载加固 (2026-08-14)
+
+> **背景**：审查发现两个短板——① **后台 WebRTC 保持"未生效"**：全工程无任何 `visibilitychange` 处理，完全依赖
+> 浏览器默认；切后台时 ICE 8s 误判定时器照跑，网络一抖回来就被切到 HLS 或报"播放失败"。② **预取可能"旧盖新"**：
+> `usePrefetch` 与 `useCachedFetch` 双写同一 sessionStorage key 无版本控制，异步预取可能用旧快照覆盖正在显示的最新
+> 数据。
+
+**后台保持**（`web`）：
+- **useWebRTCStream**（`hooks/useWebRTCStream.ts`）：`document.hidden` 时**挂起 ICE 8s 误判定时器**（后台节流 +
+  网络空转不再错报 error）；新增 `visibilitychange` 处理——回前台时若 ICE 仍 disconnected/failed 或 connectionState
+  已 failed/closed，**drop 旧 PC 并重新协商**（retry），用户回来看到的是一路清晰的直播而非吊在后台的陈旧 HLS 回退。
+- **PreviewFrame**（`components/LiveVideo.tsx`）：预览帧 10s 轮询在后台**暂停**（没人看的摄像头缩略图不再白刷），
+  回前台先立即刷一帧再恢复节奏。
+- **useHLSStream**（`hooks/useHLSStream.ts`）：后台不触发 stall 看门狗；回前台**重新武装 15s 看门狗**给 stream
+  一个重新缓冲的窗口。
+
+**预加载加固**（`web`）：
+- **usePrefetch**（`hooks/usePrefetch.ts`）：**新鲜度守卫**——预取结果仅在缓存缺失或已超 30s TTL 时才写入，绝不
+  覆盖新数据（修复"画面倒退/旧盖新"）；预取失败改为**上报后端**（context "prefetch"，不再静默丢弃）。
+- **splash 并行预取**（`App.tsx`）：等待 `/user/me` 的 splash 空转期间，并行预取 `home.cameras.list`，Dashboard 与
+  Cameras 页首帧都能从缓存渲染、零闪烁。
+
+#### 验证
+- `web`：`npx tsc -b` 零错误 + `npm run build` 成功，已部署 NAS（web 镜像重建，JS 哈希 `index-DpLpzBnB.js`）。
+- 后端无改动（`home-api` 未重建，healthy）。
+
+#### 版本
+- Backend: v1.8.42（无代码改动）
+- Web: v1.8.42（WebRTC/预览帧/HLS 后台保持 + 预取新鲜度守卫/失败上报 + splash 并行预取）
+- Android: v1.8.42（无改动）
+
 ### v1.8.41 — 稳定性 × 纠错 × 上报三件套 (2026-08-14)
 
 > **背景**：整条链路（后端核心 + 前端播放 + 前端网络韧性 + 客户端上报）的"稳定性提升、错误后纠错、典型错误
