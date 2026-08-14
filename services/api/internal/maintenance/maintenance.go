@@ -107,9 +107,11 @@ type Config struct {
 	RecordingQuotaBytes uint64
 	// OnQuotaExceeded / OnQuotaRecovered are invoked on quota edge
 	// transitions. Nil callbacks are silently skipped (monitor still
-	// runs; alerts unaffected).
-	OnQuotaExceeded  func()
-	OnQuotaRecovered func()
+	// runs; alerts unaffected). They return an error (v1.8.34): a
+	// non-nil error means the action didn't take effect, so the monitor
+	// keeps the previous state and retries on the next sample.
+	OnQuotaExceeded  func() error
+	OnQuotaRecovered func() error
 
 	// SysResourceInterval is how often CPU + memory are sampled.
 	// 0 disables the resource monitor.

@@ -45,17 +45,22 @@ type RecordingSizeMonitor struct {
 	warnBytes uint64
 	critBytes uint64
 
-	// v1.8.32: quota + action callbacks.
-	quotaBytes uint64
-	onExceed   func()
-	onRecover  func()
+	// v1.8.32: quota + action callbacks. The callbacks return an error
+	// so the monitor only commits the crossed state once the action
+	// actually succeeds (v1.8.34). Otherwise a transient failure (e.g.
+	// the first sample racing the Frigate restart that BootReplay just
+	// triggered) would pin quotaActive=true, skip the action, and never
+	// retry until the size drops back under quota.
+	quotaBytes  uint64
+	onExceed    func() error
+	onRecover   func() error
 	quotaActive bool
 
 	lastLevel string
 }
 
 // NewRecordingSizeMonitor creates a monitor for the recordings tree.
-func NewRecordingSizeMonitor(db *gorm.DB, bus *eventbus.Bus, root string, interval time.Duration, warnBytes, critBytes uint64, quotaBytes uint64, onExceed, onRecover func()) *RecordingSizeMonitor {
+func NewRecordingSizeMonitor(db *gorm.DB, bus *eventbus.Bus, root string, interval time.Duration, warnBytes, critBytes uint64, quotaBytes uint64, onExceed, onRecover func() error) *RecordingSizeMonitor {
 	return &RecordingSizeMonitor{
 		db:         db,
 		bus:        bus,
@@ -105,18 +110,33 @@ func (m *RecordingSizeMonitor) sample() {
 	if m.quotaBytes > 0 {
 		over := size >= m.quotaBytes
 		if over && !m.quotaActive {
-			m.quotaActive = true
 			if m.onExceed != nil {
 				log.Printf("maintenance: recordings size %s over quota %s — triggering retention reduction",
 					humanBytes(size), humanBytes(m.quotaBytes))
-				m.onExceed()
+				// v1.8.34: only commit the crossed state once the
+				// action succeeds. A transient failure (first sample
+				// racing the Frigate restart from BootReplay) keeps
+				// quotaActive=false so the next sample retries instead
+				// of silently skipping the retention reduction.
+				if err := m.onExceed(); err != nil {
+					log.Printf("maintenance: quota exceeded action failed, will retry next sample: %v", err)
+				} else {
+					m.quotaActive = true
+				}
+			} else {
+				m.quotaActive = true
 			}
 		} else if !over && m.quotaActive {
-			m.quotaActive = false
 			if m.onRecover != nil {
 				log.Printf("maintenance: recordings size back under quota %s — restoring normal retention",
 					humanBytes(m.quotaBytes))
-				m.onRecover()
+				if err := m.onRecover(); err != nil {
+					log.Printf("maintenance: quota recovered action failed, will retry next sample: %v", err)
+				} else {
+					m.quotaActive = false
+				}
+			} else {
+				m.quotaActive = false
 			}
 		}
 	}
