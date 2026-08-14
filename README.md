@@ -611,6 +611,57 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.41 — 稳定性 × 纠错 × 上报三件套 (2026-08-14)
+
+> **背景**：整条链路（后端核心 + 前端播放 + 前端网络韧性 + 客户端上报）的"稳定性提升、错误后纠错、典型错误
+> 服务器上报"。目标是：进程不轻易死（优雅停机/recovery）、挂了能被看见（panic/5xx/渲染错误/播放失败统一
+> 落 SystemLog）、网络抖动能自愈（指数退避重试/重连）、客户端上报不刷屏也不丢（按用户限流 + 队列去重）。
+
+**后端核心**（`services/api`）：
+- **优雅停机**（`cmd/main.go`）：SIGTERM/SIGINT → `s.Shutdown`（10s 排水窗口）→ 停 audit-log 订阅者 → 关 EventBus，
+  各组件经 defer 栈干净退出，替代 Docker SIGKILL 强杀。
+- **自定义 Recovery 中间件**（`internal/middleware/recovery.go`）：接管 gin 默认 recovery，捕获 panic → 写
+  "server.panic" 关键级 SystemLog + 实时广播 → 返回统一 `{code:500,data:null}`，不再返回空 body。
+- **5xx 错误日志中间件**（`internal/middleware/errorlog.go`）：每次 >=500 响应持久化为 "server.error" SystemLog，
+  带 **60/min 窗口限流 + 10min 去重**，避免错误风暴刷屏。
+- **统一错误工具**（`internal/utils/errors.go`）：sentinel error + `APIError` + `error→HTTP 状态码` 映射。
+- **统一重试工具**（`internal/utils/retry.go`）：指数退避 + 抖动；`pushRetentionWithRetry` 由固定 30s 改为
+  5s→40s 退避。
+- **健康检查**：新增 `/health/ready` 就绪探针（DB ping 门控；MQTT 仅上报、可选），供 Docker/CF 探针区分
+  "进程活"与"可服务"。
+- **客户端上报强化**（`internal/handler/client_error_handler.go` + `model/system_log.go`）：限流改为**按
+  用户/IP 分桶**（默认 60/min/key，防单用户吃光全局配额）；去重改为索引列 `context` 精确比较（替代脆弱的
+  payload JSON LIKE）；`LevelWarning` 纳入清理上限（200 条）。
+
+**前端播放上报**（`web`）：
+- **ErrorBoundary**（新增 `components/ErrorBoundary.tsx`）：捕获渲染/生命周期异常（window onerror 抓不到的
+  那类），上报 `render.error.*` 并渲染重试卡片；已包在 App 路由外层。
+- **HLS 失败上报**（`hooks/useHLSStream.ts`）：hls.js fatal 错误 + 15s stall 看门狗 → `playback.hls(.stall)`。
+- **WebRTC 失败上报**（`hooks/useWebRTCStream.ts`）：SDP/连接失败、ICE 8s 超时、`connectionState failed`、
+  `<video>` 解码错误(3/4) → `playback.webrtc(.decode)`。
+- **token 防御**（`api/client.ts`）：`getToken/setToken/clearTokenAndRedirect` 全部 try/catch 包裹，私有浏览/
+  存储被禁用时不再崩溃，降级为"无 token → 401 → 回登录"。
+
+**前端网络韧性**（`web`）：
+- **axios 幂等重试**（`api/client.ts`）：网络错误(0) 与 5xx 对**幂等方法**(GET/HEAD/OPTIONS/PUT/DELETE) 指数
+  退避重试（1s→4s，最多 2 次）；POST 永不自动重试（避免副作用重复提交）。
+- **WS 指数退避 + 重连刷新**（`hooks/useWebSocket.ts`）：固定 3s 改为 1s→15s 封顶指数退避 + ±20% 抖动（多
+  tab 不齐步回连）；订阅集合持久化，重连后自动重发 `subscribe`，非 admin 断线不再静默丢事件。
+
+**客户端上报强化**（`web`）：
+- **上报器队列 + 去重**（`lib/errorReport.ts`）：内存队列 + 离线缓冲（网络故障时缓存、8s 退避重试、上限 5 次
+  后丢弃）；tab 内 60s 去重折叠（同 context+message 只入队一次并累加 count）；队列上限 50 防内存爆炸。
+  后端 `client.error` 沿用既有按用户限流 + 结构化去重合并。
+
+#### 验证
+- `go test ./internal/... ./cmd/... ./tools/...` 全部通过。
+- `web`：`npx tsc -b` 零错误 + `npm run build` 成功。（顶层 `scripts` 包为历史遗留多 `main` 问题，非按包编译，与本次无关。）
+
+#### 版本
+- Backend: v1.8.41（优雅停机 + recovery/errorlog 中间件 + 统一 retry + /health/ready + 客户端上报按用户限流）
+- Web: v1.8.41（ErrorBoundary + HLS/WebRTC 播放上报 + token 防御 + axios 幂等重试 + WS 指数退避/重连刷新 + 上报队列去重）
+- Android: v1.8.41（无改动）
+
 ### v1.8.40 — 波次2 单元测试扩展：自动化引擎 / WS hub / gorm 仓储 (2026-08-14)
 
 > **背景**：测试覆盖计划第 2 波。此前仓内单测基本都是纯函数测试（`triggerMatches`、

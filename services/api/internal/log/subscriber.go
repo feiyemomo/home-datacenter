@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"sync"
 
 	"gorm.io/gorm"
 
@@ -28,6 +29,9 @@ import (
 type Subscriber struct {
 	db  *gorm.DB
 	bus *eventbus.Bus
+
+	mu     sync.Mutex
+	unsubs []func()
 }
 
 // NewSubscriber wires a Subscriber to the given DB and Bus. The
@@ -73,9 +77,25 @@ func (s *Subscriber) Start() {
 		// Capture the topic in a local variable so the closure
 		// sees the current value, not the last loop iteration's.
 		topic := t
-		s.bus.Subscribe(topic, func(e eventbus.Event) {
+		unsub := s.bus.Subscribe(topic, func(e eventbus.Event) {
 			s.handle(topic, e)
 		})
+		s.mu.Lock()
+		s.unsubs = append(s.unsubs, unsub)
+		s.mu.Unlock()
+	}
+}
+
+// Stop unsubscribes every topic this Subscriber registered. Safe to
+// call once during graceful shutdown; idempotent.
+func (s *Subscriber) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, unsub := range s.unsubs {
+		if unsub != nil {
+			unsub()
+			s.unsubs[i] = nil
+		}
 	}
 }
 
@@ -136,8 +156,9 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 // are treated as normal for pruning.
 func (s *Subscriber) pruneSystemLogs() {
 	caps := map[string]int64{
-		model.LevelNormal: 500,
-		model.LevelInfo:   200,
+		model.LevelNormal:  500,
+		model.LevelInfo:    200,
+		model.LevelWarning: 200,
 	}
 	for level, keep := range caps {
 		var count int64

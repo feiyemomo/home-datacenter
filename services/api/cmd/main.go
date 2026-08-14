@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,6 +24,7 @@ import (
 	logpkg "home-datacenter-api/internal/log"
 	"home-datacenter-api/internal/maintenance"
 	"home-datacenter-api/internal/middleware"
+	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
 	"home-datacenter-api/internal/repository"
@@ -380,7 +384,33 @@ func main() {
 	automationHandler := automation.NewHandler(database.DB, automationEngine, bus)
 
 	// ---- HTTP server ----
-	r := gin.Default()
+	// v1.8.41: gin.New() + explicit middleware instead of gin.Default()
+	// so we control recovery. The custom Recovery middleware captures
+	// panics, writes a critical "server.panic" SystemLog row and
+	// broadcasts it live, and returns a unified {code:500,data:null}
+	// envelope instead of gin's empty body.
+	r := gin.New()
+	r.Use(gin.Logger())
+	r.Use(middleware.Recovery(func(c *gin.Context, panicVal any, stack []byte) {
+		entry := &model.SystemLog{
+			Ts:        time.Now().Unix(),
+			EventType: "server.panic",
+			Level:     model.LevelCritical,
+			Source:    "server",
+			Message:   fmt.Sprintf("服务器内部错误: %v", panicVal),
+			Payload:   string(stack),
+		}
+		if err := database.DB.Create(entry).Error; err != nil {
+			log.Printf("recovery: persist panic log failed: %v", err)
+		}
+		if pj, err := json.Marshal(entry); err == nil {
+			bus.Publish(eventbus.Event{
+				Topic:   eventbus.TopicSystemLog,
+				Source:  eventbus.SourceSystem,
+				Payload: pj,
+			})
+		}
+	}))
 
 	// Trust Docker bridge / LAN proxy ranges so c.ClientIP() resolves
 	// the real client IP from X-Forwarded-For for rate limiting.
@@ -417,9 +447,41 @@ func main() {
 		c.Next()
 	})
 
+	// v1.8.41: persist every >=500 response as a "server.error" SystemLog
+	// row so backend failures surface in the dashboard log pane (not just
+	// container stderr). See internal/middleware/errorlog.go.
+	r.Use(middleware.ErrorLogMiddleware(database.DB, bus))
+
 	// Health check (kept simple for Docker / Cloudflare probes)
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
+	})
+
+	// v1.8.41: readiness probe — distinguishes "process alive" (/health)
+	// from "ready to serve". Only the DB ping gates readiness; MQTT is
+	// reported but optional (the app intentionally runs without it).
+	r.GET("/health/ready", func(c *gin.Context) {
+		ready := true
+		checks := gin.H{}
+		if sqlDB, err := database.DB.DB(); err != nil {
+			ready = false
+			checks["db"] = "error"
+		} else if err := sqlDB.Ping(); err != nil {
+			ready = false
+			checks["db"] = "down"
+		} else {
+			checks["db"] = "ok"
+		}
+		if mqttClient.IsConnected() {
+			checks["mqtt"] = "ok"
+		} else {
+			checks["mqtt"] = "disconnected"
+		}
+		status := http.StatusOK
+		if !ready {
+			status = http.StatusServiceUnavailable
+		}
+		c.JSON(status, gin.H{"status": "ready", "checks": checks})
 	})
 
 	// ---- Phase 10: Network capability detection ----
@@ -734,7 +796,29 @@ func main() {
 		MaxHeaderBytes: 1 << 20, // 1MB
 	}
 
-	if err := s.ListenAndServe(); err != nil {
+	// v1.8.41: graceful shutdown. On SIGTERM/SIGINT we stop accepting new
+	// connections, drain in-flight requests (up to 10s), stop the audit-log
+	// subscriber and close the event bus so no new events fan out during
+	// teardown. The per-component Stop/Close methods (deviceMgr, prefixWatcher,
+	// mqttClient, hub, automationEngine, bindLimiter) then run via the deferred
+	// stack when main returns, and the process exits cleanly — instead of Docker
+	// SIGKILL tearing the box down mid-write.
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		<-sig
+		log.Println("main: received shutdown signal, draining in-flight requests...")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := s.Shutdown(shutCtx); err != nil {
+			log.Printf("main: shutdown drain error: %v", err)
+		}
+		logSub.Stop()
+		bus.Close()
+		log.Println("main: shutdown complete")
+	}()
+
+	if err := s.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("failed to start server: %v", err)
 	}
 }
@@ -749,20 +833,16 @@ func main() {
 // succeeds, so the quota monitor leaves the state un-derived and retries
 // on a later sample.
 func pushRetentionWithRetry(days int, frigate *camera.FrigateClient) error {
-	const attempts = 6
-	var lastErr error
-	for i := 0; i < attempts; i++ {
+	// v1.8.41: unified Retry util — exponential backoff (5s→40s, jittered)
+	// replaces the old fixed 30s interval. Retry on any error; the quota
+	// monitor re-fires on the next sample if we never succeed.
+	return utils.Retry(6, 5*time.Second, 40*time.Second, nil, func() error {
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
 		err := frigate.PushRecordRetention(ctx, days)
-		cancel()
-		if err == nil {
-			return nil
+		if err != nil {
+			log.Printf("maintenance: frigate retention push (%d days) failed: %v", days, err)
 		}
-		lastErr = err
-		log.Printf("maintenance: frigate retention push (%d days) attempt %d/%d failed: %v", days, i+1, attempts, err)
-		select {
-		case <-time.After(30 * time.Second):
-		}
-	}
-	return lastErr
+		return err
+	})
 }
