@@ -131,7 +131,7 @@ services:
       # direct mode then both work. Update this value if the ISP
       # rotates the IPv6 prefix (find via: ip -6 addr show enp4s0 |
       # grep "scope global" | grep -v temporary).
-      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37a8:80c0:62be:b4ff:fe08:bd09}
+      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37ad:6870:62be:b4ff:fe08:bd09}
       # v1.8.24: NAS LAN IPv4 address. The container runs on a Docker
       # bridge (172.x.x.x) and cannot infer the host's physical LAN IP.
       # This value is used by SetWebRTCCandidates() to build the go2rtc
