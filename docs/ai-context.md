@@ -778,6 +778,11 @@ would never surface as the latest release.
 - **Backend `release_handler.go`** — `listAll` now matches both `app-debug-v`
   and `app-release-v` prefixes; flavor is not part of version comparison.
   Release APKs are now discoverable as the latest release.
+- **debug / release coexistence** — debug buildType gets `applicationIdSuffix
+  = ".debug"` so debug = `com.homedatacenter.app.debug` and release =
+  `com.homedatacenter.app` are two independent apps. Without this, installing
+  the release APK over an installed debug build fails with "软件包与现有软件包
+  存在冲突" because they share a package name but different signing keys.
 
 ### Verification
 - `go build ./internal/... ./cmd/...` and `go vet ./internal/handler/` pass.
