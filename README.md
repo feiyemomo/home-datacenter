@@ -627,6 +627,9 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 - `app/build.gradle.kts` 新增 `releaseSigning` 签名配置，release 构建用正式私钥签名（V1/V2/V3）。
 - release APK 已用 `keytool` 验证：SHA1/SHA256 指纹与正式 keystore 完全一致。
 - debug 继续用工程内置 `projectDebug` keystore（多人多机构建同一签名，可覆盖安装）。
+- **debug / release 共存**：给 debug 加了 `applicationIdSuffix = ".debug"`，于是 debug 包名
+  `com.homedatacenter.app.debug`、release 包名 `com.homedatacenter.app`，两者是独立应用、可同时安装。
+  此前因两包签名不同且 applicationId 相同，用 release 覆盖安装 debug 会报"软件包与现有软件包存在冲突"。
 
 **`push-apk.ps1` 支持双 flavor**：
 - 新增 `-Flavor debug|release`、`-Password`、`-DryRun`；按 flavor 选择 APK 路径与远程命名 `app-{flavor}-vX.Y.Z.apk`。
