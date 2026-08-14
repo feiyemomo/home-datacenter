@@ -318,14 +318,24 @@ func main() {
 		MemCritPct:             cfg.Maintenance.MemCritPct,
 		// v1.8.28: probe the sibling services the dashboard depends
 		// on. The api container is on the home-net bridge, so it
-		// reaches them by service name (no host port needed). The
-		// web front-end is probed over HTTP; mosquitto over TCP:1883.
+		// reaches them by container name (no host port needed).
+		// NOTE (v1.8.33): use the container names (home-web /
+		// home-mosquitto), NOT the compose service names (web /
+		// mosquitto). compose.yaml sets `container_name`, so Docker
+		// registers the container name as the DNS alias and the bare
+		// service name is NOT resolvable — probing `web` / `mosquitto`
+		// always failed with "bad address" and fired false "不可达"
+		// alerts for every service since v1.8.28.
 		ServiceProbes: []maintenance.ServiceProbe{
-			{Name: "Web 前端", URL: "http://web/"},
-			{Name: "Mosquitto", NetworkAddr: "mosquitto:1883"},
+			{Name: "Web 前端", URL: "http://home-web/"},
+			{Name: "Mosquitto", NetworkAddr: "home-mosquitto:1883"},
 		},
 		ServiceInterval: 30 * time.Second,
 		ServiceFails:    3,
+		// v1.8.33: wait 60s before the first probe so a container
+		// restart's transient DNS/network race can't trip the
+		// consecutive-failure threshold and fire a spurious alert.
+		ServiceStartupDelay: 60 * time.Second,
 	})
 
 	// Purge any soft-deleted camera rows left over from older

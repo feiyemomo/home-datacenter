@@ -1641,6 +1641,55 @@ Root cause: `SetWebRTCCandidates` sent the partial config **bare** (`{go2rtc:{..
 
 ---
 
+## Phase 27 (v1.8.33): Fix Service Monitor "不可达" False Alarms + Restore Silently-Dead MQTT
+
+### Phase 27 span: v1.8.33 (Backend + Frigate config)
+
+#### Symptom
+After every api restart, the service monitor fired `服务 Web 前端 不可达` and `服务 Mosquitto 不可达` alerts even though both containers were `(healthy)` in `docker compose ps`.
+
+#### Initial hypothesis (wrong)
+A transient DNS "startup race". Added a `ServiceStartupDelay` (60s) grace before the first probe. **The alerts still fired** — proving it was NOT transient.
+
+#### Root cause: wrong hostnames, not a race
+compose.yaml sets `container_name: home-web` / `home-mosquitto`. Docker registers the **container name** as the DNS alias on the network; the bare **service name** (`web` / `mosquitto`) is NOT resolvable. The probes used `http://web/` and `mosquitto:1883` → every probe failed with `bad address`.
+
+Same wrong-hostname bug silently disabled the entire MQTT pipeline:
+- api `mqtt.broker: tcp://mosquitto:1883` (config.yaml + config.go default) → api never connected to the broker.
+- Frigate `mqtt.host: mosquitto` (deploy/frigate/config.yml) → Frigate never published detection events.
+
+Verified from inside the api container: `getent hosts web` fails, `home-web`/`home-mosquitto` resolve and connect fine.
+
+#### Design 2: use container names + keep grace as defense-in-depth
+- `ServiceProbes` → `http://home-web/`, `home-mosquitto:1883`.
+- Startup grace kept (60s) so a genuine container-restart DNS blip can't trip the 3-failure threshold.
+- api MQTT broker → `tcp://home-mosquitto:1883` (config.yaml + config.go default).
+- Frigate MQTT host → `home-mosquitto` (deploy/frigate/config.yml; requires `docker restart home-frigate` to apply the bind-mounted change).
+- compose.yaml comment corrected.
+
+#### NAS verification (192.168.31.235)
+- api log: `mqtt connected to tcp://home-mosquitto:1883` + subscribed all topics incl. `frigate/events`; `service monitor startup grace 1m0s before first probe`; **0** "不可达" alerts in 5 min.
+- mosquitto log: `New client connected ... as frigate` and `as home-datacenter` — both api and Frigate now reach the broker (previously MQTT was fully down).
+- api `/health` → `{"status":"ok"}`.
+
+#### Notes / follow-ups
+- The api's MQTT client shows periodic "connection closed by client" reconnects (keepalive/session). Functionally the subscribe + publish path works; not exercised further in this phase.
+- Rule of thumb going forward: on a compose network where services set `container_name`, always reference the **container name** (e.g. `home-api`, `home-frigate`, `home-mosquitto`, `home-web`), never the bare service name.
+
+### Files Changed (Phase 27)
+
+| File | Change |
+|------|--------|
+| `cmd/main.go` | Probe hostnames `home-web`/`home-mosquitto`; `ServiceStartupDelay: 60s` |
+| `internal/maintenance/service.go` | `startupDelay` field + wait before first probe |
+| `internal/maintenance/maintenance.go` | `ServiceStartupDelay` config + pass-through |
+| `configs/config.yaml` | MQTT broker → `tcp://home-mosquitto:1883` |
+| `internal/config/config.go` | Default MQTT broker → `tcp://home-mosquitto:1883` |
+| `deploy/frigate/config.yml` | MQTT host → `home-mosquitto` |
+| `compose.yaml` | Correct misleading host comment |
+
+---
+
 ## Phase 19 (v1.8.25): Web Playback Fix + Client Error Reporting + Transcode Cache
 
 ### Phase 19 span: v1.8.25 (Backend) + v1.8.25 (Web)
