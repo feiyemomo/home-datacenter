@@ -58,3 +58,6 @@ android/local.properties
 android/*.log
 android/app/build/
 android/build/
+# Versioned APK binaries live on the NAS (data/releases), not in git.
+android/app-debug-*.apk
+android/app-release-*.apk

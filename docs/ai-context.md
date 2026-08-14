@@ -271,8 +271,8 @@ deploy/
 │   │       ├── HomeCenterService.kt     // foreground service for background WS keepalive
 │   │       ├── TokenStore.kt            // token / URL persistence (SharedPreferences)
 │   │       └── MainActivity.kt          // binder + service control UI
-│   ├── build.gradle.kts, settings.gradle.kts, gradlew, ...
-│   └── deploy/android/HomeDatacenterClient.kt  // legacy single-file reference client
+│   ├── build.gradle.kts, settings.gradle.kts, gradlew, push-apk.ps1, ...
+│   └── (legacy single-file `deploy/android/HomeDatacenterClient.kt` removed in v1.8.43)
 ```
 
 ---
@@ -2095,7 +2095,8 @@ both write the same sessionStorage key with no freshness guard.
   - `App.tsx`: during the splash wait (`token && !initialized`), prefetch
     `home.cameras.list` in parallel so Dashboard and Cameras first frames come
     from cache with no loading flash.
-- **Android reference client sync** (`deploy/android/HomeDatacenterClient.kt`):
+- **Android reference client sync** (`android/app/src/main/java/com/example/homecenter/`,
+  later organized into the Gradle project in v1.8.43):
   - Error reporting: `POST /api/v1/system/client-errors` API method +
     `ClientErrorReport` model + `ClientErrorReporter` (2s global rate limit +
     60s dedup folding identical reports with an incremented `count` + coroutine
@@ -2114,8 +2115,8 @@ both write the same sessionStorage key with no freshness guard.
 - `web`: `npx tsc -b` zero errors + `npm run build` succeeds; deployed to NAS
   (web image rebuilt, JS hash `index-DpLpzBnB.js`).
 - Backend unchanged (`home-api` not rebuilt, healthy).
-- Android: reference-client source updated (`deploy/android/HomeDatacenterClient.kt`);
-  repo has no Gradle project, so no APK is produced.
+- Android: reference-client source lives in the `android/` Gradle project
+  (v1.8.43); `android/push-apk.ps1` builds and pushes the debug APK to NAS.
 
 ### Files Changed (Phase 37)
 
@@ -2126,7 +2127,7 @@ both write the same sessionStorage key with no freshness guard.
 | `web/src/hooks/useHLSStream.ts` | Background hold: stall watchdog re-armable, skip when hidden |
 | `web/src/hooks/usePrefetch.ts` | Freshness (30s TTL) guard + prefetch failure reporting |
 | `web/src/App.tsx` | Splash parallel prefetch of home.cameras.list |
-| `deploy/android/HomeDatacenterClient.kt` | client-errors API + ClientErrorReporter; WS onFailure reporting + onNetworkAvailable; NetworkMonitor; HomeCenterService foreground service |
+| `android/app/src/main/java/com/example/homecenter/` | client-errors API + ClientErrorReporter; WS onFailure reporting + onNetworkAvailable; NetworkMonitor; HomeCenterService foreground service (organized into Gradle project in v1.8.43) |
 | `README.md` | v1.8.42 changelog entry (Web + Android) |
 
 ---

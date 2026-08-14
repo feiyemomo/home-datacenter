@@ -769,7 +769,7 @@ ping/pong (30s) and an application-level heartbeat. The JWT's
 device events, non-admins receive only events whose topic matches one
 of their subscriptions.
 
-See `docs/ai-context.md` → Phase 3 and `deploy/android/HomeDatacenterClient.kt`
+See `docs/ai-context.md` → Phase 3 and `android/app/src/main/java/com/example/homecenter/HomeCenterClient.kt`
 for the wire format (`{type, topic, payload, ts}`).
 
 ---

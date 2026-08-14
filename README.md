@@ -636,9 +636,18 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
   修正 `asConverterFactory` import。
 - `HomeCenterService` 缺 `OkHttpClient` import；`ClientErrorReporter` 折叠时 `filter` 返回 `List` 需 `toMutableList()`。
 
+**发布流程**（`android/push-apk.ps1`）：
+- 一键构建 debug APK → 更名 `app-debug-v<version>.apk` → 写 `release-notes-v<version>.txt` → scp 到 NAS
+  `data/releases/`。版本号从 `app/build.gradle.kts` 自动读取；支持 `-Notes`、`-BuildOnly`、`-DryRun`、`-Password`。
+
+**去冗余**：
+- 删除 `deploy/android/HomeDatacenterClient.kt`（980 行单文件参考客户端）——其协议层/Service/Activity 已完整迁移进
+  gradle 工程，避免两份源码漂移。
+
 #### 验证
 - `./gradlew assembleDebug` 构建成功，产出 `app/build/outputs/apk/debug/app-debug.apk`（约 6.3 MB）。
 - APK 已推送至 NAS `data/releases/app-debug-v1.8.43.apk`（versionCode 124, versionName 1.8.43），可直接安装。
+- `push-apk.ps1` 端到端跑通（构建/更名/写 notes/推送 NAS）。
 
 #### 版本
 - Backend: v1.8.43（无代码改动）
@@ -668,7 +677,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 - **splash 并行预取**（`App.tsx`）：等待 `/user/me` 的 splash 空转期间，并行预取 `home.cameras.list`，Dashboard 与
   Cameras 页首帧都能从缓存渲染、零闪烁。
 
-**Android 客户端**（`deploy/android/HomeDatacenterClient.kt`，参考客户端）：
+**Android 客户端**（`android/`，Gradle 工程）：
 - **错误上报**：新增 `POST /api/v1/system/client-errors` 接口 + `ClientErrorReport` 数据模型 + `ClientErrorReporter`
   （2s 全局限流 + 60s 去重折叠 count + 协程后台上报，永不抛异常）；WS `onFailure` 接入上报（context
   "android.ws"），失败会出现在 Dashboard 日志面板。
@@ -680,7 +689,7 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 #### 验证
 - `web`：`npx tsc -b` 零错误 + `npm run build` 成功，已部署 NAS（web 镜像重建，JS 哈希 `index-DpLpzBnB.js`）。
 - 后端无改动（`home-api` 未重建，healthy）。
-- Android：参考客户端源码更新（仓库无 Gradle 工程，不打 APK）。
+- Android：参考客户端源码整理进 `android/` Gradle 工程（v1.8.43），可构建并推送 APK。
 
 #### 版本
 - Backend: v1.8.42（无代码改动）
