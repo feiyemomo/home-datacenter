@@ -46,8 +46,12 @@ auth:
     enabled: true
 
 # Phase 3: MQTT broker (Mosquitto)
+# v1.8.33: use the container name `home-mosquitto` (compose sets
+# container_name, so the bare service name `mosquitto` is NOT
+# resolvable on the Docker network — it made the MQTT connection
+# fail with "no such host" and disabled real-time features).
 mqtt:
-  broker: tcp://mosquitto:1883
+  broker: tcp://home-mosquitto:1883
   client_id: home-datacenter
   username: ""
   password: ""

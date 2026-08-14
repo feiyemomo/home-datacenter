@@ -10,9 +10,10 @@
 #     you can stop publishing 8080 — the tunnel reaches the api
 #     service on the internal Docker network by name (home-api).
 #   - Mosquitto port 1883 is NOT published to the host by default;
-#     the api reaches it on the internal network as "mosquitto:1883".
-#     Set MQTT_BIND_PORT below if you need host access for local
-#     device testing.
+#     the api reaches it on the internal network as "home-mosquitto:1883"
+#     (container name — compose sets container_name, so the bare service
+#     name "mosquitto" is not resolvable). Set MQTT_BIND_PORT below if
+#     you need host access for local device testing.
 #
 # Security hardening:
 #   - All services run with no-new-privileges:true.

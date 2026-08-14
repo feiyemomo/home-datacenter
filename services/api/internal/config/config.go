@@ -339,7 +339,9 @@ func Load(path string) error {
 	v.SetDefault("auth.rate_limit.enabled", true)
 
 	// Phase 3 defaults — MQTT disabled by default (empty broker).
-	v.SetDefault("mqtt.broker", "tcp://mosquitto:1883")
+	// v1.8.33: container name `home-mosquitto` (compose sets
+	// container_name, so the bare service name isn't resolvable).
+	v.SetDefault("mqtt.broker", "tcp://home-mosquitto:1883")
 	v.SetDefault("mqtt.client_id", "home-datacenter")
 	v.SetDefault("mqtt.username", "")
 	v.SetDefault("mqtt.password", "")

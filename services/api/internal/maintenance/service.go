@@ -52,10 +52,13 @@ type ServiceMonitor struct {
 	// down tracks services currently in the down state so alerts are
 	// edge-triggered.
 	down map[string]bool
+	// startupDelay is waited once before the first probe (v1.8.33) so
+	// the api's embedded DNS / network settles before sampling starts.
+	startupDelay time.Duration
 }
 
 // NewServiceMonitor creates a monitor that probes the given services.
-func NewServiceMonitor(db *gorm.DB, bus *eventbus.Bus, probes []ServiceProbe, interval time.Duration, threshold int) *ServiceMonitor {
+func NewServiceMonitor(db *gorm.DB, bus *eventbus.Bus, probes []ServiceProbe, interval time.Duration, threshold int, startupDelay time.Duration) *ServiceMonitor {
 	if threshold <= 0 {
 		threshold = 3
 	}
@@ -67,11 +70,18 @@ func NewServiceMonitor(db *gorm.DB, bus *eventbus.Bus, probes []ServiceProbe, in
 		consecutiveFailures: make(map[string]int),
 		threshold:           threshold,
 		down:                make(map[string]bool),
+		startupDelay:        startupDelay,
 	}
 }
 
-// Run probes once immediately, then on every tick forever.
+// Run waits out the startup delay (so a container restart's transient
+// DNS/network race doesn't trip the consecutive-failure threshold),
+// then probes immediately and on every tick forever.
 func (m *ServiceMonitor) Run() {
+	if m.startupDelay > 0 {
+		log.Printf("maintenance: service monitor startup grace %s before first probe", m.startupDelay)
+		time.Sleep(m.startupDelay)
+	}
 	m.sample()
 	ticker := time.NewTicker(m.interval)
 	defer ticker.Stop()

@@ -611,6 +611,27 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.33 — 修复服务监控"不可达"误报 + 打通被静默禁用的 MQTT 链路 (2026-08-14)
+
+> **根因不是"启动竞态"，而是主机名写错**：compose 为容器设置了 `container_name`（`home-web` / `home-mosquitto`），Docker 只注册**容器名**为网络别名，裸服务名 `web` / `mosquitto` 根本不可解析。从 v1.8.28 起服务监控用 `web` / `mosquitto` 探测——**每次探测都因 "bad address" 失败**，对每个服务都报了假"不可达"；同时 api 的 MQTT broker 和 Frigate 的 MQTT host 也用了 `mosquitto`，导致**整个 MQTT 实时链路（api 订阅 + Frigate 检测事件上报）自始就未连通**。
+
+**修复内容**：
+- **服务监控探针主机名**（`cmd/main.go`）：`http://web/` → `http://home-web/`，`mosquitto:1883` → `home-mosquitto:1883`。
+- **服务监控启动宽限期**（`internal/maintenance/service.go` + `maintenance.go`）：`ServiceStartupDelay` 新增，`Run()` 首次探测前先等待（本机 60s），避免容器重启瞬间的短瞬 DNS/网络抖动触发误报（纵深防御；主因仍是主机名）。
+- **api MQTT broker**（`configs/config.yaml` + `config.go` 默认值）：`tcp://mosquitto:1883` → `tcp://home-mosquitto:1883`。
+- **Frigate MQTT host**（`deploy/frigate/config.yml`）：`host: mosquitto` → `host: home-mosquitto`。
+- **compose.yaml 注释**更正为正确的主机名。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- api 日志：`mqtt connected to tcp://home-mosquitto:1883` 并订阅全部主题（含 `frigate/events`）；`service monitor startup grace 1m0s before first probe`；重启后 5 分钟内 **0 条**"不可达"告警。
+- mosquitto 日志：`New client connected ... as frigate` + `as home-datacenter`——**Frigate 与 api 均成功连上 broker**（此前 MQTT 全链路不可用）。
+- api `/health` 返回 `{"status":"ok"}`。
+
+#### 版本
+- Backend: v1.8.33
+- Web: v1.8.33（无前端改动）
+- Android: v1.8.24（无改动）
+
 ### v1.8.32 — 录像配额自动缩短留存 + WebRTC 候选重启感知推送 (2026-08-14)
 
 > **两块能力补全**：① 录像配额监控——录像总占用超阈值时**自动**把 Frigate 留存从 7 天缩短到 3 天（旧片在下一个清理周期被删），回落后自动恢复 7 天，避免小磁盘被录像悄悄撑满；② 修复 WebRTC `candidates` 推送的重启竞态——顺带揪出真正的根因是 API 载荷格式错误（一直 400），重构为"重启前推送 + 深合并持久化"，重启后候选不再丢失。

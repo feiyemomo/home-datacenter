@@ -129,6 +129,15 @@ type Config struct {
 	// ServiceFails is how many consecutive failures flag a service
 	// as down. Default 3.
 	ServiceFails int
+	// ServiceStartupDelay is how long to wait after process boot before
+	// the FIRST service probe (v1.8.33). The api container's embedded
+	// DNS (127.0.0.11) can briefly fail to resolve sibling hostnames
+	// right after a (re)start, so an immediate probe would rack up
+	// consecutive failures and fire a spurious "不可达" alert. Waiting
+	// out the startup window before sampling eliminates the false
+	// positive; the consecutive-failure threshold then only guards
+	// against genuine outages.
+	ServiceStartupDelay time.Duration
 }
 
 // StartAll launches every background maintenance loop in its own
@@ -158,7 +167,7 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 		go NewSysResourceMonitor(db, bus, cfg.SysResourceInterval, cfg.CPUWarnPct, cfg.CPUCritPct, cfg.MemWarnPct, cfg.MemCritPct).Run()
 	}
 	if cfg.ServiceInterval > 0 && len(cfg.ServiceProbes) > 0 {
-		go NewServiceMonitor(db, bus, cfg.ServiceProbes, cfg.ServiceInterval, cfg.ServiceFails).Run()
+		go NewServiceMonitor(db, bus, cfg.ServiceProbes, cfg.ServiceInterval, cfg.ServiceFails, cfg.ServiceStartupDelay).Run()
 	}
 	log.Println("maintenance: background loops started")
 }
