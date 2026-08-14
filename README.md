@@ -611,6 +611,39 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.43 — Android 整理为 Gradle 工程并成功构建 APK (2026-08-14)
+
+> **背景**：参考客户端此前是单文件 `deploy/android/HomeDatacenterClient.kt`，无法真正构建、调试、lint 或打 APK。
+> 本轮把它整理成标准 Android Gradle 工程（`android/`），让后台保活 / WS 韧性 / 错误上报能作为可安装应用落地。
+
+**工程骨架**（`android/`）：
+- `settings.gradle.kts` / `build.gradle.kts` / `app/build.gradle.kts`：module 结构、AGP 8.9.1 + Kotlin 2.0.21 +
+  serialization、Retrofit/OkHttp/Coroutines 依赖、`BuildConfig` 里 baked 默认 Base/WS URL。
+- Gradle wrapper（8.11.1）+ `local.properties`（sdk.dir 指向本机 SDK，不提交）。
+
+**代码迁移**（`app/src/main/java/com/example/homecenter/`）：
+- `HomeCenterClient.kt`：纯协议层——数据模型、Retrofit API、`HomeCenterRepository`、`HomeCenterFactory`、`ClientErrorReporter`、
+  `HomeCenterWebSocket`（心跳 + 订阅持久 + 指数退避重连）、`NetworkMonitor`。
+- `HomeCenterService.kt`：前台服务（`START_STICKY` + 通知 + `FOREGROUND_SERVICE_CONNECTED_DEVICE`），后台保活 WS；
+  缺省权限已在 `AndroidManifest.xml` 声明。
+- `TokenStore.kt` / `MainActivity.kt`：token/URL 持久化 + 绑定/启停 UI。
+- `AndroidManifest.xml`：`INTERNET` / `ACCESS_NETWORK_STATE` / 前台服务等权限 + Service 声明。
+
+**修复的构建问题**：
+- 注释内含 `*/`（`/api/v1/* endpoint.`）导致整个文件被当作未闭合注释、类全部不可解析。
+- `NetworkCallback` 实际是 `ConnectivityManager` 的嵌套类，修正 import。
+- `retrofit2-kotlinx-serialization-converter:1.0.0` 包名是 `com.jakewharton.retrofit2.converter.kotlinx.serialization`，
+  修正 `asConverterFactory` import。
+- `HomeCenterService` 缺 `OkHttpClient` import；`ClientErrorReporter` 折叠时 `filter` 返回 `List` 需 `toMutableList()`。
+
+#### 验证
+- `./gradlew assembleDebug` 构建成功，产出 `app/build/outputs/apk/debug/app-debug.apk`（约 6.3 MB）。
+
+#### 版本
+- Backend: v1.8.43（无代码改动）
+- Web: v1.8.43（无前端改动）
+- Android: v1.8.43（整理为 Gradle 工程，构建出可安装 debug APK）
+
 ### v1.8.42 — 后台保持 + 预加载加固 + Android 端同步 (2026-08-14)
 
 > **背景**：审查发现两个短板——① **后台 WebRTC 保持"未生效"**：全工程无任何 `visibilitychange` 处理，完全依赖
