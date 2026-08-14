@@ -783,6 +783,20 @@ would never surface as the latest release.
   `com.homedatacenter.app` are two independent apps. Without this, installing
   the release APK over an installed debug build fails with "软件包与现有软件包
   存在冲突" because they share a package name but different signing keys.
+- **CI / tests / keystore backup** (Android `home-datacenter-app`):
+  - `.github/workflows/release.yml` — JVM unit tests on `main` push; on a
+    `v*` tag or manual trigger it reconstructs the release keystore from
+    GitHub Secrets and builds the signed release APK (uploaded as artifact).
+  - Secrets (`RELEASE_KEYSTORE_B64`, `RELEASE_KEY_ALIAS`,
+    `RELEASE_STORE_PASSWORD`, `RELEASE_KEY_PASSWORD`) documented in
+    `SECRETS.md`; the keystore is gitignored and never stored in the repo.
+  - Unit tests in `app/src/test/**` (17 tests): JwtUtil claim parsing,
+    UpdateInfo/WsMessage serialization round-trips, NetworkPathPreference
+    fallback. JwtUtil was moved off `android.util.Base64` to `java.util.Base64`
+    (pure JVM, unit-testable without Robolectric).
+  - `backup-keystore.ps1` — backs up `home-release.jks` + `keystore.properties`
+    to a folder OUTSIDE the repo with a restore guide; run it and keep an
+    offline copy, because losing the release key bricks all future APK upgrades.
 
 ### Verification
 - `go build ./internal/... ./cmd/...` and `go vet ./internal/handler/` pass.
