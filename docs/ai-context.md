@@ -1824,6 +1824,50 @@ This removes the btrfs faststart re-open from the critical path entirely.
 
 ---
 
+## Phase 33 (v1.8.38): IPv6 Prefix Rotation — Config Synced to DDNS Current Prefix + Camera Offline Diagnosis
+
+### Phase 33 span: v1.8.38 (Backend config) — no web / Android code change
+
+#### Background
+The ISP rotated the /64 prefix again (DHCPv6-PD). The IPv6 DDNS `nas.feiyemomo.top` auto-updated to the new prefix
+`2409:8a70:37ad:6870` (SLAAC EUI-64 interface ID `62be:b4ff:fe08:bd09` is stable — only the prefix rotates), but the
+backend config still held the old prefix `2409:8a70:37a8:80c0`. As a result `GET /api/v1/network/status` advertised an
+unreachable IPv6 address, and go2rtc's WebRTC IPv6 candidate pointed at a dead prefix.
+
+The Android `BaseUrlResolver.IPV6_DIRECT_URL` has used the DDNS domain `http://nas.feiyemomo.top:8088/` since v1.6.32,
+so it needs no change — the DDNS AAAA record is the single source of truth that follows prefix rotations automatically.
+The web `Network.tsx` / `LiveVideo.tsx` / `Dashboard.tsx` already recognize the `nas.feiyemomo.top` hostname. Only the
+backend IP-literal config required syncing (backend `NAS_IPV6_ADDRESS` is validated with `net.ParseIP`, and WebRTC ICE
+candidates require an IP:port, not a hostname).
+
+#### Changes (old prefix → ddns current prefix `2409:8a70:37ad:6870:62be:b4ff:fe08:bd09`)
+- `compose.yaml`: `NAS_IPV6_ADDRESS` default value updated.
+- `deploy/frigate/config.yml`: `go2rtc.webrtc.candidates` IPv6 entry updated.
+- `.env.example`: `NAS_IPV6_ADDRESS` sample value updated.
+- NAS `/vol1/docker/home-datacenter/.env`: `NAS_IPV6_ADDRESS` updated in place (backed up to `.env.bak-*`; `deploy-nas.ps1` never overwrites `.env`).
+
+#### NAS verification (192.168.31.235, 2026-08-14)
+- `docker compose up -d` recreated `home-api` (env change triggers recreate); `/health` → `{"status":"ok"}`.
+- api log `network:` line now reports the new address `direct=http://[2409:8a70:37ad:6870:62be:b4ff:fe08:bd09]:8088/`,
+  and `camera: webrtc candidates pushed after boot replay` confirms new candidates were pushed to go2rtc.
+
+#### Camera offline diagnosis (前门 / 院子)
+- From the NAS host: both `192.168.31.100` / `.101` fail ping, RTSP:554, and ONVIF:80; ARP neighbor table shows `FAILED`.
+- A full `/24` scan (ports 80 + 554) found **no** RTSP-capable device — the cameras have disappeared from the LAN
+  (power loss / disconnected / IP change). This is a physical-layer issue requiring on-site inspection of power + cabling,
+  not a software/config problem. Left to be resolved by the operator.
+
+### Files Changed (Phase 33)
+
+| File | Change |
+|------|--------|
+| `compose.yaml` | `NAS_IPV6_ADDRESS` default → `2409:8a70:37ad:6870:62be:b4ff:fe08:bd09` |
+| `deploy/frigate/config.yml` | `go2rtc.webrtc.candidates` IPv6 entry → new prefix |
+| `.env.example` | `NAS_IPV6_ADDRESS` sample → new prefix |
+| NAS `.env` | `NAS_IPV6_ADDRESS` updated + backed up |
+
+---
+
 ## Phase 32 (v1.8.37): Recording Quota 400 GiB + Android Progress Bar Uses Actual Coverage
 
 ### Phase 32 span: v1.8.37 (Backend config) + v1.8.37 (Android)
@@ -1893,4 +1937,4 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+**Last Updated:** 2026-08-14 (v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)

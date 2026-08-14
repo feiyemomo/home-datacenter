@@ -611,6 +611,37 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.8.38 — IPv6 前缀轮换：配置同步到 ddns 当前前缀 + 摄像头离线排查 (2026-08-14)
+
+> **背景**：运营商 DHCPv6-PD 再次轮换 /64 前缀，IPv6 ddns `nas.feiyemomo.top` 已自动更新到新前缀
+> `2409:8a70:37ad:6870`（SLAAC EUI-64 接口 ID `62be:b4ff:fe08:bd09` 稳定），但后端配置仍停留在旧前缀
+> `2409:8a70:37a8:80c0`，导致 API `network/status` 报告不可达的 IPv6 地址、误导客户端走 IPv6 直连。
+
+**改动**（旧前缀 → ddns 当前新前缀 `2409:8a70:37ad:6870:62be:b4ff:fe08:bd09`）：
+- `compose.yaml`：`NAS_IPV6_ADDRESS` 默认值更新。
+- `deploy/frigate/config.yml`：`go2rtc.webrtc.candidates` IPv6 条目更新。
+- `.env.example`：`NAS_IPV6_ADDRESS` 示例值更新。
+- NAS `/vol1/docker/home-datacenter/.env`：`NAS_IPV6_ADDRESS` 更新（`.env.bak-*` 备份，部署脚本不覆盖 .env）。
+
+> 说明：Android `BaseUrlResolver.IPV6_DIRECT_URL` 自 v1.6.32 起已用 ddns 域名 `http://nas.feiyemomo.top:8088/`，
+> 无需改动；web 端 Network 页也已识别域名。后端 `NAS_IPV6_ADDRESS` 因需 `net.ParseIP` 校验 + WebRTC ICE 需 IP:port，
+> 仍用 IP 字面量，本次同步到当前前缀。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-14）
+- `docker compose up -d` 重建 `home-api`（env 变化触发 recreate），`/health` 返回 `{"status":"ok"}`。
+- api 日志 `network:` 行已报新地址 `direct=http://[2409:8a70:37ad:6870:62be:b4ff:fe08:bd09]:8088/`，
+  且 `camera: webrtc candidates pushed after boot replay` 表明新 candidates 已推送到 go2rtc。
+
+#### 摄像头离线排查（前门 / 院子）
+- 从 NAS 探测：两台（`192.168.31.100` / `.101`）ping / RTSP:554 / ONVIF:80 **全部失败**，ARP 邻居表 `FAILED`。
+- 全 `/24` 扫描（端口 80 + 554）未发现任何 RTSP 摄像头，确认**摄像头已从局域网消失**（断电 / 断网 / IP 变更），
+  属物理层问题，待物理检查电源与网线后恢复；非配置问题。
+
+#### 版本
+- Backend: v1.8.38（IPv6 前缀同步）
+- Web: v1.8.38（无前端改动）
+- Android: v1.8.38（无改动）
+
 ### v1.8.37 — 修复录像回放间歇性转码失败导致的 CPU 占满 (2026-08-14)
 
 > **"一看录像 CPU 就占满"的根因**：录像回放的 ffmpeg 转码输出直接写到 btrfs 绑定挂载的缓存卷（`/data/recordings/.transcode-cache`）。`-movflags faststart` 需要在写完后**重开输出文件**做第二遍扫描把 moov 移到文件头；在 btrfs 上这个重开**间歇性失败**（报 `Unable to re-open output file for shifting data`），此时**完整编码已经跑完**却最终失败。代码原有的软件兜底（libx264）用同样的参数/路径重转，**同样失败**，并在 J4125 上又烧掉约 40 秒 CPU——用户看到的是"录像打不开 + CPU 被占满"，重试会反复触发，症状持续。
