@@ -226,6 +226,41 @@ type MaintenanceConfig struct {
 	// DiskIntervalMinutes is how often the disk monitor samples.
 	// Default 10.
 	DiskIntervalMinutes int `mapstructure:"disk_interval_minutes"`
+
+	// RecordingsRoot is Frigate's recording directory root (e.g.
+	// /media/frigate/recordings). Empty disables the recording
+	// health + size monitors.
+	RecordingsRoot string `mapstructure:"recordings_root"`
+	// RecordingStaleAfterMinutes is how old the newest recording
+	// segment must be before a camera is flagged as recording-stalled.
+	// Default 10.
+	RecordingStaleAfterMinutes int `mapstructure:"recording_stale_after_minutes"`
+	// RecordingCheckIntervalMinutes is how often the recording health
+	// scan runs. Default 5.
+	RecordingCheckIntervalMinutes int `mapstructure:"recording_check_interval_minutes"`
+	// RecordingSizeIntervalHours is how often the recordings tree size
+	// is walked. Default 1. 0 disables.
+	RecordingSizeIntervalHours int `mapstructure:"recording_size_interval_hours"`
+	// RecordingSizeWarnBytes / RecordingSizeCritBytes are size
+	// thresholds for the recordings tree. 0 disables that level.
+	RecordingSizeWarnBytes uint64 `mapstructure:"recording_size_warn_bytes"`
+	RecordingSizeCritBytes uint64 `mapstructure:"recording_size_crit_bytes"`
+
+	// FrigateDBPath is Frigate's own SQLite database (frigate.db),
+	// backed up daily alongside app.db. Empty disables.
+	FrigateDBPath string `mapstructure:"frigate_db_path"`
+
+	// SysResourceIntervalMinutes is how often CPU + memory are
+	// sampled. Default 5. 0 disables the resource monitor.
+	SysResourceIntervalMinutes int `mapstructure:"sys_resource_interval_minutes"`
+	// CPUWarnPct / CPUCritPct are CPU usage thresholds (0-100).
+	// Default 80 / 95.
+	CPUWarnPct uint64 `mapstructure:"cpu_warn_pct"`
+	CPUCritPct uint64 `mapstructure:"cpu_crit_pct"`
+	// MemWarnPct / MemCritPct are memory usage thresholds (0-100).
+	// Default 80 / 90.
+	MemWarnPct uint64 `mapstructure:"mem_warn_pct"`
+	MemCritPct uint64 `mapstructure:"mem_crit_pct"`
 }
 
 // AppConfig is the globally accessible configuration instance,
@@ -312,6 +347,24 @@ func Load(path string) error {
 	v.SetDefault("maintenance.disk_warn_pct", 80)
 	v.SetDefault("maintenance.disk_crit_pct", 90)
 	v.SetDefault("maintenance.disk_interval_minutes", 10)
+
+	// v1.8.28: recording + resource monitors. RecordingsRoot is
+	// left empty by default (disabled); main.go wires it to the
+	// configured Camera.RecordingDir when the container path is
+	// present. The other fields get sane defaults so an operator
+	// only needs to set recordings_root / frigate_db_path.
+	v.SetDefault("maintenance.recordings_root", "")
+	v.SetDefault("maintenance.recording_stale_after_minutes", 10)
+	v.SetDefault("maintenance.recording_check_interval_minutes", 5)
+	v.SetDefault("maintenance.recording_size_interval_hours", 1)
+	v.SetDefault("maintenance.recording_size_warn_bytes", 0)
+	v.SetDefault("maintenance.recording_size_crit_bytes", 0)
+	v.SetDefault("maintenance.frigate_db_path", "")
+	v.SetDefault("maintenance.sys_resource_interval_minutes", 5)
+	v.SetDefault("maintenance.cpu_warn_pct", 80)
+	v.SetDefault("maintenance.cpu_crit_pct", 95)
+	v.SetDefault("maintenance.mem_warn_pct", 80)
+	v.SetDefault("maintenance.mem_crit_pct", 90)
 
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /

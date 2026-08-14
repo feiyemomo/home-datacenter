@@ -95,6 +95,16 @@ services:
         condition: service_started
       frigate:
         condition: service_healthy
+    # v1.8.28: service healthcheck. The api image is alpine (busybox
+    # wget is present), so this probes the /health endpoint directly.
+    # service_healthy lets a restart policy / down-stream depends_on
+    # react to a dead API instead of a merely-started container.
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://localhost:8080/health" ]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     environment:
       - APP_CONFIG=${APP_CONFIG:-/configs/config.yaml}
       # v1.5.13: match Frigate's TZ so PlayRecording path lookups
@@ -152,6 +162,17 @@ services:
       - ./deploy/mosquitto/aclfile:/mosquitto/config/aclfile:ro
       - ./deploy/mosquitto/passwd:/mosquitto/config/passwd:ro
       - ./data/mosquitto:/mosquitto/data
+    # v1.8.28: healthcheck. eclipse-mosquitto is alpine-based and has
+    # no HTTP endpoint, so we probe the broker process directly via
+    # busybox pgrep instead of a TCP/HTTP check. A running broker
+    # process is the right "i'm up" signal; a healthcheck here lets
+    # restart / depends_on react if the broker dies.
+    healthcheck:
+      test: [ "CMD", "pgrep", "mosquitto" ]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     networks:
       - home-net
 
@@ -197,6 +218,21 @@ services:
       - "[::]:8088:80"
     depends_on:
       - api
+    # v1.8.28: healthcheck. nginx:alpine bundles busybox wget, so we
+    # probe the SPA root. A 200/40x from nginx means the server is up
+    # and serving (it returns 200 for /; the app is a static SPA).
+    #
+    # Must use 127.0.0.1, NOT localhost: nginx:alpine's /etc/hosts maps
+    # `::1 localhost ip6-loopback`, and busybox wget resolves `localhost`
+    # to the IPv6 loopback ::1 first. nginx only listens on IPv4
+    # 0.0.0.0:80 here, so wget against `localhost` fails with
+    # "Connection refused" while the server is actually healthy.
+    healthcheck:
+      test: [ "CMD", "wget", "-qO-", "http://127.0.0.1/" ]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
     networks:
       - home-net
 
