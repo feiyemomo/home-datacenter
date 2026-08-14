@@ -135,6 +135,16 @@ type FrigateClient struct {
 	// record block. Default 7; override via SetRetentionDays so the
 	// recording-quota monitor can restore the normal window after a
 	// reduction.
+	//
+	// v1.8.35: guarded by retentionMu because PushConfig (BootReplay /
+	// camera add) and PushRecordRetention (quota monitor) can run
+	// concurrently at api boot. Without the lock + shared value, the
+	// startup full-config push (requires_restart=1) could overwrite the
+	// quota monitor's reduction back to the normal window: the monitor
+	// samples immediately on start, races BootReplay, and whichever
+	// push lands last wins — so the quota reduction must be reflected
+	// in the retention value PushConfig reads, regardless of order.
+	retentionMu   sync.Mutex
 	retentionDays int
 }
 
@@ -158,7 +168,17 @@ func (c *FrigateClient) SetRetentionDays(days int) {
 	if days < 1 {
 		days = 7
 	}
+	c.retentionMu.Lock()
 	c.retentionDays = days
+	c.retentionMu.Unlock()
+}
+
+// CurrentRetention returns the current global record retention window
+// (days) that PushConfig will apply. Thread-safe (v1.8.35).
+func (c *FrigateClient) CurrentRetention() int {
+	c.retentionMu.Lock()
+	defer c.retentionMu.Unlock()
+	return c.retentionDays
 }
 
 // Alive reports whether the Frigate REST API is reachable. Used by
@@ -292,6 +312,12 @@ type HLSConfig struct {
 //     not spin up the recorder process. Without this, the config
 //     push returns 200 but no recordings are ever produced.
 func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraConfig, go2rtcStreams map[string]string, requiresRestart bool) error {
+	// Snapshot the current retention under the lock so the quota
+	// monitor's concurrent reduction is respected (v1.8.35).
+	c.retentionMu.Lock()
+	retentionDays := c.retentionDays
+	c.retentionMu.Unlock()
+
 	partial := map[string]any{
 		"cameras": camerasAsMap(cameras),
 		// Global record config: enable 24/7 continuous recording
@@ -314,10 +340,10 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 		"record": map[string]any{
 			"enabled": true,
 			"continuous": map[string]any{
-				"days": c.retentionDays,
+				"days": retentionDays,
 			},
 			"motion": map[string]any{
-				"days": c.retentionDays,
+				"days": retentionDays,
 			},
 		},
 		// Enable snapshots globally so Frigate captures a still JPEG
@@ -510,6 +536,14 @@ func (c *FrigateClient) PushRecordRetention(ctx context.Context, days int) error
 	if days < 1 {
 		days = 1
 	}
+	// v1.8.35: record the new window as the current retention so a
+	// concurrent PushConfig (BootReplay / camera add) applies the same
+	// value instead of overwriting it with the stale normal window. This
+	// makes the quota reduction stick regardless of goroutine ordering.
+	c.retentionMu.Lock()
+	c.retentionDays = days
+	c.retentionMu.Unlock()
+
 	partial := map[string]any{
 		"record": map[string]any{
 			"enabled": true,
