@@ -108,12 +108,18 @@ export default function Dashboard() {
     const alerts = alertsData?.alerts ?? [];
 
     const { prefetchOnIdle } = usePrefetch();
+    const warmedRef = useRef(false);
 
     useEffect(() => {
-        if (statusData) {
+        // Warm the Cameras + Network page caches once, on the first status
+        // snapshot. Those pages have their own 30s/60s polling, so re-running
+        // this on every 10s status update only re-arms redundant prefetches
+        // and grows usePrefetch's cleanup list.
+        if (statusData && !warmedRef.current) {
+            warmedRef.current = true;
             prefetchOnIdle("home.cameras.list", () => listCameras(), 2000);
             prefetchOnIdle("home.network.status", () =>
-                getNetworkStatus(false).then(res => [res, null] as any),
+                getNetworkStatus(false).then(res => ({ status: res, clientIPv6: null })),
                 3000
             );
         }
