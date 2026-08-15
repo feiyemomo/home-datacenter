@@ -18,16 +18,22 @@ import type { JwtClaims, User } from "@/types";
 
 // Prefetch sessionStorage keys — must match useCachedFetch keys exactly
 // so that cached values are immediately available to the consuming pages.
-//   home.cameras.list        — Cameras.tsx
-//   home.network.status      — Network.tsx
-//   home.dashboard.weather   — WeatherCard.tsx (rendered on Dashboard)
-//   home.dashboard.alerts    — Dashboard.tsx
+//   home.cameras.list       — Cameras.tsx
+//   home.network.status     — Network.tsx (structure: { status, clientIPv6 })
+//   home.dashboard.weather  — WeatherCard.tsx (rendered on Dashboard)
+//   home.dashboard.alerts   — Dashboard.tsx
 const PREFETCH_KEYS = {
     cameras: "home.cameras.list",
     network: "home.network.status",
     weather: "home.dashboard.weather",
     alerts: "home.dashboard.alerts",
 } as const;
+
+// Mirrors usePrefetch's PREFETCH_TTL_MS. A cache entry younger than this
+// is "fresh" and is never overwritten by a prefetch — otherwise a slow
+// prefetch response could clobber fresher WS-driven data with a stale
+// snapshot (the "screen going backwards" regression).
+const PREFETCH_TTL_MS = 30_000;
 
 interface AuthContextValue {
     token: string | null;
@@ -79,6 +85,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             const now = Date.now();
             const writeCache = (key: string, v: unknown) => {
                 try {
+                    // Freshness guard (mirrors usePrefetch): never
+                    // overwrite an existing cache entry newer than 30s
+                    // so a slow prefetch can't clobber fresher WS-driven
+                    // data with a stale snapshot.
+                    const raw = sessionStorage.getItem(key);
+                    if (raw) {
+                        const parsed = JSON.parse(raw) as { t: number };
+                        if (parsed && now - parsed.t < PREFETCH_TTL_MS) {
+                            return;
+                        }
+                    }
                     sessionStorage.setItem(key, JSON.stringify({ t: now, v }));
                 } catch {
                     // private browsing or quota exceeded — silently ignore
@@ -88,7 +105,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 writeCache(PREFETCH_KEYS.cameras, cameras.value);
             }
             if (network.status === "fulfilled") {
-                writeCache(PREFETCH_KEYS.network, network.value);
+                // Match the consuming Network.tsx shape: { status, clientIPv6 }.
+                // clientIPv6 is unknown during splash (it needs a separate
+                // client-side probe), so it's seeded as null and the page
+                // self-heals with "checking…" on mount.
+                writeCache(PREFETCH_KEYS.network, {
+                    status: network.value,
+                    clientIPv6: null,
+                });
             }
             if (weather.status === "fulfilled") {
                 writeCache(PREFETCH_KEYS.weather, weather.value);

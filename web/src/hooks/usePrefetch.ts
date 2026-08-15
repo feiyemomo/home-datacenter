@@ -54,20 +54,37 @@ export function usePrefetch(): PrefetchResult {
 
             const doPrefetch = async () => {
                 if (cancelled) return;
+
+                // Freshness gate BEFORE issuing the request: if a cache
+                // entry newer than TTL already exists, skip the network
+                // hit entirely. Dashboard's 10s status poll re-arms
+                // prefetchOnIdle every cycle; without this gate each
+                // re-arm fired a real request that the post-fetch guard
+                // then discarded (3 wasted round-trips per 30s).
+                const readCache = () => {
+                    try {
+                        const raw = sessionStorage.getItem(key);
+                        if (!raw) return null;
+                        return JSON.parse(raw) as { t: number };
+                    } catch {
+                        // unreadable cache — treat as absent, safe to fetch.
+                        return null;
+                    }
+                };
+                const cache = readCache();
+                if (cache && Date.now() - cache.t < PREFETCH_TTL_MS) {
+                    return;
+                }
+
                 try {
                     const v = await fetcher();
                     if (cancelled) return;
-                    // Freshness guard: don't clobber a newer cache entry.
-                    try {
-                        const raw = sessionStorage.getItem(key);
-                        if (raw) {
-                            const parsed = JSON.parse(raw) as { t: number };
-                            if (parsed && Date.now() - parsed.t < PREFETCH_TTL_MS) {
-                                return;
-                            }
-                        }
-                    } catch {
-                        // unreadable cache — treat as absent, safe to write.
+                    // Second guard after the round-trip: live (WS-driven)
+                    // data may have refreshed the cache while the request
+                    // was in flight — never clobber it.
+                    const fresh = readCache();
+                    if (fresh && Date.now() - fresh.t < PREFETCH_TTL_MS) {
+                        return;
                     }
                     sessionStorage.setItem(key, JSON.stringify({ t: Date.now(), v }));
                 } catch (e) {

@@ -1,11 +1,8 @@
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { Loader2, Server } from "lucide-react";
-import { useEffect } from "react";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
-import { usePrefetch } from "@/hooks/usePrefetch";
-import { listCameras } from "@/api/camera";
 import { Layout } from "@/components/Layout";
 import OfflineBanner from "@/components/OfflineBanner";
 import Login from "@/pages/Login";
@@ -48,19 +45,6 @@ export default function App() {
 function AppRoutes() {
     const { token, initialized } = useAuth();
     const location = useLocation();
-    const { prefetchOnIdle } = usePrefetch();
-
-    // v1.8.42: prefetch the camera list during the splash wait. The
-    // splash is a pure spinner while /user/me resolves — that idle time
-    // is otherwise wasted. Warming "home.cameras.list" here means the
-    // Dashboard AND Cameras pages both render their first frame from
-    // cache with no loading flash. The freshness guard in usePrefetch
-    // ensures it never clobbers newer WS-driven data.
-    useEffect(() => {
-        if (token && !initialized) {
-            prefetchOnIdle("home.cameras.list", () => listCameras(), 0);
-        }
-    }, [token, initialized, prefetchOnIdle]);
 
     // Full-screen splash while the /user/me probe is in flight.
     if (token && !initialized) {
