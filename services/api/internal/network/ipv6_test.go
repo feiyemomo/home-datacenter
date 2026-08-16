@@ -56,10 +56,32 @@ func TestIPv6PrefixMatches(t *testing.T) {
 	}
 }
 
-func TestOutboundIPv6Address_EnvShortCircuit(t *testing.T) {
-	// When NAS_IPV6_ADDRESS is set to a valid IPv6 address, the
-	// function must return it directly without making any HTTP request.
-	// This is the path that takes effect in the docker deployment.
+func TestIPv6FromDNS(t *testing.T) {
+	tests := []struct {
+		name     string
+		hostname string
+		want     string
+	}{
+		{name: "empty hostname", hostname: "", want: ""},
+		{name: "invalid hostname", hostname: "nonexistent.invalid", want: ""},
+		{name: "ipv4-only", hostname: "1.1.1.1", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := IPv6FromDNS(tt.hostname)
+			if got != tt.want {
+				t.Errorf("IPv6FromDNS(%q) = %q, want %q", tt.hostname, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestOutboundIPv6Address_PrefersDNSOverEnv(t *testing.T) {
+	// The DDNS lookup must be consulted before the static env var so a
+	// prefix rotation is picked up from the AAAA record. Use an
+	// unroutable, non-resolving hostname so DNS fails deterministically
+	// and we fall through to NAS_IPV6_ADDRESS.
+	t.Setenv("NAS_IPV6_DDNS", "nonexistent.invalid")
 	t.Setenv("NAS_IPV6_ADDRESS", "2001:db8::100")
 
 	got := OutboundIPv6Address()

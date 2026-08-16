@@ -12,6 +12,7 @@ import {
     cameraFrameUrl,
     setRecordingPlan,
     getIceConfig,
+    preheatCamera,
 } from "@/api/camera";
 import { RecordingTimeline } from "@/components/RecordingTimeline";
 import type { Camera, CameraEventMessage, CameraStatusEvent, IceConfig, WsMessage } from "@/types";
@@ -304,8 +305,22 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // Pre-negotiate WebRTC offer during preview mode (when transport
     // would use WebRTC). The PC + gathered offer is stored in
     // prefetchedWebrtcRef for useWebRTCStream to consume on Play.
+    //
+    // v1.8.46: also re-warm the backend go2rtc producer here. The
+    // splash preheat (AuthContext) only runs once at login and go2rtc
+    // releases producers after #stop=120s of no consumers — so if the
+    // operator reads the dashboard for a few minutes and then opens a
+    // camera, the producer has already idled out and Play pays the
+    // 1-3s cold-start (RTSP reconnect + ffmpeg transcode). Warming on
+    // preview mount re-arms that 120s window right before the operator
+    // is most likely to click Play, and the every-10s preview frame
+    // poll keeps it warm while the card is on screen — eliminating the
+    // fast/slow variance in time-to-first-frame. Fire-and-forget; the
+    // next real SDP/MP4 request warms the source anyway on failure.
     useEffect(() => {
         if (mode !== "preview" || transport === "hls") return;
+
+        preheatCamera(camera.id).catch(() => {});
 
         let cancelled = false;
 

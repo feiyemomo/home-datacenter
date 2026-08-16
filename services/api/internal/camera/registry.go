@@ -38,12 +38,15 @@ type Registry struct {
 	// When no consumer is watching, go2rtc keeps the RTSP source
 	// connection alive for this many seconds before tearing it down.
 	// Default 30. Increase for environments with flaky RTSP where
-	// frequent reconnections cause HLS stalls.
+	// frequent reconnections cause HLS stalls. v1.9.x bumped to 120 so
+	// the splash-screen preheat keeps producers warm long enough for a
+	// normal login → live-view navigation to hit a hot source without
+	// paying the 1-2s cold-start.
 	StopTimeout int
 }
 
 func NewRegistry(db *gorm.DB, g *Go2RTCClient, fr *FrigateClient, box *utils.SecretBox, onvif *ONVIFController, webRTCURL string) *Registry {
-	return &Registry{DB: db, Go2: g, Frigate: fr, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL, StopTimeout: 30}
+	return &Registry{DB: db, Go2: g, Frigate: fr, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL, StopTimeout: 120}
 }
 
 // RegisterInput is the wire format for POST /api/v1/cameras.
@@ -121,6 +124,29 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 	if profile == "" && r.ONVIF != nil {
 		if ps, perr := r.ONVIF.DiscoverProfiles(ctx, in.Host, in.ONVIFPort, in.Username, in.Password); perr == nil && len(ps) > 0 {
 			profile = ps[0].Token
+		}
+	}
+
+	// Auto-codec detection (v1.9.x): when the operator did not explicitly
+	// choose a codec or transcode, probe the camera's native video codec.
+	// An HEVC/H.265 camera would otherwise stream H.265 passthrough
+	// (`#video=copy`), which breaks go2rtc's frame-grab (ffmpeg exit 183 →
+	// HTTP 500) and WebRTC live view (Chrome has no H.265 codec). Routing
+	// it to the h264 transcode pipeline transparently makes it usable.
+	// H.264 cameras keep the cheap passthrough path. Best-effort: if the
+	// probe fails (camera offline, ffprobe missing) we keep the requested
+	// default rather than fail the registration.
+	if in.Codec == "" && !in.Transcode {
+		raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+			in.Username, in.Password, in.Host, in.RTSPPort, in.ChannelID)
+		probed := probeVideoCodec(ctx, raw)
+		if codec, trans := codecFromProbe(probed); trans {
+			in.Codec, in.Transcode = codec, true
+			log.Printf("camera: %q: auto-transcode to h264 (native codec %q)", name, probed)
+		} else if probed != "" {
+			log.Printf("camera: %q: native codec %q, keeping passthrough", name, probed)
+		} else {
+			log.Printf("camera: %q: codec probe failed, keeping passthrough", name)
 		}
 	}
 

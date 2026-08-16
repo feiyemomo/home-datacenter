@@ -13,7 +13,12 @@ RUN go mod download
 
 COPY . .
 
-RUN go build -o server ./cmd
+# -a forces recompilation of every package, ignoring the Go build cache.
+# Without it, a Docker layer-cached `go build` can silently reuse a stale
+# object (e.g. an old ws_handler.go) whose source changed on disk — the
+# running binary then diverges from the committed source. The cost is a
+# slower first build; correctness beats the cache here.
+RUN go build -a -o server ./cmd
 
 FROM alpine:latest
 

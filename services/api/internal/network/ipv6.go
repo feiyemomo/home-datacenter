@@ -169,19 +169,29 @@ func IPv6ReachableURL(port int) string {
 }
 
 // OutboundIPv6Address returns the current outbound IPv6 address of the
-// host by querying an external echo service (ident.me, with api64.ipify.org
-// as fallback). ident.me responds with the raw IP as plain text.
+// host, used by the PrefixWatcher to detect ISP DHCPv6-PD prefix
+// rotations and push fresh WebRTC candidates to go2rtc.
 //
-// If the NAS_IPV6_ADDRESS environment variable is set, it is returned
-// directly without any network probe. This short-circuit mirrors
-// CheckIPv6(): the home-api container runs on a docker bridge without
-// an IPv6 subnet, so an in-container HTTP probe to ident.me would
-// always time out. The env var is the authoritative source in the
-// deployment and is the path that actually takes effect.
+// Lookup priority:
+//  1. DNS AAAA lookup of the NAS_IPV6_DDNS hostname (default
+//     nas.feiyemomo.top). The host's DDNS client keeps this AAAA record
+//     pointing at the current public IPv6, so a prefix rotation is picked
+//     up as soon as the record updates. A DNS query runs over IPv4, so
+//     this works even though the home-api container has no IPv6 egress.
+//  2. NAS_IPV6_ADDRESS env var (operator-configured static address).
+//  3. HTTP echo probes (ident.me / api64.ipify.org) — only reachable if
+//     the container has IPv6 egress, which it normally does not.
 //
-// 3s timeout per request. Returns "" on failure — never panics, never
-// blocks the caller.
+// Returns "" on failure — never panics, never blocks the caller.
 func OutboundIPv6Address() string {
+	ddns := os.Getenv("NAS_IPV6_DDNS")
+	if ddns == "" {
+		ddns = "nas.feiyemomo.top"
+	}
+	if addr := IPv6FromDNS(ddns); addr != "" {
+		return addr
+	}
+
 	if envAddr := os.Getenv("NAS_IPV6_ADDRESS"); envAddr != "" {
 		if ip := net.ParseIP(envAddr); ip != nil && ip.To4() == nil {
 			return envAddr
@@ -203,6 +213,23 @@ func OutboundIPv6Address() string {
 		if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
 			return addr
 		}
+	}
+	return ""
+}
+
+// IPv6FromDNS resolves the hostname and returns the first global-scope,
+// non-link-local IPv6 address from its AAAA records. Returns "" if the
+// hostname does not resolve or has no suitable IPv6 record.
+func IPv6FromDNS(hostname string) string {
+	ips, err := net.LookupIP(hostname)
+	if err != nil {
+		return ""
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		return ip.String()
 	}
 	return ""
 }
