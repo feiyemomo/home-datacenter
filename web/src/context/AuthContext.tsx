@@ -10,7 +10,7 @@ import {
 import { bind as bindApi } from "@/api/auth";
 import { getCurrentUser } from "@/api/system";
 import { clearTokenAndRedirect, getToken, setToken } from "@/api/client";
-import { listCameras, listAlerts } from "@/api/camera";
+import { listCameras, listAlerts, preheatCamera } from "@/api/camera";
 import { getNetworkStatus } from "@/api/network";
 import { getWeather } from "@/api/weather";
 import { decodeJwtPayload } from "@/lib/utils";
@@ -103,6 +103,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             };
             if (cameras.status === "fulfilled") {
                 writeCache(PREFETCH_KEYS.cameras, cameras.value);
+                // v1.9.x: warm the backend (go2rtc/RTSP) streams during
+                // splash so the first WebRTC/HLS/MP4 request doesn't pay
+                // the 1-10s cold-start. Fire-and-forget — never blocks the
+                // splash gate. go2rtc keeps producers warm for 120s
+                // (#stop=120, see Registry.StopTimeout), so a normal login
+                // → live-view navigation hits a hot source without the
+                // 1-2s cold-start; idle cameras still release after 120s
+                // so they cost nothing long-term. Only online cameras are
+                // warmed; offline ones can't connect and would just fail
+                // silently.
+                for (const cam of cameras.value) {
+                    if (cam.status === "online") {
+                        preheatCamera(cam.id).catch(() => {});
+                    }
+                }
             }
             if (network.status === "fulfilled") {
                 // Match the consuming Network.tsx shape: { status, clientIPv6 }.

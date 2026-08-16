@@ -55,6 +55,15 @@ type CameraHandler struct {
 	// same defaults, and a stale-but-correct-dimension frame is
 	// preferable to multiplying upstream calls.
 	frameCache sync.Map
+
+	// transcodeSem serializes recording transcodes. The J4125's iGPU
+	// thrashes under concurrent VAAPI load: 5 simultaneous 60s
+	// transcodes each balloon from ~10s to ~65s (measured on the NAS),
+	// and the app/browser fires several recording requests at once
+	// when opening a timeline. A single slot keeps every transcode at
+	// full speed. Already-cached minutes serve instantly without
+	// touching the semaphore, so re-plays never block the queue.
+	transcodeSem chan struct{}
 }
 
 // frameCacheEntry is the value type stored in CameraHandler.frameCache.
@@ -72,7 +81,7 @@ type UserResolver interface {
 }
 
 func NewCameraHandler(reg *camera.Registry, onvif *camera.ONVIFController, rec *camera.Recorder, publicBase, rawIce string, userSvc UserResolver, bus *eventbus.Bus) *CameraHandler {
-	return &CameraHandler{Reg: reg, ONVIF: onvif, Rec: rec, PublicBase: publicBase, RawIce: rawIce, UserSvc: userSvc, bus: bus}
+	return &CameraHandler{Reg: reg, ONVIF: onvif, Rec: rec, PublicBase: publicBase, RawIce: rawIce, UserSvc: userSvc, bus: bus, transcodeSem: make(chan struct{}, 1)}
 }
 
 // callerIsAdmin returns (userID, isAdmin, ok) for the current request.
@@ -1095,6 +1104,23 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	// minuteStart as before.
 	tmpOut := filepath.Join(tmpDir, fmt.Sprintf("%d.mp4", minuteStart))
 
+	// v1.8.46: serialize ffmpeg transcodes end-to-end. The J4125 iGPU
+	// thrashes under concurrent VAAPI sessions — 5 simultaneous 60s
+	// transcodes each take ~65s vs ~10s cold (measured on the NAS). One
+	// slot keeps every transcode at full speed; the app's timeline
+	// requests queue here and drain at ~7s each. Cached minutes skip the
+	// semaphore entirely (checked above), so re-plays never block.
+	// release is idempotent (select-default) so it can run both before
+	// serve() and as a defer on the early-return error paths.
+	h.transcodeSem <- struct{}{}
+	releaseSem := func() {
+		select {
+		case <-h.transcodeSem:
+		default:
+		}
+	}
+	defer releaseSem()
+
 	cmd := buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("PlayRecording: ffmpeg transcode failed: %v: %s", err, string(output))
@@ -1131,6 +1157,11 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 			log.Printf("PlayRecording: cache promote failed (serving temp): %v", err)
 		}
 	}
+
+	// Release the transcode slot before streaming the body so a queued
+	// request for the next minute can start transcoding while this one
+	// is being served/downloaded.
+	releaseSem()
 
 	serve(finalPath)
 }
@@ -1186,6 +1217,13 @@ func vaapiAvailable() bool {
 // the software libx264 pipeline. Both produce browser-compatible
 // output; hardware is ~10x faster on the J4125 iGPU.
 func buildTranscodeCmd(listPath, outPath string, hw bool) *exec.Cmd {
+	// v1.8.46: cap the encode at 1280x720 (downscale only, aspect kept).
+	// Recordings are monitored in a small player where 1440p is wasted;
+	// halving pixels cuts both decode and encode work, trimming a tmp
+	// (HEVC 2560x1440) minute from ~10s to ~7s on the J4125. The min()
+	// expression never upscales, so 720p-or-smaller sources pass through
+	// unchanged. force_original_aspect_ratio=decrease keeps the frame
+	// letterboxed to the correct shape for non-16:9 sensors.
 	if hw {
 		// -hwaccel vaapi -hwaccel_output_format vaapi decodes each
 		// concat segment on the iGPU and hands VAAPI surfaces straight
@@ -1197,6 +1235,7 @@ func buildTranscodeCmd(listPath, outPath string, hw bool) *exec.Cmd {
 			"-hwaccel_output_format", "vaapi",
 			"-f", "concat", "-safe", "0",
 			"-i", listPath,
+			"-vf", "scale_vaapi=w=min(1280\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease",
 			"-c:v", "h264_vaapi", "-qp", "24",
 			"-c:a", "aac", "-b:a", "96k",
 			"-fflags", "+genpts",
@@ -1207,6 +1246,7 @@ func buildTranscodeCmd(listPath, outPath string, hw bool) *exec.Cmd {
 	return exec.Command("ffmpeg", "-y",
 		"-f", "concat", "-safe", "0",
 		"-i", listPath,
+		"-vf", "scale=min(1280\\,iw):min(720\\,ih):force_original_aspect_ratio=decrease",
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
 		"-c:a", "aac", "-b:a", "96k",
 		"-fflags", "+genpts",

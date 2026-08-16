@@ -22,6 +22,20 @@ export async function getCamera(id: number): Promise<Camera> {
     return data;
 }
 
+/**
+ * Preheat a camera's backend stream (go2rtc/RTSP) so the first
+ * WebRTC/HLS/MP4 request doesn't pay the 1-10s cold-start.
+ *
+ * Best-effort and non-blocking: the server returns 200 immediately and
+ * connects the RTSP source in a detached goroutine. go2rtc releases the
+ * producer after ~30s of no consumers (`#stop=30`), so preheating an
+ * idle camera costs nothing in the long run. Callers should fire this
+ * without awaiting it.
+ */
+export async function preheatCamera(id: number): Promise<void> {
+    await client.post(`/cameras/${id}/preheat`);
+}
+
 export interface RegisterCameraPayload {
     name: string;
     vendor?: string;
