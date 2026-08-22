@@ -139,10 +139,15 @@ export async function setRecordingPlan(
 
 export async function listRecordings(
     id: number,
-    limit = 50,
+    after?: number,
+    before?: number,
 ): Promise<CameraRecording[]> {
+    const params = new URLSearchParams();
+    if (after !== undefined) params.set("after", String(after));
+    if (before !== undefined) params.set("before", String(before));
+    const qs = params.toString();
     const { data } = await client.get<CameraRecording[]>(
-        `/cameras/${id}/recordings?limit=${limit}`,
+        `/cameras/${id}/recordings${qs ? `?${qs}` : ""}`,
     );
     return data ?? [];
 }
@@ -226,6 +231,17 @@ export async function getMotionRanges(
  */
 export function recordingFileUrl(cameraId: number, recId: number): string {
     return `/api/v1/cameras/${cameraId}/recordings/${recId}/file`;
+}
+
+/**
+ * fMP4 streaming URL for the MediaSource-based player (v1.8.48). Unlike
+ * /file (which transcodes the whole 60s before sending), /stream emits
+ * fragmented MP4 segments as the encoder produces them, so the first
+ * frame arrives ~1-2s on a cold HEVC minute. Only meaningful for a
+ * fetch()-based MSE client — a plain <video src> still uses /file.
+ */
+export function recordingStreamUrl(cameraId: number, recId: number): string {
+    return `/api/v1/cameras/${cameraId}/recordings/${recId}/stream`;
 }
 
 /**

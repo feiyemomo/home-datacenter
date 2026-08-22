@@ -5,7 +5,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import { useWebRTCStream, waitForIceGathering } from "@/hooks/useWebRTCStream";
-import { useHLSStream } from "@/hooks/useHLSStream";
+import { useHLSStream, canDecodeHEVC } from "@/hooks/useHLSStream";
 import {
     ptzMove,
     gotoPreset,
@@ -149,13 +149,16 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // and revoking any in-flight recording blob URL.
     const [mode, setMode] = useState<"preview" | "live" | "playback">("preview");
 
-    // Path drives which sub-component is mounted. We start on
-    // WebRTC and flip to HLS on the primary's onError (in auto
-    // mode only; explicit WebRTC/HLS selections are sticky).
+    // Path drives which sub-component is mounted. We start on WebRTC
+    // and flip on failure in the order: HEVC-HLS (native, zero transcode,
+    // only when the browser can decode HEVC) → WebRTC (H.264) → HLS
+    // (H.264). In auto mode a failure drops us one step down the chain;
+    // explicit webrtc/hls selections are sticky and never auto-flip.
+    type LivePath = "hevc-hls" | "webrtc" | "hls";
     const [transport, setTransport] = useState<TransportMode>(readTransport);
     // Internal effective path. Differs from `transport` only
-    // in "auto" mode where a WebRTC failure flipped us to HLS.
-    const [path, setPath] = useState<"webrtc" | "hls">("webrtc");
+    // in "auto" mode where a failure flipped us to a lower path.
+    const [path, setPath] = useState<LivePath>("webrtc");
     // Generation counter increments on every retry; changing it
     // forces a remount of the active sub-component.
     const [generation, setGeneration] = useState(0);
@@ -181,10 +184,18 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     }
 
     // Reset to the requested transport on camera change. For
-    // "auto" we start on WebRTC; for explicit selections we
-    // honor the choice immediately.
+    // "auto" we start on HEVC-HLS when the camera offers a native-HEVC
+    // passthrough stream AND the browser can decode HEVC (eliminates
+    // the server transcode entirely); otherwise WebRTC. For explicit
+    // webrtc/hls selections we honor the choice immediately.
     useEffect(() => {
-        setPath(transport === "hls" ? "hls" : "webrtc");
+        if (transport === "hls") {
+            setPath("hls");
+        } else if (transport === "webrtc") {
+            setPath("webrtc");
+        } else {
+            setPath(!!camera.stream.hls_hevc_url && canDecodeHEVC() ? "hevc-hls" : "webrtc");
+        }
         setGeneration(0);
     }, [camera.id, transport]);
 
@@ -389,7 +400,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // path is whatever `path` resolved to (WebRTC succeeded or
     // HLS took over); in explicit modes the effective path is
     // always the requested one.
-    const effectivePath: "webrtc" | "hls" =
+    const effectivePath: LivePath =
         transport === "hls"
             ? "hls"
             : transport === "webrtc"
@@ -400,6 +411,11 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // a failure surfaces as an error overlay the operator can
     // act on, instead of silently switching to HLS.
     const onWebRTCFallback = transport === "auto" ? () => setPath("hls") : undefined;
+
+    // HEVC-HLS → WebRTC fallback. Only wired in auto mode; a native
+    // HEVC stream that fails to play (codec probe slipped, transcode
+    // hiccup, go2rtc restart) degrades to the transcoded H.264 path.
+    const onHevcHlsFallback = transport === "auto" ? () => setPath("webrtc") : undefined;
 
     return (
         <Card className="glass glass-glow glass-hover-lift rounded-2xl bg-[rgb(var(--glass-bg)/0.92)]">
@@ -550,7 +566,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             })}
                                         </div>
                                         <div className="text-[11px] text-fg-muted">
-                                            当前：<span className="text-fg font-medium">{effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
+                                            当前：<span className="text-fg font-medium">{effectivePath === "hevc-hls" ? "HEVC HLS" : effectivePath === "webrtc" ? "WebRTC" : "HLS"}</span>
                                         </div>
                                     </div>
                                 )}
@@ -627,8 +643,12 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                         ) : (
                             <HLSVideo
                                 key={`hls-${generation}`}
-                                src={camera.stream.hls_url}
+                                src={effectivePath === "hevc-hls"
+                                    ? camera.stream.hls_hevc_url!
+                                    : camera.stream.hls_url}
+                                hevc={effectivePath === "hevc-hls"}
                                 onRetry={retry}
+                                onFallback={onHevcHlsFallback}
                             />
                         )
                     )}
@@ -946,18 +966,25 @@ function WebRTCVideo({
  */
 function HLSVideo({
     src,
+    hevc,
     onRetry,
+    onFallback,
 }: {
     src: string;
+    hevc?: boolean;
     onRetry: () => void;
+    onFallback?: () => void;
 }) {
-    const { videoRef, state, error, retry } = useHLSStream({ src });
+    const { videoRef, state, error, retry } = useHLSStream({ src, hevc });
+    useEffect(() => {
+        if (state === "error") onFallback?.();
+    }, [state, onFallback]);
     return (
         <VideoSurface
             videoRef={videoRef}
             state={state === "idle" ? "loading" : state}
             error={error}
-            label="HLS"
+            label={hevc ? "HEVC" : "HLS"}
             onRetry={state === "error" ? () => { retry(); onRetry(); } : undefined}
         />
     );

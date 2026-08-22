@@ -34,6 +34,15 @@ export type HLSState =
 export interface UseHLSStreamOptions {
     /** Fully-resolved m3u8 URL (relative to dashboard origin is fine). */
     src: string;
+    /**
+     * Whether `src` serves HEVC/H.265 video. When true we pre-probe the
+     * browser's HEVC decode support and surface a clear error (instead of
+     * letting MSE silently produce black frames) — appropriate for the
+     * native-HEVC passthrough live stream. When false (an H.264 source,
+     * e.g. the transcoded fallback), we skip the probe and let hls.js's
+     * own codec handling decide. Default false.
+     */
+    hevc?: boolean;
 }
 
 export interface UseHLSStreamResult {
@@ -42,6 +51,28 @@ export interface UseHLSStreamResult {
     error: string | null;
     retry: () => void;
     stop: () => void;
+}
+
+/**
+ * canDecodeHEVC — reports whether this browser could plausibly decode
+ * HEVC/H.265 over Media Source Extensions. Used by the live-view player
+ * to pick between the camera's zero-transcode HEVC HLS stream and the
+ * transcoded H.264 fallback.
+ *
+ * MSE and the `<video>` element can disagree on support (Chrome-on-
+ * Windows without the HEVC extension: element reports "", MSE claims
+ * "maybe" and then produces black frames) — so this requires BOTH to
+ * report support, matching the probe inside useHLSStream.
+ */
+export function canDecodeHEVC(): boolean {
+    if (typeof window === "undefined") return false;
+    const v = document.createElement("video");
+    const probe = 'video/mp4; codecs="hvc1.1.6.L153.B0"';
+    const element = v.canPlayType(probe) !== "";
+    const mse = typeof MediaSource !== "undefined"
+        && typeof (MediaSource as any).isTypeSupported === "function"
+        && (MediaSource as any).isTypeSupported(probe);
+    return element && mse;
 }
 
 export function useHLSStream(
@@ -190,57 +221,38 @@ export function useHLSStream(
         };
         document.addEventListener("visibilitychange", onVisibility);
 
-        // Probe HEVC decode support *before* handing off to hls.js.
-        // go2rtc's HLS passthrough ships the camera's native HEVC
-        // (see `CODECS="hvc1..."` in the master playlist) — we have
-        // no transcoder in the pipeline (deploy/go2rtc/Dockerfile
-        // deliberately excludes ffmpeg). If the browser's MSE can't
-        // actually decode the stream, hls.js will happily pull
-        // every segment, feed them to MSE, and the decoder will
-        // silently produce black frames. The `<video>` element
-        // never fires `playing`, the stall watchdog eventually
-        // trips, and the user sees a misleading "HLS stream
-        // stalled" message that points at go2rtc when the actual
-        // problem is the browser.
-        //
-        // `canPlayType` returns "" when the browser has no decoder
-        // for the requested codec. Chrome on Windows additionally
-        // requires the paid "HEVC Video Extensions" plugin from the
-        // Microsoft Store; Firefox and Linux Chrome have no HEVC
-        // support at all. Safari on Apple Silicon decodes HEVC in
-        // hardware. Probe with a realistic codec string — we use
-        // the profile that Hikvision ships (`hvc1.1.6.L153.B0`).
-        //
-        // hls.js doesn't actually use the `<video>` element's
-        // decoder for its own MSE pipeline — it pushes bytes to
-        // `MediaSource` and relies on the browser's MSE decoder.
-        // `video.canPlayType` and `MediaSource.isTypeSupported`
-        // can disagree on Chrome-on-Windows without the HEVC
-        // extension installed: the former returns "" (no element
-        // decoder), but the latter can claim "maybe" and hls.js
-        // will then send bytes that decode to nothing. Probe BOTH
-        // and require both to be non-empty before we attempt
-        // playback; if either says no, surface a clear error.
-        const hevcProbe = 'video/mp4; codecs="hvc1.1.6.L153.B0"';
-        const canPlayHEVC = v.canPlayType(hevcProbe) !== "";
-        const mseSupportsHEVC = typeof MediaSource !== "undefined"
-            && typeof MediaSource.isTypeSupported === "function"
-            && MediaSource.isTypeSupported(hevcProbe);
-        if (!canPlayHEVC || !mseSupportsHEVC) {
-            if (stallTimer !== null) window.clearTimeout(stallTimer);
-            document.removeEventListener("visibilitychange", onVisibility);
-            v.removeEventListener("playing", onPlaying);
-            v.removeEventListener("error", onError);
-            v.removeEventListener("waiting", onWaiting);
-            setState("error");
-            setError(
-                `Browser cannot decode H.265/HEVC over MSE (canPlayType=${canPlayHEVC ? "yes" : "no"}, MSE=${mseSupportsHEVC ? "yes" : "no"}). ` +
-                "The camera streams HEVC and this platform does not include a server-side transcoder. " +
-                "Options: (1) install 'HEVC Video Extensions' from the Microsoft Store (Chrome on Windows), " +
-                "(2) switch to a browser with built-in HEVC support (Safari on Apple Silicon), or " +
-                "(3) swap the camera for an H.264 model.",
-            );
-            return;
+        // Probe HEVC decode support *before* handing off to hls.js —
+        // but ONLY for a genuinely-HEVC source (opts.hevc). The native
+        // passthrough live stream ships HEVC; if the browser's MSE can't
+        // decode it, hls.js will happily pull every segment, feed them
+        // to MSE, and the decoder will silently produce black frames
+        // (the `<video>` never fires `playing`; the stall watchdog trips
+        // and blames go2rtc). Catching that here gives a clear error.
+        // An H.264 source (the transcoded fallback) is universally
+        // decodeable, so we skip the probe and trust hls.js's own
+        // manifestIncompatibleCodecs handling.
+        if (opts.hevc) {
+            const hevcProbe = 'video/mp4; codecs="hvc1.1.6.L153.B0"';
+            const canPlayHEVC = v.canPlayType(hevcProbe) !== "";
+            const mseSupportsHEVC = typeof MediaSource !== "undefined"
+                && typeof MediaSource.isTypeSupported === "function"
+                && MediaSource.isTypeSupported(hevcProbe);
+            if (!canPlayHEVC || !mseSupportsHEVC) {
+                if (stallTimer !== null) window.clearTimeout(stallTimer);
+                document.removeEventListener("visibilitychange", onVisibility);
+                v.removeEventListener("playing", onPlaying);
+                v.removeEventListener("error", onError);
+                v.removeEventListener("waiting", onWaiting);
+                setState("error");
+                setError(
+                    `Browser cannot decode H.265/HEVC over MSE (canPlayType=${canPlayHEVC ? "yes" : "no"}, MSE=${mseSupportsHEVC ? "yes" : "no"}). ` +
+                    "The camera streams HEVC and this platform does not include a server-side transcoder. " +
+                    "Options: (1) install 'HEVC Video Extensions' from the Microsoft Store (Chrome on Windows), " +
+                    "(2) switch to a browser with built-in HEVC support (Safari on Apple Silicon), or " +
+                    "(3) swap the camera for an H.264 model.",
+                );
+                return;
+            }
         }
 
         // Native HLS — legacy Safari / iOS WebView without MSE.

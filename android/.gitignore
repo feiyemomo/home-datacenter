@@ -1,0 +1,4 @@
+# Official signing material must NEVER be committed (security red-line).
+app/keystore.properties
+app/keystore/home-release.jks
+app/**/*.jks

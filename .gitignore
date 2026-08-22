@@ -61,3 +61,5 @@ android/build/
 # Versioned APK binaries live on the NAS (data/releases), not in git.
 android/app-debug-*.apk
 android/app-release-*.apk
+# Release notes are publish artifacts (scp'd to NAS), not tracked in git.
+android/release-notes-v*.txt

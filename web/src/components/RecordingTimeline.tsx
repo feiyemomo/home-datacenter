@@ -17,8 +17,10 @@ import {
     listRecordings,
     getMotionRanges,
     recordingFileUrl,
+    recordingStreamUrl,
     type MotionRange,
 } from "@/api/camera";
+import { mseSupported, startMseStream, type MseStreamHandle } from "@/lib/fmp4Mse";
 import type { CameraRecording } from "@/types";
 
 /**
@@ -43,6 +45,7 @@ import type { CameraRecording } from "@/types";
  */
 
 const DAY_COUNT = 7; // matches Frigate's record.continuous.days retention
+const PAGE_DAYS = 7; // how many extra days each "加载更早" page reveals
 
 /** Format a Date as YYYY-MM-DD (local time). */
 function dayKey(d: Date): string {
@@ -170,15 +173,21 @@ export interface RecordingTimelineProps {
  */
 export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: RecordingTimelineProps) {
     const today = useMemo(() => new Date(), []);
+    // olderPages: number of extra 7-day pages loaded via "加载更早".
+    // The day picker + timeline window grow as the user paginates back
+    // into a camera's history (recordings survive beyond Frigate's 7-day
+    // retention if it was ever closed / its DB not GC'd).
+    const [olderPages, setOlderPages] = useState(0);
     const days = useMemo(() => {
         const arr: Date[] = [];
-        for (let i = 0; i < DAY_COUNT; i++) {
+        const count = DAY_COUNT + olderPages * PAGE_DAYS;
+        for (let i = 0; i < count; i++) {
             const d = new Date(today);
             d.setDate(d.getDate() - i);
             arr.push(d);
         }
         return arr;
-    }, [today]);
+    }, [today, olderPages]);
 
     // Resolve initial day from targetTime if provided.
     const initialDay = useMemo(() => {
@@ -213,6 +222,12 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     const [fetchingId, setFetchingId] = useState<number | null>(null);
     const [playError, setPlayError] = useState<string | null>(null);
     const videoRef = useRef<HTMLVideoElement>(null);
+    // v1.8.48: when true, the recording plays via MediaSource (fMP4 /stream)
+    // with no `src` attribute — the MSE handle feeds the buffer. Direct-URL
+    // playback (videoUrl set) uses the classic /file path. We auto-fallback
+    // to the direct URL if MSE setup errors.
+    const [mseActive, setMseActive] = useState(false);
+    const mseHandleRef = useRef<MseStreamHandle | null>(null);
 
     // Player state.
     const [isPlaying, setIsPlaying] = useState(false);
@@ -245,6 +260,35 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     useEffect(() => {
         void loadRecordings();
     }, [loadRecordings]);
+
+    // Load one more page of history (PAGE_DAYS days before the current
+    // oldest day). Recordings on the NAS can outlive Frigate's 7-day
+    // retention (e.g. retention was changed, or the DB was never GC'd),
+    // so we page back with explicit after/before windows. The backend
+    // defaults to now-7d when both are omitted, so bounds are always
+    // sent on this path. A boundary minute may straddle two windows, so
+    // we drop anything already present before appending.
+    const loadEarlier = useCallback(async () => {
+        setLoadingRecs(true);
+        setRecError(null);
+        try {
+            const oldest = days[days.length - 1];
+            const before = dayStartUnix(oldest);
+            const after = before - PAGE_DAYS * 86_400;
+            const list = await listRecordings(cameraId, after, before);
+            const already = new Set(allRecordings.map((r) => r.id));
+            const fresh = list
+                .filter((r) => r.id < before && !already.has(r.id))
+                .sort((a, b) => a.id - b.id);
+            setOlderPages((p) => p + 1);
+            if (fresh.length > 0) setAllRecordings((prev) => [...prev, ...fresh]);
+            setSelectedDay(oldest);
+        } catch (e) {
+            setRecError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setLoadingRecs(false);
+        }
+    }, [cameraId, days, allRecordings]);
 
     // No blob URL cleanup needed — we use direct URLs now and let
     // the browser manage the HTTP connection.
@@ -363,27 +407,55 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // the <video> element can authenticate without us attaching an
     // Authorization header (which <video> cannot do natively).
     async function playRecording(rec: CameraRecording, seekOffset = 0) {
-        // Stop any current playback. No blob URL to revoke anymore —
-        // we use the raw URL and let the browser manage the connection.
+        // Stop any current playback (also tears down an active MSE stream).
+        mseHandleRef.current?.cleanup();
+        mseHandleRef.current = null;
         setVideoUrl(null);
+        setMseActive(false);
         setActiveRec(null);
         setPlayError(null);
         setFetchingId(rec.id);
 
-        try {
+        // Fallback when MSE is unavailable or fails: play the classic
+        // /file URL, which still delivers a browser-decodable MP4.
+        const fallBackToFile = () => {
+            setMseActive(false);
+            mseHandleRef.current?.cleanup();
+            mseHandleRef.current = null;
             const url = recordingFileUrl(cameraId, rec.id);
             setVideoUrl(url);
             setActiveRec(rec);
-            // Seek to the requested offset once metadata loads.
-            if (seekOffset > 0) {
-                const v = videoRef.current;
-                if (v) {
-                    const onMeta = () => {
-                        v.currentTime = seekOffset;
-                        v.removeEventListener("loadedmetadata", onMeta);
-                    };
-                    v.addEventListener("loadedmetadata", onMeta);
-                }
+            setPlayError(null);
+            seekOnceReady(seekOffset);
+        };
+
+        try {
+            const v = videoRef.current;
+            if (!v) { fallBackToFile(); return; }
+            if (mseSupported()) {
+                const handle = startMseStream(
+                    recordingStreamUrl(cameraId, rec.id),
+                    v,
+                    (msg) => {
+                        // On error fall back to the direct-URL path so
+                        // playback never breaks (reported for visibility).
+                        reportClientError({
+                            level: "info",
+                            context: "recording.mse.fallback",
+                            message: msg,
+                            url: recordingStreamUrl(cameraId, rec.id),
+                        });
+                        setActiveRec((cur) => cur ?? rec);
+                        fallBackToFile();
+                    },
+                );
+                mseHandleRef.current = handle;
+                setMseActive(true);
+                setActiveRec(rec);
+                // v1.8.24 style: let the MSE buffer catch up before seeking.
+                if (seekOffset > 0) seekOnceReady(seekOffset);
+            } else {
+                fallBackToFile();
             }
         } catch (e) {
             setPlayError(e instanceof Error ? e.message : String(e));
@@ -392,7 +464,28 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         }
     }
 
+    // Retry applying a within-minute seek until buffered data supports it
+    // (MSE can't seek into a not-yet-buffered range until the pump fills it).
+    function seekOnceReady(seekOffset: number) {
+        const v = videoRef.current;
+        if (!v || seekOffset <= 0) return;
+        let n = 0;
+        const trySeek = () => {
+            if (n++ > 24) return;
+            if (!v) return;
+            if (v.currentTime >= seekOffset) return;
+            if (v.readyState >= 2) {
+                try { v.currentTime = seekOffset; } catch { /* retry */ }
+            }
+            window.setTimeout(trySeek, 400);
+        };
+        trySeek();
+    }
+
     function stopPlayback() {
+        mseHandleRef.current?.cleanup();
+        mseHandleRef.current = null;
+        setMseActive(false);
         setVideoUrl(null);
         setActiveRec(null);
         setIsPlaying(false);
@@ -571,11 +664,11 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // physical video area. The parent provides the target element.
     const videoSurface = (
         <>
-            {videoUrl && activeRec ? (
+            {(videoUrl || mseActive) && activeRec ? (
                 <>
                     <video
                         ref={videoRef}
-                        src={videoUrl}
+                        src={videoUrl ?? undefined}
                         autoPlay
                         playsInline
                         muted
@@ -801,6 +894,18 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                             </button>
                         );
                     })}
+                    {/* "加载更早" — pages one more 7-day window into the
+                     * retained history and selects its oldest day. */}
+                    <button
+                        type="button"
+                        onClick={() => { stopPlayback(); void loadEarlier(); }}
+                        disabled={loadingRecs}
+                        className="shrink-0 inline-flex items-center gap-1 rounded-lg glass-subtle px-2 py-1 text-[10px] font-medium text-fg-muted hover:text-fg hover:bg-[rgb(var(--bg-subtle)/0.5)] transition-colors disabled:opacity-50"
+                        title="查看更早的录像（如有）"
+                    >
+                        {loadingRecs ? <Loader2 size={10} className="animate-spin" /> : <SkipBack size={10} />}
+                        加载更早
+                    </button>
                 </div>
 
                 {/* 24-hour timeline SeekBar with event ribbon + motion overlay */}
