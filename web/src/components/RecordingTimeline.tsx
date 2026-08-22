@@ -375,6 +375,67 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         [dayMotion],
     );
 
+    // ----- Adjacent-minute prefetch (v1.8.49) -----
+    // The backend transcodes a new 60s bucket on first request and caches
+    // it in .stream-cache only AFTER the minute has fully closed. So a
+    // timeline jump to a fresh minute pays a full cold transcode (~1-2s
+    // to first frame). To make sequential playback feel instant, we
+    // prefetch the neighboring minutes in the background while the user
+    // watches the current one: fetching the /stream URL to completion
+    // forces the backend to transcode + cache-promote that minute, so a
+    // later jump to it is a cache direct-serve (no transcode wait).
+    //
+    // Cost control: prefetches are fire-and-forget with a shared AbortController
+    // and a bounded set of already-touched minute ids, so repeated use of the
+    // same timeline area only warms each minute once per mount. When the user
+    // explicitly switches (playRecording → cleanup), the abort cancels any
+    // in-flight prefetch — the backend sees the disconnect, releases the
+    // transcode slot, and the real request proceeds immediately.
+    const warmedMinutesRef = useRef(new Set<number>());
+    const prefetchCtrlRef = useRef<AbortController | null>(null);
+    const CURRENT_CAM_CAP = 24; // never warm far more of the day than this per camera
+
+    const prefetchMinute = useCallback((recId: number) => {
+        if (!recId || warmedMinutesRef.current.has(recId)) return;
+        if (warmedMinutesRef.current.size >= CURRENT_CAM_CAP) return;
+        warmedMinutesRef.current.add(recId);
+        // Abort any previous prefetch (bounded to one in flight at a time)
+        // so we never stack many concurrent ffmpeg transcodes.
+        prefetchCtrlRef.current?.abort();
+        const ac = new AbortController();
+        prefetchCtrlRef.current = ac;
+        const url = recordingStreamUrl(cameraId, recId);
+        (async () => {
+            try {
+                const resp = await fetch(url, { signal: ac.signal, credentials: "same-origin" });
+                if (!resp.ok || !resp.body) return;
+                // Drain the body fully so the backend transcode runs to
+                // completion and cache-promotes the closed minute. We do not
+                // parse or store the bytes — this is a pure warm request.
+                const reader = resp.body.getReader();
+                for (;;) {
+                    const { done } = await reader.read();
+                    if (done) break;
+                }
+            } catch {
+                // Aborted (user switched) or transient error — non-fatal.
+            } finally {
+                if (prefetchCtrlRef.current === ac) prefetchCtrlRef.current = null;
+            }
+        })();
+    }, [cameraId]);
+
+    // Warm the two neighbors of whatever is being played, plus on teardown
+    // cancel any in-flight prefetch so it doesn't hold a transcode slot.
+    useEffect(() => {
+        if (!activeRec) return;
+        // Prefer the forward neighbor (natural playback direction), then
+        // re-warm the current just in case it wasn't cached.
+        prefetchMinute(activeRec.id + 60);
+        prefetchMinute(activeRec.id - 60);
+        return () => prefetchCtrlRef.current?.abort();
+    }, [activeRec, prefetchMinute]);
+
     // ----- targetTime handling: pick the right day + auto-play -----
     useEffect(() => {
         if (!targetTime || targetTime <= 0) return;
@@ -494,12 +555,24 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     }
 
     // ----- <video> event wiring -----
+    // Throttle timeupdate→setCurrentTime to ~10/s. timeupdate can fire at
+    // a much higher rate while MSE catches up after a seek/switch, and
+    // every setCurrentTime re-renders this tree (portal + controls). An
+    // unthrottled burst is exactly what pegs a tab's main thread and makes
+    // the browser show "页面无响应" when switching recordings.
+    const lastTimeRef = useRef(0);
     useEffect(() => {
         const v = videoRef.current;
         if (!v) return;
+        const nowRef = lastTimeRef;
         const onPlay = () => setIsPlaying(true);
         const onPause = () => setIsPlaying(false);
-        const onTime = () => setCurrentTime(v.currentTime);
+        const onTime = () => {
+            const now = Date.now();
+            if (now - nowRef.current < 100) return;
+            nowRef.current = now;
+            setCurrentTime(v.currentTime);
+        };
         const onDur = () => setDuration(v.duration || 0);
         const onEnd = () => {
             // Auto-advance to the next recording bucket.
