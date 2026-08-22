@@ -197,6 +197,10 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		_ = r.DB.Delete(cam).Error
 		return nil, fmt.Errorf("go2rtc add stream: %w", err)
 	}
+	// Native-HEVC camera gets a second zero-transcode passthrough live
+	// stream (<name>_hevc) so HEVC-capable browsers can skip the J4125
+	// transcode. Best-effort — a failure falls back to H.264.
+	r.addHEVCStream(ctx, cam, in.Username, in.Password)
 
 	// Preheat the go2rtc stream: force an RTSP source connection now
 	// so the operator's first frame doesn't pay the 1-10s cold-start
@@ -210,6 +214,7 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 	preheatCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	r.Go2.Preheat(preheatCtx, cam.StreamName)
+	r.preheatHEVCStream(cam)
 
 	// Push the full config to Frigate so its AI detection and
 	// recording pipelines pick up the new camera. Best-effort:
@@ -303,6 +308,9 @@ func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	slug := r.FrigateSlugUnique(&cam)
 	if cam.StreamName != "" {
 		_ = r.Go2.RemoveStream(ctx, cam.StreamName)
+		// Drop the native-HEVC passthrough companion stream too
+		// (best-effort; a 404 when it never existed is fine).
+		_ = r.Go2.RemoveStream(ctx, hevcStreamName(cam.StreamName))
 	}
 	if err := r.DB.Unscoped().Delete(&cam).Error; err != nil {
 		return err
@@ -515,6 +523,7 @@ func (r *Registry) UpdateCodec(ctx context.Context, id uint, codec string) error
 	if err == nil {
 		rtspURL := r.rtspURL(&cam, user, pass)
 		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
+		r.addHEVCStream(ctx, &cam, user, pass)
 	}
 	return nil
 }
@@ -556,6 +565,7 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 	if err == nil {
 		rtspURL := r.rtspURL(&cam, user, pass)
 		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
+		r.addHEVCStream(ctx, &cam, user, pass)
 	}
 	return nil
 }
@@ -690,6 +700,9 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 			Record: FrigateRecord{Enabled: recEnabled && c.Status != "offline"},
 		})
 		go2rtcStreams[c.StreamName] = go2rtcURL
+		if cameraIsNativeHEVC(&c) {
+			go2rtcStreams[hevcStreamName(c.StreamName)] = r.hevcPassthroughURL(&c, u, p)
+		}
 	}
 	// requires_restart=true when enabling recording so Frigate
 	// starts the recording ffmpeg pipeline. Without a restart the
@@ -1164,6 +1177,14 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 				continue
 			}
 			log.Printf("camera: boot replay: cam %d (%s): stream added", c.ID, c.StreamName)
+			// Native-HEVC camera also re-registers its passthrough
+			// companion stream (<name>_hevc). Best-effort — a failure
+			// just means the front-end uses the transcoded H.264 path.
+			if cameraIsNativeHEVC(&c) {
+				if err := r.Go2.AddStream(ctx, hevcStreamName(c.StreamName), r.hevcPassthroughURL(&c, u, p)); err != nil {
+					log.Printf("camera: boot replay: cam %d (%s): add HEVC stream (non-fatal): %v", c.ID, c.StreamName, err)
+				}
+			}
 			// Preheat each stream so the first user request after a
 			// container restart doesn't pay the cold-start cost. Best-effort,
 			// non-blocking; a slow preheat must not hold up boot replay.
@@ -1172,6 +1193,7 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 				defer cancel()
 				r.Go2.Preheat(pCtx, streamName)
 			}(c.StreamName)
+			r.preheatHEVCStream(&c)
 		}
 
 		// Push WebRTC candidates FIRST, before the full config push.
@@ -1350,6 +1372,9 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		// the existing stream URLs (e.g. /api/stream.m3u8?src=前门)
 		// continue to work.
 		go2rtcStreams[c.StreamName] = go2rtcURL
+		if cameraIsNativeHEVC(&c) {
+			go2rtcStreams[hevcStreamName(c.StreamName)] = r.hevcPassthroughURL(&c, u, p)
+		}
 	}
 	// requires_restart=true is always passed. Frigate's ffmpeg pipeline
 	// only picks up changes to detect.fps, record.enabled, or stream URLs
@@ -1618,6 +1643,75 @@ func effectiveCodec(cam *model.Camera) string {
 	return "passthrough"
 }
 
+// hevcStreamName is the go2rtc stream key of a camera's second,
+// native-HEVC passthrough live stream. The primary stream (keyed by
+// the friendly name) transcodes to H.264 for universal WebRTC/HLS
+// compatibility; this companion stream serves the camera's native
+// HEVC with zero transcoding so HEVC-capable browsers can watch the
+// high-quality source without tying up the J4125 ffmpeg pipeline.
+const hevcStreamSuffix = "_hevc"
+
+func hevcStreamName(name string) string { return name + hevcStreamSuffix }
+
+// cameraIsNativeHEVC reports whether the camera's native video source
+// is HEVC/H.265 — i.e. `effectiveCodec` equals "h264", which is only
+// the case when we transcode the camera's HEVC source to H.264.
+// Native-H.264 cameras keep `passthrough` and are NOT given a HEVC
+// companion stream (their H.264 native stream already plays on every
+// browser; a "HEVC" stream would just duplicate identical H.264).
+func cameraIsNativeHEVC(cam *model.Camera) bool {
+	return effectiveCodec(cam) == "h264"
+}
+
+// hevcPassthroughURL builds the go2rtc source for a camera's native
+// HEVC companion stream. It forces passthrough regardless of the
+// camera's configured servicing codec: the video track is handed
+// through untouched (native HEVC via `rtsp://` scheme, or
+// `#video=copy` when audio must be transcoded to AAC), so the fanout
+// incurs no video transcode cost. Mirrors the passthrough branch of
+// rtspURL.
+func (r *Registry) hevcPassthroughURL(cam *model.Camera, user, pass string) string {
+	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	stopFrag := "#stop=30"
+	if r.StopTimeout > 0 {
+		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
+	}
+	if cameraHasAudio(cam) {
+		return "ffmpeg:" + raw + "#video=copy#audio=aac" + stopFrag
+	}
+	return raw + "#audio=0" + stopFrag
+}
+
+// addHEVCStream best-effort registers a camera's native-HEVC
+// passthrough companion stream (<name>_hevc). No-op for cameras that
+// are not native HEVC. Explicitly non-fatal: a missing passthrough
+// stream just means the front-end falls back to the transcoded H.264
+// path, so a transient go2rtc error must never fail registration or
+// boot replay.
+func (r *Registry) addHEVCStream(ctx context.Context, cam *model.Camera, user, pass string) {
+	if r.Go2 == nil || !cameraIsNativeHEVC(cam) {
+		return
+	}
+	if err := r.Go2.AddStream(ctx, hevcStreamName(cam.StreamName), r.hevcPassthroughURL(cam, user, pass)); err != nil {
+		log.Printf("camera: add HEVC passthrough stream %q (non-fatal): %v", hevcStreamName(cam.StreamName), err)
+	}
+}
+
+// preheatHEVCStream warms a camera's native-HEVC passthrough stream so
+// the first HLS request on it doesn't pay the RTSP cold-start. Fire
+// into a goroutine that owns its own timeout; best-effort.
+func (r *Registry) preheatHEVCStream(cam *model.Camera) {
+	if r.Go2 == nil || !cameraIsNativeHEVC(cam) {
+		return
+	}
+	go func(streamName string) {
+		pCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		r.Go2.Preheat(pCtx, streamName)
+	}(hevcStreamName(cam.StreamName))
+}
+
 // cameraHasAudio reports whether the camera was registered with
 // audio capability. The flag is stored as a generic JSON value in
 // Capabilities, so we tolerate bool / numeric / string forms
@@ -1745,6 +1839,11 @@ type StreamConfig struct {
 	StreamName string `json:"stream_name"`
 	WebRTC     string `json:"webrtc_url"`
 	HLS        string `json:"hls_url"`
+	// HLSHEVC is the HLS URL of the camera's native-HEVC passthrough
+	// companion stream (<name>_hevc). Empty for non-HEVC cameras. When
+	// present, a browser that can decode HEVC can watch this zero-
+	// transcode HLS instead of the transcoded H.264 stream above.
+	HLSHEVC string `json:"hls_hevc_url"`
 }
 
 func (r *Registry) StreamConfig(c *model.Camera) StreamConfig {
@@ -1772,19 +1871,36 @@ func (r *Registry) StreamConfig(c *model.Camera) StreamConfig {
 	// and mpegts.NewConsumer based on the presence of `mp4` in the
 	// query string. The `&mp4=` value matches the upstream "legacy"
 	// media set (H.264+H.265 video, AAC audio).
+	var hevcHLS string
+	if cameraIsNativeHEVC(c) {
+		hevcHLS = "/api/stream.m3u8?src=" + url.QueryEscape(hevcStreamName(c.StreamName)) + "&mp4="
+	}
 	if r.WebRTCURL != "" {
 		base := strings.TrimRight(r.WebRTCURL, "/")
 		return StreamConfig{
 			StreamName: c.StreamName,
 			WebRTC:     base + "/api/webrtc?src=" + enc,
 			HLS:        base + "/api/stream.m3u8?src=" + enc + "&mp4=",
+			HLSHEVC:    pickHEVCHLS(base, hevcHLS),
 		}
 	}
 	return StreamConfig{
 		StreamName: c.StreamName,
 		WebRTC:     r.Go2.WebRTCURL(c.StreamName),
 		HLS:        r.Go2.HLSURL(c.StreamName),
+		HLSHEVC:    pickHEVCHLS(r.Go2.Base, hevcHLS),
 	}
+}
+
+// pickHEVCHLS returns base+hevcPath when hevcPath is non-empty (a
+// native-HEVC camera), else "". Centralizes the "empty means no HEVC
+// companion stream" contract so the public-base and in-network
+// branches stay identical.
+func pickHEVCHLS(base, hevcPath string) string {
+	if hevcPath == "" {
+		return ""
+	}
+	return strings.TrimRight(base, "/") + hevcPath
 }
 
 // itoa is a tiny convenience so callers don't need to import strconv

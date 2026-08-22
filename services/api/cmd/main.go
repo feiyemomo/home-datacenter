@@ -673,6 +673,12 @@ func main() {
 			camGroup.GET(":id/presets/discover", camHandler.ListPresets)
 			camGroup.GET(":id/recordings", camHandler.ListRecordings)
 			camGroup.GET(":id/recordings/:recId/file", camHandler.PlayRecording)
+			// v1.8.48: fMP4 streaming variant for the web MSE player. On a
+			// cache hit it serves the cached fragmented MP4; on a miss it
+			// transcodes on the fly (HEVC→H.264) and streams segments as
+			// the encoder emits them, so the browser's first frame arrives
+			// in ~1-2s instead of after the whole 60s encodes.
+			camGroup.GET(":id/recordings/:recId/stream", camHandler.PlayRecordingStream)
 			// v1.6.0: motion ranges for day-playback SeekBar overlay.
 			// Replaces alerts-as-overlay-source — motion fires on any
 			// pixel-diff activity, alerts only fire on AI detection.

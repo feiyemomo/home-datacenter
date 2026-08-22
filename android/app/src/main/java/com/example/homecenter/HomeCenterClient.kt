@@ -31,6 +31,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
+import kotlinx.serialization.builtins.ListSerializer
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -45,6 +46,7 @@ import retrofit2.http.GET
 import retrofit2.http.Header
 import retrofit2.http.POST
 import retrofit2.http.Path
+import retrofit2.http.Query
 import java.util.concurrent.TimeUnit
 
 private const val TAG = "HomeCenter"
@@ -111,6 +113,52 @@ data class DeviceList(
     @SerialName("devices") val devices: List<Device> = emptyList()
 )
 
+// =====================================================================================
+// 1.5 Camera / recording models (aligned with the web CameraStream / CameraRecording)
+// =====================================================================================
+
+/**
+ * Live-stream URLs for a camera. The controller returns these as *relative*
+ * paths (`/go2rtc/...`) because the deployment proxy (web nginx) fronts both
+ * the /api path (home-api) and the /go2rtc path (Frigate's bundled go2rtc) on
+ * one origin with a JWT `auth_request` gate. Resolve them against
+ * [TokenStore.baseUrl] before playback.
+ */
+@Serializable
+data class CameraStream(
+    @SerialName("stream_name") val streamName: String = "",
+    @SerialName("webrtc_url") val webrtcUrl: String = "",
+    @SerialName("hls_url") val hlsUrl: String = "",
+    // HLS passthrough of the camera's native-HEVC companion stream
+    // (<name>_hevc). Empty for non-HEVC cameras.
+    @SerialName("hls_hevc_url") val hlsHevcUrl: String = ""
+)
+
+@Serializable
+data class Camera(
+    val id: Long = 0,
+    val name: String = "",
+    val type: String = "",
+    val status: String = "offline",   // online / offline / unknown
+    val codec: String = "",            // h264 / hevc / ...
+    val transcode: Boolean = false,
+    val capabilities: JsonElement? = null,
+    val stream: CameraStream? = null
+) {
+    val isOnline: Boolean get() = status == "online"
+}
+
+/** A 60-second recording segment. `id` is the minute-start unix timestamp. */
+@Serializable
+data class CameraRecording(
+    val id: Long = 0,
+    @SerialName("camera_id") val cameraId: Long = 0,
+    @SerialName("start_at") val startAt: String = "",
+    @SerialName("end_at") val endAt: String = "",
+    @SerialName("duration_seconds") val durationSeconds: Long = 60,
+    @SerialName("segment_count") val segmentCount: Int = 0
+)
+
 /**
  * Canonical WebSocket message envelope.
  *   type  "heartbeat" | "event" | "subscribe" | "unsubscribe" | "broadcast" | "online_list" | "error"
@@ -168,6 +216,25 @@ interface HomeCenterApi {
         @Header("Authorization") auth: String,
         @Body report: ClientErrorReport
     ): ApiResponse
+
+    // ---- cameras & recordings (added: video-client upgrade) ------------------
+
+    /** GET /api/v1/cameras — all cameras the caller may view. */
+    @GET("api/v1/cameras")
+    suspend fun listCameras(@Header("Authorization") auth: String): ApiResponse
+
+    /**
+     * GET /api/v1/cameras/{id}/recordings — recording segments, defaulting to
+     * the last 7 days. Pass after/before (unix seconds) to page further back.
+     */
+    @GET("api/v1/cameras/{id}/recordings")
+    suspend fun listRecordings(
+        @Header("Authorization") auth: String,
+        @Path("id") id: Long,
+        @Query("after") after: Long? = null,
+        @Query("before") before: Long? = null,
+        @Query("limit") limit: Long? = null
+    ): ApiResponse
 }
 
 // =====================================================================================
@@ -197,6 +264,29 @@ class HomeCenterRepository(private val api: HomeCenterApi) {
     suspend fun revokeDevice(token: String, deviceId: Long) {
         val resp = api.revokeDevice(bearer(token), deviceId)
         ensureSuccess(resp)
+    }
+
+    /** GET /api/v1/cameras → the cameras the caller may view. */
+    suspend fun listCameras(token: String): List<Camera> {
+        val resp = api.listCameras(bearer(token))
+        ensureSuccess(resp)
+        return resp.decode(ListSerializer(Camera.serializer()))
+    }
+
+    /**
+     * GET /api/v1/cameras/{id}/recordings. Without after/before the server
+     * returns the last 7 days; pass after/before (unix seconds) to page older.
+     */
+    suspend fun listRecordings(
+        token: String,
+        cameraId: Long,
+        after: Long? = null,
+        before: Long? = null,
+        limit: Long? = null
+    ): List<CameraRecording> {
+        val resp = api.listRecordings(bearer(token), cameraId, after, before, limit)
+        ensureSuccess(resp)
+        return resp.decode(ListSerializer(CameraRecording.serializer()))
     }
 
     /** Report a client error. Best-effort: never throws. */
@@ -356,6 +446,12 @@ class HomeCenterWebSocket(
         val request = Request.Builder()
             .url(wsUrl)
             .header("Authorization", "Bearer $token")
+            // The deployment proxy (web nginx /api/v1/ws block) authenticates
+            // the WS handshake via the Sec-WebSocket-Protocol subprotocol
+            // (`bearer.<jwt>`), not the Authorization header (which nginx
+            // discards on upgrade). Adding it is harmless on a direct LAN
+            // connection where the backend reads the header instead.
+            .header("Sec-WebSocket-Protocol", "bearer.$token")
             .build()
 
         webSocket = client.newWebSocket(request, WsListener())

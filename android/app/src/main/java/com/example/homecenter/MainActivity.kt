@@ -63,10 +63,12 @@ class MainActivity : AppCompatActivity() {
         val bindButton = Button(this).apply { text = "绑定并连接" }
         val serviceButton = Button(this).apply { text = "启动后台服务" }
         val stopButton = Button(this).apply { text = "停止后台服务" }
+        val camerasButton = Button(this).apply { text = "摄像头列表 · 直播/录像" }
 
         bindButton.setOnClickListener { bind() }
         serviceButton.setOnClickListener { startService() }
         stopButton.setOnClickListener { stopService() }
+        camerasButton.setOnClickListener { startActivity(android.content.Intent(this, CameraListActivity::class.java)) }
 
         logView = TextView(this).apply {
             textSize = 12f
@@ -77,6 +79,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(userIdInput)
         root.addView(accessKeyInput)
         root.addView(bindButton)
+        root.addView(camerasButton)
         root.addView(serviceButton)
         root.addView(stopButton)
         root.addView(ScrollView(this).apply {

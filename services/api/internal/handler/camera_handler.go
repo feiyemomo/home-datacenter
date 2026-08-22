@@ -534,8 +534,25 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// v1.8.47: honor optional before/after (unix seconds) so the client
+	// can fetch recordings older than the default 7-day window (e.g. a
+	// camera's history before it went offline). Defaults match Frigate's
+	// record.continuous.days=7 retention: now-7d .. now.
 	after := time.Now().AddDate(0, 0, -7).Unix()
 	before := time.Now().Unix()
+	if s := strings.TrimSpace(c.Query("after")); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			after = v
+		}
+	}
+	if s := strings.TrimSpace(c.Query("before")); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			before = v
+		}
+	}
+	if before < after {
+		before, after = after, before
+	}
 	buckets, err := h.Reg.ListRecordingMinutesFromDisk(cam, after, before)
 	if err != nil {
 		log.Printf("[handler] failed to list recordings: %v", err)
@@ -1009,6 +1026,209 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	// v1.8.25: result is cached on disk so re-plays of the same minute
 	// are instant (see transcodeRecording).
 	h.transcodeRecording(c, cam, minuteStart, paths)
+}
+
+// PlayRecordingStream — GET /api/v1/cameras/:id/recordings/:recId/stream
+//
+// fMP4 streaming variant of PlayRecording for the web MediaSource player.
+// Unlike /file (which encodes the whole 60s to a faststart MP4, copies it
+// to the cache volume, THEN sends it — first frame waits for the full
+// transcode, typically ~5s cold on a HEVC source), this endpoint streams
+// fragmented MP4 segments to the client as the encoder emits them, so the
+// browser's first frame arrives in ~1-2s.
+//
+// Cache: reuse .stream-cache/<camID>/<minuteStart>.fmp4 when present
+// (serve directly, Range works). On a miss we transcode on the fly and
+// TEE stdout to both the response and a temp file; for a closed minute we
+// promote the temp to the cache so the next replay is instant. The init
+// segment (ftyp+moov) is written at the very start (empty_moov), which is
+// exactly what the MSE client needs to set up its SourceBuffer.
+func (h *CameraHandler) PlayRecordingStream(c *gin.Context) {
+	if rc := http.NewResponseController(c.Writer); rc != nil {
+		if err := rc.SetWriteDeadline(time.Now().Add(120 * time.Second)); err != nil {
+			log.Printf("[handler] PlayRecordingStream: set write deadline: %v", err)
+		}
+	}
+	cam, ok := h.requireCanRead(c)
+	if !ok {
+		return
+	}
+	minuteStart, err := strconv.ParseInt(c.Param("recId"), 10, 64)
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid recId (expected unix timestamp)")
+		return
+	}
+	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
+	if err != nil || len(paths) == 0 {
+		utils.Fail(c, http.StatusNotFound, "no recording segments found in this minute")
+		return
+	}
+	h.streamRecording(c, cam, minuteStart, paths)
+}
+
+func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minuteStart int64, paths []string) {
+	cacheDir := fmt.Sprintf("/data/recordings/.stream-cache/%d", cam.ID)
+	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d.fmp4", minuteStart))
+	// Cache hit: serve the fragmented MP4 directly (http.ServeFile gives
+	// Content-Length + Range, which the MSE client tolerates fine).
+	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {
+		c.Header("Cache-Control", "no-store")
+		http.ServeFile(c.Writer, c.Request, cacheFile)
+		return
+	}
+
+	// Build the ffmpeg concat list for the 60s minute.
+	tmpDir, err := os.MkdirTemp("", "stream_")
+	if err != nil {
+		log.Printf("[handler] create temp dir: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "create temp dir")
+		return
+	}
+	defer os.RemoveAll(tmpDir)
+	var listBuilder strings.Builder
+	for _, p := range paths {
+		escaped := strings.ReplaceAll(p, "'", "'\\''")
+		listBuilder.WriteString(fmt.Sprintf("file '%s'\n", escaped))
+	}
+	listPath := filepath.Join(tmpDir, "list.txt")
+	if err := os.WriteFile(listPath, []byte(listBuilder.String()), 0o644); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "write concat list")
+		return
+	}
+
+	// One transcode slot (see transcodeSem notes in transcodeRecording).
+	h.transcodeSem <- struct{}{}
+	releaseSem := func() {
+		select {
+		case <-h.transcodeSem:
+		default:
+		}
+	}
+	defer releaseSem()
+
+	cmd := buildFMP4Cmd(listPath, vaapiAvailable())
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "pipe ffmpeg")
+		return
+	}
+	cmd.Stderr = nil // discard progress; errors surface via exit status
+
+	// Tee encoder output to the temp file for cache promotion.
+	tmpOut := filepath.Join(tmpDir, fmt.Sprintf("%d.fmp4", minuteStart))
+	outF, err := os.Create(tmpOut)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "create output")
+		return
+	}
+	defer outF.Close()
+
+	if err := cmd.Start(); err != nil {
+		log.Printf("[handler] start ffmpeg stream: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "start ffmpeg")
+		return
+	}
+
+	// Commit the response with no Content-Length → chunked transfer.
+	c.Header("Cache-Control", "no-store")
+	c.Header("Content-Type", "video/mp4")
+	c.Status(http.StatusOK)
+
+	flusher, _ := c.Writer.(http.Flusher)
+	ctxDone := c.Request.Context().Done()
+	buf := make([]byte, 32*1024)
+	writeErr := error(nil)
+	for {
+		n, rerr := stdout.Read(buf)
+		if n > 0 {
+			if _, werr := c.Writer.Write(buf[:n]); werr != nil {
+				writeErr = werr
+				break
+			}
+			if _, werr := outF.Write(buf[:n]); werr != nil {
+				writeErr = werr
+				break
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			writeErr = rerr
+			break
+		}
+		if ctxDone != nil {
+			select {
+			case <-ctxDone:
+				writeErr = fmt.Errorf("client disconnected")
+			default:
+			}
+			if writeErr != nil {
+				break
+			}
+		}
+	}
+
+	// If the client left (or the write failed), stop the encoder so we
+	// don't hold the transcode slot for a partial 60s we'll never send.
+	if writeErr != nil {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+		log.Printf("[handler] streamRecording aborted: %v", writeErr)
+		return
+	}
+	if err := cmd.Wait(); err != nil {
+		log.Printf("[handler] streamRecording ffmpeg: %v", err)
+		return
+	}
+
+	// Cache only closed minutes (see transcodeRecording). tmpOut is
+	// complete here (client consumed the whole stream), so promotion is
+	// safe and makes the next replay instant.
+	if time.Now().Unix()-minuteStart > 90 {
+		if err := os.MkdirAll(cacheDir, 0o755); err == nil {
+			if cerr := copyToCache(tmpOut, cacheFile); cerr != nil {
+				log.Printf("[handler] streamRecording cache promote failed: %v", cerr)
+			}
+		}
+	}
+}
+
+// buildFMP4Cmd returns the ffmpeg command that concatenates the segments
+// in listPath and emits a fragmented MP4 (H.264/AAC) to stdout, so the
+// handler can stream segments as they're encoded. empty_moov puts the
+// init segment (ftyp+moov) at the very front; frag_keyframe emits one
+// fragment per keyframe so the client's MediaSource gets contiguous
+// playable chunks immediately. hw uses the VAAPI hardware pipeline.
+func buildFMP4Cmd(listPath string, hw bool) *exec.Cmd {
+	if hw {
+		return exec.Command("ffmpeg", "-y",
+			"-vaapi_device", "/dev/dri/renderD128",
+			"-hwaccel", "vaapi",
+			"-hwaccel_output_format", "vaapi",
+			"-f", "concat", "-safe", "0",
+			"-i", listPath,
+			"-vf", "scale_vaapi=w=min(1280\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease",
+			"-c:v", "h264_vaapi", "-qp", "24",
+			"-c:a", "aac", "-b:a", "96k",
+			"-f", "mp4",
+			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+			"pipe:1")
+	}
+	return exec.Command("ffmpeg", "-y",
+		"-f", "concat", "-safe", "0",
+		"-i", listPath,
+		"-vf", "scale=min(1280\\,iw):min(720\\,ih):force_original_aspect_ratio=decrease",
+		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+		"-c:a", "aac", "-b:a", "96k",
+		"-f", "mp4",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"pipe:1")
 }
 
 // transcodeRecording concatenates the given recording segments into a

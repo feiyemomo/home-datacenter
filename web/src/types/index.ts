@@ -222,6 +222,13 @@ export interface CameraStream {
     stream_name: string;
     webrtc_url: string;
     hls_url: string;
+    /**
+     * HLS URL of the camera's native-HEVC passthrough live stream
+     * (<name>_hevc). Empty for non-HEVC cameras. When present AND the
+     * browser can decode HEVC, the live player prefers this zero-
+     * transcode stream over the transcoded H.264 `hls_url` / WebRTC.
+     */
+    hls_hevc_url?: string;
 }
 
 /** Per-segment recording metadata. */

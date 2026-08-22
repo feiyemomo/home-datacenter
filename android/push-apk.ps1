@@ -26,7 +26,11 @@ param(
     [switch]$DryRun,
     [switch]$BuildOnly,   # build + version-rename locally, but do NOT push to NAS
     # NAS password; when set, uses SSH_ASKPASS to feed it non-interactively.
-    [string]$Password
+    [string]$Password,
+    # Build flavor to push: "debug" (default) or "release" (official keystore
+    # signed). Release chooses app-release.apk, assembles via assembleRelease.
+    [ValidateSet("debug", "release")]
+    [string]$Flavor = "debug"
 )
 
 $ErrorActionPreference = "Stop"
@@ -72,22 +76,23 @@ Write-Step "Version: $versionName (versionCode $versionCode)"
 
 # --- build -------------------------------------------------------------------
 if (-not $DryRun) {
-    Write-Step "==> Building debug APK (gradlew.bat assembleDebug)"
-    & "$AndroidDir\gradlew.bat" assembleDebug --console=plain
+    $buildTask = if ($Flavor -eq "release") { "assembleRelease" } else { "assembleDebug" }
+    Write-Step "==> Building ${Flavor} APK (gradlew.bat $buildTask)"
+    & "$AndroidDir\gradlew.bat" $buildTask --console=plain
     if ($LASTEXITCODE -ne 0) {
         Write-Err "ERROR: Gradle build failed (exit $LASTEXITCODE)."
         exit 1
     }
 }
 
-$srcApk  = Join-Path $AndroidDir "app\build\outputs\apk\debug\app-debug.apk"
+$srcApk  = Join-Path $AndroidDir "app\build\outputs\apk\$Flavor\app-$Flavor.apk"
 if (-not (Test-Path $srcApk)) {
     Write-Err "ERROR: build output not found: $srcApk"
     exit 1
 }
 
 # --- versioned rename ---------------------------------------------------------
-$versionedApk   = Join-Path $AndroidDir "app-debug-v$versionName.apk"
+$versionedApk   = Join-Path $AndroidDir "app-$Flavor-v$versionName.apk"
 $versionedNotes = Join-Path $AndroidDir "release-notes-v$versionName.txt"
 
 if (-not $DryRun) {
@@ -142,5 +147,5 @@ finally {
     }
 }
 
-Write-Ok "==> Pushed app-debug-v$versionName.apk to NAS."
+Write-Ok "==> Pushed app-$Flavor-v$versionName.apk to NAS."
 if ($Notes) { Write-Ok "==> Pushed release-notes-v$versionName.txt to NAS." }

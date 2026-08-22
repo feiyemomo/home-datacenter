@@ -38,6 +38,19 @@ class TokenStore(context: Context) {
         prefs.edit().clear().apply()
     }
 
+    /**
+     * The controller returns camera stream URLs as *relative* paths
+     * (`/go2rtc/api/stream.m3u8?...`). Resolve them against [baseUrl] (which
+     * must point at the web-nginx origin that fronts both /api/ and /go2rtc/)
+     * to get an absolute URL ExoPlayer / OkHttp can open.
+     */
+    fun resolveAbsolute(raw: String): String {
+        if (raw.isEmpty()) return ""
+        if (raw.startsWith("http://") || raw.startsWith("https://")) return raw
+        val base = baseUrl.trimEnd('/')
+        return base + (if (raw.startsWith("/")) raw else "/$raw")
+    }
+
     companion object {
         private const val PREFS_NAME = "home_datacenter"
         private const val KEY_TOKEN = "jwt"

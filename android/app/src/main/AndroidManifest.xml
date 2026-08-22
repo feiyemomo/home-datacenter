@@ -26,6 +26,14 @@
             </intent-filter>
         </activity>
 
+        <!-- Video client screens. -->
+        <activity android:name=".CameraListActivity" android:exported="false" />
+        <activity android:name=".LiveActivity" android:exported="false"
+            android:screenOrientation="fullUser" />
+        <activity android:name=".RecordingsActivity" android:exported="false" />
+        <activity android:name=".PlaybackActivity" android:exported="false"
+            android:screenOrientation="fullUser" />
+
         <!-- Background realtime channel. mergedMode only matters on API 33+;
              foregroundServiceType matches the manifest permission above. -->
         <service
