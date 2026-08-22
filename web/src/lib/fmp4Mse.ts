@@ -130,6 +130,21 @@ export interface MseStreamHandle {
 const FB_CODEC = "avc1.640028,mp4a.40.2";
 
 /**
+ * Upper bound on bytes in flight between the fetch reader and the append
+ * pump. The /stream endpoint emits the whole 60s clip; without a cap we
+ * read it at socket speed and shovel every byte into SourceBuffer
+ * continuously, which balloons the JS/MSE heap and saturates the main
+ * thread (the tab shows "页面无响应" while switching recordings). Keeping
+ * this modest bounds memory and lets the decoder keep pace.
+ */
+const MAX_INFLIGHT_BYTES = 8 * 1024 * 1024;
+
+/** Microtask/event-loop yield so heavy loop iterations don't block paint. */
+function sleep(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
  * Stream a fragmented MP4 into `video` via MediaSource.
  *
  * Reads the init segment from the head of the stream, derives the codec
@@ -219,38 +234,62 @@ export function startMseStream(
             return;
         }
 
-        // Sequential append pump.
+        // Sequential append pump. Yields to the event loop after each
+        // fragment so the browser can demux/decode/paint incrementally
+        // instead of running appendBuffer back-to-back on the main thread.
         const queue: Uint8Array[] = [];
+        let queuedBytes = 0;
         let flushing = false;
         let ended = false;
         const drain = async () => {
             if (flushing || !activeSb) return;
             flushing = true;
-            while (queue.length && !aborted) {
-                const chunk = queue.shift()!;
-                await appendOnce(activeSb!, chunk);
+            try {
+                while (queue.length && !aborted) {
+                    const chunk = queue.shift()!;
+                    queuedBytes -= chunk.byteLength;
+                    await appendOnce(activeSb, chunk);
+                    await sleep(0);
+                }
+            } finally {
+                flushing = false;
             }
-            flushing = false;
             if (ended && queue.length === 0 && activeSb && activeSb.updating === false) {
                 try { (ms as any).endOfStream(); } catch { /* already ended */ }
             }
         };
-        if (rest.length) { queue.push(rest); rest = new Uint8Array(0); }
+        if (rest.length) { queue.push(rest); queuedBytes += rest.byteLength; rest = new Uint8Array(0); }
         void drain();
 
+        let readErr: unknown = null;
         try {
             for (;;) {
                 const { done, value } = await reader.read();
                 if (done) break;
                 queue.push(value);
+                queuedBytes += value.byteLength;
                 void drain();
+                // Backpressure: pause the network read until the append pump
+                // has digested most of what's already buffered. Without this
+                // the whole clip is pulled at socket speed and appended
+                // without pause (heap bloat + main-thread saturation → page
+                // unresponsive when switching recordings).
+                while (queuedBytes > MAX_INFLIGHT_BYTES && !aborted) {
+                    await sleep(16);
+                }
             }
         } catch (e) {
-            if (!aborted) onError(mseMessage(e));
-            return;
+            readErr = e;
         }
         if (aborted) return;
+        if (readErr) {
+            onError(mseMessage(readErr));
+            return;
+        }
+        // Drain the tail, then signal end-of-stream so playback reaches
+        // the clip's true end instead of a mid-buffer stall.
         ended = true;
+        while (queue.length && !aborted) await sleep(16);
         void drain();
     })().catch((e) => {
         if (!aborted) onError(mseMessage(e));
