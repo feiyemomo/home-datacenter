@@ -228,6 +228,11 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // to the direct URL if MSE setup errors.
     const [mseActive, setMseActive] = useState(false);
     const mseHandleRef = useRef<MseStreamHandle | null>(null);
+    const switchingPlaybackRef = useRef(false);
+    const pendingSeekRef = useRef(0);
+    // Every switch gets a generation. Async MSE/fallback callbacks from an
+    // older recording must not overwrite the state of the newly selected one.
+    const playbackGenerationRef = useRef(0);
 
     // Player state.
     const [isPlaying, setIsPlaying] = useState(false);
@@ -407,6 +412,8 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     // the <video> element can authenticate without us attaching an
     // Authorization header (which <video> cannot do natively).
     async function playRecording(rec: CameraRecording, seekOffset = 0) {
+        const generation = ++playbackGenerationRef.current;
+        switchingPlaybackRef.current = true;
         // Stop any current playback (also tears down an active MSE stream).
         mseHandleRef.current?.cleanup();
         mseHandleRef.current = null;
@@ -419,6 +426,8 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         // Fallback when MSE is unavailable or fails: play the classic
         // /file URL, which still delivers a browser-decodable MP4.
         const fallBackToFile = () => {
+            if (playbackGenerationRef.current !== generation) return;
+            pendingSeekRef.current = Math.max(0, seekOffset);
             setMseActive(false);
             mseHandleRef.current?.cleanup();
             mseHandleRef.current = null;
@@ -426,17 +435,31 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
             setVideoUrl(url);
             setActiveRec(rec);
             setPlayError(null);
-            seekOnceReady(seekOffset);
         };
 
         try {
-            const v = videoRef.current;
+            // Cold start: the portaled <video> is not mounted yet (activeRec
+            // was null — first clip after loading a day, or after a day switch
+            // / stopPlayback). Previously "no element" forced the slow /file
+            // path, which finishes a whole-clip faststart transcode before
+            // sending a byte (~4-7s TTFB measured) — while MSE /stream streams
+            // fMP4 progressively and is ready in ~0.2s. When MSE is available
+            // we now mount the surface (below) and start the stream on it;
+            // /file remains the fallback only for non-MSE browsers or if the
+            // element never arrives.
+            let v = videoRef.current;
+            if (!v && mseSupported()) {
+                setMseActive(true);
+                setActiveRec(rec);
+                v = await waitForVideoEl(generation);
+            }
             if (!v) { fallBackToFile(); return; }
             if (mseSupported()) {
                 const handle = startMseStream(
                     recordingStreamUrl(cameraId, rec.id),
                     v,
                     (msg) => {
+                        if (playbackGenerationRef.current !== generation) return;
                         // On error fall back to the direct-URL path so
                         // playback never breaks (reported for visibility).
                         reportClientError({
@@ -450,39 +473,76 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                     },
                 );
                 mseHandleRef.current = handle;
+                if (playbackGenerationRef.current !== generation) {
+                    handle.cleanup();
+                    return;
+                }
                 setMseActive(true);
                 setActiveRec(rec);
-                // v1.8.24 style: let the MSE buffer catch up before seeking.
-                if (seekOffset > 0) seekOnceReady(seekOffset);
+                // v1.8.24 style: let the MSE buffer catch up before seeking,
+                // then make sure the (reused, same-day) element resumes.
+                seekOnceReady(seekOffset);
             } else {
                 fallBackToFile();
             }
         } catch (e) {
-            setPlayError(e instanceof Error ? e.message : String(e));
+            if (playbackGenerationRef.current === generation) {
+                setPlayError(e instanceof Error ? e.message : String(e));
+            }
         } finally {
-            setFetchingId(null);
+            if (playbackGenerationRef.current === generation) setFetchingId(null);
+            if (playbackGenerationRef.current === generation) switchingPlaybackRef.current = false;
         }
+    }
+
+    // After mounting the surface (see the cold-start branch in playRecording),
+    // React attaches the <video> ref during the commit. Resolve with the
+    // element once it is available, or null if the generation moved on or it
+    // took too long (the caller then falls back to /file).
+    function waitForVideoEl(generation: number): Promise<HTMLVideoElement | null> {
+        return new Promise((resolve) => {
+            let tries = 0;
+            const tick = () => {
+                if (playbackGenerationRef.current !== generation) return resolve(null);
+                const el = videoRef.current;
+                if (el) return resolve(el);
+                if (++tries > 60) return resolve(null); // ~1.5s cap
+                window.setTimeout(tick, 25);
+            };
+            tick();
+        });
     }
 
     // Retry applying a within-minute seek until buffered data supports it
     // (MSE can't seek into a not-yet-buffered range until the pump fills it).
     function seekOnceReady(seekOffset: number) {
         const v = videoRef.current;
-        if (!v || seekOffset <= 0) return;
+        if (!v) return;
         let n = 0;
         const trySeek = () => {
             if (n++ > 24) return;
             if (!v) return;
-            if (v.currentTime >= seekOffset) return;
-            if (v.readyState >= 2) {
-                try { v.currentTime = seekOffset; } catch { /* retry */ }
+            // Wait until a frame is buffered before seeking/playing (MSE can't
+            // seek into a not-yet-buffered range until the pump fills it).
+            if (v.readyState < 2) {
+                window.setTimeout(trySeek, 400);
+                return;
             }
-            window.setTimeout(trySeek, 400);
+            // Apply the in-minute offset (if any), then make sure the reused
+            // element actually resumes — startMseStream runs asynchronously and
+            // the portaled <video> is shared across a same-day switch, so it
+            // does not reliably resume on its own.
+            if (seekOffset > 0 && v.currentTime < seekOffset) {
+                try { v.currentTime = seekOffset; } catch { /* continue */ }
+            }
+            v.play().catch(() => undefined);
         };
         trySeek();
     }
 
     function stopPlayback() {
+        playbackGenerationRef.current += 1;
+        switchingPlaybackRef.current = true;
         mseHandleRef.current?.cleanup();
         mseHandleRef.current = null;
         setMseActive(false);
@@ -491,7 +551,51 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         setIsPlaying(false);
         setCurrentTime(0);
         setDuration(0);
+        switchingPlaybackRef.current = false;
     }
+
+    // Do not leave a fetch reader, SourceBuffer, or object URL alive when the
+    // playback panel is removed (for example when returning to live view).
+    useEffect(() => () => {
+        playbackGenerationRef.current += 1;
+        mseHandleRef.current?.cleanup();
+        mseHandleRef.current = null;
+    }, []);
+
+    // A same-day switch reuses the portaled <video> node. Explicitly restart
+    // the native media load after the new URL is rendered, then apply the
+    // requested in-minute offset only after metadata exists. Without this,
+    // the seek can target the previous file and leave the new clip black or
+    // paused until the selected day changes and remounts the panel.
+    //
+    // MSE path (mseActive): the SourceBuffer pump in fmp4Mse.ts owns the
+    // resource — startMseStream assigns a fresh object URL and appends media
+    // progressively, so the reused element restarts on its own. Calling
+    // v.load() here re-runs the media load algorithm against the MSE source
+    // and forces a full reset that the stream must recover from (exactly the
+    // reset the cleanup() comment in fmp4Mse.ts was changed to avoid); on a
+    // same-day switch this is what leaves the new clip black until the selected
+    // day changes and remounts the panel. So we bail for MSE and let the pump
+    // (autoplay + seekOnceReady) resume playback, and only force a reload for
+    // the direct-URL path, which needs it to apply the in-minute seek.
+    useEffect(() => {
+        const v = videoRef.current;
+        if (!v) return;
+        if (mseActive) return; // MSE pump owns loading + playback
+        if (!videoUrl) return; // direct-URL path only
+        const seekAndPlay = () => {
+            const offset = pendingSeekRef.current;
+            if (offset > 0 && Number.isFinite(v.duration)) {
+                try { v.currentTime = Math.min(offset, Math.max(0, v.duration - 0.05)); } catch { /* retry below */ }
+            }
+            pendingSeekRef.current = 0;
+            v.play().catch(() => undefined);
+        };
+        v.addEventListener("loadedmetadata", seekAndPlay, { once: true });
+        v.load();
+        if (v.readyState >= 1) seekAndPlay();
+        return () => v.removeEventListener("loadedmetadata", seekAndPlay);
+    }, [videoUrl, mseActive, activeRec?.id]);
 
     // ----- <video> event wiring -----
     useEffect(() => {
@@ -499,7 +603,18 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
         if (!v) return;
         const onPlay = () => setIsPlaying(true);
         const onPause = () => setIsPlaying(false);
-        const onTime = () => setCurrentTime(v.currentTime);
+        // Throttle timeupdate→setCurrentTime to ~10/s. timeupdate fires at a
+        // much higher rate while MSE catches up right after a seek/switch,
+        // and every setCurrentTime re-renders this whole tree. An unthrottled
+        // burst is exactly what saturates the main thread and makes switching
+        // recordings feel like a freeze.
+        let lastTime = 0;
+        const onTime = () => {
+            const now = Date.now();
+            if (now - lastTime < 100) return;
+            lastTime = now;
+            setCurrentTime(v.currentTime);
+        };
         const onDur = () => setDuration(v.duration || 0);
         const onEnd = () => {
             // Auto-advance to the next recording bucket.
@@ -659,6 +774,73 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
     const aiEventCount = mergedMotion.filter((r) => r.peak_objects > 0).length;
     const motionEventCount = mergedMotion.length - aiEventCount;
 
+    // ----- Memoized heavy sub-trees -----
+    // setCurrentTime fires ~10/s while a recording plays (MSE catch-up peaks
+    // much higher), and every update re-renders this whole component. The
+    // 24h timeline (1440 minute-buckets) and the event ribbon are the two
+    // most expensive parts, and depend on NOTHING that changes per-frame
+    // (currentTime/duration/play state). Memoizing them as stable element
+    // references stops React from reconciling ~1440+ child nodes on every
+    // frame — the dominant main-thread cost that made switching recordings
+    // feel like the page had frozen.
+    const bucketTimelineEl = useMemo(() => (
+        <div className="absolute inset-0">
+            {minuteBuckets.map((b, i) => (
+                <div
+                    key={b.startUnix}
+                    className="absolute top-0 bottom-0"
+                    style={{
+                        left: `${(i / 1440) * 100}%`,
+                        width: `${(1 / 1440) * 100}%`,
+                    }}
+                >
+                    {b.hasRec && (
+                        <div className="absolute inset-0 bg-[rgb(var(--accent-primary)/0.35)]" />
+                    )}
+                </div>
+            ))}
+        </div>
+    ), [minuteBuckets]);
+
+    const eventRibbonEl = useMemo(() => (
+        <div className="relative h-6 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
+            {dayMotion.length === 0 ? (
+                <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/40">
+                    无活动事件
+                </div>
+            ) : (
+                <>
+                    {mergedMotion.map((r, i) => {
+                        const rawStartFrac = (r.start - dayStart) / 86_400;
+                        const rawEndFrac = (r.start + r.duration - dayStart) / 86_400;
+                        const startFrac = Math.max(0, Math.min(1, rawStartFrac));
+                        const endFrac = Math.max(0, Math.min(1, rawEndFrac));
+                        if (endFrac <= startFrac) return null;
+                        const hasAI = r.peak_objects > 0;
+                        return (
+                            <button
+                                key={`${r.start}-${i}`}
+                                type="button"
+                                onClick={() => handleMarkerClick(r.start)}
+                                className={cn(
+                                    "absolute top-1/2 -translate-y-1/2 rounded-full transition-all hover:brightness-125 hover:z-30 cursor-pointer",
+                                    hasAI
+                                        ? "h-3 bg-red-500 shadow-sm shadow-red-500/60 hover:scale-y-110 z-20"
+                                        : "h-1.5 bg-amber-500/50 hover:bg-amber-500/70 z-10",
+                                )}
+                                style={{
+                                    left: `${startFrac * 100}%`,
+                                    width: `${Math.max(0.15, (endFrac - startFrac) * 100)}%`,
+                                }}
+                                title={`${hasAI ? "人员活动" : "画面变动"} · ${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}（点击跳转）`}
+                            />
+                        );
+                    })}
+                </>
+            )}
+        </div>
+    ), [dayMotion, mergedMotion, dayStart, handleMarkerClick]);
+
     // ----- Video surface (portaled into LiveVideo's main video area) -----
     // Rendered via createPortal so live and playback share the same
     // physical video area. The parent provides the target element.
@@ -681,6 +863,11 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                             // video element errors (network/decode/src).
                             // Most common causes: JWT cookie missing,
                             // backend 404, or HEVC decode failure.
+                            // During an MSE -> /file fallback, cleanup removes
+                            // the old blob source before React binds the new
+                            // URL. Browsers may emit a transient error for
+                            // that empty source; it is not a playback failure.
+                            if (switchingPlaybackRef.current || (!videoUrl && mseActive)) return;
                             const el = videoRef.current;
                             const code = el?.error?.code;
                             const detail = el?.error?.message;
@@ -946,42 +1133,7 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                      *   - Container grew h-4 → h-6 to fit the taller AI bars
                      *     with vertical breathing room for the glow + hover scale.
                      */}
-                    <div className="relative h-6 w-full overflow-hidden rounded-md bg-slate-900 ring-1 ring-inset ring-white/10">
-                        {dayMotion.length === 0 ? (
-                            <div className="absolute inset-0 flex items-center justify-center text-[10px] text-white/40">
-                                无活动事件
-                            </div>
-                        ) : (
-                            <>
-                                {mergedMotion.map((r, i) => {
-                                    const rawStartFrac = (r.start - dayStart) / 86_400;
-                                    const rawEndFrac = (r.start + r.duration - dayStart) / 86_400;
-                                    const startFrac = Math.max(0, Math.min(1, rawStartFrac));
-                                    const endFrac = Math.max(0, Math.min(1, rawEndFrac));
-                                    if (endFrac <= startFrac) return null;
-                                    const hasAI = r.peak_objects > 0;
-                                    return (
-                                        <button
-                                            key={`${r.start}-${i}`}
-                                            type="button"
-                                            onClick={() => handleMarkerClick(r.start)}
-                                            className={cn(
-                                                "absolute top-1/2 -translate-y-1/2 rounded-full transition-all hover:brightness-125 hover:z-30 cursor-pointer",
-                                                hasAI
-                                                    ? "h-3 bg-red-500 shadow-sm shadow-red-500/60 hover:scale-y-110 z-20"
-                                                    : "h-1.5 bg-amber-500/50 hover:bg-amber-500/70 z-10",
-                                            )}
-                                            style={{
-                                                left: `${startFrac * 100}%`,
-                                                width: `${Math.max(0.15, (endFrac - startFrac) * 100)}%`,
-                                            }}
-                                            title={`${hasAI ? "人员活动" : "画面变动"} · ${formatHMS(r.start)} · 时长 ${formatDuration(r.duration)} · 强度 ${r.motion_score} · ${r.segment_count} 段${hasAI ? ` · ${r.peak_objects} 个目标` : ""}（点击跳转）`}
-                                        />
-                                    );
-                                })}
-                            </>
-                        )}
-                    </div>
+                    {eventRibbonEl}
 
                     {/* SeekBar */}
                     <div
@@ -1005,23 +1157,10 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                          * (0.5px → 1px on non-Retina screens) caused 1440
                          * buckets to overflow the container, making 591 minutes
                          * of recordings visually fill ~100% of the 24h bar
-                         * instead of the correct ~41%. */}
-                        <div className="absolute inset-0">
-                            {minuteBuckets.map((b, i) => (
-                                <div
-                                    key={b.startUnix}
-                                    className="absolute top-0 bottom-0"
-                                    style={{
-                                        left: `${(i / 1440) * 100}%`,
-                                        width: `${(1 / 1440) * 100}%`,
-                                    }}
-                                >
-                                    {b.hasRec && (
-                                        <div className="absolute inset-0 bg-[rgb(var(--accent-primary)/0.35)]" />
-                                    )}
-                                </div>
-                            ))}
-                        </div>
+                         * instead of the correct ~41%. The bucket surface itself
+                         * is memoized (bucketTimelineEl) so the ~1440 nodes are
+                         * not re-reconciled on every timeupdate. */}
+                        {bucketTimelineEl}
                         {/* Playhead */}
                         {playheadFraction !== null && playheadFraction >= 0 && playheadFraction <= 1 && (
                             <div

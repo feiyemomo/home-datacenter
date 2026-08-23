@@ -41,8 +41,15 @@ function findMoovEnd(buf: Uint8Array): number {
             size = Number(dv.getBigUint64(0, false));
         }
         if (type === "moov") return pos + header + (size - header);
-        pos += header + (size - header);
-        if (pos <= 0) break; // safety: no progress
+        // size === 0 means "box extends to end of file"; we cannot safely
+        // skip forward without knowing its bounds, so stop scanning. Without
+        // this guard, pos never advances and the loop spins forever, freezing
+        // the tab (this is exactly the "页面无响应" reported on recording
+        // switches if a producer emits a size-0/legacy top-level box).
+        if (size === 0) break;
+        const next = pos + header + (size - header);
+        if (next <= pos) break; // safety: no progress
+        pos = next;
     }
     return -1;
 }
@@ -64,8 +71,11 @@ function findBox(data: Uint8Array, start: number, end: number, type: string): nu
             size = Number(dv.getBigUint64(0, false));
         }
         if (boxType === type) return pos + header;
-        pos += size;
-        if (pos <= 0 || pos > end) break;
+        // size === 0 → extends to end; cannot advance safely, stop scanning.
+        if (size === 0) break;
+        const next = pos + size;
+        if (next <= pos || next > end) break; // no progress / past the window
+        pos = next;
     }
     return -1;
 }
@@ -169,7 +179,13 @@ export function startMseStream(
         aborted = true;
         ac.abort();
         revoke();
-        try { video.removeAttribute("src"); video.load(); } catch { /* noop */ }
+        // Remove the source only — do NOT call video.load(). On a cold
+        // switch load() re-runs the media load algorithm against an empty
+        // src, firing a spurious error event that React's onError turns into
+        // a "播放失败" banner, and it forces a full reset the next stream
+        // must recover from. Removing the blob URL is enough to stop the
+        // current playback; the next startMseStream assigns a fresh src.
+        try { video.removeAttribute("src"); } catch { /* noop */ }
         activeSb = null;
     };
 
@@ -258,6 +274,16 @@ export function startMseStream(
                 try { (ms as any).endOfStream(); } catch { /* already ended */ }
             }
         };
+        // The init segment (ftyp+moov) MUST be appended BEFORE any moof/mdat
+        // fragment so the demuxer has the track + codec configuration. It was
+        // parsed above for parseVideoCodec but never fed to the SourceBuffer —
+        // without it the browser fails with CHUNK_DEMUXER_ERROR_APPEND_FAILED
+        // (MEDIA_ERR_SRC_NOT_SUPPORTED) on the first fragment and the clip
+        // plays black. This is the "同一天切换黑屏" root cause: direct-URL clips
+        // (first of a day) never build a SourceBuffer, so they play; only the
+        // same-day MSE clips (2nd+) hit this and only go black until the day
+        // changes and remounts the panel via the direct path.
+        if (init.length) { queue.push(init); queuedBytes += init.byteLength; }
         if (rest.length) { queue.push(rest); queuedBytes += rest.byteLength; rest = new Uint8Array(0); }
         void drain();
 
