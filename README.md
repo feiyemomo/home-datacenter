@@ -611,6 +611,32 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 更新日志
 
+### v1.9.0 — Web 录像回放修复 + 前端性能优化（路由拆包） (2026-08-23)
+
+> **背景**：本轮是 Web 端的一批回放修复与首屏性能优化。① 修掉「同一天内切换录像片段黑屏、切日期才恢复」的根因——MSE 从未把 fMP4 的 init 段 append 进 SourceBuffer，demuxer 拿不到 moov/codec；② 让一天内的第一段录像也走渐进式 `/stream`（首字节 ~0.2s）而非整段转码的 `/file`（~4-7s）；③ 路由级代码拆包，首屏关键路径从 ~281kB gzip 降到 ~85kB gzip。
+
+**录像回放修复**（`web/src/lib/fmp4Mse.ts`、`web/src/components/RecordingTimeline.tsx`）：
+- **MSE 缺 init 段**：`startMseStream` 之前把 `ftyp+moov`（init 段）取出后仅用于解析 codec，却从未 `appendBuffer` 进 SourceBuffer，只喂了 `moof/mdat` 分片 → demuxer 报 `CHUNK_DEMUXER_ERROR_APPEND_FAILED`（`readyState=0`）→ 同一天内切换的第 2 段起录像黑屏。现在先 append init 再喂分片。
+- **播放切换竞态**：`playRecording` 加 `playbackGenerationRef` 代数 + `switchingPlaybackRef` 守卫，旧片段异步 MSE/回退回调不会再覆盖新片段状态。
+- **同一天切换 reload**：只有 direct-URL 路径才 `v.load()` + 元数据后 seek/play（MSE 由 pump 自行加载）；`seekOnceReady` 在缓冲就绪后 `v.play()` 恢复共享 `<video>` 播放。
+- **冷启动改走 /stream**：一天内第一段录像（此时 `<video>` 尚未挂载，`videoRef.current` 为 null）此前直接回退到 `/file`；现在若 MSE 可用，先挂载视频再 `startMseStream`（`waitForVideoEl` 等元素就绪），走渐进式 `/stream`。
+
+**前端性能优化**（`web/src/App.tsx`、`web/vite.config.ts`）：
+- **路由级 `lazy()` 拆包** + `Suspense` fallback：hls.js（~162kB gzip）与录像播放引擎不再进登录/仪表盘/网络/日志的关键路径，仅打开摄像头时才加载。
+- **`manualChunks` vendor 分包**：`vendor-react` / `vendor-hls` 作为 content-hash 不可变 chunk，发版时只有被改动的 chunk 变化，浏览器可长期缓存。
+- `chunkSizeWarningLimit: 600`（覆盖稳定 vendor-hls chunk）。
+- 新增 `rollup-plugin-visualizer` devDependency（方便后续做 bundle 组成分析）。
+
+#### 验证（NAS 192.168.31.235 实测，2026-08-23）
+- `npm run build`（`tsc -b && vite build`）零错误，产物 `index-DcAFAOf3.js`。
+- 部署后 `home-web` healthy、HTTP 200；`home-api` 用缓存镜像未重建；`frigate`/`mosquitto` 未动。
+- 端点实测（摄像头 17 / 同 recId）：`/file` 首字节 TTFB ≈ 4.4–7.3s（整段 faststart 转码完才发），`/stream` TTFB ≈ 0.11–0.19s（渐进式 fMP4）；时间轴查询 `/recordings` ≈ 40ms（非瓶颈）。
+- 机制级复现（Chrome headless + 真实 fMP4 + 同一 `<video>` 复用）：skip-init → `CHUNK_DEMUXER_ERROR`/`readyState=0`（复现黑屏）；append-init → `readyState=4` 正常播放。
+
+#### 版本
+- Web: v1.9.0（回放修复 + 路由拆包；`package.json` 增加 visualizer devDep）
+- Backend / Android: 无改动
+
 ### v1.8.44 — 三端一键编排 + Release 正式签名 + 后端识别 release 命名 (2026-08-15)
 
 > **背景**：此前三端（Android / Go 后端 / Web）各自独立构建，发布靠手动逐个执行。本轮新增顶层编排脚本把三端
