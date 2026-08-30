@@ -33,7 +33,7 @@ export default function Login() {
         const trimmedId = userId.trim();
         const trimmedKey = accessKey.trim();
         if (!trimmedId || !trimmedKey) {
-            setError("用户 ID 和 Access Key 不能为空");
+            setError("用户 ID 和密码不能为空");
             return;
         }
         const idNum = Number(trimmedId);
@@ -73,7 +73,7 @@ export default function Login() {
                     </div>
                     <CardTitle className="text-[15px] font-medium">登录到家庭数据中心</CardTitle>
                     <p className="text-xs text-fg-muted">
-                        将此浏览器绑定到已存在的设备凭据。
+                        输入管理员设置的密码来绑定设备。
                     </p>
                 </CardHeader>
 
@@ -103,7 +103,7 @@ export default function Login() {
                         </div>
 
                         <div className="space-y-2">
-                            <Label htmlFor="access_key">Access Key</Label>
+                            <Label htmlFor="access_key">密码</Label>
                             <div className="relative">
                                 <KeyRound
                                     size={16}
@@ -112,7 +112,7 @@ export default function Login() {
                                 <Input
                                     id="access_key"
                                     type="password"
-                                    placeholder="十六进制 Access Key"
+                                    placeholder="管理员设置的密码"
                                     className="pl-9 font-mono"
                                     value={accessKey}
                                     onChange={(e) => setAccessKey(e.target.value)}
