@@ -1,4 +1,4 @@
-package main
+﻿package main
 
 import (
 	"fmt"
@@ -42,11 +42,12 @@ func main() {
 
 	deviceName := "MacBook-Pro"
 
-	// 创建设备
-	_, accessKey, err := deviceService.CreateDevice(
-		userID,
-		deviceName,
-	)
+    // 创建设备
+    _, accessKey, err := deviceService.CreateDevice(
+        userID,
+        deviceName,
+        "",
+    )
 
 	if err != nil {
 		log.Fatal(err)

@@ -38,23 +38,28 @@ func NewDeviceService(
 //
 // The device name is trimmed and must be 1-64 runes; otherwise
 // ErrInvalidDeviceName is returned. revoked_at is left NULL so the
-// device is immediately usable for /auth/bind.
 func (s *DeviceService) CreateDevice(
-	userID uint,
-	name string,
+    userID uint,
+    name string,
+    keyOverride string,
 ) (*model.Device, string, error) {
 	// 1. Validate name (1-64 runes after trim).
 	n := strings.TrimSpace(name)
 	if c := utf8.RuneCountInString(n); c < 1 || c > 64 {
 		return nil, "", ErrInvalidDeviceName
 	}
-
-	// 2. Generate the plaintext access_key (64 hex chars, same
-	//    generator the user-create path uses).
-	accessKey, err := utils.GenerateAccessKey()
-	if err != nil {
-		return nil, "", err
-	}
+    // 2. Manual password (keyOverride) becomes this device access key.
+    //    The user-create path passes the admin-set password so the new
+    //    user binds with it instead of a random 64-hex key. Only the
+    //    SHA256 hash is persisted; empty keeps the legacy generator.
+    accessKey := keyOverride
+    if accessKey == "" {
+        generated, err := utils.GenerateAccessKey()
+        if err != nil {
+            return nil, "", err
+        }
+        accessKey = generated
+    }
 
 	// 3. Persist only the SHA256 hash; revoked_at stays NULL.
 	device := &model.Device{

@@ -162,7 +162,7 @@ func (h *DeviceHandler) Create(c *gin.Context) {
 		return
 	}
 
-	device, accessKey, err := h.deviceService.CreateDevice(userID, req.DeviceName)
+	device, accessKey, err := h.deviceService.CreateDevice(userID, req.DeviceName, "")
 	if err != nil {
 		if errors.Is(err, service.ErrInvalidDeviceName) {
 			utils.Fail(c, http.StatusBadRequest, "device_name must be 1-64 chars")

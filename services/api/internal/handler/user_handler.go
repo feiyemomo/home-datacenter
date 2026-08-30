@@ -168,8 +168,9 @@ func (h *UserHandler) List(c *gin.Context) {
 
 // createUserRequest is the JSON body for POST /api/v1/user.
 type createUserRequest struct {
-	Name    string `json:"name"`
-	IsAdmin bool   `json:"is_admin"`
+    Name     string `json:"name"`
+    IsAdmin  bool   `json:"is_admin"`
+    Password string `json:"password"` // v1.10.1: manual password (letters+digits); empty keeps legacy random access_key
 }
 
 // Create inserts a new user. Admin-only.
@@ -197,7 +198,7 @@ func (h *UserHandler) Create(c *gin.Context) {
 	// Create a default device for the new user so they can
 	// immediately bind with the returned access_key.
 	deviceName := fmt.Sprintf("%s-device", u.Name)
-	device, accessKey, err := h.deviceService.CreateDevice(u.ID, deviceName)
+    device, accessKey, err := h.deviceService.CreateDevice(u.ID, deviceName, req.Password)
 	if err != nil {
 		// Device creation failed but user was created — log and
 		// still return the user without access_key.
@@ -211,13 +212,15 @@ func (h *UserHandler) Create(c *gin.Context) {
 		return
 	}
 
+    accessKeyField := accessKey
+    if req.Password != "" { accessKeyField = "" }
 	utils.Success(c, gin.H{
 		"id":         u.ID,
 		"name":       u.Name,
 		"is_admin":   u.IsAdmin,
 		"created_at": u.CreatedAt.Format("2006-01-02 15:04:05"),
 		"updated_at": u.UpdatedAt.Format("2006-01-02 15:04:05"),
-		"access_key": accessKey,
+        "access_key": accessKeyField,
 		"device": gin.H{
 			"id":          device.ID,
 			"device_name": device.DeviceName,
