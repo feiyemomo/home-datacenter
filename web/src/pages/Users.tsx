@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
-import { Plus, RefreshCw, Trash2, Loader2, UserCog, Copy, Check } from "lucide-react";
+import { Plus, RefreshCw, Trash2, Loader2, UserCog } from "lucide-react";
 import { createUser, deleteUser, listUsers, updateUser } from "@/api/user";
 import { ApiError } from "@/api/client";
 import { useAuth } from "@/hooks/useAuth";
@@ -50,6 +50,7 @@ export default function Users() {
     const [showCreate, setShowCreate] = useState(false);
     const [newName, setNewName] = useState("");
     const [newIsAdmin, setNewIsAdmin] = useState(false);
+    const [newPassword, setNewPassword] = useState("");
     
     const [creating, setCreating] = useState(false);
     const [createResult, setCreateResult] = useState<CreateUserResponse | null>(null);
@@ -74,15 +75,26 @@ export default function Users() {
             setError("请输入名称");
             return;
         }
+            const password = newPassword.trim();
+            if (!password) {
+                setError("请设置密码");
+                return;
+            }
+            if (!/^[A-Za-z0-9]+$/.test(password)) {
+                setError("密码仅限字母和数字");
+                return;
+            }
         setCreating(true);
         setError(null);
         try {
             const result = await createUser({
                 name,
                 is_admin: newIsAdmin,
+                    password: newPassword,
             });
             setNewName("");
             setNewIsAdmin(false);
+            setNewPassword("");
             setShowCreate(false);
             setCreateResult(result);
             refetch();
@@ -106,15 +118,6 @@ export default function Users() {
         }
     }, [copied]);
 
-    async function handleCopyAccessKey() {
-        if (!createResult?.access_key) return;
-        try {
-            await navigator.clipboard.writeText(createResult.access_key);
-            setCopied(true);
-        } catch {
-            // 剪贴板写入失败，静默忽略
-        }
-    }
 
     async function handleSave(u: UserListEntry) {
         const draft = editing[u.id];
@@ -261,6 +264,12 @@ export default function Users() {
                                 maxLength={32}
                                 autoFocus
                             />
+                            <Input
+                                placeholder="密码（仅限字母和数字）"
+                                value={newPassword}
+                                onChange={(e) => setNewPassword(e.target.value)}
+                                maxLength={64}
+                            />
                             <label className="flex items-center gap-2 text-sm text-fg-muted">
                                 <input
                                     type="checkbox"
@@ -294,31 +303,7 @@ export default function Users() {
                         </CardDescription>
                     </CardHeader>
                     <CardContent className="space-y-3">
-                        {createResult.access_key && (
-                            <div className="flex items-center gap-2 rounded-lg border border-[rgb(var(--accent-success)/0.3)] bg-[rgb(var(--accent-success)/0.05)] px-3 py-2">
-                                <code className="flex-1 select-all text-sm font-mono text-fg break-all">
-                                    {createResult.access_key}
-                                </code>
-                                <Button
-                                    size="sm"
-                                    variant="ghost"
-                                    className="shrink-0"
-                                    onClick={handleCopyAccessKey}
-                                >
-                                    {copied ? (
-                                        <>
-                                            <Check size={14} className="text-[rgb(var(--accent-success))]" />
-                                            已复制
-                                        </>
-                                    ) : (
-                                        <>
-                                            <Copy size={14} />
-                                            复制
-                                        </>
-                                    )}
-                                </Button>
-                            </div>
-                        )}
+                        {/* v1.10.2: manual-password mode — access_key is never returned (the password is the bind credential). */}
                         <div className="flex justify-end">
                             <Button
                                 size="sm"

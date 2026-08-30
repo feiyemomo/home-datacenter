@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Shared TypeScript types for the Home Datacenter dashboard.
  *
  * The backend wraps every response in:
@@ -72,6 +72,7 @@ export interface UserDeleteResponse {
 export interface CreateUserRequest {
     name: string;
     is_admin: boolean;
+    password?: string;
     initial_device_name?: string;
 }
 
