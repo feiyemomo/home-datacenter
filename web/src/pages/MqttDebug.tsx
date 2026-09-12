@@ -48,7 +48,7 @@ export default function MqttDebug() {
     const [result, setResult] = useState<PublishMqttResponse | null>(null);
     const [error, setError] = useState<string | null>(null);
 
-    const { lastMessage, sendMessage, isConnected } = useWebSocket();
+    const { lastMessage, subscribe, isConnected } = useWebSocket();
     const [log, setLog] = useState<LogEntry[]>([]);
 
     // Validate the payload as JSON in real time.
@@ -65,9 +65,10 @@ export default function MqttDebug() {
     }, [payload]);
 
     // Subscribe broadly so the log catches every event the server emits.
+    // Uses subscribe() which records the topic and auto-sends once the socket is open/reconnected.
     useEffect(() => {
-        sendMessage({ type: "subscribe", topic: "" });
-    }, [sendMessage]);
+        subscribe("");
+    }, [subscribe]);
 
     // Append incoming WS messages to the log.
     useEffect(() => {

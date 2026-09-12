@@ -26,22 +26,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ErrorRetry } from "@/components/ErrorRetry";
-
-/**
- * Detect whether the current page was loaded via the relay path
- * (Cloudflare Tunnel) rather than a direct LAN or IPv6 connection.
- * Mirrors Dashboard.tsx's detectApiPath() logic.
- */
-function isOnRelay(): boolean {
-    if (typeof window === "undefined") return false;
-    const h = window.location.hostname;
-    if (h === "localhost" || h === "127.0.0.1") return false;
-    if (h.startsWith("192.168.") || h.startsWith("10.")) return false;
-    if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return false;
-    // IPv6 literal — direct connection, not relay
-    if (/^\[[0-9a-f:]+\]$/i.test(h)) return false;
-    return true;
-}
+import { isOnRelay } from "@/lib/network";
 
 /**
  * Network page: displays the server's network capability report.

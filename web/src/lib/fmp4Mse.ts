@@ -223,10 +223,16 @@ export function startMseStream(
         const vc = parseVideoCodec(init);
         const codecs = vc ? `${vc},mp4a.40.2` : FB_CODEC;
 
+        if (aborted) return;
+
         // ---- 2. Set up MediaSource + SourceBuffer ----
         const ms = new MS();
         const objUrl = URL.createObjectURL(ms as any);
         revoke = () => URL.revokeObjectURL(objUrl);
+        if (aborted) {
+            revoke();
+            return;
+        }
         video.src = objUrl;
 
         const opened = new Promise<void>((res, rej) => {
@@ -239,9 +245,13 @@ export function startMseStream(
             await opened;
         } catch (e) {
             if (!aborted) onError(mseMessage(e));
+            revoke();
             return;
         }
-        if (aborted) return;
+        if (aborted) {
+            revoke();
+            return;
+        }
         activeSb = ms.addSourceBuffer(`video/mp4; codecs="${codecs}"`);
 
         // ---- 3. Append init, then stream fragments ----

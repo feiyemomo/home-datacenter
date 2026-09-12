@@ -1,5 +1,5 @@
 import { lazy, Suspense } from "react";
-import { Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import { Loader2, Server } from "lucide-react";
 import { AuthProvider, useAuth } from "@/hooks/useAuth";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
@@ -83,7 +83,6 @@ function RouteFallback() {
  */
 function AppRoutes() {
     const { token, initialized } = useAuth();
-    const location = useLocation();
 
     // Full-screen splash while the /user/me probe is in flight.
     if (token && !initialized) {
@@ -92,99 +91,38 @@ function AppRoutes() {
 
     return (
         <ErrorBoundary context="app">
-            <div key={location.pathname} className="animate-slide-up">
-                <OfflineBanner />
-                <Suspense fallback={<RouteFallback />}>
-                    <Routes>
-                        <Route path="/login" element={<Login />} />
+            <OfflineBanner />
+            <Suspense fallback={<RouteFallback />}>
+                <Routes>
+                    <Route path="/login" element={<Login />} />
 
-                        <Route
-                            path="/dashboard"
-                            element={
-                                <ProtectedRoute>
-                                    <Layout>
-                                        <Dashboard />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/cameras"
-                            element={
-                                <ProtectedRoute>
-                                    <Layout>
-                                        <Cameras />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/network"
-                            element={
-                                <ProtectedRoute>
-                                    <Layout>
-                                        <Network />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/logs"
-                            element={
-                                <ProtectedRoute adminOnly>
-                                    <Layout>
-                                        <Logs />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/cameras/new"
-                            element={
-                                <ProtectedRoute adminOnly>
-                                    <Layout>
-                                        <DeviceCreate />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/users"
-                            element={
-                                <ProtectedRoute adminOnly>
-                                    <Layout>
-                                        <Users />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/mqtt"
-                            element={
-                                <ProtectedRoute adminOnly>
-                                    <Layout>
-                                        <MqttDebug />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
-                        <Route
-                            path="/profile"
-                            element={
-                                <ProtectedRoute>
-                                    <Layout>
-                                        <Profile />
-                                    </Layout>
-                                </ProtectedRoute>
-                            }
-                        />
+                    {/* Authenticated routes sharing persistent Layout */}
+                    <Route
+                        element={
+                            <ProtectedRoute>
+                                <Layout />
+                            </ProtectedRoute>
+                        }
+                    >
+                        <Route path="/dashboard" element={<Dashboard />} />
+                        <Route path="/cameras" element={<Cameras />} />
+                        <Route path="/network" element={<Network />} />
+                        <Route path="/profile" element={<Profile />} />
 
-                        {/* Default redirects */}
-                        <Route path="/" element={<Navigate to="/dashboard" replace />} />
-                        <Route path="*" element={<Navigate to="/dashboard" replace />} />
-                    </Routes>
-                </Suspense>
-            </div>
+                        {/* Admin-only routes */}
+                        <Route element={<ProtectedRoute adminOnly />}>
+                            <Route path="/logs" element={<Logs />} />
+                            <Route path="/cameras/new" element={<DeviceCreate />} />
+                            <Route path="/users" element={<Users />} />
+                            <Route path="/mqtt" element={<MqttDebug />} />
+                        </Route>
+                    </Route>
+
+                    {/* Default redirects */}
+                    <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                    <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                </Routes>
+            </Suspense>
         </ErrorBoundary>
     );
 }

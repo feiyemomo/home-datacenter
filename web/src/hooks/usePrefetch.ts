@@ -31,15 +31,12 @@ export interface PrefetchResult {
  */
 export function usePrefetch(): PrefetchResult {
     // Collect cleanup functions that should run on unmount.
-    const cleanupsRef = useRef<Array<() => void>>([]);
+    const cleanupsRef = useRef<Set<() => void>>(new Set());
 
     useEffect(() => {
         return () => {
-            const fns = cleanupsRef.current;
-            for (let i = 0; i < fns.length; i++) {
-                fns[i]();
-            }
-            cleanupsRef.current = [];
+            cleanupsRef.current.forEach((fn) => fn());
+            cleanupsRef.current.clear();
         };
     }, []);
 
@@ -107,24 +104,30 @@ export function usePrefetch(): PrefetchResult {
                 typeof window !== "undefined" && "requestIdleCallback" in window;
 
             if (useRIC) {
+                let cleanup: () => void;
                 const id = requestIdleCallback(
                     () => {
+                        cleanupsRef.current.delete(cleanup);
                         doPrefetch();
                     },
                     { timeout: idleMs },
                 );
-                cleanupsRef.current.push(() => {
+                cleanup = () => {
                     cancelled = true;
                     cancelIdleCallback(id);
-                });
+                };
+                cleanupsRef.current.add(cleanup);
             } else {
+                let cleanup: () => void;
                 const id = setTimeout(() => {
+                    cleanupsRef.current.delete(cleanup);
                     doPrefetch();
                 }, idleMs);
-                cleanupsRef.current.push(() => {
+                cleanup = () => {
                     cancelled = true;
                     clearTimeout(id);
-                });
+                };
+                cleanupsRef.current.add(cleanup);
             }
         },
         [],

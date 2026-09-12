@@ -103,15 +103,60 @@ export function useCachedFetch<T>(
     const onErrorRef = useRef(options.onError);
     onErrorRef.current = options.onError;
 
+    // Keep track of active fetch execution to ignore superseded fetches and unmounts.
+    const fetchIdRef = useRef(0);
+    const isMountedRef = useRef(true);
+
+    useEffect(() => {
+        isMountedRef.current = true;
+        return () => {
+            isMountedRef.current = false;
+            fetchIdRef.current += 1;
+        };
+    }, []);
+
+    // When the key or enabled flag changes after mount, sync cache state for the new key.
+    const isFirstRender = useRef(true);
+    useEffect(() => {
+        if (isFirstRender.current) {
+            isFirstRender.current = false;
+            return;
+        }
+        if (!enabled) {
+            setData(null);
+            setLoading(false);
+            setError(null);
+            setIsStale(false);
+            return;
+        }
+        try {
+            const raw = sessionStorage.getItem(key);
+            if (raw) {
+                const parsed = JSON.parse(raw) as { t: number; v: T };
+                setData(parsed.v);
+                setLoading(false);
+            } else {
+                setData(null);
+                setLoading(true);
+            }
+        } catch {
+            setData(null);
+            setLoading(true);
+        }
+        setError(null);
+        setIsStale(false);
+    }, [key, enabled]);
+
     const fetchNow = useCallback(() => {
-        let cancelled = false;
+        const myId = ++fetchIdRef.current;
         let retryCount = 0;
 
         (async () => {
             while (true) {
+                if (!isMountedRef.current || myId !== fetchIdRef.current) return;
                 try {
                     const v = await fetcherRef.current();
-                    if (cancelled) return;
+                    if (!isMountedRef.current || myId !== fetchIdRef.current) return;
                     setData(v);
                     setError(null);
                     setIsStale(false);
@@ -124,13 +169,13 @@ export function useCachedFetch<T>(
                     }
                     return;
                 } catch (e) {
-                    if (cancelled) return;
+                    if (!isMountedRef.current || myId !== fetchIdRef.current) return;
                     retryCount++;
                     if (retryCount <= maxRetries) {
                         // Exponential backoff: 1s → 2s → 4s ...
                         const delay = retryDelay * Math.pow(2, retryCount - 1);
                         await new Promise((r) => setTimeout(r, delay));
-                        if (cancelled) return;
+                        if (!isMountedRef.current || myId !== fetchIdRef.current) return;
                     } else {
                         // All retries exhausted.
                         const err = e instanceof Error ? e : new Error(String(e));
@@ -155,7 +200,9 @@ export function useCachedFetch<T>(
                         break;
                     }
                 } finally {
-                    if (!cancelled) setLoading(false);
+                    if (isMountedRef.current && myId === fetchIdRef.current) {
+                        setLoading(false);
+                    }
                 }
             }
         })();
@@ -166,6 +213,7 @@ export function useCachedFetch<T>(
     // event).
     const mutate = useCallback(
         (newData: T | null) => {
+            if (!isMountedRef.current) return;
             setData(newData);
             setError(null);
             setIsStale(false);

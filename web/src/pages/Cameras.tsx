@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -277,24 +277,34 @@ function CamCard({
 }
 
 /**
- * WsBridge — child-as-render hook wrapper.
+ * WsBridge — observer pattern wrapper for camera WS events.
  */
 function WsBridge({ children }: { children: (onMsg: (h: (m: WsMessage) => void) => () => void) => React.ReactNode }) {
     const ws = useWebSocket(true);
-    const [last, setLast] = useState<WsMessage | null>(null);
+    const listenersRef = useRef<Set<(m: WsMessage) => void>>(new Set());
 
     useEffect(() => {
-        if (ws.lastMessage) setLast(ws.lastMessage);
+        ws.subscribe("device");
+        ws.subscribe("camera");
+    }, [ws.subscribe]);
+
+    useEffect(() => {
+        if (!ws.lastMessage) return;
+        listenersRef.current.forEach((handler) => {
+            try {
+                handler(ws.lastMessage!);
+            } catch {
+                // Ignore listener error
+            }
+        });
     }, [ws.lastMessage]);
 
-    const onMsg = useCallback(
-        (h: (m: WsMessage) => void) => {
-            void last;
-            h(ws.lastMessage ?? { type: "noop", ts: 0 });
-            return () => undefined;
-        },
-        [last, ws.lastMessage],
-    );
+    const onMsg = useCallback((h: (m: WsMessage) => void) => {
+        listenersRef.current.add(h);
+        return () => {
+            listenersRef.current.delete(h);
+        };
+    }, []);
 
     return <>{children(onMsg)}</>;
 }

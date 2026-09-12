@@ -63,3 +63,6 @@ android/app-debug-*.apk
 android/app-release-*.apk
 # Release notes are publish artifacts (scp'd to NAS), not tracked in git.
 android/release-notes-v*.txt
+
+# web sync tarball used by scp-based deploys
+web-sync.tar.gz

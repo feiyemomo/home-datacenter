@@ -268,6 +268,8 @@
         filter: blur(80px);
         pointer-events: none;
         z-index: 0;
+        will-change: transform;
+        transform: translateZ(0);
     }
 
     @media (prefers-reduced-motion: no-preference) {

@@ -186,7 +186,7 @@ export function useHLSStream(
         const stallTimeoutMs = 15_000;
         let stallTimer: number | null = null;
         const armStallWatchdog = () => {
-            if (stallTimer !== null) if (stallTimer !== null) window.clearTimeout(stallTimer);
+            if (stallTimer !== null) window.clearTimeout(stallTimer);
             stallTimer = window.setTimeout(() => {
                 stallTimer = null;
                 if (cancelled) return;

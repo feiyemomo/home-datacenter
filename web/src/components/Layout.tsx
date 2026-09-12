@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { NavLink } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import {
     Activity,
     LayoutDashboard,
@@ -187,7 +187,7 @@ export function Sidebar({ open, onClose }: SidebarProps) {
 }
 
 interface LayoutProps {
-    children: ReactNode;
+    children?: ReactNode;
 }
 
 /**
@@ -281,6 +281,7 @@ function ThemeMenu() {
 /** App shell with enhanced liquid glass layout */
 export function Layout({ children }: LayoutProps) {
     const [sidebarOpen, setSidebarOpen] = useState(false);
+    const location = useLocation();
 
     return (
         <div className="relative flex h-screen overflow-hidden bg-surface">
@@ -324,8 +325,8 @@ export function Layout({ children }: LayoutProps) {
 
                 {/* Main scroll area */}
                 <main className="relative z-10 flex-1 overflow-y-auto p-5 md:p-8">
-                    <div className="relative z-10">
-                        {children}
+                    <div key={location.pathname} className="relative z-10 animate-slide-up">
+                        {children ?? <Outlet />}
                     </div>
                 </main>
             </div>

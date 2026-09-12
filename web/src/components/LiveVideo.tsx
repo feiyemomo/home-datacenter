@@ -62,23 +62,7 @@ const TRANSPORT_KEY = "home.transport";
  * domain (nas.feiyemomo.top — pure-AAAA, IPv6 direct). Everything
  * else (e.g. api.feiyemomo.top) is considered remote.
  */
-function isRemoteAccess(): boolean {
-    if (typeof window === "undefined") return false;
-    const h = window.location.hostname;
-    if (h === "localhost" || h === "127.0.0.1") return false;
-    if (h.startsWith("192.168.") || h.startsWith("10.")) return false;
-    if (/^172\.(1[6-9]|2[0-9]|3[0-1])\./.test(h)) return false;
-    // DDNS domain (nas.feiyemomo.top) — pure-AAAA record, so access
-    // via this hostname is an IPv6 direct connection, not a relay.
-    if (h === "nas.feiyemomo.top") return false;
-    // IPv6 literal (e.g. [2001:db8::1] or [::1]) — direct connection,
-    // not relay. Aligns with Dashboard.tsx detectApiPath() which
-    // classifies IPv6 literals as a direct path. Without this, IPv6
-    // direct access defaults to HLS, blocking WebRTC on the
-    // highest-quality path.
-    if (/^\[[0-9a-f:]+\]$/i.test(h)) return false;
-    return true;
-}
+import { isRemoteAccess } from "@/lib/network";
 
 function readTransport(): TransportMode {
     if (typeof window === "undefined") return "auto";
@@ -220,6 +204,8 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // RecordingTimeline render is triggered once the element mounts.
     const [videoAreaEl, setVideoAreaEl] = useState<HTMLDivElement | null>(null);
 
+    const toastTimerRef = useRef<number | null>(null);
+
     // Subscribe to "device.<id>" over the existing WS layer.
     useEffect(() => {
         if (!onWsMessage) return;
@@ -239,11 +225,22 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
             if ("event" in p && (p as CameraEventMessage).type === "camera") {
                 const ev = p as CameraEventMessage;
                 setEventToast(`${ev.event} @ ${new Date(ev.ts * 1000).toLocaleTimeString()}`);
-                const t = window.setTimeout(() => setEventToast(null), 4000);
-                return () => window.clearTimeout(t);
+                if (toastTimerRef.current !== null) {
+                    window.clearTimeout(toastTimerRef.current);
+                }
+                toastTimerRef.current = window.setTimeout(() => {
+                    setEventToast(null);
+                    toastTimerRef.current = null;
+                }, 4000);
             }
         });
-        return off;
+        return () => {
+            off();
+            if (toastTimerRef.current !== null) {
+                window.clearTimeout(toastTimerRef.current);
+                toastTimerRef.current = null;
+            }
+        };
     }, [camera.id, onWsMessage]);
 
     async function sendPTZ(command: string) {
@@ -363,22 +360,31 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
 
         return () => {
             cancelled = true;
+            if (prefetchedWebrtcRef.current) {
+                try { prefetchedWebrtcRef.current.pc.close(); } catch { /* */ }
+                prefetchedWebrtcRef.current = null;
+            }
         };
     }, [mode, transport, camera.id]);
 
     // When entering live mode, the prefetched PC (if any) has been
     // passed to WebRTCVideo as a prop. Clear the ref so the stale-PC
     // cleanup below doesn't close a PC the hook now owns.
+    // When switching to playback mode, tear down the prefetched PC immediately.
     useEffect(() => {
         if (mode === "live") {
             prefetchedWebrtcRef.current = null;
+        } else if (mode === "playback") {
+            if (prefetchedWebrtcRef.current) {
+                try { prefetchedWebrtcRef.current.pc.close(); } catch { /* */ }
+                prefetchedWebrtcRef.current = null;
+            }
         }
     }, [mode]);
 
     // Clean up unconsumed prefetched PCs on camera change, transport
     // switch, or unmount. This catches the case where the user changes
-    // camera or switches to HLS while in preview mode (the prefetch
-    // effect's cleanup only sets `cancelled`, it doesn't close the PC).
+    // camera or switches to HLS while in preview mode.
     useEffect(() => {
         return () => {
             if (prefetchedWebrtcRef.current) {

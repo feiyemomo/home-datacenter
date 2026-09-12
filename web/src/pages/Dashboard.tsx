@@ -36,20 +36,7 @@ import AlertItem from "@/components/dashboard/AlertItem";
 import AlertSnapshotModal from "@/components/dashboard/AlertSnapshotModal";
 import SystemSnapshot from "@/components/dashboard/SystemSnapshot";
 import { Skeleton } from "@/components/Skeleton";
-
-const NAS_DDNS_DOMAIN = "nas.feiyemomo.top";
-
-function detectApiPath(): "lan" | "ipv6" | "remote" {
-    if (typeof window === "undefined") return "remote";
-    const h = window.location.hostname;
-    if (h === "localhost" || h === "127.0.0.1") return "lan";
-    if (/^192\.168\./.test(h)) return "lan";
-    if (/^10\./.test(h)) return "lan";
-    if (/^172\.(1[6-9]|2[0-9]|3[01])\./.test(h)) return "lan";
-    if (h === NAS_DDNS_DOMAIN) return "ipv6";
-    if (/^\[[0-9a-f:]+\]$/i.test(h)) return "ipv6";
-    return "remote";
-}
+import { detectApiPath } from "@/lib/network";
 
 export default function Dashboard() {
     const navigate = useNavigate();
@@ -57,6 +44,16 @@ export default function Dashboard() {
     const [clientIPv6, setClientIPv6] = useState<boolean | null>(null);
     const [liveAlert, setLiveAlert] = useState<CameraAlert | null>(null);
     const [selectedAlert, setSelectedAlert] = useState<CameraAlert | null>(null);
+    const alertTimerRef = useRef<number | null>(null);
+
+    useEffect(() => {
+        return () => {
+            if (alertTimerRef.current !== null) {
+                window.clearTimeout(alertTimerRef.current);
+                alertTimerRef.current = null;
+            }
+        };
+    }, []);
     const {
         data: systemLogs,
         loading: _logsLoading,
@@ -67,14 +64,16 @@ export default function Dashboard() {
         { refetchMs: 10000 },
     );
 
-    const ws = useWebSocket(true);
+    const { lastMessage, subscribe } = useWebSocket(true);
 
-    const lastMessageRef = useRef(ws.lastMessage);
-    lastMessageRef.current = ws.lastMessage;
     const systemLogsRef = useRef(systemLogs);
     systemLogsRef.current = systemLogs;
-    const liveAlertRef = useRef(liveAlert);
-    liveAlertRef.current = liveAlert;
+
+    // Subscribe to system.log and camera.motion topics
+    useEffect(() => {
+        subscribe("system.log");
+        subscribe("camera.motion");
+    }, [subscribe]);
 
     const forceRefreshRef = useRef(true);
 
@@ -126,13 +125,12 @@ export default function Dashboard() {
     }, [statusData, prefetchOnIdle]);
 
     useEffect(() => {
-        const msg = lastMessageRef.current;
-        if (!msg) return;
-        if (msg.type !== "event") return;
+        if (!lastMessage) return;
+        if (lastMessage.type !== "event") return;
 
-        if (msg.topic === "system.log") {
+        if (lastMessage.topic === "system.log") {
             try {
-                const p = msg.payload as Record<string, unknown>;
+                const p = lastMessage.payload as Record<string, unknown>;
                 if (p && p.event_type) {
                     const newLog: SystemLog = {
                         id: typeof p.id === "number" ? p.id : Date.now(),
@@ -153,13 +151,14 @@ export default function Dashboard() {
             return;
         }
 
-        if (msg.topic !== "camera.motion") return;
+        if (lastMessage.topic !== "camera.motion") return;
 
         try {
-            const p = msg.payload as Record<string, unknown>;
+            const p = lastMessage.payload as Record<string, unknown>;
             if (p && p.type === "detection") {
+                const eventId = typeof p.event_id === "string" ? p.event_id : String(p.ts ?? Date.now());
                 setLiveAlert({
-                    id: typeof p.event_id === "string" ? p.event_id : String(p.ts ?? Date.now()),
+                    id: eventId,
                     camera_slug: String(p.camera_slug ?? ""),
                     camera_id: typeof p.camera_id === "number" ? p.camera_id : undefined,
                     camera_name: typeof p.camera_name === "string" ? p.camera_name : undefined,
@@ -171,19 +170,23 @@ export default function Dashboard() {
                     has_clip: typeof p.has_clip === "boolean" ? p.has_clip : false,
                     has_snapshot: typeof p.has_snapshot === "boolean" ? p.has_snapshot : false,
                 });
-                window.setTimeout(() => {
+                if (alertTimerRef.current !== null) {
+                    window.clearTimeout(alertTimerRef.current);
+                }
+                alertTimerRef.current = window.setTimeout(() => {
                     setLiveAlert((current) => {
-                        if (current && current.id === (typeof p.event_id === "string" ? p.event_id : String(p.ts ?? Date.now()))) {
+                        if (current && current.id === eventId) {
                             return null;
                         }
                         return current;
                     });
+                    alertTimerRef.current = null;
                 }, 8000);
             }
         } catch {
             // Ignore malformed events
         }
-    }, [mutateLogs]);
+    }, [lastMessage, mutateLogs]);
 
     useEffect(() => {
         checkClientIPv6().then((v) => setClientIPv6(v));

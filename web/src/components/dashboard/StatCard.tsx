@@ -36,11 +36,15 @@ function StatCardInner({ label, value, icon, accent, hint }: StatCardProps) {
     useEffect(() => {
         if (value !== displayValue) {
             setAnimate(true);
+            let timer2: ReturnType<typeof setTimeout> | null = null;
             const timer = setTimeout(() => {
                 setDisplayValue(value);
-                setTimeout(() => setAnimate(false), 50);
+                timer2 = setTimeout(() => setAnimate(false), 50);
             }, 150);
-            return () => clearTimeout(timer);
+            return () => {
+                clearTimeout(timer);
+                if (timer2 !== null) clearTimeout(timer2);
+            };
         }
     }, [value, displayValue]);
 

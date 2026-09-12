@@ -1,11 +1,11 @@
-import { Navigate, useLocation } from "react-router-dom";
+import { Navigate, Outlet, useLocation } from "react-router-dom";
 import { useAuth } from "@/hooks/useAuth";
 import { getToken } from "@/api/client";
 
 interface ProtectedRouteProps {
     /** If true, only admins may render the children. */
     adminOnly?: boolean;
-    children: React.ReactNode;
+    children?: React.ReactNode;
 }
 
 /**
@@ -36,7 +36,7 @@ export function ProtectedRoute({ adminOnly, children }: ProtectedRouteProps) {
         return <Navigate to="/dashboard" replace />;
     }
 
-    return <>{children}</>;
+    return <>{children ?? <Outlet />}</>;
 }
 
 export default ProtectedRoute;
