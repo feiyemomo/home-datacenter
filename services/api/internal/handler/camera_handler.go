@@ -611,6 +611,11 @@ func (h *CameraHandler) DeleteRecording(c *gin.Context) {
 // Query params:
 //
 //	limit — max results (default 20, max 100)
+//	camera_id — filter by home-api camera ID
+//	camera — filter by Frigate camera slug
+//	label — filter by detection label (person, car, etc.)
+//	before — unix timestamp upper bound
+//	after — unix timestamp lower bound
 func (h *CameraHandler) ListAlerts(c *gin.Context) {
 	limit := 20
 	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
@@ -620,9 +625,36 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 		}
 	}
 
+	filter := camera.EventFilter{
+		Limit:             limit,
+		IncludeThumbnails: true,
+		Labels:            strings.TrimSpace(c.Query("label")),
+	}
+
+	if beforeStr := c.Query("before"); beforeStr != "" {
+		if b, err := strconv.ParseInt(beforeStr, 10, 64); err == nil {
+			filter.Before = b
+		}
+	}
+	if afterStr := c.Query("after"); afterStr != "" {
+		if a, err := strconv.ParseInt(afterStr, 10, 64); err == nil {
+			filter.After = a
+		}
+	}
+
+	if camIDStr := c.Query("camera_id"); camIDStr != "" {
+		if cid, err := strconv.ParseUint(camIDStr, 10, 64); err == nil && cid > 0 {
+			if slug, ok := h.Reg.LookupFrigateSlugByCameraID(uint(cid)); ok {
+				filter.Cameras = slug
+			}
+		}
+	} else if slug := strings.TrimSpace(c.Query("camera")); slug != "" {
+		filter.Cameras = slug
+	}
+
 	// Include thumbnails so the dashboard can render preview images
 	// without a second round-trip per event.
-	events, err := h.Reg.Frigate.ListEvents(c.Request.Context(), limit, true)
+	events, err := h.Reg.Frigate.ListEventsFiltered(c.Request.Context(), filter)
 	if err != nil {
 		log.Printf("[handler] failed to fetch frigate events: %v", err)
 		utils.Fail(c, http.StatusBadGateway, "failed to fetch frigate events")
@@ -1275,6 +1307,9 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	// never change, so a cached transcode is correct indefinitely.
 	serve := func(path string) {
 		c.Header("Cache-Control", "no-store")
+		if c.Query("download") == "1" {
+			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"camera_%d_%d.mp4\"", cam.ID, minuteStart))
+		}
 		http.ServeFile(c.Writer, c.Request, path)
 	}
 	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {

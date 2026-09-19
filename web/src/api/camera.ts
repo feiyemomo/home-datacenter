@@ -287,9 +287,25 @@ export interface ListAlertsResponse {
     total: number;
 }
 
-export async function listAlerts(limit = 20): Promise<ListAlertsResponse> {
+export interface AlertFilters {
+    limit?: number;
+    cameraId?: number;
+    label?: string;
+    before?: number;
+    after?: number;
+}
+
+export async function listAlerts(params: number | AlertFilters = 20): Promise<ListAlertsResponse> {
+    const filter: AlertFilters = typeof params === "number" ? { limit: params } : params;
+    const q = new URLSearchParams();
+    if (filter.limit) q.set("limit", String(filter.limit));
+    if (filter.cameraId) q.set("camera_id", String(filter.cameraId));
+    if (filter.label) q.set("label", filter.label);
+    if (filter.before) q.set("before", String(filter.before));
+    if (filter.after) q.set("after", String(filter.after));
+
     const { data } = await client.get<ListAlertsResponse>(
-        `/cameras/alerts?limit=${limit}`,
+        `/cameras/alerts?${q.toString()}`,
     );
     return data ?? { alerts: [], total: 0 };
 }

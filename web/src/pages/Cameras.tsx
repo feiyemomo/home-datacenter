@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2 } from "lucide-react";
+import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, LayoutGrid, List, Maximize2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
@@ -12,6 +12,7 @@ import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { LiveVideo } from "@/components/LiveVideo";
 import { ErrorRetry } from "@/components/ErrorRetry";
 import { Skeleton } from "@/components/Skeleton";
+import { cn } from "@/lib/utils";
 
 type CodecOption = "passthrough" | "h264" | "h265";
 
@@ -34,6 +35,7 @@ export default function Cameras() {
     const nav = useNavigate();
     const [error, setError] = useState<string | null>(null);
     const [searchParams] = useSearchParams();
+    const [viewMode, setViewMode] = useState<"list" | "grid4">("list");
 
     const targetCameraId = searchParams.get("camera") ? Number(searchParams.get("camera")) : undefined;
     const targetTime = searchParams.get("time") ? Number(searchParams.get("time")) : undefined;
@@ -71,7 +73,39 @@ export default function Cameras() {
                         </p>
                     </div>
                 </div>
-                <div className="flex gap-2">
+                <div className="flex items-center gap-2">
+                    {/* View switcher */}
+                    <div className="flex rounded-xl glass-subtle p-0.5 border border-[rgb(var(--border)/0.2)]">
+                        <button
+                            type="button"
+                            onClick={() => setViewMode("list")}
+                            className={cn(
+                                "flex items-center gap-1 px-2.5 py-1 text-xs rounded-lg transition-all",
+                                viewMode === "list"
+                                    ? "bg-[rgb(var(--accent-primary)/0.2)] text-[rgb(var(--accent-primary))] font-medium shadow-sm"
+                                    : "text-fg-muted hover:text-fg"
+                            )}
+                            title="卡片列表视图"
+                        >
+                            <List size={13} />
+                            列表
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setViewMode("grid4")}
+                            className={cn(
+                                "flex items-center gap-1 px-2.5 py-1 text-xs rounded-lg transition-all",
+                                viewMode === "grid4"
+                                    ? "bg-[rgb(var(--accent-primary)/0.2)] text-[rgb(var(--accent-primary))] font-medium shadow-sm"
+                                    : "text-fg-muted hover:text-fg"
+                            )}
+                            title="四分屏同屏矩阵视图"
+                        >
+                            <LayoutGrid size={13} />
+                            四分屏
+                        </button>
+                    </div>
+
                     <Button
                         size="sm"
                         variant="outline"
@@ -104,47 +138,103 @@ export default function Cameras() {
 
             <WsBridge>
                 {(onMsg) => (
-                    <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 stagger-children">
-                        {loading ? (
-                            [0, 1, 2].map((i) => (
-                                <div key={i} className="flex flex-col overflow-hidden glass rounded-2xl">
-                                    <div className="flex items-center justify-between gap-3 px-4 py-2.5">
-                                        <div className="min-w-0 flex-1 space-y-2">
-                                            <Skeleton className="h-4 w-32" />
-                                            <Skeleton className="h-3 w-24" />
+                    viewMode === "grid4" ? (
+                        <div id="multi-cam-grid" className="space-y-4 animate-fade-in">
+                            <div className="flex items-center justify-between px-1">
+                                <span className="text-xs text-fg-muted font-medium">
+                                    同屏实时监控（并发最多 4 路实时画面）
+                                </span>
+                                <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 px-2 text-xs text-fg-muted hover:text-fg"
+                                    onClick={() => {
+                                        const el = document.getElementById("multi-cam-grid");
+                                        if (!document.fullscreenElement) {
+                                            el?.requestFullscreen().catch(() => {});
+                                        } else {
+                                            document.exitFullscreen().catch(() => {});
+                                        }
+                                    }}
+                                >
+                                    <Maximize2 size={13} className="mr-1" />
+                                    全屏矩阵
+                                </Button>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                {(cams ?? []).slice(0, 4).map((cam) => (
+                                    <div key={cam.id} className="relative rounded-2xl overflow-hidden glass border border-[rgb(var(--border)/0.3)] shadow-lg group">
+                                        <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-3 py-1.5 bg-gradient-to-b from-black/80 via-black/40 to-transparent">
+                                            <span className="text-xs font-medium text-white truncate drop-shadow">{cam.name}</span>
+                                            <div className="flex items-center gap-1.5">
+                                                <Badge variant={cam.status === "online" ? "success" : "danger"} className="text-[9px] py-0 px-1.5 h-4">
+                                                    {cam.status === "online" ? "实时" : "离线"}
+                                                </Badge>
+                                                <button
+                                                    type="button"
+                                                    onClick={() => setViewMode("list")}
+                                                    className="text-[10px] text-white/70 hover:text-white underline ml-1"
+                                                    title="在单路详情中打开"
+                                                >
+                                                    详情
+                                                </button>
+                                            </div>
                                         </div>
-                                        <Skeleton className="h-6 w-16 rounded-full" />
+                                        <div className="aspect-video w-full bg-black/90">
+                                            <LiveVideo camera={cam} isAdmin={isAdmin} onWsMessage={onMsg} />
+                                        </div>
                                     </div>
-                                    <Skeleton className="aspect-video w-full rounded-none" />
-                                </div>
-                            ))
-                        ) : (
-                            <>
-                                {(cams ?? []).map((cam) => (
-                                    <CamCard
-                                        key={cam.id}
-                                        cam={cam}
-                                        isAdmin={isAdmin}
-                                        onDelete={() => remove(cam.id)}
-                                        onRefresh={refetch}
-                                        onWsMessage={onMsg}
-                                        targetTime={(targetCameraId === cam.id) ? targetTime : undefined}
-                                    />
                                 ))}
                                 {(cams ?? []).length === 0 && !loading && (
-                                    <div className="col-span-full rounded-2xl border border-[rgb(var(--border)/0.2)] p-10 text-center animate-fade-in">
-                                        <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.4)]">
-                                            <CameraIcon size={28} className="text-fg-subtle" />
-                                        </div>
-                                        <p className="text-sm font-medium text-fg">暂无注册的摄像头</p>
-                                        <p className="mt-1 text-xs text-fg-muted">
-                                            {isAdmin ? "点击右上角「注册」按钮添加第一个摄像头。" : "请联系管理员添加摄像头设备。"}
-                                        </p>
+                                    <div className="col-span-full rounded-2xl border border-[rgb(var(--border)/0.2)] p-10 text-center">
+                                        <p className="text-sm font-medium text-fg">暂无在线摄像头</p>
                                     </div>
                                 )}
-                            </>
-                        )}
-                    </div>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="grid grid-cols-1 gap-5 md:grid-cols-2 xl:grid-cols-3 stagger-children">
+                            {loading ? (
+                                [0, 1, 2].map((i) => (
+                                    <div key={i} className="flex flex-col overflow-hidden glass rounded-2xl">
+                                        <div className="flex items-center justify-between gap-3 px-4 py-2.5">
+                                            <div className="min-w-0 flex-1 space-y-2">
+                                                <Skeleton className="h-4 w-32" />
+                                                <Skeleton className="h-3 w-24" />
+                                            </div>
+                                            <Skeleton className="h-6 w-16 rounded-full" />
+                                        </div>
+                                        <Skeleton className="aspect-video w-full rounded-none" />
+                                    </div>
+                                ))
+                            ) : (
+                                <>
+                                    {(cams ?? []).map((cam) => (
+                                        <CamCard
+                                            key={cam.id}
+                                            cam={cam}
+                                            isAdmin={isAdmin}
+                                            onDelete={() => remove(cam.id)}
+                                            onRefresh={refetch}
+                                            onWsMessage={onMsg}
+                                            targetTime={(targetCameraId === cam.id) ? targetTime : undefined}
+                                        />
+                                    ))}
+                                    {(cams ?? []).length === 0 && !loading && (
+                                        <div className="col-span-full rounded-2xl border border-[rgb(var(--border)/0.2)] p-10 text-center animate-fade-in">
+                                            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.4)]">
+                                                <CameraIcon size={28} className="text-fg-subtle" />
+                                            </div>
+                                            <p className="text-sm font-medium text-fg">暂无注册的摄像头</p>
+                                            <p className="mt-1 text-xs text-fg-muted">
+                                                {isAdmin ? "点击右上角「注册」按钮添加第一个摄像头。" : "请联系管理员添加摄像头设备。"}
+                                            </p>
+                                        </div>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                    )
                 )}
             </WsBridge>
         </div>

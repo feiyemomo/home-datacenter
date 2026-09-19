@@ -20,7 +20,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { usePrefetch } from "@/hooks/usePrefetch";
-import { formatUptime } from "@/lib/utils";
+import { formatUptime, cn } from "@/lib/utils";
 import type { SystemStatus, NetworkStatus, SystemLog } from "@/types";
 import {
     Card,
@@ -95,13 +95,15 @@ export default function Dashboard() {
     const error = statusError ? statusError.message : null;
     const loading = statusLoading && status === null;
 
+    const [alertLabel, setAlertLabel] = useState<string>("");
+
     const {
         data: alertsData,
         loading: alertsLoading,
         refetch: refetchAlerts,
     } = useCachedFetch<{ alerts: CameraAlert[] }>(
-        "home.dashboard.alerts",
-        () => listAlerts(20),
+        `home.dashboard.alerts.${alertLabel || "all"}`,
+        () => listAlerts(alertLabel ? { limit: 20, label: alertLabel } : 20),
         { refetchMs: 30000 },
     );
     const alerts = alertsData?.alerts ?? [];
@@ -444,6 +446,28 @@ export default function Dashboard() {
                         <Activity size={15} /> 检测报警
                     </CardTitle>
                     <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1">
+                            {[
+                                { label: "全部", val: "" },
+                                { label: "人形", val: "person" },
+                                { label: "车辆", val: "car" },
+                                { label: "动物", val: "dog" },
+                            ].map((f) => (
+                                <button
+                                    key={f.val}
+                                    type="button"
+                                    onClick={() => setAlertLabel(f.val)}
+                                    className={cn(
+                                        "rounded-md px-2 py-0.5 text-[10px] transition-all",
+                                        alertLabel === f.val
+                                            ? "bg-[rgb(var(--accent-primary)/0.2)] text-[rgb(var(--accent-primary))] font-medium ring-1 ring-inset ring-[rgb(var(--accent-primary)/0.4)]"
+                                            : "glass-subtle text-fg-muted hover:text-fg"
+                                    )}
+                                >
+                                    {f.label}
+                                </button>
+                            ))}
+                        </div>
                         <Badge variant="outline" className="text-[10px] glass-subtle">
                             {alerts.length} 条记录
                         </Badge>

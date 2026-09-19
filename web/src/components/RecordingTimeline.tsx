@@ -9,6 +9,7 @@ import {
     RefreshCw,
     AlertTriangle,
     Gauge,
+    Download,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { reportClientError } from "@/lib/errorReport";
@@ -953,7 +954,18 @@ export function RecordingTimeline({ cameraId, targetTime, videoPortalTarget }: R
                             <span className="ml-1 truncate text-white/60">
                                 {formatHMS(activeRec.id)} · {Math.floor(activeRec.duration_seconds)}s
                             </span>
-                            <div className="ml-auto relative">
+                            <div className="ml-auto relative flex items-center gap-1.5">
+                                <a
+                                    href={`${recordingFileUrl(cameraId, activeRec.id)}?download=1`}
+                                    download={`camera_${cameraId}_${activeRec.id}.mp4`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex h-5 w-5 items-center justify-center rounded-md bg-white/10 hover:bg-white/20 text-white/80 hover:text-white transition-colors"
+                                    title="下载此录像片段 (MP4)"
+                                    aria-label="下载此录像片段"
+                                >
+                                    <Download size={10} />
+                                </a>
                                 <button
                                     type="button"
                                     onClick={() => setShowSpeed((v) => !v)}

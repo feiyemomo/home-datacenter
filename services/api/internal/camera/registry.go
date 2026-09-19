@@ -474,6 +474,13 @@ func (r *Registry) LookupByFrigateSlug(slug string) (uint, bool) {
 	return 0, false
 }
 
+// LookupFrigateSlugByCameraID resolves a home-api camera ID to its unique
+// Frigate slug for query filtering.
+func (r *Registry) LookupFrigateSlugByCameraID(id uint) (string, bool) {
+	slug, ok := r.computeUniqueSlugs()[id]
+	return slug, ok
+}
+
 // UpdateCodec changes the output codec for a camera and re-pushes
 // the stream to go2rtc so the new codec takes effect immediately
 // without requiring a container restart.

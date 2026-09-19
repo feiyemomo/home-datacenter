@@ -662,24 +662,39 @@ func (e *FrigateEvent) EffectiveTopScore() float64 {
 	return e.TopScore
 }
 
-// ListEvents queries Frigate for recent detection events.
-// Frigate's GET /api/events returns events sorted newest-first.
-// The limit parameter caps the number of results (0 = server default).
-//
-// When includeThumbnails is true, Frigate returns a small base64-encoded
-// JPEG thumbnail for each event (typically 1-3KB). These are used by
-// the dashboard's alert list for instant preview without a second
-// round-trip per event.
-func (c *FrigateClient) ListEvents(ctx context.Context, limit int, includeThumbnails bool) ([]FrigateEvent, error) {
+// EventFilter holds optional criteria for querying Frigate events.
+type EventFilter struct {
+	Cameras           string
+	Labels            string
+	Before            int64
+	After             int64
+	Limit             int
+	IncludeThumbnails bool
+}
+
+// ListEventsFiltered queries Frigate for detection events matching filter criteria.
+func (c *FrigateClient) ListEventsFiltered(ctx context.Context, f EventFilter) ([]FrigateEvent, error) {
 	u := c.FrigateBase + "/api/events"
 	params := url.Values{}
-	if limit > 0 {
-		params.Set("limit", strconv.Itoa(limit))
+	if f.Limit > 0 {
+		params.Set("limit", strconv.Itoa(f.Limit))
 	}
-	if includeThumbnails {
+	if f.IncludeThumbnails {
 		params.Set("include_thumbnails", "1")
 	} else {
 		params.Set("include_thumbnails", "0")
+	}
+	if f.Cameras != "" {
+		params.Set("cameras", f.Cameras)
+	}
+	if f.Labels != "" {
+		params.Set("labels", f.Labels)
+	}
+	if f.Before > 0 {
+		params.Set("before", strconv.FormatInt(f.Before, 10))
+	}
+	if f.After > 0 {
+		params.Set("after", strconv.FormatInt(f.After, 10))
 	}
 	if len(params) > 0 {
 		u += "?" + params.Encode()
@@ -702,6 +717,21 @@ func (c *FrigateClient) ListEvents(ctx context.Context, limit int, includeThumbn
 		return nil, fmt.Errorf("decode frigate events: %w", err)
 	}
 	return events, nil
+}
+
+// ListEvents queries Frigate for recent detection events.
+// Frigate's GET /api/events returns events sorted newest-first.
+// The limit parameter caps the number of results (0 = server default).
+//
+// When includeThumbnails is true, Frigate returns a small base64-encoded
+// JPEG thumbnail for each event (typically 1-3KB). These are used by
+// the dashboard's alert list for instant preview without a second
+// round-trip per event.
+func (c *FrigateClient) ListEvents(ctx context.Context, limit int, includeThumbnails bool) ([]FrigateEvent, error) {
+	return c.ListEventsFiltered(ctx, EventFilter{
+		Limit:             limit,
+		IncludeThumbnails: includeThumbnails,
+	})
 }
 
 // EventSnapshot fetches the full-resolution snapshot JPEG for a given
