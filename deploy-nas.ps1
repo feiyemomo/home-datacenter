@@ -47,6 +47,7 @@
 param(
     [switch]$DryRun,
     [switch]$NoBuild,
+    [switch]$NoCache,
     [switch]$Logs,
     [switch]$SetupKeys,
     # NAS password. When set, uses SSH_ASKPASS to feed the password to
@@ -321,8 +322,13 @@ if ($exitCode -ne 0) {
 }
 
 # ---- Step 5: build + start services on the NAS ----
+$buildCmd = ""
+if (-not $NoBuild) {
+    $cacheFlag = if ($NoCache) { "--no-cache" } else { "" }
+    $buildCmd = "docker compose build $cacheFlag api web && "
+}
 Write-Host "==> [5/5] Building and starting services on NAS (docker compose up -d $BuildFlag)" -ForegroundColor Cyan
-$composeCmd = "cd '$REMOTE_PATH' && docker compose up -d $BuildFlag 2>&1"
+$composeCmd = "cd '$REMOTE_PATH' && ${buildCmd}docker compose up -d $BuildFlag 2>&1"
 $exitCode = Invoke-NasSSH -RemoteCmd $composeCmd
 if ($exitCode -ne 0) {
     Write-Error "ERROR: docker compose up failed on NAS. Check the output above."
