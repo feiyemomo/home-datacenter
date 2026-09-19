@@ -1,3 +1,5 @@
+//go:build ignore
+
 // fix_camera_password — re-encrypt every camera's stored password
 // with a single new value, then re-push the resulting RTSP URL to
 // go2rtc so the live stream picks up the corrected credentials.

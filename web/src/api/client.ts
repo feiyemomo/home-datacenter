@@ -1,8 +1,11 @@
 import axios, { AxiosError, type AxiosResponse, type InternalAxiosRequestConfig } from "axios";
-import type { ApiEnvelope } from "@/types";
+import type { ApiEnvelope, BindResponse } from "@/types";
 
 /** localStorage key for the JWT issued by /auth/bind. */
 export const TOKEN_KEY = "hd_token";
+
+/** Custom event dispatched when token is updated (via login or sliding refresh). */
+export const TOKEN_UPDATED_EVENT = "hd_token_updated";
 
 /**
  * Read the stored JWT, or null if absent.
@@ -22,7 +25,7 @@ export function getToken(): string | null {
     }
 }
 
-/** Persist the JWT. Best-effort; never throws. */
+/** Persist the JWT and notify active listeners. Best-effort; never throws. */
 export function setToken(token: string): void {
     try {
         localStorage.setItem(TOKEN_KEY, token);
@@ -30,6 +33,11 @@ export function setToken(token: string): void {
         // Storage unavailable — token lives only in memory for this
         // session. The app still works; the user just re-logs in after
         // a reload.
+    }
+    if (typeof window !== "undefined") {
+        window.dispatchEvent(
+            new CustomEvent(TOKEN_UPDATED_EVENT, { detail: { token } }),
+        );
     }
 }
 
@@ -118,10 +126,11 @@ function isTransient(status: number): boolean {
     return status === 0 || status >= 500;
 }
 
-/** Custom per-request field so the interceptor can count retries. */
+/** Custom per-request field so the interceptor can count retries and track refresh attempts. */
 declare module "axios" {
     interface InternalAxiosRequestConfig {
         __retryCount?: number;
+        __isRetryAfterRefresh?: boolean;
     }
 }
 
@@ -129,7 +138,10 @@ function sleepMs(ms: number): Promise<void> {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// ---- Response interceptor: unwrap envelope, handle 401, retry ----
+/** Shared promise for in-flight token refresh to coalesce concurrent 401s. */
+let refreshPromise: Promise<string> | null = null;
+
+// ---- Response interceptor: unwrap envelope, handle 401 with sliding refresh, retry ----
 client.interceptors.response.use(
     (response: AxiosResponse<ApiEnvelope<unknown>>) => {
         const envelope = response.data;
@@ -151,10 +163,60 @@ client.interceptors.response.use(
         const message =
             error.response?.data?.message ?? error.message ?? "request failed";
 
-        // 401 is terminal — the token is bad/expired; retrying won't help.
+        // Handle 401: attempt single-flight sliding token refresh before redirecting
         if (status === 401) {
-            clearTokenAndRedirect();
-            return Promise.reject(new ApiError(status, message));
+            const config = error.config;
+            const url = config?.url ?? "";
+            const isAuthEndpoint =
+                url.includes("/auth/refresh") ||
+                url.includes("/auth/bind") ||
+                url.includes("/auth/logout");
+
+            // If it's an auth endpoint itself, or no token is stored, or this request
+            // was already retried once after a refresh, 401 is genuinely terminal.
+            if (!config || isAuthEndpoint || !getToken() || config.__isRetryAfterRefresh) {
+                clearTokenAndRedirect();
+                return Promise.reject(new ApiError(status, message));
+            }
+
+            // Coalesce concurrent 401s into a single /auth/refresh call
+            if (!refreshPromise) {
+                refreshPromise = (async () => {
+                    const currentToken = getToken();
+                    if (!currentToken) {
+                        throw new Error("No token available to refresh");
+                    }
+                    // Use a standalone axios call to bypass client interceptors
+                    const res = await axios.post<ApiEnvelope<BindResponse>>(
+                        "/api/v1/auth/refresh",
+                        null,
+                        {
+                            headers: {
+                                Authorization: `Bearer ${currentToken}`,
+                            },
+                            timeout: 10000,
+                        },
+                    );
+                    if (res.data && res.data.code === 0 && res.data.data?.token) {
+                        const newToken = res.data.data.token;
+                        setToken(newToken);
+                        return newToken;
+                    }
+                    throw new Error(res.data?.message || "Refresh failed");
+                })().finally(() => {
+                    refreshPromise = null;
+                });
+            }
+
+            try {
+                const freshToken = await refreshPromise;
+                config.__isRetryAfterRefresh = true;
+                config.headers.set("Authorization", `Bearer ${freshToken}`);
+                return client.request(config);
+            } catch {
+                clearTokenAndRedirect();
+                return Promise.reject(new ApiError(status, message));
+            }
         }
 
         // v1.8.41: idempotent retry with exponential backoff. Only retry

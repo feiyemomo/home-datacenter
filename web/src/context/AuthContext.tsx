@@ -10,7 +10,7 @@ import {
 } from "react";
 import { bind as bindApi, refresh as refreshApi } from "@/api/auth";
 import { getCurrentUser } from "@/api/system";
-import { clearTokenAndRedirect, getToken, setToken } from "@/api/client";
+import { clearTokenAndRedirect, getToken, setToken, TOKEN_UPDATED_EVENT } from "@/api/client";
 import { listCameras, listAlerts, preheatCamera } from "@/api/camera";
 import { getNetworkStatus } from "@/api/network";
 import { getWeather } from "@/api/weather";
@@ -55,6 +55,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const [user, setUser] = useState<User | null>(null);
     const [initialized, setInitialized] = useState(false);
     const refreshedOnOpenRef = useRef(false);
+
+    // Keep tokenState in sync if interceptor or background refresh updates JWT
+    useEffect(() => {
+        const handleTokenUpdated = (e: Event) => {
+            const customEvent = e as CustomEvent<{ token: string }>;
+            if (customEvent.detail?.token) {
+                setTokenState(customEvent.detail.token);
+            }
+        };
+        window.addEventListener(TOKEN_UPDATED_EVENT, handleTokenUpdated);
+        return () => window.removeEventListener(TOKEN_UPDATED_EVENT, handleTokenUpdated);
+    }, []);
 
     const claims = useMemo<JwtClaims | null>(() => {
         if (!token) return null;
