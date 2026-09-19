@@ -19,3 +19,15 @@ export async function bind(
     // Response interceptor already unwrapped `data` from the envelope.
     return data.token;
 }
+
+/**
+ * Re-issue a fresh long-lived JWT for the current authenticated session,
+ * updating iat and resetting sliding expiration.
+ *
+ * POST /api/v1/auth/refresh
+ */
+export async function refresh(): Promise<string> {
+    const { data } = await client.post<BindResponse>("/auth/refresh");
+    return data.token;
+}
+

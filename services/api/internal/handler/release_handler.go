@@ -10,7 +10,9 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -43,19 +45,41 @@ import (
 // — no database row, no config file edit, no service restart.
 type ReleaseHandler struct {
 	releasesDir string
+	db          *gorm.DB
 }
 
 // NewReleaseHandler creates a handler that serves APK files from
 // the given directory. The directory must exist (or be created on
 // first deploy); missing directory is not a fatal error — the
 // endpoints will return 404 with a clear message.
-func NewReleaseHandler(releasesDir string) *ReleaseHandler {
-	return &ReleaseHandler{releasesDir: releasesDir}
+func NewReleaseHandler(releasesDir string, db *gorm.DB) *ReleaseHandler {
+	return &ReleaseHandler{releasesDir: releasesDir, db: db}
+}
+
+// isUserAdmin checks if the current authenticated user has the admin role.
+func (h *ReleaseHandler) isUserAdmin(c *gin.Context) bool {
+	if h.db == nil {
+		return false
+	}
+	raw, ok := c.Get("user_id")
+	if !ok {
+		return false
+	}
+	uid, ok := raw.(uint)
+	if !ok {
+		return false
+	}
+	var u model.User
+	if err := h.db.Select("id, is_admin").First(&u, uid).Error; err != nil {
+		return false
+	}
+	return u.IsAdmin
 }
 
 // apkFile is one entry in the releases directory after parsing.
 type apkFile struct {
 	Path         string // absolute path on disk
+	Flavor       string // "debug" or "release"
 	VersionName  string // e.g. "1.6.10"
 	VersionCode  int    // e.g. 53 (parsed from versionName as 1*10000 + 6*100 + 10)
 	SizeBytes    int64
@@ -76,22 +100,27 @@ type apkFile struct {
 //	  "data": {
 //	    "version_name": "1.6.10",
 //	    "version_code": 53,
-//	    "download_url": "/api/v1/release/latest/apk",
-//	    "file_name": "app-debug-v1.6.10.apk",
+//	    "download_url": "/api/v1/release/latest/apk?flavor=release",
+//	    "file_name": "app-release-v1.6.10.apk",
+//	    "flavor": "release",
 //	    "size_bytes": 93543219,
 //	    "release_notes": ""
 //	  }
 //	}
 //
-// The Android client compares version_code against its own
-// PackageInfo.versionCode to decide whether to prompt the user.
-// download_url is a RELATIVE path — the client prepends its
-// resolved base URL (LAN or Cloudflare Tunnel) so the same endpoint
-// works in both environments.
+// 普通用户只能接收 release 版本的推送；admin 用户可以接收 debug 与 release 两种版本。
 func (h *ReleaseHandler) Latest(c *gin.Context) {
-	apk, err := h.findLatest()
+	flavor := strings.TrimSpace(c.Query("flavor"))
+	isAdmin := h.isUserAdmin(c)
+
+	// 普通用户只接受 release 版本；admin 用户接受两种版本
+	if !isAdmin {
+		flavor = "release"
+	}
+
+	apk, err := h.findLatest(flavor)
 	if err != nil {
-		log.Printf("[handler] no releases available: %v", err)
+		log.Printf("[handler] no %s releases available: %v", flavor, err)
 		utils.Fail(c, http.StatusNotFound, "no releases available")
 		return
 	}
@@ -99,8 +128,9 @@ func (h *ReleaseHandler) Latest(c *gin.Context) {
 	utils.Success(c, gin.H{
 		"version_name":  apk.VersionName,
 		"version_code":  apk.VersionCode,
-		"download_url":  "/api/v1/release/latest/apk",
+		"download_url":  "/api/v1/release/latest/apk?flavor=" + apk.Flavor,
 		"file_name":     apk.FileName,
+		"flavor":        apk.Flavor,
 		"size_bytes":    apk.SizeBytes,
 		"release_notes": apk.ReleaseNotes,
 	})
@@ -118,9 +148,17 @@ func (h *ReleaseHandler) Latest(c *gin.Context) {
 // application/octet-stream which also works — Android's
 // PackageInstaller accepts both.
 func (h *ReleaseHandler) Download(c *gin.Context) {
-	apk, err := h.findLatest()
+	flavor := strings.TrimSpace(c.Query("flavor"))
+	isAdmin := h.isUserAdmin(c)
+
+	// 普通用户只接受 release 版本
+	if !isAdmin {
+		flavor = "release"
+	}
+
+	apk, err := h.findLatest(flavor)
 	if err != nil {
-		log.Printf("[handler] no releases available: %v", err)
+		log.Printf("[handler] no %s releases available: %v", flavor, err)
 		utils.Fail(c, http.StatusNotFound, "no releases available")
 		return
 	}
@@ -135,12 +173,10 @@ func (h *ReleaseHandler) Download(c *gin.Context) {
 }
 
 // findLatest scans the releases directory, parses version numbers
-// from filenames matching the convention "app-debug-vX.Y.Z.apk",
-// and returns the one with the highest version_code. Returns an
-// error if the directory doesn't exist, is empty, or contains no
-// matching files.
-func (h *ReleaseHandler) findLatest() (*apkFile, error) {
-	apks, err := h.listAll()
+// from filenames matching the convention "app-{flavor}-vX.Y.Z.apk",
+// and returns the one with the highest version_code matching targetFlavor.
+func (h *ReleaseHandler) findLatest(targetFlavor string) (*apkFile, error) {
+	apks, err := h.listAll(targetFlavor)
 	if err != nil {
 		return nil, err
 	}
@@ -148,10 +184,6 @@ func (h *ReleaseHandler) findLatest() (*apkFile, error) {
 
 	// Read optional release notes from a sibling text file named
 	// release-notes-v{version}.txt. Missing file = empty string.
-	// This lets the publisher attach a changelog per release by
-	// simply dropping a .txt file alongside the APK — no DB, no
-	// config edit. The Android app renders this as the "版本特点"
-	// section in the update dialog.
 	notesPath := filepath.Join(h.releasesDir, "release-notes-v"+latest.VersionName+".txt")
 	notes, _ := os.ReadFile(notesPath)
 	latest.ReleaseNotes = string(notes)
@@ -160,13 +192,8 @@ func (h *ReleaseHandler) findLatest() (*apkFile, error) {
 
 // listAll scans the releases directory and returns every APK matching
 // the "app-{flavor}-vX.Y.Z.apk" convention (flavor in {debug, release}),
-// sorted by version_code descending (newest first). Returns os.ErrNotExist
-// if the directory is empty or has no matching files.
-//
-// v1.8.44: release APKs (signed with the official keystore) are now published
-// under the "app-release-" prefix alongside the long-standing "app-debug-"
-// prefix. Both are parsed identically; the flavor is not part of the version.
-func (h *ReleaseHandler) listAll() ([]apkFile, error) {
+// filtered optionally by targetFlavor, sorted by version_code descending (newest first).
+func (h *ReleaseHandler) listAll(targetFlavor string) ([]apkFile, error) {
 	if h.releasesDir == "" {
 		return nil, os.ErrNotExist
 	}
@@ -192,12 +219,18 @@ func (h *ReleaseHandler) listAll() ([]apkFile, error) {
 		}
 		// Strip the recognized prefix and ".apk" suffix → "1.6.10"
 		var verStr string
+		var flavor string
 		switch {
 		case strings.HasPrefix(name, debugPrefix):
+			flavor = "debug"
 			verStr = strings.TrimSuffix(strings.TrimPrefix(name, debugPrefix), ".apk")
 		case strings.HasPrefix(name, releasePrefix):
+			flavor = "release"
 			verStr = strings.TrimSuffix(strings.TrimPrefix(name, releasePrefix), ".apk")
 		default:
+			continue
+		}
+		if targetFlavor != "" && targetFlavor != "all" && flavor != targetFlavor {
 			continue
 		}
 		code, ok := parseVersionCode(verStr)
@@ -212,6 +245,7 @@ func (h *ReleaseHandler) listAll() ([]apkFile, error) {
 
 		apks = append(apks, apkFile{
 			Path:        filepath.Join(h.releasesDir, name),
+			Flavor:      flavor,
 			VersionName: verStr,
 			VersionCode: code,
 			SizeBytes:   info.Size(),
@@ -235,16 +269,11 @@ func (h *ReleaseHandler) listAll() ([]apkFile, error) {
 // the releases directory, along with their sibling release-notes
 // files. Returns the number of APKs removed. Safe to call repeatedly:
 // it is a no-op when there are already ≤ keep releases.
-//
-// v1.8.27: the releases directory previously accumulated one ~90MB
-// APK per published version forever (5.1GB at last check) while the
-// in-app updater only ever needs the latest. This is the automatic
-// counterpart to the manual cleanup the operator used to do by hand.
 func (h *ReleaseHandler) CleanupOldReleases(keep int) (int, error) {
 	if h.releasesDir == "" || keep <= 0 {
 		return 0, nil
 	}
-	apks, err := h.listAll()
+	apks, err := h.listAll("")
 	if err != nil {
 		// os.ErrNotExist (empty dir) is not an error worth logging.
 		if err == os.ErrNotExist {

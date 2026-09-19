@@ -271,7 +271,8 @@ curl -s http://localhost/health
 # 期望：{"status":"ok"}
 
 # 3. Web 前端
-# 浏览器打开 http://localhost，应能看到登录页
+# 浏览器打开 http://localhost，可直接体验响应式 Dashboard
+# 详细的前端架构设计、流媒体拉流机制与本地开发说明请查阅 web/README.md
 
 # 4. MQTT 连通性（可选）
 docker exec -it home-mosquitto mosquitto_sub -u home-datacenter -P "$MQTT_PASSWORD" -t 'home-datacenter/#' -v -C 1
@@ -610,6 +611,26 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 ---
 
 ## 更新日志
+
+### v1.9.1 — Web 前端架构重构、竞态消除与流媒体健壮性加固 (2026-09-13)
+
+> **背景**：全面重构 Web 前端架构与生命周期安全。① 建立常驻 Layout 嵌套路由架构，杜绝页面跳转时顶栏与侧栏全量销毁闪烁；② 统一网络拓扑感知（`lib/network.ts`）；③ 彻底清理 400+ 行未引用的 Devices 遗留代码；④ 消除 `useCachedFetch` 异步重试竞态、卸载残留及动态 key 缓存不同步；⑤ 修复 WebRTC/MSE 切换回放及时间轴快切时的端口与 Blob URL 泄漏；⑥ 完善 Nginx 安全响应头（CSP/add_header 继承）与样式高对比度。详见 [`web/README.md`](web/README.md)。
+
+**架构与路由**（`web/src/App.tsx`、`web/src/components/Layout.tsx`、`web/src/components/ProtectedRoute.tsx`）：
+- **持久化 Layout Shell**：将 React Router 路由表改为 `<Layout />` 嵌套路由，顶栏、侧栏导航与高斯模糊背景常驻；切页时仅内部 `<Outlet />` 容器触发 slide-up 过渡动画。
+- **清理遗留死代码**：安全移除未路由的 `Devices.tsx`（400+ 行），瘦身代码库。
+
+**网络与拓扑**（`web/src/lib/network.ts`、`web/src/pages/Network.tsx`、`web/src/pages/Dashboard.tsx`）：
+- **统一网络工具库**：抽离 `detectApiPath()`、`isRemoteAccess()` 与 `isOnRelay()`，集中管理 NAS DDNS 域名常量，修复 IPv6 AAAA 直连误判为中继穿透的缺陷。
+
+**流媒体与并发安全**（`web/src/components/LiveVideo.tsx`、`web/src/lib/fmp4Mse.ts`、`web/src/hooks/useCachedFetch.ts`）：
+- **WebRTC / MSE 资源生命周期**：切至录像回放时销毁未完成的 WebRTC 预握手连接；MSE 创建 Blob URL 前后增加中止检查并即时 revoke，防止内存堆积。
+- **`useCachedFetch` 竞态阻断**：增加 `fetchIdRef` 与 `isMountedRef`，切页或组件卸载时立即废弃旧请求，修复指数退避期间卸载组件导致的泄露以及跨页数据覆盖问题；支持动态 key 缓存即时重置。
+- **定时器与空闲队列**：修复 `StatCard` 嵌套定时器泄露；`usePrefetch` 改用 `Set` 集合并在任务执行后自清除，杜绝长时间后台运行的内存单调累积。
+
+**生产部署与样式**（`web/nginx.conf`、`web/index.html`、`web/src/index.css`）：
+- **Nginx CSP & 继承陷阱**：修复 `location = /index.html` 覆盖全局安全响应头的配置陷阱；CSP 规则放行 `blob:`、`ws:`、`wss:`。
+- **渲染性能与可读性**：`.orb` 动效样式增加 GPU 硬件图层提升；修复 Light 模式下顶层继承导致的文本对比度问题。
 
 ### v1.9.0 — Web 录像回放修复 + 前端性能优化（路由拆包） (2026-08-23)
 

@@ -195,6 +195,10 @@ interface HomeCenterApi {
     @POST("api/v1/auth/bind")
     suspend fun bindDevice(@Body req: BindRequest): ApiResponse
 
+    /** POST /api/v1/auth/refresh — re-issue a fresh 365-day JWT for the caller. */
+    @POST("api/v1/auth/refresh")
+    suspend fun refreshToken(@Header("Authorization") auth: String): ApiResponse
+
     /** GET /api/v1/user/me — current user profile. */
     @GET("api/v1/user/me")
     suspend fun getMe(@Header("Authorization") auth: String): ApiResponse
@@ -245,6 +249,12 @@ class HomeCenterRepository(private val api: HomeCenterApi) {
 
     suspend fun bind(userId: Long, accessKey: String): String {
         val resp = api.bindDevice(BindRequest(userId, accessKey))
+        ensureSuccess(resp)
+        return resp.decode(BindData.serializer()).token
+    }
+
+    suspend fun refreshToken(token: String): String {
+        val resp = api.refreshToken(bearer(token))
         ensureSuccess(resp)
         return resp.decode(BindData.serializer()).token
     }

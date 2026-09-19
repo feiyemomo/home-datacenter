@@ -539,6 +539,8 @@ func main() {
 			// The cookie is HttpOnly so JS cannot delete it — the
 			// frontend must call this endpoint to expire it properly.
 			auth.POST("/logout", authHandler.Logout)
+			// POST /auth/refresh re-issues a fresh JWT for an authenticated client with updated iat
+			auth.POST("/refresh", middleware.JWTAuth(deviceRepo), authHandler.Refresh)
 		}
 
 		user := api.Group("/user")
@@ -621,7 +623,7 @@ func main() {
 		// matching "app-debug-vX.Y.Z.apk" and returns the highest
 		// version. Publishing a new release is just scp'ing a new
 		// APK into the directory — no DB row, no restart.
-		releaseHandler := handler.NewReleaseHandler(config.AppConfig.Releases.Dir)
+		releaseHandler := handler.NewReleaseHandler(config.AppConfig.Releases.Dir, database.DB)
 		releaseGroup := api.Group("/release")
 		releaseGroup.Use(middleware.JWTAuth(deviceRepo))
 		{

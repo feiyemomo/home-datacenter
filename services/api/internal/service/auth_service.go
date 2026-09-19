@@ -94,3 +94,33 @@ func (s *AuthService) Bind(
 func (s *AuthService) GetDeviceForAuth(deviceID uint) (*model.Device, error) {
 	return s.deviceRepo.GetByID(deviceID)
 }
+
+// Refresh re-issues a fresh long-lived JWT for an already-authenticated device,
+// updating its LastLoginAt timestamp to the current time.
+func (s *AuthService) Refresh(userID uint, deviceID uint) (string, *model.Device, error) {
+	device, err := s.deviceRepo.GetByID(deviceID)
+	if err != nil {
+		return "", nil, err
+	}
+	if device.UserID != userID {
+		return "", nil, errors.New("device does not belong to user")
+	}
+	if device.RevokedAt.Valid {
+		return "", nil, errors.New("device revoked")
+	}
+
+	// Update last login timestamp
+	now := time.Now()
+	device.LastLoginAt = utils.NullTime{Time: now, Valid: true}
+	if err := s.deviceRepo.Update(device); err != nil {
+		return "", nil, err
+	}
+
+	token, err := utils.GenerateToken(userID, device.ID, device.TokenVersion)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return token, device, nil
+}
+

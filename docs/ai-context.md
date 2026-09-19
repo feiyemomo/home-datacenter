@@ -239,24 +239,26 @@ services/api/
 ├── Dockerfile
 └── (compose.yaml at project root)
 
-web/                             // React + Vite + Tailwind dashboard SPA
+web/                             // React 18 + Vite 5 + Tailwind dashboard SPA
+├── README.md                    // Web frontend architecture and developer guide
 ├── src/
-│   ├── pages/{Dashboard,Cameras,Devices,DeviceCreate,Login,MqttDebug,Profile}.tsx
-│   │                       // Cameras: list + live view + delete (read-mostly)
-│   │                       // DeviceCreate: /cameras/new — dedicated full-page
-│   │                       //   form for registering a camera (Phase 7)
-│   ├── api/{auth,camera,client,device,system}.ts
+│   ├── pages/{Dashboard,Cameras,DeviceCreate,Login,Logs,MqttDebug,Network,Profile,Users}.tsx
+│   │                       // Cameras: live stream (WebRTC/HLS) + timeline playback (MSE)
+│   │                       // DeviceCreate: /cameras/new — camera registration wizard
+│   │                       // Network: topology, IPv6 direct vs tunnel relay detection
+│   │                       // Users: admin CRUD with last-admin/self-delete guards
+│   ├── api/{auth,camera,client,device,network,system,user,weather}.ts
 │   │                  // client.ts: axios + authedFetch() + authHeaderFor()
-│   │                  //   (authedFetch attaches the JWT to plain fetch
-│   │                  //   requests going through nginx's /go2rtc/ location,
-│   │                  //   which is gated by auth_request /api/v1/auth/verify)
-│   ├── context/AuthContext.tsx  // /user/me probe, isAdmin
-│   ├── hooks/{useAuth,useWebSocket,useHLSStream,useWebRTCStream}.ts
-│   │            // useHLSStream: HLS primary path (HEVC over fMP4)
-│   │            // useWebRTCStream: low-latency path; auto-fallback to HLS
-│   │            //   for HEVC cameras on Chromium (Chrome/Edge/WebView)
-│   └── components/              // Layout, Sidebar, ProtectedRoute, ui/*
-├── nginx.conf                   // SPA + /api proxy + /api/v1/ws upgrade
+│   ├── lib/{network,fmp4Mse,errorReport,utils}.ts
+│   │                  // network.ts: unified topology & API path detection
+│   │                  // fmp4Mse.ts: MSE fMP4 progressive stream playback engine
+│   ├── context/AuthContext.tsx  // /user/me probe, isAdmin, token store
+│   ├── hooks/{useAuth,useCachedFetch,useHLSStream,usePrefetch,useTheme,useWebRTCStream,useWebSocket}.ts
+│   │            // useCachedFetch: sessionStorage caching, silent refresh & race condition safe
+│   │            // useWebSocket: subprotocol auth, heartbeat, persisted subscriptions
+│   │            // useHLSStream / useWebRTCStream: streaming video hooks with cleanup
+│   └── components/              // Layout (persistent shell), Sidebar, ProtectedRoute, LiveVideo, etc.
+├── nginx.conf                   // SPA + /api proxy (keepalive) + /api/v1/ws upgrade + CSP
 └── Dockerfile
 
 deploy/

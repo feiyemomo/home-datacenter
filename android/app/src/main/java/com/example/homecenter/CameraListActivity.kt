@@ -77,6 +77,17 @@ class CameraListActivity : ComponentActivity() {
         )
         lifecycleScope.launch {
             try {
+                // Silently refresh token on app open so iat stays fresh and sliding expiration is active
+                launch(Dispatchers.IO) {
+                    try {
+                        val freshToken = repo.refreshToken(token)
+                        if (freshToken.isNotEmpty()) {
+                            store.token = freshToken
+                        }
+                    } catch (_: Throwable) {
+                        // Silent fallback — current token remains valid
+                    }
+                }
                 val cameras = withContext(Dispatchers.IO) { repo.listCameras(token) }
                 render(cameras)
             } catch (t: Throwable) {

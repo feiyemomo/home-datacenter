@@ -27,10 +27,10 @@ param(
     [switch]$BuildOnly,   # build + version-rename locally, but do NOT push to NAS
     # NAS password; when set, uses SSH_ASKPASS to feed it non-interactively.
     [string]$Password,
-    # Build flavor to push: "debug" (default) or "release" (official keystore
-    # signed). Release chooses app-release.apk, assembles via assembleRelease.
+    # Build flavor to push: "release" (default, official keystore
+    # signed) or "debug". Release chooses app-release.apk, assembles via assembleRelease.
     [ValidateSet("debug", "release")]
-    [string]$Flavor = "debug"
+    [string]$Flavor = "release"
 )
 
 $ErrorActionPreference = "Stop"

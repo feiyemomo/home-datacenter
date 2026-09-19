@@ -4,10 +4,11 @@ import {
     useContext,
     useEffect,
     useMemo,
+    useRef,
     useState,
     type ReactNode,
 } from "react";
-import { bind as bindApi } from "@/api/auth";
+import { bind as bindApi, refresh as refreshApi } from "@/api/auth";
 import { getCurrentUser } from "@/api/system";
 import { clearTokenAndRedirect, getToken, setToken } from "@/api/client";
 import { listCameras, listAlerts, preheatCamera } from "@/api/camera";
@@ -53,6 +54,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const [token, setTokenState] = useState<string | null>(() => getToken());
     const [user, setUser] = useState<User | null>(null);
     const [initialized, setInitialized] = useState(false);
+    const refreshedOnOpenRef = useRef(false);
 
     const claims = useMemo<JwtClaims | null>(() => {
         if (!token) return null;
@@ -103,16 +105,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             };
             if (cameras.status === "fulfilled") {
                 writeCache(PREFETCH_KEYS.cameras, cameras.value);
-                // v1.9.x: warm the backend (go2rtc/RTSP) streams during
-                // splash so the first WebRTC/HLS/MP4 request doesn't pay
-                // the 1-10s cold-start. Fire-and-forget — never blocks the
-                // splash gate. go2rtc keeps producers warm for 120s
-                // (#stop=120, see Registry.StopTimeout), so a normal login
-                // → live-view navigation hits a hot source without the
-                // 1-2s cold-start; idle cameras still release after 120s
-                // so they cost nothing long-term. Only online cameras are
-                // warmed; offline ones can't connect and would just fail
-                // silently.
                 for (const cam of cameras.value) {
                     if (cam.status === "online") {
                         preheatCamera(cam.id).catch(() => {});
@@ -120,10 +112,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
                 }
             }
             if (network.status === "fulfilled") {
-                // Match the consuming Network.tsx shape: { status, clientIPv6 }.
-                // clientIPv6 is unknown during splash (it needs a separate
-                // client-side probe), so it's seeded as null and the page
-                // self-heals with "checking…" on mount.
                 writeCache(PREFETCH_KEYS.network, {
                     status: network.value,
                     clientIPv6: null,
@@ -141,8 +129,23 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         // (redirect to /login); here we just clear the user and
         // continue to `initialized` so the splash resolves.
         const userPromise = getCurrentUser()
-            .then((u) => {
-                if (!cancelled) setUser(u);
+            .then(async (u) => {
+                if (cancelled) return;
+                setUser(u);
+                // Silently refresh token on app open to acquire a fresh JWT with updated iat
+                // and maintain sliding expiration, without blocking the splash screen.
+                if (!refreshedOnOpenRef.current) {
+                    refreshedOnOpenRef.current = true;
+                    try {
+                        const freshJwt = await refreshApi();
+                        if (!cancelled && freshJwt) {
+                            setToken(freshJwt);
+                            setTokenState(freshJwt);
+                        }
+                    } catch {
+                        // Silent fallback — current token remains valid
+                    }
+                }
             })
             .catch(() => {
                 if (!cancelled) setUser(null);
@@ -166,6 +169,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const login = useCallback(async (userId: number, accessKey: string) => {
         const jwt = await bindApi(userId, accessKey);
+        refreshedOnOpenRef.current = true;
         setToken(jwt);
         setTokenState(jwt);
         // Fetch the user identity immediately so isAdmin is available
@@ -175,6 +179,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }, []);
 
     const logout = useCallback(() => {
+        refreshedOnOpenRef.current = false;
         clearTokenAndRedirect();
         setTokenState(null);
         setUser(null);

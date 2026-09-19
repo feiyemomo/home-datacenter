@@ -253,3 +253,36 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 	c.SetCookie("home_token", "", -1, "/", "", secureCookie, true)
 	utils.Success(c, gin.H{"logged_out": true})
 }
+
+// Refresh re-issues a fresh long-lived JWT for the currently authenticated client,
+// updating its last_login_at timestamp and refreshing the auth cookie.
+//
+//	Route: POST /api/v1/auth/refresh
+func (h *AuthHandler) Refresh(c *gin.Context) {
+	userID := c.GetUint("user_id")
+	deviceID := c.GetUint("device_id")
+	if userID == 0 || deviceID == 0 {
+		utils.Fail(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	token, device, err := h.authService.Refresh(userID, deviceID)
+	if err != nil {
+		utils.Fail(c, http.StatusUnauthorized, err.Error())
+		return
+	}
+
+	const maxAge = 365 * 24 * 60 * 60
+	secureCookie := false
+	if config.AppConfig != nil {
+		secureCookie = config.AppConfig.Server.SecureCookie
+	}
+	c.SetSameSite(http.SameSiteLaxMode)
+	c.SetCookie("home_token", token, maxAge, "/", "", secureCookie, true)
+
+	utils.Success(c, gin.H{
+		"token":     token,
+		"device_id": device.ID,
+	})
+}
+
