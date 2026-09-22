@@ -516,16 +516,23 @@ export default function Automations() {
 
             {/* Modal for Create / Edit Rule */}
             {modalOpen && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-fade-in">
-                    <div className="w-full max-w-lg rounded-2xl border border-border/70 bg-card p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto">
-                        <div className="flex items-center justify-between pb-3 border-b border-border/50">
+                <div
+                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in"
+                    onClick={() => setModalOpen(false)}
+                >
+                    <div
+                        className="relative w-full max-w-lg rounded-2xl border border-[rgb(var(--border)/0.8)] bg-surface-raised p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto"
+                        onClick={(e) => e.stopPropagation()}
+                    >
+                        <div className="flex items-center justify-between pb-3 border-b border-[rgb(var(--border)/0.6)]">
                             <h3 className="text-lg font-bold text-fg flex items-center gap-2">
                                 <Zap className="text-[rgb(var(--accent-primary))]" size={20} />
                                 {editingRule ? "编辑自动化规则" : "新建自动化联动规则"}
                             </h3>
                             <button
+                                type="button"
                                 onClick={() => setModalOpen(false)}
-                                className="text-fg-subtle hover:text-fg"
+                                className="p-1 rounded-lg text-fg-subtle hover:text-fg hover:bg-surface-subtle transition-colors"
                             >
                                 <X size={18} />
                             </button>
@@ -533,15 +540,15 @@ export default function Automations() {
 
                         {/* Presets picker for new rule */}
                         {!editingRule && (
-                            <div className="space-y-2">
+                            <div className="space-y-2 p-3 rounded-xl bg-surface-subtle border border-[rgb(var(--border)/0.5)]">
                                 <Label className="text-xs text-fg-muted">快速套用推荐预置模板：</Label>
-                                <div className="flex flex-wrap gap-2">
+                                <div className="flex flex-wrap gap-2 pt-1">
                                     {PRESETS.map((p, idx) => (
                                         <button
                                             key={idx}
                                             type="button"
                                             onClick={() => applyPreset(p)}
-                                            className="text-xs px-2.5 py-1.5 rounded-lg border border-border/60 bg-[rgb(var(--bg-subtle)/0.3)] hover:bg-[rgb(var(--accent-primary)/0.1)] hover:border-[rgb(var(--accent-primary)/0.4)] transition-all text-fg"
+                                            className="text-xs px-2.5 py-1.5 rounded-lg border border-[rgb(var(--border)/0.8)] bg-surface hover:bg-[rgb(var(--accent-primary)/0.12)] hover:border-[rgb(var(--accent-primary)/0.5)] transition-all text-fg shadow-sm font-medium"
                                         >
                                             {p.label}
                                         </button>
@@ -614,7 +621,7 @@ export default function Automations() {
 
                             {/* Dynamic Action Fields */}
                             {formActionType === "notify" && (
-                                <div className="space-y-3 p-3 rounded-xl bg-[rgb(var(--bg-subtle)/0.3)] border border-border/40">
+                                <div className="space-y-3 p-3.5 rounded-xl bg-surface-subtle border border-[rgb(var(--border)/0.5)]">
                                     <div className="space-y-1">
                                         <Label className="text-xs">通知标题</Label>
                                         <Input
@@ -635,7 +642,7 @@ export default function Automations() {
                             )}
 
                             {formActionType === "mqtt" && (
-                                <div className="space-y-3 p-3 rounded-xl bg-[rgb(var(--bg-subtle)/0.3)] border border-border/40">
+                                <div className="space-y-3 p-3.5 rounded-xl bg-surface-subtle border border-[rgb(var(--border)/0.5)]">
                                     <div className="space-y-1">
                                         <Label className="text-xs">MQTT Topic *</Label>
                                         <Input
@@ -656,7 +663,7 @@ export default function Automations() {
                             )}
 
                             {formActionType === "webhook" && (
-                                <div className="space-y-3 p-3 rounded-xl bg-[rgb(var(--bg-subtle)/0.3)] border border-border/40">
+                                <div className="space-y-3 p-3.5 rounded-xl bg-surface-subtle border border-[rgb(var(--border)/0.5)]">
                                     <div className="space-y-1">
                                         <Label className="text-xs">Webhook URL *</Label>
                                         <Input
@@ -684,7 +691,7 @@ export default function Automations() {
                             </div>
 
                             {/* Buttons */}
-                            <div className="flex items-center justify-end gap-3 pt-3 border-t border-border/40">
+                            <div className="flex items-center justify-end gap-3 pt-3 border-t border-[rgb(var(--border)/0.5)]">
                                 <Button
                                     type="button"
                                     variant="outline"
