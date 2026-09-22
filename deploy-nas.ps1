@@ -66,7 +66,10 @@ $NAS_PORT   = 22
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
 # =============================================================
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
+if (Test-Path variable:PSNativeCommandUseErrorActionPreference) {
+    $PSNativeCommandUseErrorActionPreference = $false
+}
 $ProjectRoot = $PSScriptRoot
 Set-Location $ProjectRoot
 
