@@ -16,6 +16,16 @@ type MetricsSnapshot struct {
 	Disk           DiskMetrics       `json:"disk"`
 	Recordings     RecordingsMetrics `json:"recordings"`
 	TranscodeCache CacheMetrics      `json:"transcode_cache"`
+
+	// Flat convenience fields for mobile & lightweight consumers:
+	CPUPercent        float64 `json:"cpu_percent"`
+	MemoryUsedMB      uint64  `json:"memory_used_mb"`
+	MemoryTotalMB     uint64  `json:"memory_total_mb"`
+	MemoryPercent     float64 `json:"memory_percent"`
+	RecordingsUsedGB  float64 `json:"recordings_used_gb"`
+	RecordingsLimitGB float64 `json:"recordings_limit_gb"`
+	RecordingsPercent float64 `json:"recordings_percent"`
+	TranscodeCacheMB  uint64  `json:"transcode_cache_mb"`
 }
 
 type CPUMetrics struct {
@@ -58,6 +68,17 @@ var (
 	lastCPUSampleAt time.Time
 )
 
+func init() {
+	go func() {
+		// Initial sample
+		SampleCPU()
+		for {
+			time.Sleep(3 * time.Second)
+			SampleCPU()
+		}
+	}()
+}
+
 // SampleCPU computes the CPU usage delta since the last call.
 func SampleCPU() float64 {
 	tot, idle, err := cpuUsage()
@@ -68,7 +89,7 @@ func SampleCPU() float64 {
 	metricsMu.Lock()
 	defer metricsMu.Unlock()
 
-	if lastCPUTotal == 0 || time.Since(lastCPUSampleAt) > 30*time.Second {
+	if lastCPUTotal == 0 {
 		lastCPUTotal = tot
 		lastCPUIdle = idle
 		lastCPUSampleAt = time.Now()
@@ -161,6 +182,15 @@ func CollectMetrics(diskPath string, recordingsDir string, quotaBytes uint64) Me
 		Disk:           disk,
 		Recordings:     rec,
 		TranscodeCache: cache,
+
+		CPUPercent:        cpuPct,
+		MemoryUsedMB:      mem.UsedBytes / (1024 * 1024),
+		MemoryTotalMB:     mem.TotalBytes / (1024 * 1024),
+		MemoryPercent:     mem.UsedPercent,
+		RecordingsUsedGB:  math.Round((float64(rec.SizeBytes)/(1024*1024*1024))*10) / 10,
+		RecordingsLimitGB: float64(rec.QuotaBytes) / (1024 * 1024 * 1024),
+		RecordingsPercent: rec.QuotaPercent,
+		TranscodeCacheMB:  cache.SizeBytes / (1024 * 1024),
 	}
 }
 
