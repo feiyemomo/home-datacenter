@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Power, Play, MoreVertical } from "lucide-react";
+import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight, ZoomIn, ZoomOut, Square, AlertTriangle, Loader2, RefreshCw, Play, MoreVertical } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -244,7 +244,6 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     }, [camera.id, onWsMessage]);
 
     async function sendPTZ(command: string) {
-        if (!isAdmin) return;
         setBusy(true);
         setPtzError(null);
         try {
@@ -257,7 +256,6 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     }
 
     async function sendPreset(alias: string) {
-        if (!isAdmin) return;
         setBusy(true);
         setPtzError(null);
         try {
@@ -708,7 +706,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             <Button
                                 size="icon"
                                 variant="outline"
-                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                disabled={busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("up")}
                                 aria-label="上转"
                                 className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
@@ -719,7 +717,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             <Button
                                 size="icon"
                                 variant="outline"
-                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                disabled={busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("left")}
                                 aria-label="左转"
                                 className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
@@ -729,7 +727,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             <Button
                                 size="icon"
                                 variant="outline"
-                                disabled={!isAdmin || busy}
+                                disabled={busy}
                                 onClick={() => sendPTZ("stop")}
                                 aria-label="停止转动"
                                 className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
@@ -739,7 +737,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             <Button
                                 size="icon"
                                 variant="outline"
-                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                disabled={busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("right")}
                                 aria-label="右转"
                                 className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
@@ -750,7 +748,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                             <Button
                                 size="icon"
                                 variant="outline"
-                                disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                disabled={busy || !camera.capabilities.ptz}
                                 onClick={() => sendPTZ("down")}
                                 aria-label="下转"
                                 className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
@@ -766,7 +764,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 <Button
                                     size="sm"
                                     variant="outline"
-                                    disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                    disabled={busy || !camera.capabilities.ptz}
                                     onClick={() => sendPTZ("zoom_in")}
                                     className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                                 >
@@ -776,19 +774,13 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                 <Button
                                     size="sm"
                                     variant="outline"
-                                    disabled={!isAdmin || busy || !camera.capabilities.ptz}
+                                    disabled={busy || !camera.capabilities.ptz}
                                     onClick={() => sendPTZ("zoom_out")}
                                     className="hover:bg-[rgb(var(--bg-subtle)/0.6)]"
                                 >
                                     <ZoomOut size={14} className="mr-1" />
                                     拉远
                                 </Button>
-                                {!isAdmin && (
-                                    <Badge variant="outline" className="text-[10px]">
-                                        <Power size={10} className="mr-1" />
-                                        仅观看
-                                    </Badge>
-                                )}
                             </div>
                             {Object.keys(camera.presets ?? {}).length > 0 && (
                                 <div className="flex flex-wrap items-center gap-1">
@@ -797,7 +789,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
                                             key={alias}
                                             size="sm"
                                             variant="secondary"
-                                            disabled={!isAdmin || busy}
+                                            disabled={busy}
                                             onClick={() => sendPreset(alias)}
                                         >
                                             {alias}

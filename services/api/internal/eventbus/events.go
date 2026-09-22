@@ -33,6 +33,9 @@ const (
 	// connected dashboards see new log entries in real time.
 	TopicSystemLog = "system.log"
 
+	// --- Security events (v1.11.0) ---
+	TopicSecurityGuardMode = "security.guard_mode"
+
 	// --- User auth events ---
 	// Emitted by the auth handler on /auth/bind success and by the
 	// device handler on device revoke. Persisted by the log

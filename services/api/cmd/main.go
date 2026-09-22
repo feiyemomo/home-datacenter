@@ -28,6 +28,7 @@ import (
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
 	"home-datacenter-api/internal/repository"
+	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
 	"home-datacenter-api/internal/ws"
@@ -191,7 +192,12 @@ func main() {
 			hub, deviceRepo, deviceMgr, userService,
 		)
 	}
+	guardMgr := security.NewGuardManager(database.DB, bus)
+	mqttHandler.SetGuardProvider(guardMgr)
+	securityHandler := handler.NewSecurityHandler(guardMgr)
+
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
+	systemHandler.ConfigureMetrics(cfg.Maintenance.DiskPath, cfg.Camera.RecordingDir, cfg.Maintenance.RecordingQuotaBytes, bus)
 	systemLogHandler := handler.NewSystemLogHandler(database.DB)
 	clientErrorHandler := handler.NewClientErrorHandler(database.DB)
 
@@ -612,6 +618,16 @@ func main() {
 			// level. The log stays in the audit trail but is
 			// removed from the "pending" section.
 			systemAdmin.PATCH("/logs/:id", systemLogHandler.Verify)
+			// v1.11.0: clean-cache purges /data/recordings/.transcode-cache.
+			systemAdmin.POST("/clean-cache", systemHandler.CleanCache)
+		}
+
+		// v1.11.0: Security Guard arm/disarm modes.
+		securityGroup := api.Group("/security")
+		securityGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			securityGroup.GET("/guard", securityHandler.GetGuard)
+			securityGroup.PUT("/guard", securityHandler.SetGuard)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so

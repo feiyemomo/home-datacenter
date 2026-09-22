@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"time"
@@ -8,6 +9,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"home-datacenter-api/internal/device"
+	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/maintenance"
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/utils"
 	"home-datacenter-api/internal/ws"
@@ -15,10 +18,14 @@ import (
 
 // SystemHandler exposes system-level status and debug endpoints.
 type SystemHandler struct {
-	mqttClient *mqtt.Client
-	hub        *ws.Hub
-	deviceMgr  *device.Manager
-	startTime  time.Time
+	mqttClient    *mqtt.Client
+	hub           *ws.Hub
+	deviceMgr     *device.Manager
+	startTime     time.Time
+	diskPath      string
+	recordingsDir string
+	quotaBytes    uint64
+	bus           *eventbus.Bus
 }
 
 // NewSystemHandler creates a handler for system status and MQTT debug.
@@ -35,11 +42,20 @@ func NewSystemHandler(
 	}
 }
 
+// ConfigureMetrics sets up the filesystem and recording paths for telemetry.
+func (h *SystemHandler) ConfigureMetrics(diskPath, recordingsDir string, quotaBytes uint64, bus *eventbus.Bus) {
+	h.diskPath = diskPath
+	h.recordingsDir = recordingsDir
+	h.quotaBytes = quotaBytes
+	h.bus = bus
+}
+
 // Status returns real-time system metrics for the dashboard.
 //
 //	Route: GET /api/v1/system/status
 func (h *SystemHandler) Status(c *gin.Context) {
 	onlineDevices := h.deviceMgr.GetOnlineDevices()
+	metrics := maintenance.CollectMetrics(h.diskPath, h.recordingsDir, h.quotaBytes)
 
 	utils.Success(c, gin.H{
 		"mqtt_connected":      h.mqttClient.IsConnected(),
@@ -48,6 +64,38 @@ func (h *SystemHandler) Status(c *gin.Context) {
 		"online_device_ids":   onlineDevices,
 		"uptime_seconds":      int64(time.Since(h.startTime).Seconds()),
 		"server_time":         time.Now().Format("2006-01-02 15:04:05"),
+		"metrics":             metrics,
+	})
+}
+
+// CleanCache clears the transcode cache under recordings directory.
+//
+//	Route: POST /api/v1/system/clean-cache
+func (h *SystemHandler) CleanCache(c *gin.Context) {
+	reclaimed, count, err := maintenance.CleanTranscodeCache(h.recordingsDir)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to clean transcode cache")
+		return
+	}
+
+	if h.bus != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"reclaimed_bytes": reclaimed,
+			"deleted_files":   count,
+			"user_id":         c.GetUint("user_id"),
+			"ts":              time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicSystemLog,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityInfo,
+			Payload:  payload,
+		})
+	}
+
+	utils.Success(c, gin.H{
+		"reclaimed_bytes": reclaimed,
+		"deleted_files":   count,
 	})
 }
 

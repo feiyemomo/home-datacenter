@@ -1,4 +1,4 @@
-﻿/**
+/**
  * Shared TypeScript types for the Home Datacenter dashboard.
  *
  * The backend wraps every response in:
@@ -109,6 +109,7 @@ export interface SystemStatus {
     online_device_ids: number[];
     uptime_seconds: number;
     server_time: string;
+    metrics?: SystemMetrics;
 }
 
 /** Request body for POST /api/v1/mqtt/publish. */
@@ -395,3 +396,127 @@ export interface StoredEvent {
     payload: Record<string, unknown> | null;
     timestamp: string;
 }
+
+// -------------------- Automation Rules (Phase 5/6) --------------------
+
+export interface NumberOp {
+    op: ">" | ">=" | "<" | "<=" | "==" | "!=";
+    val: number;
+}
+
+export interface RuleCondition {
+    time_gte?: string;
+    time_lte?: string;
+    payload_eq?: Record<string, unknown>;
+    source?: string;
+    threshold?: Record<string, NumberOp>;
+    regex?: Record<string, string>;
+    any?: boolean;
+}
+
+export interface RuleAction {
+    type: "notify" | "mqtt" | "webhook" | string;
+    user_id?: number;
+    title?: string;
+    body?: string;
+    topic?: string;
+    payload?: string;
+    qos?: number;
+    url?: string;
+    method?: string;
+    headers?: Record<string, string>;
+    timeout_ms?: number;
+    retry_max?: number;
+}
+
+export interface RuleThrottle {
+    cooldown_s?: number;
+    rate_per_min?: number;
+    dedup?: boolean;
+}
+
+export interface AutomationRule {
+    id: number;
+    name: string;
+    trigger: string;
+    condition: RuleCondition;
+    action: RuleAction;
+    throttle: RuleThrottle;
+    enabled: boolean;
+    fire_count: number;
+    last_fire_at?: number;
+    created_at: number;
+    updated_at: number;
+}
+
+export interface AutomationRulesResponse {
+    rules: AutomationRule[];
+    total: number;
+}
+
+export interface AutomationMetrics {
+    total_events: number;
+    total_matches: number;
+    total_fires: number;
+    total_dropped_cooldown: number;
+    total_dropped_rate: number;
+    total_dropped_dedup: number;
+    total_errors: number;
+    rules: Record<string, {
+        matches: number;
+        fires: number;
+        errors: number;
+        cooldown_drops: number;
+        rate_drops: number;
+        dedup_drops: number;
+        last_fire_ts: number;
+    }>;
+}
+
+// -------------------- Security Guard (v1.11.0) --------------------
+
+export type SecurityMode = "disarmed" | "armed_home" | "armed_away";
+
+export interface SecurityGuardState {
+    mode: SecurityMode;
+    updated_by?: string;
+    updated_at: number;
+}
+
+// -------------------- Datacenter Ops & Metrics (v1.11.0) --------------------
+
+export interface SystemMetrics {
+    cpu?: {
+        percent: number;
+        cores?: number;
+    };
+    memory?: {
+        total_bytes: number;
+        available_bytes: number;
+        used_bytes: number;
+        used_percent: number;
+    };
+    disk?: {
+        path: string;
+        total_bytes: number;
+        free_bytes: number;
+        used_bytes: number;
+        used_percent: number;
+    };
+    recordings?: {
+        size_bytes: number;
+        quota_bytes: number;
+        quota_percent: number;
+        quota_active: boolean;
+    };
+    transcode_cache?: {
+        size_bytes: number;
+        file_count: number;
+    };
+    services?: Array<{
+        name: string;
+        status: "online" | "offline" | "warn";
+        latency_ms?: number;
+    }>;
+}
+

@@ -39,6 +39,7 @@ const Logs = lazy(() => import("@/pages/Logs"));
 const MqttDebug = lazy(() => import("@/pages/MqttDebug"));
 const Profile = lazy(() => import("@/pages/Profile"));
 const Users = lazy(() => import("@/pages/Users"));
+const Automations = lazy(() => import("@/pages/Automations"));
 
 /**
  * Application routes.
@@ -114,6 +115,7 @@ function AppRoutes() {
                             <Route path="/logs" element={<Logs />} />
                             <Route path="/cameras/new" element={<DeviceCreate />} />
                             <Route path="/users" element={<Users />} />
+                            <Route path="/automations" element={<Automations />} />
                             <Route path="/mqtt" element={<MqttDebug />} />
                         </Route>
                     </Route>

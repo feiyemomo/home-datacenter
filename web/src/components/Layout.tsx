@@ -17,10 +17,17 @@ import {
     Monitor,
     Network as NetworkIcon,
     Check,
+    Zap,
+    Shield,
+    ShieldAlert,
+    ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme, type Theme } from "@/hooks/useTheme";
+import { useWebSocket } from "@/hooks/useWebSocket";
+import { getSecurityGuard, setSecurityGuard } from "@/api/security";
+import type { SecurityMode } from "@/types";
 import { Button } from "@/components/ui/button";
 
 interface NavItem {
@@ -44,6 +51,12 @@ const NAV_ITEMS: NavItem[] = [
         to: "/users",
         label: "用户",
         icon: <UserCog size={18} />,
+        adminOnly: true,
+    },
+    {
+        to: "/automations",
+        label: "智能联动",
+        icon: <Zap size={18} />,
         adminOnly: true,
     },
     {
@@ -278,6 +291,158 @@ function ThemeMenu() {
     );
 }
 
+/**
+ * SecurityGuardMenu — 3-state home security arming switcher.
+ * Synchronizes with backend and WebSocket in real-time.
+ */
+function SecurityGuardMenu() {
+    const [mode, setMode] = useState<SecurityMode>("armed_away");
+    const [open, setOpen] = useState(false);
+    const [loading, setLoading] = useState(false);
+    const ref = useRef<HTMLDivElement>(null);
+    const { lastMessage } = useWebSocket();
+
+    useEffect(() => {
+        getSecurityGuard()
+            .then((res) => {
+                if (res?.mode) setMode(res.mode);
+            })
+            .catch(() => {});
+    }, []);
+
+    useEffect(() => {
+        if (!lastMessage) return;
+        if (lastMessage.type === "security.guard_mode") {
+            const payload = lastMessage.payload as any;
+            if (payload?.mode) {
+                setMode(payload.mode);
+            }
+        }
+    }, [lastMessage]);
+
+    useEffect(() => {
+        if (!open) return;
+        const onClick = (e: MouseEvent) => {
+            if (ref.current && !ref.current.contains(e.target as Node)) {
+                setOpen(false);
+            }
+        };
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setOpen(false);
+        };
+        window.addEventListener("mousedown", onClick);
+        window.addEventListener("keydown", onKey);
+        return () => {
+            window.removeEventListener("mousedown", onClick);
+            window.removeEventListener("keydown", onKey);
+        };
+    }, [open]);
+
+    const handleSelect = async (newMode: SecurityMode) => {
+        if (newMode === mode) {
+            setOpen(false);
+            return;
+        }
+        setLoading(true);
+        try {
+            const res = await setSecurityGuard(newMode);
+            setMode(res.mode);
+        } catch (e) {
+            console.error("failed to switch security guard mode", e);
+        } finally {
+            setLoading(false);
+            setOpen(false);
+        }
+    };
+
+    const MODES: Array<{
+        value: SecurityMode;
+        label: string;
+        desc: string;
+        color: string;
+        icon: typeof Shield;
+    }> = [
+        {
+            value: "armed_away",
+            label: "离家布防",
+            desc: "全警戒，AI 异动触发即时强提醒与联动",
+            color: "text-rose-500 bg-rose-500/10 border-rose-500/30",
+            icon: ShieldAlert,
+        },
+        {
+            value: "armed_home",
+            label: "在家守护",
+            desc: "监控重点外围，忽略室内移动",
+            color: "text-amber-500 bg-amber-500/10 border-amber-500/30",
+            icon: Shield,
+        },
+        {
+            value: "disarmed",
+            label: "撤防免打扰",
+            desc: "在家免打扰，告警静音不弹窗",
+            color: "text-emerald-500 bg-emerald-500/10 border-emerald-500/30",
+            icon: ShieldCheck,
+        },
+    ];
+
+    const current = MODES.find((m) => m.value === mode) || MODES[0];
+    const CurrentIcon = current.icon;
+
+    return (
+        <div ref={ref} className="relative z-50">
+            <button
+                onClick={() => setOpen((v) => !v)}
+                disabled={loading}
+                className={cn(
+                    "flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-medium border transition-all duration-200 shadow-sm hover:brightness-105",
+                    current.color
+                )}
+                title={`当前安防模式：${current.label}（点击切换）`}
+            >
+                <CurrentIcon size={14} className={loading ? "animate-spin" : ""} />
+                <span>{current.label}</span>
+            </button>
+            {open && (
+                <div
+                    role="menu"
+                    className="absolute right-0 top-full mt-2 w-64 overflow-hidden rounded-xl glass p-2 shadow-2xl animate-scale-in ring-1 ring-[rgb(var(--border)/0.3)] space-y-1"
+                >
+                    <div className="px-2 py-1 text-[11px] font-semibold text-fg-subtle border-b border-border/40 mb-1">
+                        切换家庭安防模式
+                    </div>
+                    {MODES.map((m) => {
+                        const Icon = m.icon;
+                        const active = m.value === mode;
+                        return (
+                            <button
+                                key={m.value}
+                                onClick={() => handleSelect(m.value)}
+                                className={cn(
+                                    "w-full flex items-start gap-2.5 p-2 rounded-lg text-left transition-all text-xs",
+                                    active
+                                        ? "bg-[rgb(var(--accent-primary)/0.12)] text-[rgb(var(--accent-primary))]"
+                                        : "hover:bg-[rgb(var(--bg-subtle)/0.5)] text-fg"
+                                )}
+                            >
+                                <Icon size={16} className="mt-0.5 shrink-0" />
+                                <div className="min-w-0 flex-1">
+                                    <div className="font-medium flex items-center justify-between">
+                                        <span>{m.label}</span>
+                                        {active && <Check size={13} />}
+                                    </div>
+                                    <div className="text-[10px] text-fg-muted mt-0.5 leading-tight">
+                                        {m.desc}
+                                    </div>
+                                </div>
+                            </button>
+                        );
+                    })}
+                </div>
+            )}
+        </div>
+    );
+}
+
 /** App shell with enhanced liquid glass layout */
 export function Layout({ children }: LayoutProps) {
     const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -310,6 +475,7 @@ export function Layout({ children }: LayoutProps) {
                     </div>
 
                     <div className="ml-auto flex items-center gap-2">
+                        <SecurityGuardMenu />
                         <a
                             href="/health"
                             target="_blank"

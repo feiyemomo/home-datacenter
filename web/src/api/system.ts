@@ -53,3 +53,18 @@ export async function listSystemLogs(
     });
     return data as SystemLogListResponse;
 }
+
+export interface CleanCacheResponse {
+    reclaimed_bytes: number;
+    deleted_files: number;
+}
+
+/**
+ * Purge recordings transcode cache. Admin only.
+ *
+ * POST /api/v1/system/clean-cache
+ */
+export async function cleanTranscodeCache(): Promise<CleanCacheResponse> {
+    const { data } = await client.post<CleanCacheResponse>("/system/clean-cache");
+    return data;
+}

@@ -40,6 +40,12 @@ type Handler struct {
 	// slugLookup resolves a Frigate camera slug (e.g. "front_door")
 	// back to a home-api camera ID. Implemented by camera.Registry.
 	slugLookup SlugLookup
+	guardProvider GuardModeProvider
+}
+
+// GuardModeProvider returns the active security arming mode.
+type GuardModeProvider interface {
+	GetMode() string
 }
 
 // SlugLookup resolves a Frigate camera slug to a camera ID.
@@ -55,6 +61,11 @@ func NewHandler(bus *eventbus.Bus, manager *device.Manager, slugLookup SlugLooku
 		slugLookup = &noopSlugLookup{}
 	}
 	return &Handler{bus: bus, manager: manager, slugLookup: slugLookup}
+}
+
+// SetGuardProvider attaches a GuardModeProvider to the handler.
+func (h *Handler) SetGuardProvider(gp GuardModeProvider) {
+	h.guardProvider = gp
 }
 
 // noopSlugLookup is a fallback that never resolves.
@@ -240,6 +251,11 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		ts = time.Now().Unix()
 	}
 
+	muted := false
+	if h.guardProvider != nil && h.guardProvider.GetMode() == "disarmed" {
+		muted = true
+	}
+
 	canonical, _ := json.Marshal(struct {
 		EventID     string   `json:"event_id"`
 		CameraID    uint     `json:"camera_id"`
@@ -249,6 +265,7 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		Zones       []string `json:"zones,omitempty"`
 		HasSnapshot bool     `json:"has_snapshot"`
 		HasClip     bool     `json:"has_clip"`
+		Muted       bool     `json:"muted"`
 		TS          int64    `json:"ts"`
 	}{
 		EventID:     frigEv.After.ID,
@@ -259,6 +276,7 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		Zones:       frigEv.After.CurrentZones,
 		HasSnapshot: frigEv.After.HasSnapshot,
 		HasClip:     frigEv.After.HasClip,
+		Muted:       muted,
 		TS:          ts,
 	})
 

@@ -75,9 +75,7 @@ func toResponse(r model.Rule) ruleResponse {
 	}
 }
 
-// createRuleRequest is the JSON body for POST /rules and PUT /rules/:id.
-// All fields are optional on update; on create, name + trigger + action
-// are required.
+// createRuleRequest is the JSON body for POST /rules.
 type createRuleRequest struct {
 	Name      string          `json:"name"`
 	Trigger   string          `json:"trigger"`
@@ -85,6 +83,18 @@ type createRuleRequest struct {
 	Action    model.Action    `json:"action"`
 	Throttle  model.Throttle  `json:"throttle"`
 	Enabled   *bool           `json:"enabled"`
+}
+
+// updateRuleRequest is the JSON body for PUT /rules/:id.
+// Fields use pointers so omitted fields (e.g. only toggling enabled)
+// do not overwrite existing Condition, Action, or Throttle with zero values.
+type updateRuleRequest struct {
+	Name      *string          `json:"name"`
+	Trigger   *string          `json:"trigger"`
+	Condition *model.Condition `json:"condition"`
+	Action    *model.Action    `json:"action"`
+	Throttle  *model.Throttle  `json:"throttle"`
+	Enabled   *bool            `json:"enabled"`
 }
 
 // List returns all rules, newest first.
@@ -190,13 +200,13 @@ func (h *Handler) Update(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
-	var req createRuleRequest
+	var req updateRuleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Action.Type != "" {
-		if err := validateAction(req.Action); err != nil {
+	if req.Action != nil && req.Action.Type != "" {
+		if err := validateAction(*req.Action); err != nil {
 			log.Printf("[handler] invalid action: %v", err)
 			utils.Fail(c, http.StatusBadRequest, "invalid action")
 			return
@@ -208,22 +218,21 @@ func (h *Handler) Update(c *gin.Context) {
 		utils.Fail(c, http.StatusNotFound, "rule not found")
 		return
 	}
-	if req.Name != "" {
-		r.Name = req.Name
+	if req.Name != nil && *req.Name != "" {
+		r.Name = *req.Name
 	}
-	if req.Trigger != "" {
-		r.Trigger = req.Trigger
+	if req.Trigger != nil && *req.Trigger != "" {
+		r.Trigger = *req.Trigger
 	}
-	// Condition/Action/Throttle are structs; zero values mean
-	// "not provided", but since we unmarshal JSON, empty fields
-	// stay as their zero values. We always overwrite with the
-	// request body so the user can clear a condition by sending
-	// {}.
-	r.Condition = req.Condition
-	if req.Action.Type != "" {
-		r.Action = req.Action
+	if req.Condition != nil {
+		r.Condition = *req.Condition
 	}
-	r.Throttle = req.Throttle
+	if req.Action != nil && req.Action.Type != "" {
+		r.Action = *req.Action
+	}
+	if req.Throttle != nil {
+		r.Throttle = *req.Throttle
+	}
 	if req.Enabled != nil {
 		r.Enabled = *req.Enabled
 	}

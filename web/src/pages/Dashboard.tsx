@@ -35,6 +35,7 @@ import LiveAlertBanner from "@/components/dashboard/LiveAlertBanner";
 import AlertItem from "@/components/dashboard/AlertItem";
 import AlertSnapshotModal from "@/components/dashboard/AlertSnapshotModal";
 import SystemSnapshot from "@/components/dashboard/SystemSnapshot";
+import SystemMetricsCard from "@/components/dashboard/SystemMetricsCard";
 import { Skeleton } from "@/components/Skeleton";
 import { detectApiPath } from "@/lib/network";
 
@@ -519,6 +520,9 @@ export default function Dashboard() {
                     onClose={() => setSelectedAlert(null)}
                 />
             )}
+
+            {/* Datacenter Operations and Storage Health */}
+            <SystemMetricsCard metrics={status?.metrics} />
 
             {/* Raw JSON snapshot */}
             <SystemSnapshot status={status} />
