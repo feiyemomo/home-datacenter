@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, LayoutGrid, List, Maximize2 } from "lucide-react";
+import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, LayoutGrid, List, Maximize2, Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
@@ -12,6 +12,7 @@ import { useCachedFetch } from "@/hooks/useCachedFetch";
 import { LiveVideo } from "@/components/LiveVideo";
 import { ErrorRetry } from "@/components/ErrorRetry";
 import { Skeleton } from "@/components/Skeleton";
+import FamilyFaceManager from "@/components/vision/FamilyFaceManager";
 import { cn } from "@/lib/utils";
 
 type CodecOption = "passthrough" | "h264" | "h265";
@@ -35,7 +36,7 @@ export default function Cameras() {
     const nav = useNavigate();
     const [error, setError] = useState<string | null>(null);
     const [searchParams] = useSearchParams();
-    const [viewMode, setViewMode] = useState<"list" | "grid4">("list");
+    const [viewMode, setViewMode] = useState<"list" | "grid4" | "vision">("list");
 
     const targetCameraId = searchParams.get("camera") ? Number(searchParams.get("camera")) : undefined;
     const targetTime = searchParams.get("time") ? Number(searchParams.get("time")) : undefined;
@@ -104,6 +105,20 @@ export default function Cameras() {
                             <LayoutGrid size={13} />
                             四分屏
                         </button>
+                        <button
+                            type="button"
+                            onClick={() => setViewMode("vision")}
+                            className={cn(
+                                "flex items-center gap-1 px-2.5 py-1 text-xs rounded-lg transition-all",
+                                viewMode === "vision"
+                                    ? "bg-[rgb(var(--accent-primary)/0.2)] text-[rgb(var(--accent-primary))] font-medium shadow-sm"
+                                    : "text-fg-muted hover:text-fg"
+                            )}
+                            title="家人识别与 AI 视觉感知管理"
+                        >
+                            <Sparkles size={13} />
+                            家人与 AI 视觉
+                        </button>
                     </div>
 
                     <Button
@@ -138,7 +153,9 @@ export default function Cameras() {
 
             <WsBridge>
                 {(onMsg) => (
-                    viewMode === "grid4" ? (
+                    viewMode === "vision" ? (
+                        <FamilyFaceManager />
+                    ) : viewMode === "grid4" ? (
                         <div id="multi-cam-grid" className="space-y-4 animate-fade-in">
                             <div className="flex items-center justify-between px-1">
                                 <span className="text-xs text-fg-muted font-medium">

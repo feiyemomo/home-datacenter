@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { createPortal } from "react-dom";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import {
     Activity,
     LayoutDashboard,
@@ -443,6 +444,74 @@ function SecurityGuardMenu() {
     );
 }
 
+function FallAlertBanner() {
+    const { lastMessage, subscribe } = useWebSocket();
+    const [fallAlert, setFallAlert] = useState<{ camera_slug?: string; time?: string } | null>(null);
+    const nav = useNavigate();
+
+    useEffect(() => {
+        subscribe("camera.fall_detected");
+    }, [subscribe]);
+
+    useEffect(() => {
+        if (!lastMessage) return;
+        if (lastMessage.topic === "camera.fall_detected" || (lastMessage as any).type === "camera.fall_detected") {
+            const p = lastMessage.payload || {};
+            setFallAlert({
+                camera_slug: (p as any).camera_slug || "安防监控",
+                time: new Date().toLocaleTimeString(),
+            });
+        }
+    }, [lastMessage]);
+
+    if (!fallAlert) return null;
+
+    return createPortal(
+        <div className="fixed top-5 left-1/2 -translate-x-1/2 z-[10000] w-[92%] max-w-lg animate-bounce-in shadow-2xl">
+            <div className="rounded-2xl border-2 border-red-500 bg-red-950/95 backdrop-blur-md p-4 text-white shadow-[0_0_35px_rgba(239,68,68,0.6)] flex items-start gap-3">
+                <div className="p-2 rounded-xl bg-red-600/30 text-red-400 shrink-0 animate-pulse">
+                    <ShieldAlert size={26} />
+                </div>
+                <div className="min-w-0 flex-1">
+                    <h4 className="text-sm font-bold text-red-200 flex items-center gap-1.5">
+                        <span>🚨 紧急安全告警：检测到人员摔倒！</span>
+                    </h4>
+                    <p className="text-xs text-red-100/90 mt-1">
+                        设备【{fallAlert.camera_slug}】于 {fallAlert.time} 检测到人员异常跌倒，请立即确认现场安全！
+                    </p>
+                    <div className="flex items-center gap-2 mt-3">
+                        <button
+                            type="button"
+                            onClick={() => {
+                                setFallAlert(null);
+                                nav("/cameras");
+                            }}
+                            className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-xs font-semibold text-white shadow-md transition-all"
+                        >
+                            前往查看监控画面
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setFallAlert(null)}
+                            className="px-2.5 py-1.5 rounded-lg bg-white/10 hover:bg-white/20 text-xs text-white/80 transition-all"
+                        >
+                            我知道了
+                        </button>
+                    </div>
+                </div>
+                <button
+                    type="button"
+                    onClick={() => setFallAlert(null)}
+                    className="text-white/60 hover:text-white p-1"
+                >
+                    <X size={16} />
+                </button>
+            </div>
+        </div>,
+        document.body
+    );
+}
+
 /** App shell with enhanced liquid glass layout */
 export function Layout({ children }: LayoutProps) {
     const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -450,6 +519,7 @@ export function Layout({ children }: LayoutProps) {
 
     return (
         <div className="relative flex h-screen overflow-hidden bg-surface">
+            <FallAlertBanner />
             {/* Ambient background orbs - enhanced with more depth */}
             <div className="orb orb-warm" style={{ width: 550, height: 550, top: -180, right: -150, animationDelay: "0s" }} />
             <div className="orb orb-cool" style={{ width: 450, height: 450, bottom: -120, left: -120, animationDelay: "-8s" }} />

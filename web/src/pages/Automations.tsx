@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { createPortal } from "react-dom";
 import {
     Zap,
     Plus,
@@ -40,6 +41,36 @@ const PRESETS: Array<{
     label: string;
     rule: CreateRulePayload;
 }> = [
+    {
+        label: "🚨 人员摔倒紧急求助",
+        rule: {
+            name: "人员摔倒紧急警报联动",
+            trigger: "camera.fall_detected",
+            action: {
+                type: "notify",
+                title: "🚨 紧急摔倒警报",
+                body: "室内监控检测到人员异常跌倒，请立即确认安全状况！",
+            },
+            throttle: {
+                cooldown_s: 30,
+            },
+        },
+    },
+    {
+        label: "👋 家人归家欢迎联动",
+        rule: {
+            name: "家人归家提醒与迎宾",
+            trigger: "camera.person_recognized",
+            action: {
+                type: "notify",
+                title: "👋 家人归家提醒",
+                body: "摄像头识别到家庭成员回家，欢迎归家！",
+            },
+            throttle: {
+                cooldown_s: 180,
+            },
+        },
+    },
     {
         label: "🌙 夜间人形入侵通知",
         rule: {
@@ -112,6 +143,7 @@ export default function Automations() {
     // Form fields
     const [formName, setFormName] = useState("");
     const [formTrigger, setFormTrigger] = useState("camera.motion");
+    const [formPersonName, setFormPersonName] = useState("");
     const [formTimeGte, setFormTimeGte] = useState("");
     const [formTimeLte, setFormTimeLte] = useState("");
     const [formActionType, setFormActionType] = useState<"notify" | "mqtt" | "webhook">("notify");
@@ -191,6 +223,7 @@ export default function Automations() {
         setEditingRule(null);
         setFormName("");
         setFormTrigger("camera.motion");
+        setFormPersonName("");
         setFormTimeGte("");
         setFormTimeLte("");
         setFormActionType("notify");
@@ -207,6 +240,7 @@ export default function Automations() {
         setEditingRule(rule);
         setFormName(rule.name);
         setFormTrigger(rule.trigger);
+        setFormPersonName((rule.condition?.payload_eq as any)?.person_name || "");
         setFormTimeGte(rule.condition?.time_gte || "");
         setFormTimeLte(rule.condition?.time_lte || "");
         setFormActionType((rule.action.type as any) || "notify");
@@ -223,6 +257,7 @@ export default function Automations() {
         const r = preset.rule;
         setFormName(r.name);
         setFormTrigger(r.trigger);
+        setFormPersonName((r.condition?.payload_eq as any)?.person_name || "");
         setFormTimeGte(r.condition?.time_gte || "");
         setFormTimeLte(r.condition?.time_lte || "");
         setFormActionType((r.action.type as any) || "notify");
@@ -257,6 +292,9 @@ export default function Automations() {
         const condition: any = {};
         if (formTimeGte) condition.time_gte = formTimeGte;
         if (formTimeLte) condition.time_lte = formTimeLte;
+        if (formTrigger === "camera.person_recognized" && formPersonName.trim()) {
+            condition.payload_eq = { person_name: formPersonName.trim() };
+        }
 
         setSubmitting(true);
         try {
@@ -515,13 +553,13 @@ export default function Automations() {
             )}
 
             {/* Modal for Create / Edit Rule */}
-            {modalOpen && (
+            {modalOpen && createPortal(
                 <div
-                    className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in"
+                    className="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/75 backdrop-blur-md animate-fade-in"
                     onClick={() => setModalOpen(false)}
                 >
                     <div
-                        className="relative w-full max-w-lg rounded-2xl border border-[rgb(var(--border)/0.8)] bg-surface-raised p-6 shadow-2xl space-y-5 max-h-[90vh] overflow-y-auto"
+                        className="relative w-full max-w-lg rounded-2xl border border-[rgb(var(--border)/0.8)] bg-surface-raised p-6 shadow-2xl space-y-5 max-h-[88vh] overflow-y-auto"
                         onClick={(e) => e.stopPropagation()}
                     >
                         <div className="flex items-center justify-between pb-3 border-b border-[rgb(var(--border)/0.6)]">
@@ -576,13 +614,30 @@ export default function Automations() {
                                     value={formTrigger}
                                     onChange={(e) => setFormTrigger(e.target.value)}
                                 >
-                                    <option value="camera.motion">camera.motion (摄像头 AI 检测 / 运动)</option>
-                                    <option value="camera.offline">camera.offline (摄像头离线掉线)</option>
-                                    <option value="camera.online">camera.online (摄像头上线恢复)</option>
-                                    <option value="security.guard_mode">security.guard_mode (安防布撤防模式切换)</option>
-                                    <option value="device.status">device.status (设备状态变化)</option>
+                                    <option value="camera.fall_detected" className="bg-[#1c1c24] text-fg">🚨 camera.fall_detected (摄像头检测到人员摔倒/跌倒)</option>
+                                    <option value="camera.person_recognized" className="bg-[#1c1c24] text-fg">👤 camera.person_recognized (识别到家庭成员 / 人脸匹配)</option>
+                                    <option value="camera.motion" className="bg-[#1c1c24] text-fg">📷 camera.motion (摄像头 AI 检测 / 运动)</option>
+                                    <option value="camera.offline" className="bg-[#1c1c24] text-fg">⚠️ camera.offline (摄像头离线掉线)</option>
+                                    <option value="camera.online" className="bg-[#1c1c24] text-fg">✅ camera.online (摄像头上线恢复)</option>
+                                    <option value="security.guard_mode" className="bg-[#1c1c24] text-fg">🛡️ security.guard_mode (安防布撤防模式切换)</option>
+                                    <option value="device.status" className="bg-[#1c1c24] text-fg">🔌 device.status (设备状态变化)</option>
                                 </Select>
                             </div>
+
+                            {/* Person recognized condition */}
+                            {formTrigger === "camera.person_recognized" && (
+                                <div className="space-y-1.5 p-3 rounded-xl bg-surface-subtle border border-[rgb(var(--border)/0.5)] animate-slide-down">
+                                    <Label className="text-xs font-medium">指定匹配的家庭成员称呼 (可选)</Label>
+                                    <Input
+                                        value={formPersonName}
+                                        onChange={(e) => setFormPersonName(e.target.value)}
+                                        placeholder="留空则匹配任意识别人员；也可输入具体称呼（如：爸爸）"
+                                    />
+                                    <p className="text-[11px] text-fg-muted">
+                                        当 AI 视觉引擎在该摄像头中检测到此家庭成员时，将立即触发联动。
+                                    </p>
+                                </div>
+                            )}
 
                             {/* Condition Time Range */}
                             <div className="grid grid-cols-2 gap-3">
@@ -613,9 +668,9 @@ export default function Automations() {
                                     value={formActionType}
                                     onChange={(e) => setFormActionType(e.target.value as any)}
                                 >
-                                    <option value="notify">发送系统推送通知 (notify)</option>
-                                    <option value="mqtt">发布 MQTT 物联网指令 (mqtt)</option>
-                                    <option value="webhook">调用外部 Webhook URL (webhook)</option>
+                                    <option value="notify" className="bg-[#1c1c24] text-fg">发送系统推送通知 (notify)</option>
+                                    <option value="mqtt" className="bg-[#1c1c24] text-fg">发布 MQTT 物联网指令 (mqtt)</option>
+                                    <option value="webhook" className="bg-[#1c1c24] text-fg">调用外部 Webhook URL (webhook)</option>
                                 </Select>
                             </div>
 
@@ -713,7 +768,8 @@ export default function Automations() {
                             </div>
                         </form>
                     </div>
-                </div>
+                </div>,
+                document.body
             )}
         </div>
     );

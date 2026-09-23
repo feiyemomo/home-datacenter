@@ -39,6 +39,7 @@ class HomeCenterService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        setupNotificationChannels()
         startAsForeground()
         startRealtime()
     }
@@ -56,15 +57,32 @@ class HomeCenterService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun startAsForeground() {
-        val channel = NotificationChannel(
+    private fun setupNotificationChannels() {
+        val nm = getSystemService(NotificationManager::class.java)
+
+        // Low-priority channel for persistent foreground service icon
+        val serviceChannel = NotificationChannel(
             CHANNEL_ID,
-            "Home Datacenter",
+            "Home Datacenter 运行服务",
             NotificationManager.IMPORTANCE_LOW
         ).apply { setShowBadge(false) }
-        getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
+        nm.createNotificationChannel(serviceChannel)
 
-        // Tapping the notification returns the user to the main activity.
+        // High-priority channel for critical safety & vision alerts
+        val safetyChannel = NotificationChannel(
+            CHANNEL_SAFETY_ID,
+            "安全与跌倒告警",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "摄像头异常跌倒与安防紧急事件提醒"
+            enableVibration(true)
+            vibrationPattern = longArrayOf(0, 500, 200, 500)
+            setShowBadge(true)
+        }
+        nm.createNotificationChannel(safetyChannel)
+    }
+
+    private fun startAsForeground() {
         val contentIntent = PendingIntent.getActivity(
             this, 0,
             Intent(this, MainActivity::class.java),
@@ -84,6 +102,27 @@ class HomeCenterService : Service() {
         } else {
             startForeground(NOTIFICATION_ID, notification, 0)
         }
+    }
+
+    private fun showSafetyNotification(title: String, content: String, notificationId: Int) {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            this,
+            notificationId,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val notification = Notification.Builder(this, CHANNEL_SAFETY_ID)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        getSystemService(NotificationManager::class.java).notify(notificationId, notification)
     }
 
     private fun startRealtime() {
@@ -110,12 +149,34 @@ class HomeCenterService : Service() {
             scope = ioScope,
             listener = object : WsEventListener {
                 override fun onConnected() {
-                    Log.i(TAG, "background ws connected")
-                    // Re-subscribe to topics here (e.g. ws.subscribe("device.1")).
+                    Log.i(TAG, "background ws connected — subscribing to topics")
+                    // Subscribe to camera alerts, fall detection and recognized persons
+                    webSocket?.subscribe("camera.alert")
+                    webSocket?.subscribe("camera.fall_detected")
+                    webSocket?.subscribe("camera.person_recognized")
                 }
 
                 override fun onMessage(message: WsMessage) {
-                    // Dispatch inbound realtime events.
+                    val topic = message.topic ?: ""
+                    Log.d(TAG, "ws message received topic=$topic")
+                    when (topic) {
+                        "camera.fall_detected" -> {
+                            val cam = message.payload?.get("camera_slug")?.toString()?.replace("\"", "") ?: "室内摄像头"
+                            showSafetyNotification(
+                                title = "🚨 紧急告警：检测到人员摔倒！",
+                                content = "监控设备【$cam】检测到异常跌倒，请立即确认！",
+                                notificationId = 2001
+                            )
+                        }
+                        "camera.person_recognized" -> {
+                            val name = message.payload?.get("name")?.toString()?.replace("\"", "") ?: "家庭成员"
+                            showSafetyNotification(
+                                title = "👤 视觉识别通知",
+                                content = "摄像头识别到【$name】已归家",
+                                notificationId = 2002
+                            )
+                        }
+                    }
                 }
 
                 override fun onDisconnected(code: Int, reason: String?) {
@@ -150,6 +211,7 @@ class HomeCenterService : Service() {
     companion object {
         private const val TAG = "HomeCenter"
         private const val CHANNEL_ID = "home_datacenter"
+        private const val CHANNEL_SAFETY_ID = "channel_safety_alerts"
         private const val NOTIFICATION_ID = 1001
     }
 }
