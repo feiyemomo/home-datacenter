@@ -31,6 +31,7 @@ type Config struct {
 	Network     NetworkConfig     `mapstructure:"network"`
 	Releases    ReleasesConfig    `mapstructure:"releases"`
 	Maintenance MaintenanceConfig `mapstructure:"maintenance"`
+	Vision      VisionConfig      `mapstructure:"vision"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -128,6 +129,15 @@ type FrigateConfig struct {
 	// e.g. "http://home-frigate:5000". Set FRIGATE_BASE_URL env
 	// var to override without editing the YAML.
 	BaseURL string `mapstructure:"base_url"`
+}
+
+// VisionConfig holds Vision AI service endpoint (face recognition & pose/fall estimation).
+type VisionConfig struct {
+	// BaseURL is the in-network address of the Vision microservice,
+	// e.g. "http://home-vision:8090". Set VISION_BASE_URL env
+	// var to override without editing the YAML.
+	BaseURL string `mapstructure:"base_url"`
+	Enabled bool   `mapstructure:"enabled"`
 }
 
 // CameraConfig holds the camera platform settings.
@@ -404,6 +414,8 @@ func Load(path string) error {
 	v.SetDefault("maintenance.cpu_crit_pct", 95)
 	v.SetDefault("maintenance.mem_warn_pct", 80)
 	v.SetDefault("maintenance.mem_crit_pct", 90)
+	v.SetDefault("vision.base_url", "http://home-vision:8090")
+	v.SetDefault("vision.enabled", true)
 
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /
@@ -417,6 +429,9 @@ func Load(path string) error {
 	}
 	if envURL := os.Getenv("FRIGATE_BASE_URL"); envURL != "" {
 		v.Set("frigate.base_url", envURL)
+	}
+	if envURL := os.Getenv("VISION_BASE_URL"); envURL != "" {
+		v.Set("vision.base_url", envURL)
 	}
 	// MQTT credentials are injected via env vars in production
 	// (see compose.yaml -> MQTT_USERNAME / MQTT_PASSWORD). Without

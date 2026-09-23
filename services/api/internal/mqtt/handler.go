@@ -1,16 +1,23 @@
 package mqtt
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"log"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 
+	"home-datacenter-api/internal/camera"
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/maintenance"
+	"home-datacenter-api/internal/vision"
 )
 
 // minAlertConfidence is the minimum detection confidence (0–1)
@@ -26,6 +33,13 @@ import (
 // pre-condition let zero-confidence events bypass the filter.
 const minAlertConfidence = 0.78
 
+// visionTask encapsulates a pending image analysis request.
+type visionTask struct {
+	eventID  string
+	cameraID uint
+	slug     string
+}
+
 // Handler dispatches incoming MQTT messages to the EventBus and
 // DeviceManager. It is stateless beyond the references it holds.
 //
@@ -34,13 +48,15 @@ const minAlertConfidence = 0.78
 // alerts from the Frigate NVR and re-publish them on the EventBus
 // as camera.motion events.
 type Handler struct {
-	bus     *eventbus.Bus
-	manager *device.Manager
-	client  pahomqtt.Client // set by Client.Start() via OnConnect
-	// slugLookup resolves a Frigate camera slug (e.g. "front_door")
-	// back to a home-api camera ID. Implemented by camera.Registry.
-	slugLookup SlugLookup
+	bus           *eventbus.Bus
+	manager       *device.Manager
+	client        pahomqtt.Client // set by Client.Start() via OnConnect
+	slugLookup    SlugLookup
 	guardProvider GuardModeProvider
+	visionClient  *vision.Client
+	frigateClient *camera.FrigateClient
+	visionQueue   chan visionTask
+	visionOnce    sync.Once
 }
 
 // GuardModeProvider returns the active security arming mode.
@@ -66,6 +82,18 @@ func NewHandler(bus *eventbus.Bus, manager *device.Manager, slugLookup SlugLooku
 // SetGuardProvider attaches a GuardModeProvider to the handler.
 func (h *Handler) SetGuardProvider(gp GuardModeProvider) {
 	h.guardProvider = gp
+}
+
+// SetVision attaches vision AI client and Frigate client for intelligent frame analysis.
+func (h *Handler) SetVision(vc *vision.Client, fc *camera.FrigateClient) {
+	h.visionClient = vc
+	h.frigateClient = fc
+	if vc != nil && fc != nil {
+		h.visionOnce.Do(func() {
+			h.visionQueue = make(chan visionTask, 2)
+			go h.visionWorker()
+		})
+	}
 }
 
 // noopSlugLookup is a fallback that never resolves.
@@ -289,6 +317,118 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 
 	log.Printf("mqtt: frigate detection: camera=%s id=%d label=%s confidence=%.2f zones=%v",
 		slug, cameraID, frigEv.After.Label, confidence, frigEv.After.CurrentZones)
+
+	// Trigger asynchronous Vision AI pipeline (person recognition & pose/fall estimation)
+	// when a person is detected and vision service is configured.
+	if frigEv.After.Label == "person" && frigEv.After.ID != "" && h.visionQueue != nil {
+		select {
+		case h.visionQueue <- visionTask{
+			eventID:  frigEv.After.ID,
+			cameraID: cameraID,
+			slug:     slug,
+		}:
+		default:
+			log.Printf("vision: queue full, skipping frame analysis for event %s to protect CPU", frigEv.After.ID)
+		}
+	}
+}
+
+// visionWorker runs a single-threaded background worker for vision analysis
+// ensuring bounded CPU utilization on Intel Celeron J4125.
+func (h *Handler) visionWorker() {
+	log.Printf("vision: background analysis worker started (bounded concurrency 1)")
+	for task := range h.visionQueue {
+		h.processVisionTask(task)
+	}
+}
+
+// processVisionTask executes the multi-tier vision analysis with dynamic CPU gating.
+func (h *Handler) processVisionTask(task visionTask) {
+	// Pre-flight CPU usage load gating to protect Celeron J4125
+	cpu := maintenance.SampleCPU()
+	if cpu >= 80.0 {
+		log.Printf("vision: host CPU is high (%.1f%% >= 80%%), skipping vision analysis for event %s (circuit break)", cpu, task.eventID)
+		return
+	}
+
+	detectFace := true
+	detectPose := true
+	if cpu >= 60.0 {
+		detectPose = false // Degraded mode: run face recognition only, skip heavy 17-point pose estimation
+		log.Printf("vision: host CPU is moderate (%.1f%% >= 60%%), degrading to face recognition only (pose skipped)", cpu)
+	}
+
+	// Give Frigate a short moment (150ms) to ensure the snapshot JPEG is fully written to disk
+	time.Sleep(150 * time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rc, _, err := h.frigateClient.EventSnapshot(ctx, task.eventID)
+	if err != nil {
+		cancel()
+		log.Printf("vision: failed to fetch snapshot for event %s: %v", task.eventID, err)
+		return
+	}
+	imgBytes, err := io.ReadAll(rc)
+	rc.Close()
+	cancel()
+	if err != nil {
+		log.Printf("vision: failed to read snapshot bytes for event %s: %v", task.eventID, err)
+		return
+	}
+
+	analyzeCtx, analyzeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer analyzeCancel()
+
+	imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
+	req := vision.AnalyzeRequest{
+		ImageBase64: imgB64,
+		DetectFace:  detectFace,
+		DetectPose:  detectPose,
+	}
+	res, err := h.visionClient.Analyze(analyzeCtx, req)
+	if err != nil {
+		log.Printf("vision: analyze error for event %s: %v", task.eventID, err)
+		return
+	}
+
+	ts := time.Now().Unix()
+
+	// Emit person recognized event if any registered face matched
+	if len(res.Data.MatchedPersons) > 0 {
+		payload, _ := json.Marshal(map[string]any{
+			"event_id":    task.eventID,
+			"camera_id":   task.cameraID,
+			"camera_slug": task.slug,
+			"persons":     res.Data.MatchedPersons,
+			"faces":       res.Data.Faces,
+			"ts":          ts,
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicCameraPersonRecognized,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityInfo,
+			Payload:  payload,
+		})
+		log.Printf("vision: person recognized on camera %s: %v", task.slug, res.Data.MatchedPersons)
+	}
+
+	// Emit fall detected event if fall is detected
+	if res.Data.HasFall {
+		payload, _ := json.Marshal(map[string]any{
+			"event_id":    task.eventID,
+			"camera_id":   task.cameraID,
+			"camera_slug": task.slug,
+			"poses":       res.Data.Poses,
+			"ts":          ts,
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicCameraFallDetected,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityCritical,
+			Payload:  payload,
+		})
+		log.Printf("vision: WARNING: fall detected on camera %s (event %s)!", task.slug, task.eventID)
+	}
 }
 
 // handleDeviceMessage processes messages under "devices/{id}/*".

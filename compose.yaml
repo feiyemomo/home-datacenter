@@ -100,6 +100,8 @@ services:
         condition: service_started
       frigate:
         condition: service_healthy
+      vision:
+        condition: service_started
     # v1.8.28: service healthcheck. The api image is alpine (busybox
     # wget is present), so this probes the /health endpoint directly.
     # service_healthy lets a restart policy / down-stream depends_on
@@ -123,6 +125,7 @@ services:
       - MQTT_PASSWORD=${MQTT_PASSWORD:-}
       - GO2RTC_BASE_URL=${GO2RTC_BASE_URL:-http://home-frigate:1984}
       - FRIGATE_BASE_URL=${FRIGATE_BASE_URL:-http://home-frigate:5000}
+      - VISION_BASE_URL=${VISION_BASE_URL:-http://home-vision:8090}
       # v1.6.22: NAS public IPv6 address. The container cannot probe
       # IPv6 reachability itself (home-net bridge has no IPv6 subnet),
       # so we expose the host's public IPv6 address via env var. When
@@ -250,6 +253,31 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    networks:
+      - home-net
+
+  # vision — Edge Vision AI microservice (Intel Celeron J4125)
+  # Lightweight, AVX2-free face recognition (YuNet + SFace) & 17-point pose/fall detection
+  vision:
+    build:
+      context: ./services/vision
+    container_name: home-vision
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./data/vision:/data/vision
+    ports:
+      - "127.0.0.1:8090:8090"
+    healthcheck:
+      test: [ "CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8090/health')" ]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+    environment:
+      - TZ=Asia/Shanghai
     networks:
       - home-net
 

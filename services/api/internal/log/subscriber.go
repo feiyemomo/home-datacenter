@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"gorm.io/gorm"
@@ -66,6 +67,8 @@ func (s *Subscriber) Start() {
 		eventbus.TopicCameraCreate,
 		eventbus.TopicCameraUpdate,
 		eventbus.TopicCameraMotion,
+		eventbus.TopicCameraPersonRecognized,
+		eventbus.TopicCameraFallDetected,
 		eventbus.TopicAutomationFired,
 		eventbus.TopicAutomationCreate,
 		eventbus.TopicAutomationUpdate,
@@ -438,6 +441,43 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		}
 		message = fmt.Sprintf("摄像头 %s 检测到运动", cameraName)
 		level = model.LevelInfo
+
+	case eventbus.TopicCameraPersonRecognized:
+		var p struct {
+			CameraID uint     `json:"camera_id"`
+			Persons  []string `json:"persons"`
+			TS       int64    `json:"ts"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if p.TS > 0 {
+			ts = p.TS
+		}
+		cameraName := s.cameraLabel(p.CameraID, "")
+		if cameraName == "" {
+			cameraName = fmt.Sprintf("#%d", p.CameraID)
+		}
+		message = fmt.Sprintf("摄像头 %s 识别到人物: %s", cameraName, strings.Join(p.Persons, ", "))
+		level = model.LevelInfo
+
+	case eventbus.TopicCameraFallDetected:
+		var p struct {
+			CameraID uint  `json:"camera_id"`
+			TS       int64 `json:"ts"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if p.TS > 0 {
+			ts = p.TS
+		}
+		cameraName := s.cameraLabel(p.CameraID, "")
+		if cameraName == "" {
+			cameraName = fmt.Sprintf("#%d", p.CameraID)
+		}
+		message = fmt.Sprintf("摄像头 %s 警报: 监测到疑似跌倒事件！", cameraName)
+		level = model.LevelCritical
 
 	default:
 		return nil

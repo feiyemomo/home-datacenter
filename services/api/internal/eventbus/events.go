@@ -23,6 +23,8 @@ const (
 	TopicCameraRTSPLost     = "camera.rtsp_lost"
 	TopicCameraStatusChanged = "camera.status_changed"
 	TopicCameraMotion       = "camera.motion"
+	TopicCameraPersonRecognized = "camera.person_recognized"
+	TopicCameraFallDetected     = "camera.fall_detected"
 
 	// --- System events ---
 	TopicSystemAlert      = "system.alert"

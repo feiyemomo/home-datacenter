@@ -72,6 +72,11 @@ go2rtc:
 frigate:
   base_url: http://home-frigate:5000
 
+# Vision AI microservice (face recognition & pose/fall estimation on Celeron J4125)
+vision:
+  base_url: http://home-vision:8090
+  enabled: true
+
 camera:
   # How often to TCP-probe each camera's RTSP port.
   health_interval_seconds: 15

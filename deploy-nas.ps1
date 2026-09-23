@@ -217,7 +217,7 @@ $Excludes = @(
     "./.vscode", "./.idea",
     ".DS_Store", "Thumbs.db",
     "*.log", "log_*.txt",
-    "*.py", "__pycache__",
+    "./read_db.py", "__pycache__",
     "*.exe", "./services/api/server",
     "./web/tsconfig.tsbuildinfo", "./web/tsconfig.node.tsbuildinfo",
     # mosquitto passwd is environment-specific (each env has its own

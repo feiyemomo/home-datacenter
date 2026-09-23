@@ -44,6 +44,13 @@ go2rtc-v2/
 go2rtc-*.tar
 go2rtc-newly-built
 
+# Ad-hoc token / offer files
+.token.txt
+sdp_offer.txt
+
+# Vision models (downloaded via download_models.py)
+services/vision/models/*.onnx
+
 # Ad-hoc build logs. Generated as `build_*.log`.
 build_*.log
 

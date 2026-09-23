@@ -31,6 +31,7 @@ import (
 	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
+	"home-datacenter-api/internal/vision"
 	"home-datacenter-api/internal/ws"
 )
 
@@ -139,6 +140,14 @@ func main() {
 	// as the slug lookup so Frigate events (which use ASCII slugs
 	// like "front_door") can be mapped back to camera IDs.
 	mqttHandler := mqtt.NewHandler(bus, deviceMgr, camReg)
+
+	var visionClient *vision.Client
+	if cfg.Vision.Enabled && cfg.Vision.BaseURL != "" {
+		visionClient = vision.NewClient(cfg.Vision.BaseURL)
+		mqttHandler.SetVision(visionClient, frigate)
+		log.Printf("vision: AI client initialized targeting %s", cfg.Vision.BaseURL)
+	}
+
 	mqttClient := mqtt.NewClient(mqtt.Config{
 		Broker:   cfg.MQTT.Broker,
 		ClientID: cfg.MQTT.ClientID,
@@ -792,6 +801,14 @@ func main() {
 			{
 				adminNet.GET("/p2p/peers", netHandler.ListPeers)
 			}
+		}
+
+		// Vision AI service (face recognition & pose/fall estimation)
+		visionGroup := api.Group("/vision")
+		visionGroup.Use(middleware.JWTAuth(deviceRepo))
+		{
+			visionHandler := vision.NewHandler(visionClient)
+			visionHandler.RegisterRoutes(visionGroup)
 		}
 	}
 
