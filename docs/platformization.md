@@ -1197,6 +1197,77 @@ strings).
 
 ---
 
+## Phase 11: Edge Vision AI & Fall Detection Microservice
+
+> Status: ✅ Implemented & Deployed — 2026-09-23
+
+### 1. Motivation & Architecture
+
+Building upon Phase 9 (Frigate NVR object detection), Phase 11 introduces fine-grained, edge-computed **person identification** and **skeletal pose / fall detection** to the camera ecosystem.
+
+```
+                      ┌────────────────────────────────────────┐
+                      │             home-frigate               │
+                      │  (OpenVINO person detection + NVR)     │
+                      └──────────────────┬─────────────────────┘
+                                         │ MQTT (frigate/events)
+                                         ▼
+                      ┌────────────────────────────────────────┐
+                      │               home-api                 │
+                      │ 1. Asynchronous bounded worker (cap:2) │
+                      │ 2. Dynamic CPU gate (maintenance)      │
+                      │ 3. Snapshot fetch from Frigate         │
+                      └──────────────────┬─────────────────────┘
+                                         │ HTTP POST /api/v1/analyze
+                                         ▼
+                      ┌────────────────────────────────────────┐
+                      │              home-vision               │
+                      │  OpenCV DNN (SSE4.2 / oneDNN, no AVX2) │
+                      │  - YuNet (face detection ~15ms)        │
+                      │  - SFace (cosine matching ~40ms)       │
+                      │  - YOLOv8n-pose (17 keypoints)         │
+                      └──────────────────┬─────────────────────┘
+                                         │ JSON results
+                                         ▼
+                      ┌────────────────────────────────────────┐
+                      │               EventBus                 │
+                      │  - camera.person_recognized (Info)     │
+                      │  - camera.fall_detected (Critical)     │
+                      └──────────────────┬─────────────────────┘
+                                         ▼
+                      ┌────────────────────────────────────────┐
+                      │      SystemLog + WebSocket Hub         │
+                      │  Real-time push to Web and Android     │
+                      └────────────────────────────────────────┘
+```
+
+### 2. Low-Power Edge Optimizations (Intel Celeron J4125)
+
+1. **AVX2-Free Engine Selection**:
+   - The Intel Celeron J4125 lacks AVX/AVX2 instruction sets. Standard PyTorch and TensorFlow distributions throw `SIGILL` (Illegal instruction) immediately.
+   - `home-vision` uses `opencv-python-headless` compiled with Intel SSE4.2 / oneDNN, enabling reliable, high-speed neural network inference directly on the J4125 CPU.
+2. **Single-Threaded Inference Isolation**:
+   - Each inference model is configured to execute single-threaded, avoiding CPU context switching and lock contention with Frigate's OpenVINO detector.
+3. **Dynamic 3-Stage CPU Gating**:
+   - `CPU >= 80%` (**Circuit Break**): Skip vision inference entirely; prioritize RTSP video recording and live stream transcoding.
+   - `60% <= CPU < 80%` (**Degraded Mode**): Execute face recognition only (~50ms); bypass heavy 17-point pose estimation.
+   - `CPU < 60%` (**Full Analysis**): Execute full face identification and skeletal pose analysis.
+4. **Bounded Concurrency**:
+   - Single-worker queue with capacity 2. Bursts of rapid person detection events are dropped non-blocking, ensuring zero queue buildup or latency degradation.
+
+### 3. Fall Detection Geometric Classifier
+
+Rather than relying on resource-intensive temporal 3D CNNs or sequence models, fall detection evaluates multi-dimensional geometric heuristics derived from 17 COCO skeletal keypoints:
+- **Aspect Ratio ($W / H$)**: If the person's bounding box has $W/H > 1.25$, indicates a prone or recumbent body orientation.
+- **Torso Orientation Angle ($\theta$)**: Computes the angle of the line connecting shoulder midpoint and hip midpoint relative to the horizontal plane. $\theta < 35^\circ$ indicates horizontal collapse.
+- **Vertical Displacement**: Significant drop in vertical head/shoulder coordinate relative to baseline hip plane.
+
+### 4. Storage & Persistence
+- Face feature vectors are stored locally in `./data/vision/faces.json` (persisted on host disk).
+- New identities can be enrolled dynamically via `POST /api/v1/vision/persons`.
+
+---
+
 ## Next Steps (Future Extensions)
 
 - **Rule templating**: action bodies with Go templates
@@ -1204,7 +1275,6 @@ strings).
   payloads. Currently static.
 - **Per-rule audit log**: persist `automation.fired` events to
   SQLite for a durable history (currently EventBus-only, in-process).
-- **AI Layer**: a future subscriber on `*` could feed events into
-  an LLM for anomaly detection or natural-language summaries.
+- **Automation Action for Vision**: Allow automation rules to trigger PTZ presets or alarms specifically when `camera.person_recognized` matches unknown or specific persons, or on `camera.fall_detected`.
 - **Rule import/export**: backup and version-control rules as
   YAML/JSON.

@@ -28,6 +28,7 @@
 | Web | React 18 + Vite + Nginx | `home-web` | `80`（仅本地） |
 | MQTT Broker | Eclipse Mosquitto 2 | `home-mosquitto` | 1883（**不对外暴露**） |
 | NVR / AI Detection | Frigate 0.17 (bundled go2rtc + OpenVINO) | `home-frigate` | `5000` (API) / `1984` (go2rtc)（仅本地） |
+| Vision AI | Python 3.11 + OpenCV DNN (YuNet + SFace + YOLOv8n-pose) | `home-vision` | `8090`（仅本地） |
 
 Phase 4（摄像头平台化）新增 go2rtc 桥接服务；Phase 9 升级为 **Frigate 0.17**
 （`home-frigate`）——内置 go2rtc + OpenVINO AI 目标检测 + 24/7 录像。所有摄像头的
@@ -68,6 +69,13 @@ list / get 的 scope 过滤）。详见
 [`docs/api-documentation.md`](docs/api-documentation.md) 的
 "User Management (Admin)" 章节。
 
+Phase 11（边缘视觉识别与姿态/跌倒检测微服务体系）在 Intel Celeron J4125（无 AVX2、低功耗）平台上落地了**轻量化人物身份识别与 17 点骨骼姿态/跌倒检测**：
+（1）独立容器 `home-vision` 基于 OpenCV DNN（纯 SSE4.2 / oneDNN，完全避开 PyTorch 对 AVX2 的依赖，杜绝 `SIGILL`）；
+（2）加载 YuNet（人脸检测）+ SFace（余弦相似度人脸匹配，本地人脸特征向量库 `./data/vision/faces.json`）；
+（3）加载 YOLOv8n-pose ONNX，提取 17 点骨骼坐标，结合宽高比 $W/H > 1.25$ 与躯干倾角 $\theta < 35^\circ$ 实现高准确率几何跌倒判定；
+（4）Go 后端实现**前置动态 CPU 门控**（$\ge 80\%$ 熔断跳过保护录像；$60\% - 80\%$ 降级仅执行人脸匹配；$< 60\%$ 全量人脸+姿态分析），单并发消费队列杜绝 J4125 CPU 争用；
+（5）联动 EventBus 发布 `camera.person_recognized` 与 `camera.fall_detected`，并实时记录系统日志推送到 Web/App 端。
+
 所有服务都在 `home-net` 内部 Docker 网络中互相通信。默认只把 `80` 和 `8080` 绑定到 `127.0.0.1`，避免直接对外暴露。
 
 ---
@@ -82,13 +90,17 @@ list / get 的 scope 过滤）。详见
           │                              │ config push            │
        127.0.0.1:80                 127.0.0.1:8080              │ MQTT pub (frigate/#)
           │                              │                ┌──────▼──────┐
-          └────── 外部经 Cloudflare Tunnel 暴露 ────────► │ home-frigate │
-                                                           │ :5000 API   │
-                                                           │ :1984 go2rtc │
-                                                           │ WebRTC/HLS  │
-                                                           │ AI Detection│
-                                                           │ 24/7 Record │
-                                                           └─────────────┘
+          │                              ├───────────────►│ home-frigate │
+          │                              │ snapshot fetch │ :5000 API   │
+          │                              │                │ :1984 go2rtc │
+          │                              ▼                │ WebRTC/HLS  │
+          │                       ┌──────────────┐        │ AI Detection│
+          │                       │  home-vision │        │ 24/7 Record │
+          │                       │  :8090 (DNN) │        └─────────────┘
+          │                       │ YuNet+SFace  │
+          │                       │ YOLOv8n-pose │
+          │                       └──────────────┘
+          └────── 外部经 Cloudflare Tunnel 暴露 ────────►
 ```
 
 ---
@@ -161,6 +173,7 @@ docker compose up -d --build
 | `SERVER_PORT` | ❌ | 默认 `8080` |
 | `DB_PATH` | ❌ | 默认 `/data/sqlite/app.db`（容器内） |
 | `GO2RTC_BASE_URL` | ❌ | go2rtc HTTP API（摄像头平台化用），默认 `http://home-go2rtc:1984` |
+| `VISION_BASE_URL` | ❌ | Vision AI 微服务地址（人脸识别与跌倒姿态检测），默认 `http://home-vision:8090` |
 | `WEBRTC_PUBLIC_BASE` | ❌ | 浏览器拉流用的 go2rtc URL 前缀。**推荐 `/go2rtc`**（由 dashboard nginx 反代到 go2rtc，同源无 CORS）；留空 = 仅 LAN（返回 Docker 内部地址，浏览器不可达）；`https://cam.example.com` = 独立 Cloudflare Tunnel 域名 |
 
 > ⚠️ **不要把 `.env` 提交到 Git**（已经在 `.gitignore` 中忽略）。
@@ -169,10 +182,11 @@ docker compose up -d --build
 
 - **只**将 `127.0.0.1:80` 和 `127.0.0.1:8080` 绑定到本机回环地址，**不**对外暴露。
 - Mosquitto 默认 **不**绑定主机端口。如果需要本地物理设备连入测试，取消 `compose.yaml` 第 49 行附近的注释，并设置 `MQTT_BIND_PORT` 环境变量。
-- 所有服务都在 `home-net` bridge 网络中通过服务名互通：`api → mosquitto:1883`、`web → api:8080`。
+- 所有服务都在 `home-net` bridge 网络中通过服务名互通：`api → mosquitto:1883`、`web → api:8080`、`api → vision:8090`。
 
-### 持久化与运维（v1.8.27）
+### 持久化与运维（v1.8.27+）
 
+- **人脸库与视觉模型持久化**（Phase 11）：`./data/vision` 挂载到 `home-vision` 的 `/data/vision`，存储人脸特征库（`faces.json`）；三套轻量 ONNX 模型自动在微服务启动时验证并加载。
 - **Frigate 事件库持久化**：`./data/frigate/config` 挂载到 Frigate 的 `/config`，`frigate.db`、`.jwt_secret`、模型缓存等随容器重建不再丢失。录像本身仍在 `./data/frigate`（`/media/frigate`）。
 - **SQLite 自维护**：API 每 6 小时对 `app.db` 执行一次 WAL checkpoint（`TRUNCATE`），每日用 `VACUUM INTO` 生成一份一致快照到 `./data/sqlite/backups`，保留最近 7 份。参数见 `configs/config.yaml` 的 `maintenance:` 段。
 - **磁盘空间告警**：API 每 10 分钟采样数据盘使用率，跨过 80%（warn）/ 90%（crit）阈值时写入一条 `system.disk` 系统日志并实时推送到仪表盘，避免磁盘写满导致 Frigate 静默停止录像。

@@ -1053,6 +1053,230 @@ a user first opens the live view after a period of inactivity.
 
 ---
 
+## Vision AI (Phase 11)
+
+Edge AI microservice for **face recognition** (YuNet + SFace) and **17-point pose / fall detection** (YOLOv8 Nano Pose). Built with native OpenCV DNN to eliminate AVX2 instruction dependencies on low-power Intel Celeron J4125 hardware.
+
+Features a **dynamic 3-tier CPU load gate**:
+- **`< 60%` CPU** (`normal`): Full analysis (Face detection & recognition + 17-point pose/fall detection).
+- **`60% - 80%` CPU** (`degraded`): Lightweight face recognition only (~50ms), heavy pose estimation skipped.
+- **`>= 80%` CPU** (`circuit_break`): Circuit break; drops vision inference entirely to protect RTSP recording and live streaming.
+
+Asynchronous ingestion pipeline: When Frigate emits MQTT `frigate/events` (`label == "person"`), `home-api` feeds a single-threaded bounded worker (queue capacity 2, concurrency 1), fetches the event snapshot, runs inference, and publishes EventBus events.
+
+### Vision Status
+
+```
+GET /api/v1/vision/status
+```
+
+**Auth:** `Authorization: Bearer <jwt_token>`
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "online": true,
+    "face_engine_ready": true,
+    "pose_engine_ready": true,
+    "registered_persons": 2,
+    "cpu_usage_percent": 12.5,
+    "cpu_gate": "normal"
+  }
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `online` | boolean | True if `home-vision` container is reachable |
+| `face_engine_ready` | boolean | True if YuNet and SFace models loaded |
+| `pose_engine_ready` | boolean | True if YOLOv8n-pose ONNX model loaded |
+| `registered_persons` | integer | Number of enrolled identities in `faces.json` |
+| `cpu_usage_percent` | number | Real-time host CPU utilization sampled via `/proc/stat` |
+| `cpu_gate` | string | Current gate mode: `"normal"`, `"degraded"`, or `"circuit_break"` |
+
+---
+
+### List Registered Persons
+
+```
+GET /api/v1/vision/persons
+```
+
+**Auth:** `Authorization: Bearer <jwt_token>`
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "data": [
+    { "name": "张三" },
+    { "name": "李四" }
+  ]
+}
+```
+
+---
+
+### Register Person Face
+
+Enrolls a new person into the face database (`./data/vision/faces.json`). Detects the face using YuNet and extracts a 128-dimensional embedding using SFace.
+
+```
+POST /api/v1/vision/persons
+```
+
+**Auth:** `Authorization: Bearer <jwt_token>`
+
+**Request Body:**
+
+```json
+{
+  "name": "张三",
+  "image": "<base64_jpeg_or_png>",
+  "image_url": "http://..."
+}
+```
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | Yes | Unique name or identifier for the person |
+| `image` | string | Cond. | Base64-encoded image (with or without data URI prefix) |
+| `image_url` | string | Cond. | URL to download image from (used if `image` omitted) |
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "Person '张三' registered successfully"
+}
+```
+
+---
+
+### Delete Registered Person
+
+```
+DELETE /api/v1/vision/persons/:name
+```
+
+**Auth:** `Authorization: Bearer <jwt_token>`
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "message": "Person '张三' deleted successfully"
+}
+```
+
+---
+
+### Direct Image Analysis
+
+Performs on-demand face detection, face recognition, and/or pose estimation on a given image.
+
+```
+POST /api/v1/vision/analyze
+```
+
+**Auth:** `Authorization: Bearer <jwt_token>`
+
+**Request Body:**
+
+```json
+{
+  "image": "<base64_encoded_image>",
+  "detect_face": true,
+  "detect_pose": true
+}
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `image` | string | Cond. | Base64-encoded image string |
+| `image_url` | string | Cond. | Remote image URL |
+| `detect_face` | boolean | `true` | Run YuNet face detection + SFace matching |
+| `detect_pose` | boolean | `true` | Run YOLOv8n-pose 17-keypoint extraction + fall detection |
+
+**Success Response:**
+
+```json
+{
+  "code": 0,
+  "data": {
+    "faces": [
+      {
+        "box": [120, 80, 100, 120],
+        "det_score": 0.985,
+        "matched": true,
+        "name": "张三",
+        "similarity": 0.68,
+        "distance": 0.32
+      }
+    ],
+    "poses": [
+      {
+        "box": [100, 60, 200, 300],
+        "score": 0.92,
+        "is_fall": false,
+        "fall_score": 0.15,
+        "pose": "standing",
+        "aspect_ratio": 0.67,
+        "torso_angle": 82.5,
+        "keypoints": [[150, 75, 0.95], ...]
+      }
+    ],
+    "has_fall": false,
+    "matched_persons": ["张三"]
+  }
+}
+```
+
+---
+
+### Vision EventBus Events
+
+The vision pipeline emits the following events onto the EventBus:
+
+#### 1. `camera.person_recognized`
+- **Topic:** `camera.person_recognized`
+- **Severity:** `info`
+- **Payload:**
+  ```json
+  {
+    "event_id": "1727092800.123456-abc",
+    "camera_id": 10,
+    "camera_slug": "front_door",
+    "persons": ["张三"],
+    "faces": [ ... ],
+    "ts": 1727092801
+  }
+  ```
+- **Audited in SystemLog:** `"摄像头 [前门] 识别到人物: 张三"`
+
+#### 2. `camera.fall_detected`
+- **Topic:** `camera.fall_detected`
+- **Severity:** `critical`
+- **Payload:**
+  ```json
+  {
+    "event_id": "1727092800.123456-abc",
+    "camera_id": 10,
+    "camera_slug": "front_door",
+    "poses": [ ... ],
+    "ts": 1727092801
+  }
+  ```
+- **Audited in SystemLog:** `"摄像头 [前门] 警报: 监测到疑似跌倒事件！"` (Level: `critical`, high-priority push).
+
+---
+
 ## Configuration
 
 **File:** `configs/config.yaml`
@@ -1511,12 +1735,17 @@ Publish `{"status":"offline",...}` to flip it back.
 | `/api/v1/network/p2p/peers` | GET | JWT+admin | List all registered peers |
 | `/api/v1/release/latest` | GET | JWT | Latest app release metadata |
 | `/api/v1/release/latest/apk` | GET | JWT | Download latest APK |
+| `/api/v1/vision/status` | GET | JWT | Vision AI service health, engine state, real-time CPU% and gate mode |
+| `/api/v1/vision/persons` | GET | JWT | List enrolled person identities in face database |
+| `/api/v1/vision/persons` | POST | JWT | Enroll new person face (image base64/URL) |
+| `/api/v1/vision/persons/:name` | DELETE | JWT | Remove person from face database |
+| `/api/v1/vision/analyze` | POST | JWT | On-demand image analysis (face detection/matching + pose/fall estimation) |
 
-> Camera + Automation endpoints are described in detail in
+> Camera + Automation + Vision endpoints are described in detail in
 > [`docs/platformization.md`](platformization.md) and
 > [`docs/security.md`](security.md) §11–12. The rows above are the
-> authoritative route surface as of Phase 15.
+> authoritative route surface as of Phase 11 (Vision AI).
 
 ---
 
-**Document Version:** 2026-08-14 (sync: added `PATCH /system/logs/:id` verify + `POST /system/client-errors` client-error ingest to the route table)
+**Document Version:** 2026-09-23 (sync: added Phase 11 Vision AI endpoints `/api/v1/vision/*` and EventBus topics `camera.person_recognized` & `camera.fall_detected`)

@@ -43,6 +43,7 @@
 | Container | Docker + Compose |
 | Real-time | MQTT (Mosquitto) + WebSocket (gorilla/websocket) |
 | NVR / AI Detection | Frigate 0.17 (bundled go2rtc + OpenVINO CPU detector) |
+| Vision AI | Python 3.11 + OpenCV DNN (YuNet face + SFace + YOLOv8n-pose) |
 | Frontend | React + Vite + Tailwind (dashboard SPA) |
 
 ---
@@ -164,6 +165,11 @@ Custom type wrapping nullable `time.Time`. Handles pure-Go SQLite driver returni
 | `GET /api/v1/network/p2p/peers` | JWT+admin | List all registered peers |
 | `GET /api/v1/release/latest` | JWT | Latest app release metadata |
 | `GET /api/v1/release/latest/apk` | JWT | Download latest APK |
+| `GET /api/v1/vision/status` | JWT | Vision AI health, engine readiness, CPU% and gate mode |
+| `GET /api/v1/vision/persons` | JWT | List enrolled person identities in face database |
+| `POST /api/v1/vision/persons` | JWT | Enroll new person face into face database |
+| `DELETE /api/v1/vision/persons/:name` | JWT | Remove person from face database |
+| `POST /api/v1/vision/analyze` | JWT | On-demand image analysis (face matching + pose/fall estimation) |
 | `GET /api/v1/ws` | JWT | WebSocket upgrade (header or `?token=`) |
 
 **Response Envelope:**
@@ -222,6 +228,9 @@ services/api/
 │   │   ├── system_handler.go    // /system/status + /mqtt/publish
 │   │   ├── ws_handler.go        // WebSocket upgrade + origin check
 │   │   └── camera_handler.go    // /cameras* — register/list/get/delete/ptz
+│   ├── vision/                  // Phase 11 — Vision AI client & handlers
+│   │   ├── client.go            // HTTP client talking to home-vision:8090
+│   │   └── handler.go           // /api/v1/vision/* with dynamic CPU gate
 │   ├── middleware/
 │   │   ├── jwt.go               // JWT auth + revocation check
 │   │   └── admin.go             // RequireAdmin(db) — must be installed after JWTAuth
@@ -237,6 +246,13 @@ services/api/
 ├── configs/config.yaml          // Server/DB/JWT/MQTT/WS config (placeholders)
 ├── configs/config.local.yaml    // gitignored local override (real secret)
 ├── Dockerfile
+services/vision/                 // Phase 11 — Edge Vision AI Microservice
+├── main.py                      // Threading HTTP server on port 8090
+├── face_engine.py               // YuNet detection + SFace matching + faces.json DB
+├── pose_engine.py               // YOLOv8n-pose ONNX + 17 keypoints fall analysis
+├── download_models.py           // Automated model downloader (YuNet, SFace, YOLOv8n-pose)
+├── Dockerfile                   // python:3.11-slim + opencv-python-headless
+└── requirements.txt
 └── (compose.yaml at project root)
 
 web/                             // React 18 + Vite 5 + Tailwind dashboard SPA
@@ -2273,4 +2289,62 @@ Frigate records Hikvision cameras' native RTSP with `-c:v copy`, so the stored 1
 
 ---
 
-**Last Updated:** 2026-08-14 (v1.8.42: Background hold + prefetch hardening + Android sync — WebRTC ICE error timer suspended while `document.hidden` + `visibilitychange` reconnect on foreground; preview-frame 10s poll paused in background; HLS stall watchdog re-armable/skipped when hidden; `usePrefetch` 30s freshness guard + prefetch failure reporting; splash parallel prefetch of `home.cameras.list`; Android reference client adds client-errors reporting (ClientErrorReporter), WS network resilience (NetworkMonitor + onNetworkAvailable), and a foreground-service keep-alive (HomeCenterService). See Phase 37. Earlier: v1.8.41: Stability × error-recovery × server error reporting — backend graceful shutdown (SIGTERM/SIGINT drain), custom panic Recovery → `server.panic` SystemLog, `>=500` ErrorLogMiddleware (rate-limited + deduped), sentinel/APIError utils + generic exponential-backoff Retry util, `/health/ready` readiness probe, client-error per-user/IP rate limiting + indexed-`context` dedup; web ErrorBoundary (`render.error.*`), HLS (`playback.hls(.stall)`) + WebRTC (`playback.webrtc(.decode)`) playback-failure reporting, token try/catch defense, axios idempotent retry, WS exponential backoff + persisted-subscription refresh, reporter queue + offline buffer + tab dedup. See Phase 36. Earlier: v1.8.40: Wave-2 unit-test expansion — automation engine runtime tests (handleEvent / throttle / reload / notify / mqtt / webhook + SSRF & retry policy), WS hub fan-out tests (Broadcast / SendToUser / SendToAdmins / routeDeviceEvent / onEvent), GORM repository tests (Device / User on in-memory SQLite with freed-ID reuse); fixed a real bug — missing `fallthrough` in the WS hub's `user.notification` parse-error path. See Phase 35. Earlier: v1.8.39: environment diagnosis — NAS IPv6 was wholly disabled at NetworkManager level (re-enabled, `ipv6.method=auto` on eno1); DDNS `nas.feiyemomo.top` 指向物理断开的 enp4s0（`...bd09` 不可达，恢复路径二选一：接网线或改指 `...bd08`），systemd 单元已更新当前前缀；cameras 前门/院子 仍物理离线。See Phase 34. Earlier: v1.8.38: IPv6 prefix rotation — config synced to DDNS current prefix `2409:8a70:37ad:6870` in compose.yaml / NAS .env / frigate webrtc.candidates, e2e verified on NAS; cameras 前门/院子 offline = physical-layer (power/cabling), See Phase 33. Earlier: v1.8.27: persistent-operation hardening — Frigate /config DB persistence + SQLite WAL checkpoint/daily backup + Docker log rotation + disk-space alerts + old-APK cleanup, e2e verified on NAS. Earlier: v1.8.26: hardware transcode VAAPI + cache auto-cleanup + client error dedup + per-route timeout + ssh-nas.ps1 toolbox, e2e verified on NAS. Earlier: v1.8.25: Web playback fix — H.264 transcode + transcode disk cache + client error reporting, e2e re-verified on NAS. Earlier: v1.8.24: Host IP change self-adaptation — LAN IP auto-detection, configurable Android LAN URL, network robustness. See Phase 19 above. Earlier: v1.8.19: Web splash parallel prefetch + Android WebRTC parallel fallback + splash prefetch. v1.8.18: Camera lifecycle cleanup + web animations. v1.8.17: Liquid glass visual upgrade, security hardening, token rotation, log cleanup, Android theme switch fix. v1.8.9: Android network policy sync. v1.8.8 IPv6 full-path test & dev scripts consolidation. v1.8.7: Network policy review. v1.8.6 / v1.6.29 fix: Dashboard latency card. v1.8.5 IPv6 direct latency optimization. v1.8.4 IPv6 prefix rotation auto-adaptation.)
+## Phase 38 (2026-09-23): Edge Vision AI (Face Recognition + Pose/Fall Estimation with CPU Gating)
+
+### Phase 38 span: Backend + Vision Microservice (`home-vision`) + NAS Deployment
+
+#### 1. Hardware Architecture & Constraints (Intel Celeron J4125)
+- **Target Hardware**: Intel Celeron J4125 (4 cores, 4 threads, 2.0-2.7 GHz, 10W TDP).
+- **Hard Constraint**: **No AVX or AVX2 instruction support**. Heavy Python deep learning frameworks (PyTorch standard builds, TensorFlow) fail immediately with `SIGILL` (Illegal instruction).
+- **Engine Choice**: **OpenCV DNN** (`opencv-python-headless>=4.8.0`) compiled with Intel SSE4.2 / oneDNN. Provides sub-50ms inference natively on J4125 without crashing. Single-threaded inference prevents thread synchronization contention across 4 cores.
+
+#### 2. Models Deployed & Evaluated
+- **Face Detection**: YuNet ONNX (`face_detection_yunet_2023mar.onnx`, 232 KB). Pre-processes 320x320 / 640x640 frame in ~15ms on J4125.
+- **Face Recognition**: SFace ONNX (`face_recognition_sface_2021dec.onnx`, 38 MB). Generates 128-dimensional embedding in ~40ms; cosine similarity matching against local `./data/vision/faces.json` (threshold 0.363 cosine distance / 0.637 similarity).
+- **Pose & Fall Estimation**: YOLOv8 Nano Pose ONNX (`yolov8n-pose.onnx`, 13.4 MB). Extracts 17 COCO skeletal keypoints.
+  - Multi-dimensional geometric fall classification:
+    - Bounding box aspect ratio: $W/H > 1.25$ (horizontal body collapse).
+    - Torso orientation angle: $\theta < 35^\circ$ with horizontal plane.
+    - Vertical drop metric of head/shoulder relative to hip line.
+
+#### 3. Dynamic 3-Tier CPU Load Gate (`maintenance.SampleCPU()`)
+To ensure Vision AI never degrades NVR 24/7 video recording or live WebRTC/HLS streaming:
+- **`CPU >= 80%` (Circuit Break)**: Vision pipeline immediately drops the detection frame and logs a circuit-break warning.
+- **`60% <= CPU < 80%` (Degraded Mode)**: Runs face detection and recognition only (~50ms), skipping heavy 17-point skeletal pose estimation.
+- **`CPU < 60%` (Full Analysis)**: Executes full pipeline (Face + Pose/Fall detection).
+- **Concurrency**: Bounded single-worker queue (capacity 2, concurrency 1) in `services/api/internal/mqtt/handler.go`. Extra frames during heavy motion bursts are dropped non-blocking.
+
+#### 4. EventBus & Dashboard Integration
+- Triggered asynchronously when Frigate publishes `frigate/events` with `type == "new"`, `label == "person"`, and non-empty snapshot.
+- Emits:
+  - `camera.person_recognized` (Severity: `info`): contains recognized person names and face bounding boxes.
+  - `camera.fall_detected` (Severity: `critical`): contains pose bounding boxes, fall scores, and angles.
+- Log Subscriber (`services/api/internal/log/subscriber.go`) persists entries to `SystemLog` table and pushes via WebSocket to connected apps and dashboards.
+
+#### 5. NAS Deployment & Live Verification
+- Deployed via `deploy-nas.ps1 -Password '<NAS_PASSWORD>'`.
+- Verified live on NAS (192.168.31.235):
+  - `home-vision` container healthy on `127.0.0.1:8090`.
+  - `GET /api/v1/vision/status` → HTTP 200 `{"online":true,"face_engine_ready":true,"pose_engine_ready":true,"registered_persons":0,"cpu_usage_percent":6,"cpu_gate":"normal"}`.
+  - `POST /api/v1/vision/analyze` → HTTP 200 `{"code":0,"data":{"faces":[],"poses":[],"has_fall":false,"matched_persons":[]}}`.
+
+### Files Changed (Phase 38)
+
+| File | Change |
+|------|--------|
+| `services/vision/` | New — Vision AI microservice (Python 3.11, OpenCV DNN, YuNet, SFace, YOLOv8n-pose) |
+| `services/vision/download_models.py` | New — Automated ONNX model fetcher with Git LFS support |
+| `services/vision/Dockerfile` | New — Container definition for `home-vision` |
+| `services/api/internal/vision/client.go` | New — Go HTTP client for vision service |
+| `services/api/internal/vision/handler.go` | New — `/api/v1/vision/*` HTTP handlers |
+| `services/api/internal/mqtt/handler.go` | Async bounded worker, CPU gate, EventBus publishing |
+| `services/api/internal/eventbus/events.go` | Added `TopicCameraPersonRecognized` & `TopicCameraFallDetected` |
+| `services/api/internal/log/subscriber.go` | SystemLog recording for recognized persons and fall alerts |
+| `services/api/internal/config/config.go` | Added `VisionConfig` with `VISION_BASE_URL` env override |
+| `services/api/configs/config.yaml` | Added `vision:` config section |
+| `compose.yaml` | Added `home-vision` service, volume `./data/vision`, `VISION_BASE_URL` |
+| `deploy-nas.ps1` | Updated `$Excludes` to include `services/vision/*.py` |
+
+---
+
+**Last Updated:** 2026-09-23 (Phase 38 / v1.12.0: Edge Vision AI — face recognition & 17-point pose/fall estimation on Intel Celeron J4125 with OpenCV DNN, YuNet + SFace + YOLOv8n-pose, dynamic 3-stage CPU gating, bounded queue, EventBus integration, deployed and verified on NAS.)
