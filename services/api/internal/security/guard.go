@@ -70,7 +70,14 @@ func (gm *GuardManager) GetMode() string {
 
 // SetMode transitions the security mode and notifies EventBus.
 func (gm *GuardManager) SetMode(mode string, updatedBy string) (model.SecurityState, error) {
-	if mode != model.GuardModeDisarmed && mode != model.GuardModeArmedHome && mode != model.GuardModeArmedAway {
+	switch mode {
+	case "away", model.GuardModeArmedAway:
+		mode = model.GuardModeArmedAway
+	case "home", "stay", model.GuardModeArmedHome:
+		mode = model.GuardModeArmedHome
+	case "disarm", "off", model.GuardModeDisarmed:
+		mode = model.GuardModeDisarmed
+	default:
 		return model.SecurityState{}, fmt.Errorf("invalid guard mode: %q", mode)
 	}
 

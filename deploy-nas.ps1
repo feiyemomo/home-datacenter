@@ -328,7 +328,7 @@ if ($exitCode -ne 0) {
 $buildCmd = ""
 if (-not $NoBuild) {
     $cacheFlag = if ($NoCache) { "--no-cache" } else { "" }
-    $buildCmd = "docker compose build $cacheFlag api web && "
+    $buildCmd = "docker compose build $cacheFlag api vision web && "
 }
 Write-Host "==> [5/5] Building and starting services on NAS (docker compose up -d $BuildFlag)" -ForegroundColor Cyan
 $composeCmd = "cd '$REMOTE_PATH' && ${buildCmd}docker compose up -d $BuildFlag 2>&1"

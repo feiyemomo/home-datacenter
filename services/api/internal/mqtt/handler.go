@@ -17,6 +17,7 @@ import (
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/maintenance"
+	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/vision"
 )
 
@@ -35,9 +36,10 @@ const minAlertConfidence = 0.78
 
 // visionTask encapsulates a pending image analysis request.
 type visionTask struct {
-	eventID  string
-	cameraID uint
-	slug     string
+	eventID   string
+	cameraID  uint
+	slug      string
+	guardMode string
 }
 
 // Handler dispatches incoming MQTT messages to the EventBus and
@@ -279,10 +281,20 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		ts = time.Now().Unix()
 	}
 
-	muted := false
-	if h.guardProvider != nil && h.guardProvider.GetMode() == "disarmed" {
-		muted = true
+	guardMode := model.GuardModeArmedAway
+	if h.guardProvider != nil {
+		guardMode = h.guardProvider.GetMode()
 	}
+	switch guardMode {
+	case "away", model.GuardModeArmedAway:
+		guardMode = model.GuardModeArmedAway
+	case "home", "stay", model.GuardModeArmedHome:
+		guardMode = model.GuardModeArmedHome
+	case "disarm", "off", model.GuardModeDisarmed:
+		guardMode = model.GuardModeDisarmed
+	}
+
+	muted := (guardMode == model.GuardModeDisarmed)
 
 	canonical, _ := json.Marshal(struct {
 		EventID     string   `json:"event_id"`
@@ -315,17 +327,20 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		Payload:  canonical,
 	})
 
-	log.Printf("mqtt: frigate detection: camera=%s id=%d label=%s confidence=%.2f zones=%v",
-		slug, cameraID, frigEv.After.Label, confidence, frigEv.After.CurrentZones)
+	log.Printf("mqtt: frigate detection: camera=%s id=%d label=%s confidence=%.2f guard=%s muted=%v",
+		slug, cameraID, frigEv.After.Label, confidence, guardMode, muted)
 
-	// Trigger asynchronous Vision AI pipeline (person recognition & pose/fall estimation)
-	// when a person is detected and vision service is configured.
-	if frigEv.After.Label == "person" && frigEv.After.ID != "" && h.visionQueue != nil {
+	// Trigger asynchronous Vision AI pipeline:
+	// - 撤防免打扰 (disarmed): 完全跳过 AI 视觉检测，保护 CPU 并不产生告警
+	// - 离家布防 (armed_away): 仅开启人物识别（任何人员均为入侵）
+	// - 在家守护 (armed_home): 开启人物识别 + 人脸识别 + 姿态跌倒检测
+	if !muted && frigEv.After.Label == "person" && frigEv.After.ID != "" && h.visionQueue != nil {
 		select {
 		case h.visionQueue <- visionTask{
-			eventID:  frigEv.After.ID,
-			cameraID: cameraID,
-			slug:     slug,
+			eventID:   frigEv.After.ID,
+			cameraID:  cameraID,
+			slug:      slug,
+			guardMode: guardMode,
 		}:
 		default:
 			log.Printf("vision: queue full, skipping frame analysis for event %s to protect CPU", frigEv.After.ID)
@@ -344,6 +359,29 @@ func (h *Handler) visionWorker() {
 
 // processVisionTask executes the multi-tier vision analysis with dynamic CPU gating.
 func (h *Handler) processVisionTask(task visionTask) {
+	ts := time.Now().Unix()
+
+	// 离家布防模式 (armed_away):
+	// 任何人在屋内均为异常闯入！无需耗费算力跑人脸对比，直接触发入侵人员告警
+	if task.guardMode == model.GuardModeArmedAway {
+		payload, _ := json.Marshal(map[string]any{
+			"event_id":    task.eventID,
+			"camera_id":   task.cameraID,
+			"camera_slug": task.slug,
+			"persons":     []string{"离家布防异常入侵人员"},
+			"ts":          ts,
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicCameraPersonRecognized,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityCritical,
+			Payload:  payload,
+		})
+		log.Printf("vision: AWAY MODE ALERT: person detected on camera %s (event %s)!", task.slug, task.eventID)
+		return
+	}
+
+	// 在家守护模式 (armed_home):
 	// Pre-flight CPU usage load gating to protect Celeron J4125
 	cpu := maintenance.SampleCPU()
 	if cpu >= 80.0 {
@@ -391,7 +429,7 @@ func (h *Handler) processVisionTask(task visionTask) {
 		return
 	}
 
-	ts := time.Now().Unix()
+	ts = time.Now().Unix()
 
 	// Emit person recognized event if any registered face matched
 	if len(res.Data.MatchedPersons) > 0 {

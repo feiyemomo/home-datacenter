@@ -34,7 +34,7 @@ class FaceEngine:
                 self.det_model_path,
                 "",
                 (320, 320),
-                score_threshold=0.7,
+                score_threshold=0.45,
                 nms_threshold=0.3,
                 top_k=5000
             )
@@ -94,16 +94,55 @@ class FaceEngine:
         if self.detector is None or self.recognizer is None:
             raise RuntimeError("Face recognition engine not initialized")
 
+        faces = None
+        img_for_crop = img_bgr
         h, w = img_bgr.shape[:2]
+
+        # Step 1: Detect on original image with threshold 0.45
+        self.detector.setScoreThreshold(0.45)
         self.detector.setInputSize((w, h))
         _, faces = self.detector.detect(img_bgr)
+
+        # Step 2: If no face found, retry with lower threshold 0.35
+        if faces is None or len(faces) == 0:
+            self.detector.setScoreThreshold(0.35)
+            _, faces = self.detector.detect(img_bgr)
+
+        # Step 3: If still no face, try scaled image (optimal receptive field for 1080p/2K/4K CCTV frames)
+        if faces is None or len(faces) == 0:
+            max_dim = max(h, w)
+            if max_dim > 1024:
+                scale = 1024.0 / max_dim
+                nw, nh = int(w * scale), int(h * scale)
+                resized = cv2.resize(img_bgr, (nw, nh), interpolation=cv2.INTER_AREA)
+                self.detector.setInputSize((nw, nh))
+                _, faces_resized = self.detector.detect(resized)
+                if faces_resized is not None and len(faces_resized) > 0:
+                    faces = faces_resized
+                    img_for_crop = resized
+
+        # Step 4: If still no face, try CLAHE contrast enhancement for backlit/dim surveillance scenes
+        if faces is None or len(faces) == 0:
+            lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            cl = clahe.apply(l)
+            enhanced = cv2.cvtColor(cv2.merge((cl, a, b)), cv2.COLOR_LAB2BGR)
+            self.detector.setInputSize((w, h))
+            _, faces = self.detector.detect(enhanced)
+            if faces is not None and len(faces) > 0:
+                img_for_crop = enhanced
+
+        # Reset detector score threshold and input size back to 0.45
+        self.detector.setScoreThreshold(0.45)
+        self.detector.setInputSize((w, h))
 
         if faces is None or len(faces) == 0:
             raise ValueError("No face detected in the image")
 
         # Pick the largest face in image
         largest_face = max(faces, key=lambda f: f[2] * f[3])
-        aligned = self.recognizer.alignCrop(img_bgr, largest_face)
+        aligned = self.recognizer.alignCrop(img_for_crop, largest_face)
         feature = self.recognizer.feature(aligned)
 
         # Update or append
@@ -113,6 +152,7 @@ class FaceEngine:
             "feature": feature
         })
         self._save_db()
+        logger.info(f"Successfully registered person '{name}' with face box: {largest_face[:4].tolist()}")
         return True
 
     def recognize(self, img_bgr: np.ndarray, cosine_thresh=0.363):
@@ -130,7 +170,7 @@ class FaceEngine:
         for face in faces:
             box = [int(face[0]), int(face[1]), int(face[2]), int(face[3])]
             det_score = float(face[14])
-            if det_score < 0.6:
+            if det_score < 0.4:
                 continue
 
             aligned = self.recognizer.alignCrop(img_bgr, face)
