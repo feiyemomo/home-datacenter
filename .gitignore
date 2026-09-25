@@ -1,62 +1,89 @@
 # ---- Runtime data / secrets (never commit) ----
-# SQLite database + mosquitto persistence hold live state and (in the
-# DB's case) AccessKey hashes + user identities.
 /data/
 /.env
-.env.local
+.env
+.env.*
+!.env.example
+*.token.txt
+sdp_offer.txt
 
 # Local config override holds the real jwt.secret; never commit it.
 services/api/configs/config.local.yaml
 
 # ---- Deploy secrets — never commit ----
-# Anyone cloning the repo must create these manually (see docs/security.md).
 deploy/cloudflared/credentials.json
 deploy/mosquitto/passwd
 deploy/frigate/config.yml
 
-# ---- IDE / OS ----
+# ---- Local Development Tools & IDEs ----
+# VS Code
 .vscode/
-.idea/
-.DS_Store
-Thumbs.db
+*.code-workspace
 
-# ---- Go ----
+# JetBrains / IntelliJ / WebStorm / GoLand / Android Studio
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# AI Coding Assistants & Modern IDEs (Trae, Cursor, Gemini, Claude, Windsurf, etc.)
+.trae/
+.cursor/
+.cursorrules
+.gemini/
+.antigravity/
+.claude/
+.windsurf/
+
+# OS specific files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ---- Language & Framework Caches ----
+# Go
 services/api/server
 services/api/cmd.exe
 services/api/*.exe
+services/api/bin/
 *.test
 *.out
 
-# ---- Node / web ----
+# Node / web
 web/node_modules/
 web/dist/
 web/.npm-cache/
 web/.npm-prefix/
 web/tsconfig.tsbuildinfo
 web/tsconfig.node.tsbuildinfo
+.npm/
+.yarn/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
-# ---- Build artifacts & iteration leftovers ----
-# Old go2rtc build artifacts (no longer used — Frigate is a prebuilt
-# image). Kept in .gitignore so stale local dirs don't get tracked.
-go2rtc-extract/
-go2rtc-new/
-go2rtc-v2/
-go2rtc-*.tar
-go2rtc-newly-built
-
-# Ad-hoc token / offer files
-.token.txt
-sdp_offer.txt
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
 # Vision models (downloaded via download_models.py)
 services/vision/models/*.onnx
-
-# Ad-hoc build logs. Generated as `build_*.log`.
-build_*.log
-
-# Live JWT for ad-hoc curl tests. NEVER commit — rotate immediately
-# if this file leaks (see docs/security.md).
-.token.txt
 
 # ---- Android / Gradle ----
 android/.gradle/
@@ -65,20 +92,26 @@ android/local.properties
 android/*.log
 android/app/build/
 android/build/
-# Versioned APK binaries live on the NAS (data/releases), not in git.
 android/app-debug-*.apk
 android/app-release-*.apk
-# Release notes are publish artifacts (scp'd to NAS), not tracked in git.
 android/release-notes-v*.txt
 
-# web sync tarball used by scp-based deploys
+# ---- Build artifacts, logs & archives ----
+go2rtc-extract/
+go2rtc-new/
+go2rtc-v2/
+go2rtc-*.tar
+go2rtc-newly-built
 web-sync.tar.gz
+build-host/
+*.log
+build*.log
+log_*.txt
 
-# Local notes / specs / prompts (contain private IP & credentials)
+# Local prompt / debug notes
 PROMPT.md
-.trae/
 
-# Ad-hoc debug / local testing scripts & SQL
+# Ad-hoc debug scripts & SQL
 check_logs.sql
 cleanup_logs.sql
 read_db.py
@@ -100,9 +133,4 @@ fix-cam-alias.sh
 fix-dns-and-deploy.sh
 fix-eno1-ipv6.sh
 fix-routing.sh
-build-host/
-
-# Build logs & compiled binaries
-*.log
-build.log*
-services/api/bin/
+*-git-backup/

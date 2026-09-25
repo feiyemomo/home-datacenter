@@ -595,5 +595,5 @@ curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/v1/system/st
 
 ## 许可证 (License)
 
-Private / 家庭自建项目。
+本项目采用 [MIT License](LICENSE) 开源许可证。
 
