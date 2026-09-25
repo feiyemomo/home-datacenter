@@ -162,9 +162,11 @@ class HomeCenterService : Service() {
                     when (topic) {
                         "camera.fall_detected" -> {
                             val cam = message.payload?.get("camera_slug")?.toString()?.replace("\"", "") ?: "室内摄像头"
+                            val isDelayed = message.payload?.get("delayed")?.asBoolean == true
+                            val suffix = if (isDelayed) "（负载恢复后补测）" else ""
                             showSafetyNotification(
-                                title = "🚨 紧急告警：检测到人员摔倒！",
-                                content = "监控设备【$cam】检测到异常跌倒，请立即确认！",
+                                title = "🚨 紧急告警：检测到人员摔倒！$suffix",
+                                content = "监控设备【$cam】检测到异常跌倒$suffix，请立即确认！",
                                 notificationId = 2001
                             )
                         }

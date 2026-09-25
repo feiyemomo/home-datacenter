@@ -241,13 +241,22 @@ func (h *Handler) Update(c *gin.Context) {
 		return
 	}
 	_ = h.Engine.Reload()
-	// v1.8.22: audit-trail event for rule update.
+	// v1.8.22: audit-trail event for rule update with settings detail.
 	if h.Bus != nil {
+		detail := "修改规则配置"
+		if req.Enabled != nil {
+			if *req.Enabled {
+				detail = "启用规则"
+			} else {
+				detail = "停用规则"
+			}
+		}
 		payload, _ := json.Marshal(eventbus.AutomationManagePayload{
 			AdminID:  c.GetUint("user_id"),
 			RuleID:   r.ID,
 			RuleName: r.Name,
 			Action:   "update",
+			Detail:   detail,
 			Ts:       time.Now().Unix(),
 		})
 		h.Bus.Publish(eventbus.Event{

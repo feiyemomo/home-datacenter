@@ -811,7 +811,7 @@ func main() {
 		visionGroup := api.Group("/vision")
 		visionGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
-			visionHandler := vision.NewHandler(visionClient)
+			visionHandler := vision.NewHandler(visionClient, bus)
 			visionHandler.RegisterRoutes(visionGroup)
 		}
 	}

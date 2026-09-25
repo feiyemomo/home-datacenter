@@ -2,19 +2,23 @@ package vision
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/maintenance"
 )
 
 type Handler struct {
 	client *Client
+	bus    *eventbus.Bus
 }
 
-func NewHandler(client *Client) *Handler {
-	return &Handler{client: client}
+func NewHandler(client *Client, bus *eventbus.Bus) *Handler {
+	return &Handler{client: client, bus: bus}
 }
 
 func (h *Handler) RegisterRoutes(r *gin.RouterGroup) {
@@ -103,6 +107,20 @@ func (h *Handler) RegisterPerson(c *gin.Context) {
 			c.JSON(http.StatusUnprocessableEntity, gin.H{"code": 422, "message": err.Error()})
 			return
 		}
+		if h.bus != nil {
+			payload, _ := json.Marshal(eventbus.VisionPersonManagePayload{
+				AdminID:   c.GetUint("user_id"),
+				AdminName: c.GetString("user_name"),
+				Name:      req.Name,
+				Action:    "register",
+				Ts:        time.Now().Unix(),
+			})
+			h.bus.Publish(eventbus.Event{
+				Topic:   eventbus.TopicVisionPersonRegister,
+				Payload: payload,
+				Source:  eventbus.SourceSystem,
+			})
+		}
 		c.JSON(http.StatusOK, gin.H{"code": 0, "message": "Person registered successfully"})
 		return
 	}
@@ -133,6 +151,21 @@ func (h *Handler) RegisterPerson(c *gin.Context) {
 		return
 	}
 
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.VisionPersonManagePayload{
+			AdminID:   c.GetUint("user_id"),
+			AdminName: c.GetString("user_name"),
+			Name:      name,
+			Action:    "register",
+			Ts:        time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicVisionPersonRegister,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
+
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "Person registered successfully"})
 }
 
@@ -147,6 +180,22 @@ func (h *Handler) DeletePerson(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
 		return
 	}
+
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.VisionPersonManagePayload{
+			AdminID:   c.GetUint("user_id"),
+			AdminName: c.GetString("user_name"),
+			Name:      name,
+			Action:    "delete",
+			Ts:        time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicVisionPersonDelete,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
+
 	c.JSON(http.StatusOK, gin.H{"code": 0, "message": "Person deleted"})
 }
 

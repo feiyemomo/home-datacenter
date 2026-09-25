@@ -75,6 +75,10 @@ func (s *Subscriber) Start() {
 		eventbus.TopicAutomationDelete,
 		eventbus.TopicDeviceHardDelete,
 		eventbus.TopicDeviceTokenRotate,
+		// System security mode & vision person audit events:
+		eventbus.TopicSecurityGuardMode,
+		eventbus.TopicVisionPersonRegister,
+		eventbus.TopicVisionPersonDelete,
 	}
 	for _, t := range topics {
 		// Capture the topic in a local variable so the closure
@@ -266,6 +270,60 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		message = fmt.Sprintf("用户 %s 登出（设备 %s 已撤销）", userLabel, deviceLabel)
 		level = model.LevelNormal
 
+	case eventbus.TopicSecurityGuardMode:
+		var p struct {
+			Mode      string `json:"mode"`
+			UpdatedBy string `json:"updated_by"`
+			Operator  string `json:"operator"`
+			UpdatedAt int64  `json:"updated_at"`
+		}
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if p.UpdatedAt > 0 {
+			ts = p.UpdatedAt
+		}
+		modeLabel := map[string]string{
+			model.GuardModeArmedAway: "【离家布防】",
+			model.GuardModeArmedHome: "【在家守护】",
+			model.GuardModeDisarmed:  "【撤防免打扰】",
+			"away":                   "【离家布防】",
+			"home":                   "【在家守护】",
+		}[p.Mode]
+		if modeLabel == "" {
+			modeLabel = fmt.Sprintf("【%s】", p.Mode)
+		}
+		userLabel := p.UpdatedBy
+		if userLabel == "" {
+			userLabel = p.Operator
+		}
+		if userLabel == "" {
+			userLabel = "系统"
+		}
+		message = fmt.Sprintf("用户 %s 将安防布防模式更改为 %s", userLabel, modeLabel)
+		level = model.LevelNormal
+
+	case eventbus.TopicVisionPersonRegister,
+		eventbus.TopicVisionPersonDelete:
+		var p eventbus.VisionPersonManagePayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if p.Ts > 0 {
+			ts = p.Ts
+		}
+		adminLabel := p.AdminName
+		if adminLabel == "" {
+			adminLabel = s.userLabel(p.AdminID)
+		}
+		if p.Action == "delete" || topic == eventbus.TopicVisionPersonDelete {
+			message = fmt.Sprintf("管理员 %s 删除家庭成员【%s】的人脸档案", adminLabel, p.Name)
+			level = model.LevelWarning
+		} else {
+			message = fmt.Sprintf("管理员 %s 录入家庭成员【%s】的人脸特征档案", adminLabel, p.Name)
+			level = model.LevelNormal
+		}
+
 	case eventbus.TopicUserCreate,
 		eventbus.TopicUserUpdate,
 		eventbus.TopicUserDelete:
@@ -282,15 +340,19 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		if targetLabel == "" {
 			targetLabel = s.userLabel(p.TargetID)
 		}
-		actionVerb := map[string]string{
-			"create": "创建用户",
-			"update": "更新用户",
-			"delete": "删除用户",
-		}[p.Action]
-		if actionVerb == "" {
-			actionVerb = "管理用户"
+		if p.Action == "update" && p.Detail != "" {
+			message = fmt.Sprintf("管理员 %s 将用户 %s 的%s", adminLabel, targetLabel, p.Detail)
+		} else {
+			actionVerb := map[string]string{
+				"create": "创建用户",
+				"update": "更新用户",
+				"delete": "删除用户",
+			}[p.Action]
+			if actionVerb == "" {
+				actionVerb = "管理用户"
+			}
+			message = fmt.Sprintf("管理员 %s %s %s", adminLabel, actionVerb, targetLabel)
 		}
-		message = fmt.Sprintf("管理员 %s %s %s", adminLabel, actionVerb, targetLabel)
 		level = model.LevelNormal
 
 	case eventbus.TopicCameraDelete:
@@ -333,7 +395,11 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		if detail == "" {
 			detail = "配置"
 		}
-		message = fmt.Sprintf("管理员 %s 更新摄像头 %s 的 %s", adminLabel, p.CameraName, detail)
+		if strings.HasPrefix(detail, "将") || strings.HasPrefix(detail, "保存") || strings.HasPrefix(detail, "删除") {
+			message = fmt.Sprintf("管理员 %s %s（摄像头【%s】）", adminLabel, detail, p.CameraName)
+		} else {
+			message = fmt.Sprintf("管理员 %s 将摄像头【%s】的%s", adminLabel, p.CameraName, detail)
+		}
 		level = model.LevelNormal
 
 	case eventbus.TopicAutomationFired:
@@ -372,7 +438,11 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		}
 		ts = p.Ts
 		adminLabel := s.userLabel(p.AdminID)
-		message = fmt.Sprintf("管理员 %s 更新自动化规则 %s", adminLabel, p.RuleName)
+		if p.Detail != "" {
+			message = fmt.Sprintf("管理员 %s 更新自动化规则【%s】（%s）", adminLabel, p.RuleName, p.Detail)
+		} else {
+			message = fmt.Sprintf("管理员 %s 更新自动化规则【%s】", adminLabel, p.RuleName)
+		}
 		level = model.LevelNormal
 
 	case eventbus.TopicAutomationDelete:
@@ -468,6 +538,7 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		var p struct {
 			CameraID uint  `json:"camera_id"`
 			TS       int64 `json:"ts"`
+			Delayed  bool  `json:"delayed"`
 		}
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			return nil
@@ -479,7 +550,11 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		if cameraName == "" {
 			cameraName = fmt.Sprintf("#%d", p.CameraID)
 		}
-		message = fmt.Sprintf("摄像头 %s 警报: 监测到疑似跌倒事件！", cameraName)
+		if p.Delayed {
+			message = fmt.Sprintf("摄像头 %s 警报: 监测到疑似跌倒事件（负载恢复后补偿确认）！", cameraName)
+		} else {
+			message = fmt.Sprintf("摄像头 %s 警报: 监测到疑似跌倒事件！", cameraName)
+		}
 		level = model.LevelCritical
 
 	default:
@@ -504,9 +579,11 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 // host then "#<id>" if the row is missing (e.g. a delete raced
 // ahead of the offline event).
 func (s *Subscriber) cameraLabel(id uint, host string) string {
-	var cam model.Camera
-	if err := s.db.Select("name").First(&cam, id).Error; err == nil && cam.Name != "" {
-		return cam.Name
+	if s.db != nil {
+		var cam model.Camera
+		if err := s.db.Select("name").First(&cam, id).Error; err == nil && cam.Name != "" {
+			return cam.Name
+		}
 	}
 	if host != "" {
 		return host
@@ -517,9 +594,11 @@ func (s *Subscriber) cameraLabel(id uint, host string) string {
 // userLabel returns the user's friendly Name, falling back to
 // "#<id>" if the row is missing (e.g. deleted user).
 func (s *Subscriber) userLabel(id uint) string {
-	var user model.User
-	if err := s.db.Select("name").First(&user, id).Error; err == nil && user.Name != "" {
-		return user.Name
+	if s.db != nil {
+		var user model.User
+		if err := s.db.Select("name").First(&user, id).Error; err == nil && user.Name != "" {
+			return user.Name
+		}
 	}
 	return fmt.Sprintf("#%d", id)
 }

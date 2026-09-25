@@ -456,10 +456,14 @@ function FallAlertBanner() {
     useEffect(() => {
         if (!lastMessage) return;
         if (lastMessage.topic === "camera.fall_detected" || (lastMessage as any).type === "camera.fall_detected") {
-            const p = lastMessage.payload || {};
+            const p = (lastMessage.payload as any) || {};
+            const isDelayed = p.delayed;
+            const timeStr = isDelayed
+                ? `${p.ts ? new Date(p.ts * 1000).toLocaleTimeString() : new Date().toLocaleTimeString()} (负载恢复后补测)`
+                : new Date().toLocaleTimeString();
             setFallAlert({
-                camera_slug: (p as any).camera_slug || "安防监控",
-                time: new Date().toLocaleTimeString(),
+                camera_slug: p.camera_slug || "安防监控",
+                time: timeStr,
             });
         }
     }, [lastMessage]);

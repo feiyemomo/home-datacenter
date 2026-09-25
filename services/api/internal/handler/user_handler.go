@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -46,7 +47,7 @@ func NewUserHandler(
 // human-readable audit entry. TargetName is snapshotted from the
 // model row so a delete event still carries the friendly name
 // after the row is gone. action must be "create" | "update" | "delete".
-func (h *UserHandler) publishUserManageEvent(adminID, targetID uint, targetName, action string, isAdmin bool) {
+func (h *UserHandler) publishUserManageEvent(adminID, targetID uint, targetName, action string, isAdmin bool, detail string) {
 	if h.bus == nil {
 		return
 	}
@@ -67,6 +68,7 @@ func (h *UserHandler) publishUserManageEvent(adminID, targetID uint, targetName,
 		TargetName: targetName,
 		Action:     action,
 		IsAdmin:    isAdmin,
+		Detail:     detail,
 		Ts:         time.Now().Unix(),
 	})
 	h.bus.Publish(eventbus.Event{
@@ -193,7 +195,7 @@ func (h *UserHandler) Create(c *gin.Context) {
 	u := result.User
 
 	// v1.8.20: audit-trail event for user creation.
-	h.publishUserManageEvent(c.GetUint("user_id"), u.ID, u.Name, "create", u.IsAdmin)
+	h.publishUserManageEvent(c.GetUint("user_id"), u.ID, u.Name, "create", u.IsAdmin, "")
 
 	// Create a default device for the new user so they can
 	// immediately bind with the returned access_key.
@@ -293,8 +295,20 @@ func (h *UserHandler) Update(c *gin.Context) {
 		writeUserServiceError(c, err)
 		return
 	}
-	// v1.8.20: audit-trail event for user update.
-	h.publishUserManageEvent(callerID, u.ID, u.Name, "update", u.IsAdmin)
+	// v1.8.20: audit-trail event for user update with specific settings changed.
+	var details []string
+	if req.Name != nil {
+		details = append(details, fmt.Sprintf("名称更改为【%s】", *req.Name))
+	}
+	if req.IsAdmin != nil {
+		if *req.IsAdmin {
+			details = append(details, "角色提升为【管理员】")
+		} else {
+			details = append(details, "角色降级为【普通成员】")
+		}
+	}
+	detailStr := strings.Join(details, "，")
+	h.publishUserManageEvent(callerID, u.ID, u.Name, "update", u.IsAdmin, detailStr)
 	utils.Success(c, gin.H{
 		"id":         u.ID,
 		"name":       u.Name,
@@ -332,7 +346,7 @@ func (h *UserHandler) Delete(c *gin.Context) {
 		return
 	}
 	// v1.8.20: audit-trail event for user deletion.
-	h.publishUserManageEvent(callerID, id, targetName, "delete", targetIsAdmin)
+	h.publishUserManageEvent(callerID, id, targetName, "delete", targetIsAdmin, "")
 	utils.Success(c, gin.H{
 		"deleted_devices": deletedDevices,
 	})

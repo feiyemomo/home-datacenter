@@ -273,6 +273,21 @@ func (h *CameraHandler) SetPreset(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, "failed to set preset")
 		return
 	}
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: cam.Name,
+			Action:     "update",
+			Detail:     fmt.Sprintf("保存预置位【%s】", alias),
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, gin.H{"id": id, "alias": alias, "token": req.Token, "presets": cam.Presets})
 }
 
@@ -288,6 +303,21 @@ func (h *CameraHandler) DeletePreset(c *gin.Context) {
 		log.Printf("[handler] failed to delete preset: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to delete preset")
 		return
+	}
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: cam.Name,
+			Action:     "update",
+			Detail:     fmt.Sprintf("删除预置位【%s】", c.Param("alias")),
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
 	}
 	utils.Success(c, gin.H{"id": id, "presets": cam.Presets})
 }
@@ -376,12 +406,18 @@ func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 		if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
 			cameraName = cam.Name
 		}
+		codecName := body.Codec
+		if codecName == "hevc" || codecName == "h265" {
+			codecName = "H.265 (HEVC)"
+		} else if codecName == "h264" {
+			codecName = "H.264"
+		}
 		payload, _ := json.Marshal(eventbus.CameraManagePayload{
 			AdminID:    c.GetUint("user_id"),
 			CameraID:   uint(id),
 			CameraName: cameraName,
 			Action:     "update",
-			Detail:     "编码",
+			Detail:     fmt.Sprintf("编码格式更改为【%s】", codecName),
 			Ts:         time.Now().Unix(),
 		})
 		h.bus.Publish(eventbus.Event{
@@ -431,12 +467,16 @@ func (h *CameraHandler) UpdateAudio(c *gin.Context) {
 		if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
 			cameraName = cam.Name
 		}
+		audioState := "开启"
+		if !body.Enabled {
+			audioState = "关闭"
+		}
 		payload, _ := json.Marshal(eventbus.CameraManagePayload{
 			AdminID:    c.GetUint("user_id"),
 			CameraID:   uint(id),
 			CameraName: cameraName,
 			Action:     "update",
-			Detail:     "音频",
+			Detail:     fmt.Sprintf("音频输入设置为【%s】", audioState),
 			Ts:         time.Now().Unix(),
 		})
 		h.bus.Publish(eventbus.Event{
@@ -483,12 +523,16 @@ func (h *CameraHandler) SetRecordingPlan(c *gin.Context) {
 		if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
 			cameraName = cam.Name
 		}
+		detail := "录制计划更改为：关闭全天录像"
+		if body.Enabled {
+			detail = fmt.Sprintf("录制计划更改为：开启全天录像（保留 %d 天）", body.RetentionDays)
+		}
 		payload, _ := json.Marshal(eventbus.CameraManagePayload{
 			AdminID:    c.GetUint("user_id"),
 			CameraID:   uint(id),
 			CameraName: cameraName,
 			Action:     "update",
-			Detail:     "录制计划",
+			Detail:     detail,
 			Ts:         time.Now().Unix(),
 		})
 		h.bus.Publish(eventbus.Event{
@@ -1992,6 +2036,21 @@ func (h *CameraHandler) ShareCamera(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, "failed to share camera")
 		return
 	}
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   cam.ID,
+			CameraName: cam.Name,
+			Action:     "update",
+			Detail:     fmt.Sprintf("将摄像头共享给用户 #%d", req.UserID),
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
 	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": req.UserID, "can_ptz": req.CanPTZ})
 }
 
@@ -2014,6 +2073,21 @@ func (h *CameraHandler) UnshareCamera(c *gin.Context) {
 		log.Printf("[handler] failed to unshare camera: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to unshare camera")
 		return
+	}
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   cam.ID,
+			CameraName: cam.Name,
+			Action:     "update",
+			Detail:     fmt.Sprintf("取消用户 #%d 的摄像头共享权限", uid),
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
 	}
 	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": uid})
 }

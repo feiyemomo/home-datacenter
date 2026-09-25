@@ -41,6 +41,13 @@ type visionTask struct {
 	cameraID  uint
 	slug      string
 	guardMode string
+	ts        int64
+}
+
+// pendingPoseRetry tracks a skipped pose analysis task pending retry.
+type pendingPoseRetry struct {
+	task     visionTask
+	deadline time.Time
 }
 
 // Handler dispatches incoming MQTT messages to the EventBus and
@@ -60,6 +67,10 @@ type Handler struct {
 	frigateClient *camera.FrigateClient
 	visionQueue   chan visionTask
 	visionOnce    sync.Once
+
+	retryMu      sync.Mutex
+	pendingRetry map[uint]*pendingPoseRetry
+	sampleCPU    func() float64
 }
 
 // GuardModeProvider returns the active security arming mode.
@@ -80,7 +91,13 @@ func NewHandler(bus *eventbus.Bus, manager *device.Manager, slugLookup SlugLooku
 	if slugLookup == nil {
 		slugLookup = &noopSlugLookup{}
 	}
-	h := &Handler{bus: bus, manager: manager, slugLookup: slugLookup}
+	h := &Handler{
+		bus:          bus,
+		manager:      manager,
+		slugLookup:   slugLookup,
+		pendingRetry: make(map[uint]*pendingPoseRetry),
+		sampleCPU:    maintenance.SampleCPU,
+	}
 	if bus != nil {
 		bus.Subscribe(eventbus.TopicSecurityGuardMode, func(e eventbus.Event) {
 			var p struct {
@@ -106,7 +123,11 @@ func (h *Handler) SetVision(vc *vision.Client, fc *camera.FrigateClient) {
 	if vc != nil && fc != nil {
 		h.visionOnce.Do(func() {
 			h.visionQueue = make(chan visionTask, 2)
+			if h.pendingRetry == nil {
+				h.pendingRetry = make(map[uint]*pendingPoseRetry)
+			}
 			go h.visionWorker()
+			go h.retryWorker()
 		})
 	}
 }
@@ -349,15 +370,21 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 	// - 离家布防 (armed_away): 仅开启人物识别（任何人员均为入侵）
 	// - 在家守护 (armed_home): 开启人物识别 + 人脸识别 + 姿态跌倒检测
 	if !muted && frigEv.After.Label == "person" && frigEv.After.ID != "" && h.visionQueue != nil {
-		select {
-		case h.visionQueue <- visionTask{
+		task := visionTask{
 			eventID:   frigEv.After.ID,
 			cameraID:  cameraID,
 			slug:      slug,
 			guardMode: guardMode,
-		}:
+			ts:        ts,
+		}
+		select {
+		case h.visionQueue <- task:
 		default:
-			log.Printf("vision: queue full, skipping frame analysis for event %s to protect CPU", frigEv.After.ID)
+			log.Printf("vision: queue full, skipping immediate frame analysis for event %s to protect CPU", frigEv.After.ID)
+			// Queue saturated: if in armed_home mode, schedule 1-minute retry for pose/fall detection
+			if guardMode == model.GuardModeArmedHome {
+				h.schedulePoseRetry(task)
+			}
 		}
 	}
 }
@@ -371,9 +398,20 @@ func (h *Handler) visionWorker() {
 	}
 }
 
+// getCPU returns the current CPU percentage, using the injected sampler if configured.
+func (h *Handler) getCPU() float64 {
+	if h.sampleCPU != nil {
+		return h.sampleCPU()
+	}
+	return maintenance.SampleCPU()
+}
+
 // processVisionTask executes the multi-tier vision analysis with dynamic CPU gating.
 func (h *Handler) processVisionTask(task visionTask) {
-	ts := time.Now().Unix()
+	ts := task.ts
+	if ts == 0 {
+		ts = time.Now().Unix()
+	}
 
 	// 离家布防模式 (armed_away):
 	// 任何人在屋内均为异常闯入！无需耗费算力跑人脸对比，直接触发入侵人员告警
@@ -397,9 +435,10 @@ func (h *Handler) processVisionTask(task visionTask) {
 
 	// 在家守护模式 (armed_home):
 	// Pre-flight CPU usage load gating to protect Celeron J4125
-	cpu := maintenance.SampleCPU()
+	cpu := h.getCPU()
 	if cpu >= 80.0 {
 		log.Printf("vision: host CPU is high (%.1f%% >= 80%%), skipping vision analysis for event %s (circuit break)", cpu, task.eventID)
+		h.schedulePoseRetry(task)
 		return
 	}
 
@@ -408,6 +447,10 @@ func (h *Handler) processVisionTask(task visionTask) {
 	if cpu >= 60.0 {
 		detectPose = false // Degraded mode: run face recognition only, skip heavy 17-point pose estimation
 		log.Printf("vision: host CPU is moderate (%.1f%% >= 60%%), degrading to face recognition only (pose skipped)", cpu)
+		h.schedulePoseRetry(task)
+	} else {
+		// Full pose detection will run for this camera; cancel any older pending retry for it
+		h.cancelPoseRetry(task.cameraID)
 	}
 
 	// Give Frigate a short moment (150ms) to ensure the snapshot JPEG is fully written to disk
@@ -442,8 +485,6 @@ func (h *Handler) processVisionTask(task visionTask) {
 		log.Printf("vision: analyze error for event %s: %v", task.eventID, err)
 		return
 	}
-
-	ts = time.Now().Unix()
 
 	// Emit person recognized event if any registered face matched
 	if len(res.Data.MatchedPersons) > 0 {
@@ -480,6 +521,147 @@ func (h *Handler) processVisionTask(task visionTask) {
 			Payload:  payload,
 		})
 		log.Printf("vision: WARNING: fall detected on camera %s (event %s)!", task.slug, task.eventID)
+	}
+}
+
+const poseRetryWindow = 60 * time.Second
+
+// schedulePoseRetry schedules a skipped pose/fall detection for smooth 1-minute retry compensation.
+func (h *Handler) schedulePoseRetry(task visionTask) {
+	if h.visionClient == nil || h.frigateClient == nil {
+		return
+	}
+	h.retryMu.Lock()
+	defer h.retryMu.Unlock()
+	if h.pendingRetry == nil {
+		h.pendingRetry = make(map[uint]*pendingPoseRetry)
+	}
+	// Per-camera deduplication: newer person event on the same camera supersedes older one
+	h.pendingRetry[task.cameraID] = &pendingPoseRetry{
+		task:     task,
+		deadline: time.Now().Add(poseRetryWindow),
+	}
+	log.Printf("vision: scheduled pose retry (up to 1min) for camera %s (event %s)", task.slug, task.eventID)
+}
+
+// cancelPoseRetry cancels any pending retry for the specified camera (e.g. when a newer event ran full pose detection).
+func (h *Handler) cancelPoseRetry(cameraID uint) {
+	h.retryMu.Lock()
+	defer h.retryMu.Unlock()
+	if h.pendingRetry != nil {
+		delete(h.pendingRetry, cameraID)
+	}
+}
+
+// retryWorker periodically checks for pending retries when CPU recovers within 1 minute.
+func (h *Handler) retryWorker() {
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		h.checkAndRunPendingRetries()
+	}
+}
+
+// checkAndRunPendingRetries evaluates pending retry tasks against CPU and expiration.
+func (h *Handler) checkAndRunPendingRetries() {
+	h.retryMu.Lock()
+	if len(h.pendingRetry) == 0 {
+		h.retryMu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	// 1. Expire outdated tasks that exceeded 1 minute window
+	for camID, item := range h.pendingRetry {
+		if now.After(item.deadline) {
+			log.Printf("vision: pose retry window expired (1min limit) for camera %s (event %s), dropping compensation", item.task.slug, item.task.eventID)
+			delete(h.pendingRetry, camID)
+		}
+	}
+
+	if len(h.pendingRetry) == 0 {
+		h.retryMu.Unlock()
+		return
+	}
+
+	// 2. CPU load gate: only proceed if CPU has recovered (< 60%)
+	cpu := h.getCPU()
+	if cpu >= 60.0 {
+		h.retryMu.Unlock()
+		return
+	}
+
+	// 3. Select one pending task to process (ensuring bounded concurrency and no CPU spike)
+	var taskToRun *visionTask
+	for camID, item := range h.pendingRetry {
+		t := item.task
+		taskToRun = &t
+		delete(h.pendingRetry, camID)
+		break
+	}
+	h.retryMu.Unlock()
+
+	if taskToRun != nil {
+		log.Printf("vision: CPU recovered (%.1f%% < 60%%), compensating pose/fall analysis for camera %s (event %s)", cpu, taskToRun.slug, taskToRun.eventID)
+		h.processPoseRetry(*taskToRun)
+	}
+}
+
+// processPoseRetry performs the delayed pose/fall estimation for an event whose snapshot is stored in Frigate.
+func (h *Handler) processPoseRetry(task visionTask) {
+	if h.frigateClient == nil || h.visionClient == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	rc, _, err := h.frigateClient.EventSnapshot(ctx, task.eventID)
+	if err != nil {
+		cancel()
+		log.Printf("vision: retry failed to fetch snapshot for event %s: %v", task.eventID, err)
+		return
+	}
+	imgBytes, err := io.ReadAll(rc)
+	rc.Close()
+	cancel()
+	if err != nil {
+		log.Printf("vision: retry failed to read snapshot bytes for event %s: %v", task.eventID, err)
+		return
+	}
+
+	analyzeCtx, analyzeCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer analyzeCancel()
+
+	imgB64 := base64.StdEncoding.EncodeToString(imgBytes)
+	req := vision.AnalyzeRequest{
+		ImageBase64: imgB64,
+		DetectFace:  false, // Only run pose/fall estimation to save CPU
+		DetectPose:  true,
+	}
+	res, err := h.visionClient.Analyze(analyzeCtx, req)
+	if err != nil {
+		log.Printf("vision: retry analyze error for event %s: %v", task.eventID, err)
+		return
+	}
+
+	if res.Data.HasFall {
+		payload, _ := json.Marshal(map[string]any{
+			"event_id":    task.eventID,
+			"camera_id":   task.cameraID,
+			"camera_slug": task.slug,
+			"poses":       res.Data.Poses,
+			"ts":          task.ts,
+			"delayed":     true,
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicCameraFallDetected,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityCritical,
+			Payload:  payload,
+		})
+		log.Printf("vision: WARNING: fall detected on camera %s (event %s) via 1min retry compensation!", task.slug, task.eventID)
+	} else {
+		log.Printf("vision: retry pose analysis completed for camera %s (event %s): no fall detected", task.slug, task.eventID)
 	}
 }
 

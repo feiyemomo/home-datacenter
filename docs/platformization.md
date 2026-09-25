@@ -1248,12 +1248,13 @@ Building upon Phase 9 (Frigate NVR object detection), Phase 11 introduces fine-g
    - `home-vision` uses `opencv-python-headless` compiled with Intel SSE4.2 / oneDNN, enabling reliable, high-speed neural network inference directly on the J4125 CPU.
 2. **Single-Threaded Inference Isolation**:
    - Each inference model is configured to execute single-threaded, avoiding CPU context switching and lock contention with Frigate's OpenVINO detector.
-3. **Dynamic 3-Stage CPU Gating**:
-   - `CPU >= 80%` (**Circuit Break**): Skip vision inference entirely; prioritize RTSP video recording and live stream transcoding.
-   - `60% <= CPU < 80%` (**Degraded Mode**): Execute face recognition only (~50ms); bypass heavy 17-point pose estimation.
-   - `CPU < 60%` (**Full Analysis**): Execute full face identification and skeletal pose analysis.
-4. **Bounded Concurrency**:
+3. **Dynamic 3-Stage CPU Gating & 1-Minute Fall Retry Compensation**:
+   - `CPU >= 80%` (**Circuit Break**): Skip immediate vision inference; schedule pose/fall detection for smooth 1-minute retry compensation once CPU recovers to prioritize RTSP video recording and live stream transcoding.
+   - `60% <= CPU < 80%` (**Degraded Mode**): Execute face recognition only (~50ms); bypass heavy 17-point pose estimation immediately and schedule pose/fall detection for 1-minute retry compensation.
+   - `CPU < 60%` (**Full Analysis**): Execute full face identification and skeletal pose analysis; cancels any older pending pose retry for this camera.
+4. **Bounded Concurrency & Deduplicated Retry**:
    - Single-worker queue with capacity 2. Bursts of rapid person detection events are dropped non-blocking, ensuring zero queue buildup or latency degradation.
+   - 1-minute retry scheduler maintains per-camera deduplication (latest event only) and serializes retry executions after CPU recovery to prevent secondary CPU spikes. Emits `delayed: true` on late-breaking fall alerts.
 
 ### 3. Fall Detection Geometric Classifier
 
