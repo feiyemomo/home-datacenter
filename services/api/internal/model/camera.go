@@ -164,6 +164,7 @@ type CameraShare struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	CameraID  uint      `gorm:"not null;uniqueIndex:idx_camera_user" json:"camera_id"`
 	UserID    uint      `gorm:"not null;uniqueIndex:idx_camera_user" json:"user_id"`
+	CanPTZ    bool      `gorm:"column:can_ptz;default:false" json:"can_ptz"`
 	CreatedAt time.Time `json:"created_at"`
 }
 

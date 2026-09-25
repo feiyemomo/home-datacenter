@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"regexp"
@@ -70,6 +71,7 @@ type GuardModeProvider interface {
 // Returns (0, false) if no matching camera is found.
 type SlugLookup interface {
 	LookupByFrigateSlug(slug string) (uint, bool)
+	AllFrigateSlugs() []string
 }
 
 // NewHandler creates a Handler wired to the given EventBus,
@@ -78,7 +80,18 @@ func NewHandler(bus *eventbus.Bus, manager *device.Manager, slugLookup SlugLooku
 	if slugLookup == nil {
 		slugLookup = &noopSlugLookup{}
 	}
-	return &Handler{bus: bus, manager: manager, slugLookup: slugLookup}
+	h := &Handler{bus: bus, manager: manager, slugLookup: slugLookup}
+	if bus != nil {
+		bus.Subscribe(eventbus.TopicSecurityGuardMode, func(e eventbus.Event) {
+			var p struct {
+				Mode string `json:"mode"`
+			}
+			if err := json.Unmarshal(e.Payload, &p); err == nil && p.Mode != "" {
+				h.SyncFrigateDetection(p.Mode)
+			}
+		})
+	}
+	return h
 }
 
 // SetGuardProvider attaches a GuardModeProvider to the handler.
@@ -102,6 +115,7 @@ func (h *Handler) SetVision(vc *vision.Client, fc *camera.FrigateClient) {
 type noopSlugLookup struct{}
 
 func (n *noopSlugLookup) LookupByFrigateSlug(slug string) (uint, bool) { return 0, false }
+func (n *noopSlugLookup) AllFrigateSlugs() []string                    { return nil }
 
 // OnMessage is the paho.mqtt message callback. It inspects the topic
 // and routes the payload to the appropriate downstream consumers.
@@ -753,6 +767,33 @@ func (h *Handler) OnConnect(client pahomqtt.Client) {
 			log.Printf("mqtt: subscribe %q failed: %v", s.filter, token.Error())
 		} else {
 			log.Printf("mqtt: subscribed %q (QoS %d)", s.filter, s.qos)
+		}
+	}
+
+	if h.guardProvider != nil {
+		h.SyncFrigateDetection(h.guardProvider.GetMode())
+	}
+}
+
+// SyncFrigateDetection synchronizes Frigate's object detection toggle
+// with the system security mode. Disarmed shuts down detection to save
+// 100% CPU and eliminate nuisance events. Armed modes turn it ON.
+func (h *Handler) SyncFrigateDetection(guardMode string) {
+	if h.slugLookup == nil {
+		return
+	}
+	payload := "ON"
+	switch guardMode {
+	case "disarm", "off", model.GuardModeDisarmed:
+		payload = "OFF"
+	}
+	slugs := h.slugLookup.AllFrigateSlugs()
+	for _, slug := range slugs {
+		topic := fmt.Sprintf("frigate/%s/detect/set", slug)
+		if err := h.Publish(topic, payload, 1); err != nil {
+			log.Printf("mqtt: failed to set frigate detect for %s: %v", slug, err)
+		} else {
+			log.Printf("mqtt: set frigate detect for %s -> %s (guardMode=%s)", slug, payload, guardMode)
 		}
 	}
 }

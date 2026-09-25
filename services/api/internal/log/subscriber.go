@@ -422,6 +422,9 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		if err := json.Unmarshal(e.Payload, &p); err != nil {
 			return nil
 		}
+		if muted, ok := p["muted"].(bool); ok && muted {
+			return nil
+		}
 		if v, ok := p["ts"].(float64); ok {
 			ts = int64(v)
 		}

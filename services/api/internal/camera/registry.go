@@ -481,6 +481,16 @@ func (r *Registry) LookupFrigateSlugByCameraID(id uint) (string, bool) {
 	return slug, ok
 }
 
+// AllFrigateSlugs returns all unique Frigate slugs currently mapped.
+func (r *Registry) AllFrigateSlugs() []string {
+	slugsMap := r.computeUniqueSlugs()
+	out := make([]string, 0, len(slugsMap))
+	for _, s := range slugsMap {
+		out = append(out, s)
+	}
+	return out
+}
+
 // UpdateCodec changes the output codec for a camera and re-pushes
 // the stream to go2rtc so the new codec takes effect immediately
 // without requiring a container restart.
@@ -1022,20 +1032,32 @@ func (r *Registry) CanRead(c *model.Camera, userID uint, isAdmin bool) bool {
 	return ok
 }
 
-// ShareCamera grants userID read access to cameraID by inserting a
-// CameraShare row. The operation is idempotent: if a row already
-// exists (unique index idx_camera_user) the call is a no-op and
-// returns nil. This keeps the POST /cameras/:id/shares endpoint
-// safe to retry — the dashboard's "add viewer" button can be
-// double-clicked without producing a 409.
-func (r *Registry) ShareCamera(cameraID, userID uint) error {
-	// INSERT IGNORE semantics: GORM's OnConflict DoNothing maps to
-	// INSERT OR IGNORE on SQLite, which is exactly what we want —
-	// the unique index idx_camera_user guarantees one row per
-	// (camera, user) pair regardless of who wins the race.
-	share := model.CameraShare{CameraID: cameraID, UserID: userID}
-	if err := r.DB.Where("camera_id = ? AND user_id = ?", cameraID, userID).
-		FirstOrCreate(&share).Error; err != nil {
+// CanPTZ reports whether a user is allowed to control PTZ on the camera.
+// Admins and owners always can; shared users can only if CanPTZ is true on their CameraShare row.
+func (r *Registry) CanPTZ(c *model.Camera, userID uint, isAdmin bool) bool {
+	if isAdmin {
+		return true
+	}
+	if c.OwnerID == userID {
+		return true
+	}
+	var share model.CameraShare
+	if err := r.DB.Where("camera_id = ? AND user_id = ?", c.ID, userID).First(&share).Error; err != nil {
+		return false
+	}
+	return share.CanPTZ
+}
+
+// ShareCamera grants userID read access to cameraID with optional PTZ control.
+// If the share already exists, it updates can_ptz.
+func (r *Registry) ShareCamera(cameraID, userID uint, canPTZ bool) error {
+	var share model.CameraShare
+	err := r.DB.Where("camera_id = ? AND user_id = ?", cameraID, userID).First(&share).Error
+	if err == nil {
+		return r.DB.Model(&share).Update("can_ptz", canPTZ).Error
+	}
+	share = model.CameraShare{CameraID: cameraID, UserID: userID, CanPTZ: canPTZ}
+	if err := r.DB.Create(&share).Error; err != nil {
 		return fmt.Errorf("camera: share %d->%d: %w", cameraID, userID, err)
 	}
 	return nil
@@ -1685,7 +1707,7 @@ func (r *Registry) hevcPassthroughURL(cam *model.Camera, user, pass string) stri
 		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
 	}
 	if cameraHasAudio(cam) {
-		return "ffmpeg:" + raw + "#video=copy#audio=aac" + stopFrag
+		return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac" + stopFrag
 	}
 	return raw + "#audio=0" + stopFrag
 }
@@ -1756,12 +1778,12 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	if codec == "passthrough" {
 		if audioOn {
 			// Audio requested but we're on the passthrough path —
-			// the rtsp:// scheme cannot transcode PCMA to AAC, so
+			// the rtsp:// scheme cannot transcode PCMA to AAC/Opus, so
 			// switch to ffmpeg with video=copy (passthrough video)
-			// + audio=aac (transcode audio only). Adds ~5% CPU
-			// for the AAC encoder but preserves the camera's
-			// native video codec (no quality loss).
-			return "ffmpeg:" + raw + "#video=copy#audio=aac" + stopFrag
+			// + audio=opus#audio=aac (transcode audio to Opus for WebRTC
+			// and AAC for HLS). Adds negligible CPU for the audio encoder
+			// while preserving the camera's native video codec (no quality loss).
+			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac" + stopFrag
 		}
 		// Native path: no ffmpeg, no transcode. Camera
 		// delivers whatever codec it has (H.264 / H.265)
@@ -1779,9 +1801,9 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// pipeline. `video=<codec>` selects a go2rtc ffmpeg
 	// preset (h264: H.264 high@4.1 superfast/zerolatency;
 	// h265: libx265). When audio is enabled we append
-	// `#audio=aac` so ffmpeg encodes the camera's PCMA
-	// audio to AAC alongside the video transcode. Without
-	// the audio directive, parseArgs injects `-an` so
+	// `#audio=opus#audio=aac` so ffmpeg encodes the camera's PCMA
+	// audio to Opus for WebRTC and AAC for HLS alongside the video transcode.
+	// Without the audio directive, parseArgs injects `-an` so
 	// ffmpeg drops the camera's PCMA track entirely.
 	//
 	// `width=1280` downscales to 720p for h264 (bandwidth
@@ -1799,7 +1821,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// software decode.
 	audioFrag := ""
 	if audioOn {
-		audioFrag = "#audio=aac"
+		audioFrag = "#audio=opus#audio=aac"
 	}
 	if codec == "h265" {
 		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + stopFrag

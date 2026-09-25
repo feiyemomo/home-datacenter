@@ -240,7 +240,7 @@ func (h *CameraHandler) Register(c *gin.Context) {
 			Source:  eventbus.SourceSystem,
 		})
 	}
-	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), true))
+	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), true, true))
 }
 
 // SetPreset — PUT /api/v1/cameras/:id/presets/:alias
@@ -301,8 +301,8 @@ func (h *CameraHandler) ListPresets(c *gin.Context) {
 	id, _ := strconv.Atoi(c.Param("id"))
 	ps, err := h.Reg.ListPresets(c.Request.Context(), uint(id))
 	if err != nil {
-		log.Printf("[handler] failed to list presets: %v", err)
-		utils.Fail(c, http.StatusBadGateway, "failed to list presets")
+		log.Printf("[handler] presets not available for camera %d: %v", id, err)
+		utils.Success(c, []camera.Preset{})
 		return
 	}
 	utils.Success(c, ps)
@@ -656,8 +656,8 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 	// without a second round-trip per event.
 	events, err := h.Reg.Frigate.ListEventsFiltered(c.Request.Context(), filter)
 	if err != nil {
-		log.Printf("[handler] failed to fetch frigate events: %v", err)
-		utils.Fail(c, http.StatusBadGateway, "failed to fetch frigate events")
+		log.Printf("[handler] frigate events unavailable: %v", err)
+		utils.Success(c, []any{})
 		return
 	}
 
@@ -887,18 +887,22 @@ func (h *CameraHandler) Frame(c *gin.Context) {
 	// layer applied.
 	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
 
-	// Cache lookup. A hit within the 10s TTL is returned verbatim
-	// without contacting go2rtc, which collapses the 1-2s
-	// cold-stream cost during burst traffic.
-	if v, ok := h.frameCache.Load(cam.StreamName); ok {
-		if entry, ok := v.(*frameCacheEntry); ok && time.Since(entry.ts) < 10*time.Second {
-			contentType := entry.contentType
-			if contentType == "" {
-				contentType = "image/jpeg"
+	// Cache lookup. A hit within TTL is returned verbatim
+	// without contacting go2rtc, which collapses cold-stream cost
+	// during burst traffic. Multi-camera split-screen passes nocache=1
+	// to fetch fresh live frames.
+	noCache := c.Query("nocache") == "1" || c.Query("live") == "1"
+	if !noCache {
+		if v, ok := h.frameCache.Load(cam.StreamName); ok {
+			if entry, ok := v.(*frameCacheEntry); ok && time.Since(entry.ts) < 2*time.Second {
+				contentType := entry.contentType
+				if contentType == "" {
+					contentType = "image/jpeg"
+				}
+				c.Header("X-Frame-Cache", "HIT")
+				c.Data(http.StatusOK, contentType, entry.data)
+				return
 			}
-			c.Header("X-Frame-Cache", "HIT")
-			c.Data(http.StatusOK, contentType, entry.data)
-			return
 		}
 	}
 
@@ -1729,8 +1733,12 @@ func (h *CameraHandler) List(c *gin.Context) {
 	cams := h.Reg.List()
 	views := make([]gin.H, 0, len(cams))
 	for i := range cams {
+		if !isAdmin && !h.Reg.CanRead(&cams[i], uid, isAdmin) {
+			continue
+		}
 		isPrivileged := ok && (isAdmin || cams[i].OwnerID == uid)
-		views = append(views, cameraView(&cams[i], h.Reg.StreamConfig(&cams[i]), isPrivileged))
+		canPTZ := ok && h.Reg.CanPTZ(&cams[i], uid, isAdmin)
+		views = append(views, cameraView(&cams[i], h.Reg.StreamConfig(&cams[i]), isPrivileged, canPTZ))
 	}
 	utils.Success(c, views)
 }
@@ -1748,8 +1756,13 @@ func (h *CameraHandler) Get(c *gin.Context) {
 		return
 	}
 	uid, isAdmin, ok := h.callerIsAdmin(c)
+	if !isAdmin && !h.Reg.CanRead(cam, uid, isAdmin) {
+		utils.Fail(c, http.StatusForbidden, "camera access forbidden")
+		return
+	}
 	isPrivileged := ok && (isAdmin || cam.OwnerID == uid)
-	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), isPrivileged))
+	canPTZ := ok && h.Reg.CanPTZ(cam, uid, isAdmin)
+	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), isPrivileged, canPTZ))
 }
 
 // Delete — DELETE /api/v1/cameras/:id
@@ -1830,12 +1843,13 @@ func (h *CameraHandler) requireCanManageShares(c *gin.Context) (*model.Camera, b
 //	{ "user_id": 42 }
 type shareReq struct {
 	UserID uint `json:"user_id" binding:"required"`
+	CanPTZ bool `json:"can_ptz"`
 }
 
 // ShareCamera — POST /api/v1/cameras/:id/shares
 //
-// Grants the given user read access to the camera. Idempotent —
-// re-sharing with the same user is a no-op (200, not 409). Only
+// Grants the given user read access to the camera (with optional PTZ permission). Idempotent —
+// re-sharing with the same user updates permissions (200, not 409). Only
 // the camera owner or an admin may call this (enforced by
 // requireCanManageShares).
 func (h *CameraHandler) ShareCamera(c *gin.Context) {
@@ -1862,12 +1876,12 @@ func (h *CameraHandler) ShareCamera(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "cannot share with the camera owner (already has access)")
 		return
 	}
-	if err := h.Reg.ShareCamera(cam.ID, req.UserID); err != nil {
+	if err := h.Reg.ShareCamera(cam.ID, req.UserID, req.CanPTZ); err != nil {
 		log.Printf("[handler] failed to share camera: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to share camera")
 		return
 	}
-	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": req.UserID})
+	utils.Success(c, gin.H{"camera_id": cam.ID, "user_id": req.UserID, "can_ptz": req.CanPTZ})
 }
 
 // UnshareCamera — DELETE /api/v1/cameras/:id/shares/:user_id
@@ -1927,11 +1941,13 @@ type ptzReq struct {
 
 // PTZ — POST /api/v1/cameras/:id/ptz
 func (h *CameraHandler) PTZ(c *gin.Context) {
-	// v1.7.1: moved from adminCam to camGroup so non-admin users
-	// with shared read access can also control PTZ. requireCanRead
-	// enforces per-camera visibility (owner / admin / shared viewer).
 	cam, ok := h.requireCanRead(c)
 	if !ok {
+		return
+	}
+	uid, isAdmin, _ := h.callerIsAdmin(c)
+	if !h.Reg.CanPTZ(cam, uid, isAdmin) {
+		utils.Fail(c, http.StatusForbidden, "ptz permission denied")
 		return
 	}
 	var req ptzReq
@@ -2001,7 +2017,7 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 // the encrypted Credentials blob and embeds the live stream URLs.
 // When isPrivileged is false (non-admin shared viewer), host and
 // port fields are masked to prevent internal network disclosure.
-func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool) gin.H {
+func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool, canPTZ bool) gin.H {
 	host := cam.Host
 	onvifPort := cam.ONVIFPort
 	rtspPort := cam.RTSPPort
@@ -2022,6 +2038,7 @@ func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool
 		"status":       cam.Status,
 		"last_seen_at": cam.LastSeenAt,
 		"capabilities": cam.Capabilities,
+		"can_ptz":      canPTZ,
 		"meta":         cam.Meta,
 		"stream":       stream,
 		"transcode":    cam.Transcode,

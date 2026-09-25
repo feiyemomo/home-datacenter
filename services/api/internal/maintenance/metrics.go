@@ -156,23 +156,41 @@ func CollectMetrics(diskPath string, recordingsDir string, quotaBytes uint64) Me
 
 	var rec RecordingsMetrics
 	rec.QuotaBytes = quotaBytes
-	if recordingsDir != "" {
-		if sz, _, err := dirSize(recordingsDir); err == nil {
-			rec.SizeBytes = sz
-			if quotaBytes > 0 {
-				pct := math.Round((float64(sz)/float64(quotaBytes))*1000) / 10
-				rec.QuotaPercent = pct
-				rec.QuotaActive = sz >= quotaBytes
-			}
+	recDir := recordingsDir
+	if recDir == "" || recDir == "/data/recordings" {
+		if fi, err := os.Stat("/media/frigate/recordings"); err == nil && fi.IsDir() {
+			recDir = "/media/frigate/recordings"
+		}
+	}
+	if sz, _, err := dirSize(recDir); err == nil {
+		rec.SizeBytes = sz
+		if quotaBytes > 0 {
+			pct := math.Round((float64(sz)/float64(quotaBytes))*1000) / 10
+			rec.QuotaPercent = pct
+			rec.QuotaActive = sz >= quotaBytes
 		}
 	}
 
 	var cache CacheMetrics
-	if recordingsDir != "" {
-		cacheDir := filepath.Join(recordingsDir, ".transcode-cache")
-		if sz, cnt, err := dirSize(cacheDir); err == nil {
-			cache.SizeBytes = sz
-			cache.FileCount = cnt
+	cacheDirs := []string{
+		"/data/recordings/.transcode-cache",
+		"/data/recordings/.stream-cache",
+	}
+	if recordingsDir != "" && recordingsDir != "/data/recordings" {
+		cacheDirs = append(cacheDirs,
+			filepath.Join(recordingsDir, ".transcode-cache"),
+			filepath.Join(recordingsDir, ".stream-cache"),
+		)
+	}
+	seenCache := make(map[string]bool)
+	for _, cDir := range cacheDirs {
+		if seenCache[cDir] {
+			continue
+		}
+		seenCache[cDir] = true
+		if sz, cnt, err := dirSize(cDir); err == nil {
+			cache.SizeBytes += sz
+			cache.FileCount += cnt
 		}
 	}
 
@@ -194,52 +212,65 @@ func CollectMetrics(diskPath string, recordingsDir string, quotaBytes uint64) Me
 	}
 }
 
-// CleanTranscodeCache purges all files under <recordingsDir>/.transcode-cache.
+// CleanTranscodeCache purges all files under transcode and stream caches.
 func CleanTranscodeCache(recordingsDir string) (uint64, int, error) {
-	if recordingsDir == "" {
-		return 0, 0, nil
+	cacheDirs := []string{
+		"/data/recordings/.transcode-cache",
+		"/data/recordings/.stream-cache",
 	}
-	cacheDir := filepath.Join(recordingsDir, ".transcode-cache")
-	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
-		return 0, 0, nil
-	}
-
-	var reclaimed uint64
-	var deleted int
-
-	entries, err := os.ReadDir(cacheDir)
-	if err != nil {
-		return 0, 0, err
+	if recordingsDir != "" && recordingsDir != "/data/recordings" {
+		cacheDirs = append(cacheDirs,
+			filepath.Join(recordingsDir, ".transcode-cache"),
+			filepath.Join(recordingsDir, ".stream-cache"),
+		)
 	}
 
-	for _, entry := range entries {
-		subPath := filepath.Join(cacheDir, entry.Name())
-		if entry.IsDir() {
-			// Subdirectories are camera IDs (e.g. .transcode-cache/1/...)
-			files, fErr := os.ReadDir(subPath)
-			if fErr != nil {
-				continue
-			}
-			for _, file := range files {
-				filePath := filepath.Join(subPath, file.Name())
-				if info, iErr := file.Info(); iErr == nil {
-					reclaimed += uint64(info.Size())
+	var totalReclaimed uint64
+	var totalDeleted int
+	seen := make(map[string]bool)
+
+	for _, cacheDir := range cacheDirs {
+		if seen[cacheDir] {
+			continue
+		}
+		seen[cacheDir] = true
+		if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
+			continue
+		}
+
+		entries, err := os.ReadDir(cacheDir)
+		if err != nil {
+			continue
+		}
+
+		for _, entry := range entries {
+			subPath := filepath.Join(cacheDir, entry.Name())
+			if entry.IsDir() {
+				files, fErr := os.ReadDir(subPath)
+				if fErr != nil {
+					continue
 				}
-				if rErr := os.Remove(filePath); rErr == nil {
-					deleted++
-				} else {
-					log.Printf("clean-cache: remove file %s failed: %v", filePath, rErr)
+				for _, file := range files {
+					filePath := filepath.Join(subPath, file.Name())
+					if info, iErr := file.Info(); iErr == nil {
+						totalReclaimed += uint64(info.Size())
+					}
+					if rErr := os.Remove(filePath); rErr == nil {
+						totalDeleted++
+					} else {
+						log.Printf("clean-cache: remove file %s failed: %v", filePath, rErr)
+					}
 				}
-			}
-		} else {
-			if info, iErr := entry.Info(); iErr == nil {
-				reclaimed += uint64(info.Size())
-			}
-			if rErr := os.Remove(subPath); rErr == nil {
-				deleted++
+			} else {
+				if info, iErr := entry.Info(); iErr == nil {
+					totalReclaimed += uint64(info.Size())
+				}
+				if rErr := os.Remove(subPath); rErr == nil {
+					totalDeleted++
+				}
 			}
 		}
 	}
 
-	return reclaimed, deleted, nil
+	return totalReclaimed, totalDeleted, nil
 }

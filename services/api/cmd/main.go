@@ -206,7 +206,11 @@ func main() {
 	securityHandler := handler.NewSecurityHandler(guardMgr)
 
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
-	systemHandler.ConfigureMetrics(cfg.Maintenance.DiskPath, cfg.Camera.RecordingDir, cfg.Maintenance.RecordingQuotaBytes, bus)
+	recMetricsDir := cfg.Maintenance.RecordingsRoot
+	if recMetricsDir == "" {
+		recMetricsDir = cfg.Camera.RecordingDir
+	}
+	systemHandler.ConfigureMetrics(cfg.Maintenance.DiskPath, recMetricsDir, cfg.Maintenance.RecordingQuotaBytes, bus)
 	systemLogHandler := handler.NewSystemLogHandler(database.DB)
 	clientErrorHandler := handler.NewClientErrorHandler(database.DB)
 
@@ -636,7 +640,7 @@ func main() {
 		securityGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
 			securityGroup.GET("/guard", securityHandler.GetGuard)
-			securityGroup.PUT("/guard", securityHandler.SetGuard)
+			securityGroup.PUT("/guard", middleware.RequireAdmin(database.DB), securityHandler.SetGuard)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so
