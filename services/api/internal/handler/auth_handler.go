@@ -232,9 +232,38 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 		return
 	}
 
+	// Look up the user to retrieve their username and admin status.
+	role := "viewer"
+	userName := ""
+	user, err := h.authService.GetUserByID(claims.UserID)
+	if err != nil || user == nil {
+		utils.Fail(c, http.StatusUnauthorized, "user lookup failed")
+		return
+	}
+	userName = user.Name
+	if user.IsAdmin {
+		role = "admin"
+	}
+
+	// Echo response headers for nginx auth_request to forward to upstream
+	// proxies (e.g. Frigate Remote-User and Remote-Role).
+	c.Header("X-Auth-User", userName)
+	c.Header("X-Auth-Role", role)
+
+	// Optional require_admin check for nginx auth_request locations.
+	if c.Query("require_admin") == "true" || c.Query("require_admin") == "1" {
+		if !user.IsAdmin {
+			utils.Fail(c, http.StatusForbidden, "admin privileges required")
+			return
+		}
+	}
+
+
 	utils.Success(c, gin.H{
 		"user_id":   claims.UserID,
 		"device_id": claims.DeviceID,
+		"user_name": userName,
+		"role":      role,
 		"valid":     true,
 	})
 }

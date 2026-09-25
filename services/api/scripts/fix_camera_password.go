@@ -5,7 +5,7 @@
 // go2rtc so the live stream picks up the corrected credentials.
 //
 // Use case: the operator changed the camera password on the device
-// (e.g. Hikvision "<CAM_PASSWORD>") and wants all stored cameras to
+// (e.g. Hikvision "<CAMERA_PASSWORD>") and wants all stored cameras to
 // point at the new password without going through the DELETE + POST
 // dance in the dashboard.
 //
@@ -14,7 +14,7 @@
 // the API uses, so the JWT secret that derives the AES-GCM key is
 // the real one.
 //
-//	go run fix_camera_password.go -new <CAM_PASSWORD>
+//	go run fix_camera_password.go -new <NEW_PASSWORD>
 package main
 
 import (

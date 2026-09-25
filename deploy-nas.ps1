@@ -34,7 +34,7 @@
 #
 # Usage:
 #   .\deploy-nas.ps1                          # normal deploy (requires SSH key auth)
-#   .\deploy-nas.ps1 -Password '<NAS_PASSWORD>'     # use password auth (no SSH key needed)
+#   .\deploy-nas.ps1 -Password '<YOUR_PASSWORD>' # use password auth (no SSH key needed)
 #   .\deploy-nas.ps1 -DryRun                  # show what would be packed, don't touch NAS
 #   .\deploy-nas.ps1 -NoBuild                 # docker compose up -d without --build
 #                                             # (use when only compose.yaml/.env changed)

@@ -95,6 +95,12 @@ func (s *AuthService) GetDeviceForAuth(deviceID uint) (*model.Device, error) {
 	return s.deviceRepo.GetByID(deviceID)
 }
 
+// GetUserByID fetches the user record for auth verification and role lookup.
+func (s *AuthService) GetUserByID(userID uint) (*model.User, error) {
+	return s.userRepo.GetByID(userID)
+}
+
+
 // Refresh re-issues a fresh long-lived JWT for an already-authenticated device,
 // updating its LastLoginAt timestamp to the current time.
 func (s *AuthService) Refresh(userID uint, deviceID uint) (string, *model.Device, error) {

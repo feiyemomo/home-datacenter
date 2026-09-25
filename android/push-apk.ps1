@@ -16,7 +16,7 @@
 #   .\android\push-apk.ps1                        # build + push, no release notes
 #   .\android\push-apk.ps1 -Notes "v1.8.44 ..."   # build + push + write release notes
 #   .\android\push-apk.ps1 -DryRun                # show what would be pushed, don't build/touch NAS
-#   .\android\push-apk.ps1 -Password '<NAS_PASSWORD>'   # password auth (no SSH key needed)
+#   .\android\push-apk.ps1 -Password '<YOUR_PASSWORD>' # password auth (no SSH key needed)
 
 [CmdletBinding()]
 param(

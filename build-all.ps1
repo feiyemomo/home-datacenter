@@ -19,7 +19,7 @@
 #   .\build-all.ps1 -Flavor debug            # build debug APK instead
 #   .\build-all.ps1 -PushApk                 # also push the APK to NAS releases
 #   .\build-all.ps1 -PushApk -Notes "..."    # attach release notes
-#   .\build-all.ps1 -Password '<NAS_PASSWORD>'     # NAS password auth (no SSH key)
+#   .\build-all.ps1 -Password '<YOUR_PASSWORD>' # NAS password auth (no SSH key)
 #   .\build-all.ps1 -SkipAndroid             # only deploy backend + web
 #   .\build-all.ps1 -SkipDeploy              # only build Android, no NAS
 #   .\build-all.ps1 -DryRun                  # preview, touch nothing

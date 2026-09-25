@@ -764,6 +764,32 @@ func (c *FrigateClient) ListEvents(ctx context.Context, limit int, includeThumbn
 	})
 }
 
+// GetEvent retrieves metadata for a single detection event from Frigate
+// via GET /api/events/<id>. Used to resolve the event's camera for
+// authorization checks before proxying snapshots or thumbnails.
+func (c *FrigateClient) GetEvent(ctx context.Context, eventID string) (*FrigateEvent, error) {
+	u := fmt.Sprintf("%s/api/events/%s", c.FrigateBase, url.PathEscape(eventID))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+		return nil, fmt.Errorf("frigate get event: %s: %s", resp.Status, string(raw))
+	}
+	var ev FrigateEvent
+	if err := json.NewDecoder(resp.Body).Decode(&ev); err != nil {
+		return nil, fmt.Errorf("decode frigate event: %w", err)
+	}
+	return &ev, nil
+}
+
+
 // EventSnapshot fetches the full-resolution snapshot JPEG for a given
 // Frigate event ID. Frigate serves these at GET /api/events/<id>/snapshot.jpg.
 // The returned contentType is image/jpeg (or whatever Frigate returns).

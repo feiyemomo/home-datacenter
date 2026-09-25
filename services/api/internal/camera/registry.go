@@ -1578,13 +1578,13 @@ func slugifyName(name string) string {
 // helper here. Go's url.UserPassword percent-encodes reserved chars
 // in the userinfo (e.g. "@" → "%40"), which is standards-correct —
 // but go2rtc's RTSP client does NOT URL-decode the password before
-// sending it to the camera. So a password "Haikang@" becomes
-// "Haikang%40" on the wire, and the camera rejects it with
+// sending it to the camera. So a password "pass@word" becomes
+// "pass%40word" on the wire, and the camera rejects it with
 // "wrong user/pass". Building the URL as a plain string with the
 // raw password avoids this. The go2rtc URL parser splits at the
 // last "@" before the host, so a password containing "@" (e.g.
-// "Haikang@") produces "rtsp://admin:Haikang@@host..." which
-// go2rtc parses correctly as user=admin, pass=Haikang@.
+// "pass@word") produces "rtsp://admin:pass@word@host..." which
+// go2rtc parses correctly as user=admin, pass=pass@word.
 //
 // Audio handling: the platform's HLS path defaults to dropping
 // audio at the source. Camera audio codecs (G726 / PCMU /

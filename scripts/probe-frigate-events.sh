@@ -40,4 +40,5 @@ docker logs home-frigate 2>&1 | grep -iE 'mqtt|event|publish' | tail -30
 echo
 
 echo "=== mosquitto_sub - frigate/events for 5 seconds ==="
-timeout 5 docker exec home-mosquitto mosquitto_sub -h 127.0.0.1 -p 1883 -u home-datacenter -P '<NAS_PASSWORD>mqtt' -t 'frigate/events' || echo "(timeout, no events in 5s)"
+MQTT_PASS="${MQTT_PASSWORD:-<YOUR_MQTT_PASSWORD>}"
+timeout 5 docker exec home-mosquitto mosquitto_sub -h 127.0.0.1 -p 1883 -u home-datacenter -P "$MQTT_PASS" -t 'frigate/events' || echo "(timeout, no events in 5s)"

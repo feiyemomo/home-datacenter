@@ -617,6 +617,12 @@ func (h *CameraHandler) DeleteRecording(c *gin.Context) {
 //	before — unix timestamp upper bound
 //	after — unix timestamp lower bound
 func (h *CameraHandler) ListAlerts(c *gin.Context) {
+	uid, isAdmin, ok := h.callerIsAdmin(c)
+	if !ok {
+		utils.Fail(c, http.StatusUnauthorized, "unauthenticated")
+		return
+	}
+
 	limit := 20
 	if v, err := strconv.Atoi(c.Query("limit")); err == nil && v > 0 {
 		limit = v
@@ -642,22 +648,67 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 		}
 	}
 
+	var allowedSlugs map[string]bool
+	if !isAdmin {
+		allowedSlugs = make(map[string]bool)
+		for _, cam := range h.Reg.List() {
+			if h.Reg.CanRead(&cam, uid, isAdmin) {
+				if s, found := h.Reg.LookupFrigateSlugByCameraID(cam.ID); found {
+					allowedSlugs[s] = true
+				}
+			}
+		}
+		if len(allowedSlugs) == 0 {
+			utils.Success(c, gin.H{"alerts": []any{}, "total": 0})
+			return
+		}
+	}
+
 	if camIDStr := c.Query("camera_id"); camIDStr != "" {
 		if cid, err := strconv.ParseUint(camIDStr, 10, 64); err == nil && cid > 0 {
+			cam, err := h.Reg.Get(uint(cid))
+			if err != nil {
+				utils.Fail(c, http.StatusNotFound, "camera not found")
+				return
+			}
+			if !isAdmin && !h.Reg.CanRead(cam, uid, isAdmin) {
+				utils.Fail(c, http.StatusForbidden, "not your camera")
+				return
+			}
 			if slug, ok := h.Reg.LookupFrigateSlugByCameraID(uint(cid)); ok {
 				filter.Cameras = slug
 			}
 		}
 	} else if slug := strings.TrimSpace(c.Query("camera")); slug != "" {
+		camID, found := h.Reg.LookupByFrigateSlug(slug)
+		if !found {
+			utils.Fail(c, http.StatusNotFound, "camera not found")
+			return
+		}
+		cam, err := h.Reg.Get(camID)
+		if err != nil || (!isAdmin && !h.Reg.CanRead(cam, uid, isAdmin)) {
+			utils.Fail(c, http.StatusForbidden, "not your camera")
+			return
+		}
 		filter.Cameras = slug
+	} else if !isAdmin {
+		var slugs []string
+		for s := range allowedSlugs {
+			slugs = append(slugs, s)
+		}
+		filter.Cameras = strings.Join(slugs, ",")
 	}
 
 	// Include thumbnails so the dashboard can render preview images
 	// without a second round-trip per event.
+	if h.Reg == nil || h.Reg.Frigate == nil {
+		utils.Success(c, gin.H{"alerts": []any{}, "total": 0})
+		return
+	}
 	events, err := h.Reg.Frigate.ListEventsFiltered(c.Request.Context(), filter)
 	if err != nil {
 		log.Printf("[handler] frigate events unavailable: %v", err)
-		utils.Success(c, []any{})
+		utils.Success(c, gin.H{"alerts": []any{}, "total": 0})
 		return
 	}
 
@@ -679,6 +730,9 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 
 	alerts := make([]alertEntry, 0, len(events))
 	for _, ev := range events {
+		if !isAdmin && !allowedSlugs[ev.Camera] {
+			continue
+		}
 		entry := alertEntry{
 			ID:          ev.ID,
 			CameraSlug:  ev.Camera,
@@ -771,6 +825,41 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 	utils.Success(c, gin.H{"ranges": ranges, "total": len(ranges)})
 }
 
+// canReadEvent verifies that the caller has permission to view the Frigate
+// detection event identified by eventID. Admins are permitted unconditionally;
+// non-admins are checked against the camera owning the event.
+func (h *CameraHandler) canReadEvent(c *gin.Context, eventID string) bool {
+	uid, isAdmin, ok := h.callerIsAdmin(c)
+	if !ok {
+		utils.Fail(c, http.StatusUnauthorized, "unauthenticated")
+		return false
+	}
+	if isAdmin {
+		return true
+	}
+	if h.Reg == nil || h.Reg.Frigate == nil {
+		utils.Fail(c, http.StatusBadGateway, "frigate not available")
+		return false
+	}
+	ev, err := h.Reg.Frigate.GetEvent(c.Request.Context(), eventID)
+	if err != nil {
+		log.Printf("[handler] failed to get event for auth check: %v", err)
+		utils.Fail(c, http.StatusNotFound, "event not found")
+		return false
+	}
+	camID, found := h.Reg.LookupByFrigateSlug(ev.Camera)
+	if !found {
+		utils.Fail(c, http.StatusForbidden, "camera access forbidden")
+		return false
+	}
+	cam, err := h.Reg.Get(camID)
+	if err != nil || !h.Reg.CanRead(cam, uid, isAdmin) {
+		utils.Fail(c, http.StatusForbidden, "not your camera")
+		return false
+	}
+	return true
+}
+
 // AlertSnapshot — GET /api/v1/cameras/alerts/:id/snapshot
 //
 // Proxies the full-resolution snapshot JPEG for a Frigate detection
@@ -785,6 +874,9 @@ func (h *CameraHandler) AlertSnapshot(c *gin.Context) {
 	eventID := c.Param("id")
 	if eventID == "" {
 		utils.Fail(c, http.StatusBadRequest, "missing event id")
+		return
+	}
+	if !h.canReadEvent(c, eventID) {
 		return
 	}
 
@@ -817,6 +909,9 @@ func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
 	eventID := c.Param("id")
 	if eventID == "" {
 		utils.Fail(c, http.StatusBadRequest, "missing event id")
+		return
+	}
+	if !h.canReadEvent(c, eventID) {
 		return
 	}
 

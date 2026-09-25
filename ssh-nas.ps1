@@ -10,7 +10,7 @@
 #   .\ssh-nas.ps1                    # interactive menu
 #   .\ssh-nas.ps1 -Command "docker ps"   # run one command, print, exit
 #   .\ssh-nas.ps1 -Menu              # force interactive menu (default)
-#   .\ssh-nas.ps1 -Password '<NAS_PASSWORD>'  # password auth (no SSH key)
+#   .\ssh-nas.ps1 -Password '<YOUR_PASSWORD>'  # password auth (no SSH key)
 #
 # Interactive menu items:
 #   1) 服务状态      docker compose ps

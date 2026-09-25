@@ -73,3 +73,36 @@ android/release-notes-v*.txt
 
 # web sync tarball used by scp-based deploys
 web-sync.tar.gz
+
+# Local notes / specs / prompts (contain private IP & credentials)
+PROMPT.md
+.trae/
+
+# Ad-hoc debug / local testing scripts & SQL
+check_logs.sql
+cleanup_logs.sql
+read_db.py
+scan2.sh
+scan3.sh
+scan-camera.sh
+db-cam.sh
+db-cam2.sh
+check-arp.sh
+check-cam-route.sh
+check-interfaces.sh
+check-ipv6-listen.sh
+check-ipv6.sh
+check-cam.sh
+check-api.sh
+diag-ipv6-docker.sh
+diag-ipv6-route.sh
+fix-cam-alias.sh
+fix-dns-and-deploy.sh
+fix-eno1-ipv6.sh
+fix-routing.sh
+build-host/
+
+# Build logs & compiled binaries
+*.log
+build.log*
+services/api/bin/
