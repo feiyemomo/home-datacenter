@@ -196,6 +196,36 @@ func (c *FrigateClient) Alive(ctx context.Context) bool {
 	return resp.StatusCode < 500
 }
 
+// LatestFrame fetches the real-time decoded frame directly from Frigate's RAM buffer.
+// Returns within ~20-50ms (versus 4-5s for cold go2rtc ffmpeg keyframe capture).
+func (c *FrigateClient) LatestFrame(ctx context.Context, cameraSlug string) (io.ReadCloser, string, error) {
+	if c == nil || c.FrigateBase == "" {
+		return nil, "", fmt.Errorf("frigate client not configured")
+	}
+	u := fmt.Sprintf("%s/api/%s/latest.jpg", c.FrigateBase, url.PathEscape(cameraSlug))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	hc := c.HC
+	if hc == nil {
+		hc = &http.Client{Timeout: 3 * time.Second}
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, "", err
+	}
+	if resp.StatusCode >= 300 {
+		resp.Body.Close()
+		return nil, "", fmt.Errorf("frigate latest frame status %d", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct == "" {
+		ct = "image/jpeg"
+	}
+	return resp.Body, ct, nil
+}
+
 // FrigateCameraConfig is the per-camera section in Frigate's config.yml.
 //
 // Frigate's Pydantic model validates each camera name with a strict

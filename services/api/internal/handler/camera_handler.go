@@ -906,26 +906,42 @@ func (h *CameraHandler) Frame(c *gin.Context) {
 		}
 	}
 
-	// Cache miss or expired — fetch a fresh frame from go2rtc and
-	// buffer the full body so we can both return it and cache it.
-	body, contentType, err := h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
-	if err != nil {
-		// v1.7.3: retry once after 3s to cover ffmpeg cold start / restart
-		log.Printf("frame: first attempt failed for %s, retrying in 3s: %v", cam.StreamName, err)
-		select {
-		case <-time.After(3 * time.Second):
-		case <-c.Request.Context().Done():
-			log.Printf("[handler] failed to fetch frame: %v", err)
-			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame")
-			return
+	var body io.ReadCloser
+	var contentType string
+	var fetchErr error
+
+	// Fast path: Frigate maintains continuously decoded frames in memory (~20-50ms response)
+	if h.Reg != nil && h.Reg.Frigate != nil {
+		slug := h.Reg.FrigateSlugUnique(cam)
+		if slug != "" {
+			body, contentType, fetchErr = h.Reg.Frigate.LatestFrame(c.Request.Context(), slug)
+			if fetchErr != nil {
+				body = nil
+			}
 		}
-		body, contentType, err = h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
-		if err != nil {
-			log.Printf("[handler] failed to fetch frame: %v", err)
-			utils.Fail(c, http.StatusBadGateway, "failed to fetch frame")
-			return
+	}
+
+	// Fallback path: go2rtc frame capture if Frigate is not configured or failed
+	if body == nil {
+		body, contentType, fetchErr = h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
+		if fetchErr != nil {
+			// v1.7.3: retry once after 3s to cover ffmpeg cold start / restart
+			log.Printf("frame: first attempt failed for %s, retrying in 3s: %v", cam.StreamName, fetchErr)
+			select {
+			case <-time.After(3 * time.Second):
+			case <-c.Request.Context().Done():
+				log.Printf("[handler] failed to fetch frame: %v", fetchErr)
+				utils.Fail(c, http.StatusBadGateway, "failed to fetch frame")
+				return
+			}
+			body, contentType, fetchErr = h.Reg.Go2.Frame(c.Request.Context(), cam.StreamName, quality, width)
+			if fetchErr != nil {
+				log.Printf("[handler] failed to fetch frame: %v", fetchErr)
+				utils.Fail(c, http.StatusBadGateway, "failed to fetch frame")
+				return
+			}
+			log.Printf("frame: retry succeeded for %s", cam.StreamName)
 		}
-		log.Printf("frame: retry succeeded for %s", cam.StreamName)
 	}
 	// 10MB cap: a go2rtc frame is a single JPEG/MJPEG snapshot,
 	// typically well under 1MB. Without a bound, a malicious or
