@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -599,27 +600,22 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 	}
 	buckets, err := h.Reg.ListRecordingMinutesFromDisk(cam, after, before)
 	if err != nil {
-		log.Printf("[handler] failed to list recordings: %v", err)
-		utils.Fail(c, http.StatusInternalServerError, "failed to list recordings")
-		return
+		log.Printf("[handler] failed to list recordings from disk: %v", err)
 	}
 
-	// buckets is already sorted newest-first by ListRecordingMinutesFromDisk.
-	//
-	// v1.8.6: duration_seconds now derived from SegmentCount * 10
-	// instead of (EndUnix - StartUnix). Frigate 0.17 stores ~10s MP4
-	// segments that are NOT aligned to minute boundaries — segments
-	// in a minute can start at offsets like :08, :18, :28, :38, :48,
-	// :58 (8s offset from the minute edge). The bucketing logic in
-	// registry.go floors start to the minute edge (good) but tracks
-	// endUnix as max(segStart + 10), so for an 8s offset the bucket
-	// span becomes 68s instead of 60s. Summed across a 1440-minute
-	// day this inflated the displayed total to 26h-27h (user report
-	// "他一天的录像为什么有26h"). Each Frigate segment is ~10s, so
-	// count*10 gives the true recording time and correctly handles
-	// partial minutes (no segments = 0s, not 60s).
+	// v1.8.35: Cloud cascading — merge archived minutes from Quark Cloud Drive via Alist WebDAV
+	if cloudBuckets, cloudErr := h.Reg.ListRecordingMinutesFromCloud(c.Request.Context(), cam, after, before, buckets); cloudErr == nil && len(cloudBuckets) > 0 {
+		buckets = append(buckets, cloudBuckets...)
+		sort.Slice(buckets, func(i, j int) bool { return buckets[i].StartUnix > buckets[j].StartUnix })
+	}
+
+	// buckets is already sorted newest-first.
 	views := make([]gin.H, 0, len(buckets))
 	for _, b := range buckets {
+		storageType := b.Storage
+		if storageType == "" {
+			storageType = "local"
+		}
 		views = append(views, gin.H{
 			"id":               b.StartUnix,
 			"camera_id":        cam.ID,
@@ -627,6 +623,7 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 			"end_at":           time.Unix(b.EndUnix, 0).UTC().Format(time.RFC3339),
 			"duration_seconds": b.SegmentCount * 10,
 			"segment_count":    b.SegmentCount,
+			"storage":          storageType, // "local" (热) or "cloud" (冷)
 			"size_bytes":       0,
 			"size_human":       "--",
 			"file_path":        "",
@@ -924,8 +921,17 @@ func (h *CameraHandler) AlertSnapshot(c *gin.Context) {
 		return
 	}
 
-	body, contentType, err := h.Reg.Frigate.EventSnapshot(c.Request.Context(), eventID)
+	quality, _ := strconv.Atoi(c.DefaultQuery("quality", "100"))
+	if quality <= 0 || quality > 100 {
+		quality = 100
+	}
+
+	body, contentType, err := h.Reg.Frigate.EventSnapshotWithQuality(c.Request.Context(), eventID, quality)
 	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			utils.Fail(c, http.StatusNotFound, "snapshot not found")
+			return
+		}
 		log.Printf("[handler] failed to fetch snapshot: %v", err)
 		utils.Fail(c, http.StatusBadGateway, "failed to fetch snapshot")
 		return
@@ -961,6 +967,10 @@ func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
 
 	body, contentType, err := h.Reg.Frigate.EventThumbnail(c.Request.Context(), eventID)
 	if err != nil {
+		if strings.Contains(err.Error(), "404") {
+			utils.Fail(c, http.StatusNotFound, "thumbnail not found")
+			return
+		}
 		log.Printf("[handler] failed to fetch thumbnail: %v", err)
 		utils.Fail(c, http.StatusBadGateway, "failed to fetch thumbnail")
 		return
@@ -1197,13 +1207,13 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	// so we list the directory and match by MM prefix instead of
 	// constructing paths from minuteStart + offset.
 	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
-	if err != nil {
-		log.Printf("[handler] no recording directory for this minute: %v", err)
-		utils.Fail(c, http.StatusNotFound, "no recording directory for this minute")
-		return
+	if err != nil || len(paths) == 0 {
+		// Fallback to Quark Cloud Archive via Alist WebDAV
+		paths, err = h.Reg.RecordingSegmentsFromCloud(c.Request.Context(), cam, minuteStart)
 	}
-	if len(paths) == 0 {
-		utils.Fail(c, http.StatusNotFound, "no recording segments found in this minute")
+	if err != nil || len(paths) == 0 {
+		log.Printf("[handler] no recording segments found for minute %d: %v", minuteStart, err)
+		utils.Fail(c, http.StatusNotFound, "no recording segments found in this minute (neither local nor cloud)")
 		return
 	}
 
@@ -1251,15 +1261,27 @@ func (h *CameraHandler) PlayRecordingStream(c *gin.Context) {
 	}
 	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
 	if err != nil || len(paths) == 0 {
-		utils.Fail(c, http.StatusNotFound, "no recording segments found in this minute")
+		// Fallback to Quark Cloud Archive via Alist WebDAV
+		paths, err = h.Reg.RecordingSegmentsFromCloud(c.Request.Context(), cam, minuteStart)
+	}
+	if err != nil || len(paths) == 0 {
+		utils.Fail(c, http.StatusNotFound, "no recording segments found in this minute (neither local nor cloud)")
 		return
 	}
-	h.streamRecording(c, cam, minuteStart, paths)
+	quality := strings.ToLower(strings.TrimSpace(c.Query("quality")))
+	if quality != "1080p" {
+		quality = "720p"
+	}
+	h.streamRecording(c, cam, minuteStart, paths, quality)
 }
 
-func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minuteStart int64, paths []string) {
+func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minuteStart int64, paths []string, quality string) {
 	cacheDir := fmt.Sprintf("/data/recordings/.stream-cache/%d", cam.ID)
-	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d.fmp4", minuteStart))
+	cacheSuffix := ""
+	if quality == "1080p" {
+		cacheSuffix = "_1080p"
+	}
+	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d%s.fmp4", minuteStart, cacheSuffix))
 	// Cache hit: serve the fragmented MP4 directly (http.ServeFile gives
 	// Content-Length + Range, which the MSE client tolerates fine).
 	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {
@@ -1297,7 +1319,7 @@ func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minut
 	}
 	defer releaseSem()
 
-	cmd := buildFMP4Cmd(listPath, vaapiAvailable())
+	cmd := buildFMP4Cmd(listPath, vaapiAvailable(), quality)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "pipe ffmpeg")
@@ -1396,25 +1418,31 @@ func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minut
 // init segment (ftyp+moov) at the very front; frag_keyframe emits one
 // fragment per keyframe so the client's MediaSource gets contiguous
 // playable chunks immediately. hw uses the VAAPI hardware pipeline.
-func buildFMP4Cmd(listPath string, hw bool) *exec.Cmd {
+func buildFMP4Cmd(listPath string, hw bool, quality string) *exec.Cmd {
+	w, h := "1280", "720"
+	if quality == "1080p" {
+		w, h = "1920", "1080"
+	}
 	if hw {
+		vf := fmt.Sprintf("scale_vaapi=w=min(%s\\,iw):h=min(%s\\,ih):force_original_aspect_ratio=decrease", w, h)
 		return exec.Command("ffmpeg", "-y",
 			"-vaapi_device", "/dev/dri/renderD128",
 			"-hwaccel", "vaapi",
 			"-hwaccel_output_format", "vaapi",
 			"-f", "concat", "-safe", "0",
 			"-i", listPath,
-			"-vf", "scale_vaapi=w=min(1280\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease",
+			"-vf", vf,
 			"-c:v", "h264_vaapi", "-qp", "24",
 			"-c:a", "aac", "-b:a", "96k",
 			"-f", "mp4",
 			"-movflags", "frag_keyframe+empty_moov+default_base_moof",
 			"pipe:1")
 	}
+	vf := fmt.Sprintf("scale=min(%s\\,iw):min(%s\\,ih):force_original_aspect_ratio=decrease", w, h)
 	return exec.Command("ffmpeg", "-y",
 		"-f", "concat", "-safe", "0",
 		"-i", listPath,
-		"-vf", "scale=min(1280\\,iw):min(720\\,ih):force_original_aspect_ratio=decrease",
+		"-vf", vf,
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
 		"-c:a", "aac", "-b:a", "96k",
 		"-f", "mp4",
@@ -1823,10 +1851,22 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 		return
 	}
 
-	answer, err := h.Reg.Go2.ExchangeSDP(c.Request.Context(), cam.StreamName, body)
+	streamName := cam.StreamName
+	quality := strings.ToLower(strings.TrimSpace(c.Query("quality")))
+	if quality == "1080p" {
+		streamName = cam.StreamName + "_1080p"
+	}
+
+	answer, err := h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
+	if err != nil && streamName != cam.StreamName {
+		// Fallback to standard 720p stream if 1080p stream fails
+		log.Printf("webrtc: %s failed (%v), falling back to standard stream %s", streamName, err, cam.StreamName)
+		streamName = cam.StreamName
+		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
+	}
 	if err != nil {
 		// v1.7.3: retry once after 3s to cover ffmpeg cold start
-		log.Printf("webrtc: first SDP exchange failed for %s, retrying in 3s: %v", cam.StreamName, err)
+		log.Printf("webrtc: first SDP exchange failed for %s, retrying in 3s: %v", streamName, err)
 		select {
 		case <-time.After(3 * time.Second):
 		case <-c.Request.Context().Done():
@@ -1834,13 +1874,13 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP")
 			return
 		}
-		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), cam.StreamName, body)
+		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
 		if err != nil {
 			log.Printf("[handler] failed to exchange SDP: %v", err)
 			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP")
 			return
 		}
-		log.Printf("webrtc: retry succeeded for %s", cam.StreamName)
+		log.Printf("webrtc: retry succeeded for %s", streamName)
 	}
 
 	// go2rtc returns the SDP answer as the response body. We

@@ -341,7 +341,7 @@ type HLSConfig struct {
 //     pipeline during a restart — a hot config merge alone does
 //     not spin up the recorder process. Without this, the config
 //     push returns 200 but no recordings are ever produced.
-func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraConfig, go2rtcStreams map[string]string, requiresRestart bool) error {
+func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraConfig, go2rtcStreams map[string]any, requiresRestart bool) error {
 	// Snapshot the current retention under the lock so the quota
 	// monitor's concurrent reduction is respected (v1.8.35).
 	c.retentionMu.Lock()
@@ -388,7 +388,7 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 			"timestamp":  false,
 			"bounding_box": true,
 			"crop":      false,
-			"quality":   70,
+			"quality":   95,
 		},
 	}
 	if len(go2rtcStreams) > 0 {
@@ -792,10 +792,17 @@ func (c *FrigateClient) GetEvent(ctx context.Context, eventID string) (*FrigateE
 
 // EventSnapshot fetches the full-resolution snapshot JPEG for a given
 // Frigate event ID. Frigate serves these at GET /api/events/<id>/snapshot.jpg.
-// The returned contentType is image/jpeg (or whatever Frigate returns).
-// Caller is responsible for closing the returned ReadCloser.
+// Defaults to full quality (100).
 func (c *FrigateClient) EventSnapshot(ctx context.Context, eventID string) (io.ReadCloser, string, error) {
+	return c.EventSnapshotWithQuality(ctx, eventID, 100)
+}
+
+// EventSnapshotWithQuality fetches the snapshot JPEG with an explicit quality parameter.
+func (c *FrigateClient) EventSnapshotWithQuality(ctx context.Context, eventID string, quality int) (io.ReadCloser, string, error) {
 	u := fmt.Sprintf("%s/api/events/%s/snapshot.jpg", c.FrigateBase, url.PathEscape(eventID))
+	if quality > 0 {
+		u += fmt.Sprintf("?quality=%d", quality)
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, "", err

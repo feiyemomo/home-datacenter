@@ -43,10 +43,20 @@ type Registry struct {
 	// normal login → live-view navigation to hit a hot source without
 	// paying the 1-2s cold-start.
 	StopTimeout int
+	Cloud       *CloudArchiveClient
 }
 
 func NewRegistry(db *gorm.DB, g *Go2RTCClient, fr *FrigateClient, box *utils.SecretBox, onvif *ONVIFController, webRTCURL string) *Registry {
-	return &Registry{DB: db, Go2: g, Frigate: fr, Box: box, ONVIF: onvif, WebRTCURL: webRTCURL, StopTimeout: 120}
+	return &Registry{
+		DB:          db,
+		Go2:         g,
+		Frigate:     fr,
+		Box:         box,
+		ONVIF:       onvif,
+		WebRTCURL:   webRTCURL,
+		StopTimeout: 120,
+		Cloud:       NewCloudArchiveClient(),
+	}
 }
 
 // RegisterInput is the wire format for POST /api/v1/cameras.
@@ -200,6 +210,7 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 	// Native-HEVC camera gets a second zero-transcode passthrough live
 	// stream (<name>_hevc) so HEVC-capable browsers can skip the J4125
 	// transcode. Best-effort — a failure falls back to H.264.
+	r.add1080pStream(ctx, cam, in.Username, in.Password)
 	r.addHEVCStream(ctx, cam, in.Username, in.Password)
 
 	// Preheat the go2rtc stream: force an RTSP source connection now
@@ -308,6 +319,7 @@ func (r *Registry) Unregister(ctx context.Context, id uint) error {
 	slug := r.FrigateSlugUnique(&cam)
 	if cam.StreamName != "" {
 		_ = r.Go2.RemoveStream(ctx, cam.StreamName)
+		_ = r.Go2.RemoveStream(ctx, cam.StreamName+"_1080p")
 		// Drop the native-HEVC passthrough companion stream too
 		// (best-effort; a 404 when it never existed is fine).
 		_ = r.Go2.RemoveStream(ctx, hevcStreamName(cam.StreamName))
@@ -474,6 +486,18 @@ func (r *Registry) LookupByFrigateSlug(slug string) (uint, bool) {
 	return 0, false
 }
 
+// LookupCameraName resolves a camera ID to its display name.
+func (r *Registry) LookupCameraName(id uint) string {
+	if id == 0 {
+		return ""
+	}
+	var cam model.Camera
+	if err := r.DB.Select("name").First(&cam, id).Error; err == nil {
+		return cam.Name
+	}
+	return ""
+}
+
 // LookupFrigateSlugByCameraID resolves a home-api camera ID to its unique
 // Frigate slug for query filtering.
 func (r *Registry) LookupFrigateSlugByCameraID(id uint) (string, bool) {
@@ -540,6 +564,7 @@ func (r *Registry) UpdateCodec(ctx context.Context, id uint, codec string) error
 	if err == nil {
 		rtspURL := r.rtspURL(&cam, user, pass)
 		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
+		r.add1080pStream(ctx, &cam, user, pass)
 		r.addHEVCStream(ctx, &cam, user, pass)
 	}
 	return nil
@@ -582,6 +607,7 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 	if err == nil {
 		rtspURL := r.rtspURL(&cam, user, pass)
 		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
+		r.add1080pStream(ctx, &cam, user, pass)
 		r.addHEVCStream(ctx, &cam, user, pass)
 	}
 	return nil
@@ -672,7 +698,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 	cams := r.List()
 	slugs := r.computeUniqueSlugs()
 	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
-	go2rtcStreams := make(map[string]string)
+	go2rtcStreams := make(map[string]any)
 	for _, c := range cams {
 		if c.StreamName == "" {
 			continue
@@ -683,7 +709,6 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 			continue
 		}
 		go2rtcURL := r.rtspURL(&c, u, p)
-		frigatePath := r.frigateCameraPath(&c, u, p)
 		slug := slugs[c.ID]
 
 		// Default: recording enabled. Per-camera retention is set
@@ -706,17 +731,19 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 			Name:    slug,
 			Enabled: c.Status != "offline",
 			Ffmpeg: FrigateFfmpeg{
-				Inputs: []FrigateInput{
-					{
-						Path:  frigatePath,
-						Roles: []string{"detect", "record"},
-					},
-				},
+				Inputs: r.frigateInputs(&c, u, p),
 			},
 			Detect: FrigateDetect{Enabled: c.Status != "offline", FPS: 2},
 			Record: FrigateRecord{Enabled: recEnabled && c.Status != "offline"},
 		})
-		go2rtcStreams[c.StreamName] = go2rtcURL
+		if cameraHasTwoWayAudio(&c) {
+			go2rtcStreams[c.StreamName] = []string{
+				go2rtcURL,
+				r.rtspBackchannelURL(&c, u, p),
+			}
+		} else {
+			go2rtcStreams[c.StreamName] = go2rtcURL
+		}
 		if cameraIsNativeHEVC(&c) {
 			go2rtcStreams[hevcStreamName(c.StreamName)] = r.hevcPassthroughURL(&c, u, p)
 		}
@@ -836,9 +863,10 @@ func (r *Registry) RecordingSegmentsForMinute(cam *model.Camera, minuteStart int
 // The ID is the unix-second timestamp of the minute's start (floor to 60s),
 // which the front-end uses to build play URLs (/recordings/<id>/file).
 type RecordingMinute struct {
-	StartUnix    int64
-	EndUnix      int64
-	SegmentCount int
+	StartUnix    int64  `json:"start_unix"`
+	EndUnix      int64  `json:"end_unix"`
+	SegmentCount int    `json:"segment_count"`
+	Storage      string `json:"storage"` // "local" or "cloud"
 }
 
 // ListRecordingMinutesFromDisk walks Frigate's on-disk recording
@@ -989,10 +1017,29 @@ func (r *Registry) ListRecordingMinutesFromDisk(cam *model.Camera, afterUnix, be
 			StartUnix:    b.startUnix,
 			EndUnix:      b.endUnix,
 			SegmentCount: b.count,
+			Storage:      "local",
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartUnix > out[j].StartUnix })
 	return out, nil
+}
+
+// ListRecordingMinutesFromCloud queries Quark Cloud Drive via Alist WebDAV.
+func (r *Registry) ListRecordingMinutesFromCloud(ctx context.Context, cam *model.Camera, afterUnix, beforeUnix int64, localBuckets []RecordingMinute) ([]RecordingMinute, error) {
+	if r.Cloud == nil {
+		return nil, nil
+	}
+	slug := r.FrigateSlugUnique(cam)
+	return r.Cloud.ListRecordingMinutesFromCloud(ctx, slug, afterUnix, beforeUnix, localBuckets)
+}
+
+// RecordingSegmentsFromCloud downloads segments for a minute from Quark Cloud Drive via Alist WebDAV.
+func (r *Registry) RecordingSegmentsFromCloud(ctx context.Context, cam *model.Camera, minuteStart int64) ([]string, error) {
+	if r.Cloud == nil {
+		return nil, os.ErrNotExist
+	}
+	slug := r.FrigateSlugUnique(cam)
+	return r.Cloud.FetchMinuteSegments(ctx, slug, minuteStart)
 }
 
 // ListForOwner returns the cameras visible to a given user. Admins
@@ -1206,6 +1253,7 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 				continue
 			}
 			log.Printf("camera: boot replay: cam %d (%s): stream added", c.ID, c.StreamName)
+			r.add1080pStream(ctx, &c, u, p)
 			// Native-HEVC camera also re-registers its passthrough
 			// companion stream (<name>_hevc). Best-effort — a failure
 			// just means the front-end uses the transcoded H.264 path.
@@ -1250,11 +1298,12 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 		// Push the full config to Frigate so its AI detection and
 		// recording pipelines pick up every camera. Its restart
 		// now picks up the just-written candidates from config.yml.
-		// Best-effort: if Frigate's REST API is down, the go2rtc
-		// streams are still live and video works.
+		// Best-effort: if Frigate's REST API is down, retry in the
+		// background so cameras are pushed as soon as Frigate is ready.
 		if r.Frigate != nil {
 			if err := r.pushFrigateConfig(ctx); err != nil {
 				log.Printf("camera: boot replay: frigate config push (non-fatal): %v", err)
+				go r.retryPushFrigateConfigInBackground(12, 10*time.Second)
 			}
 		}
 
@@ -1361,7 +1410,7 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 	cams := r.List()
 	slugs := r.computeUniqueSlugs()
 	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
-	go2rtcStreams := make(map[string]string)
+	go2rtcStreams := make(map[string]any)
 	for _, c := range cams {
 		if c.StreamName == "" {
 			continue
@@ -1372,7 +1421,6 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 			continue
 		}
 		go2rtcURL := r.rtspURL(&c, u, p)             // ffmpeg:rtsp://...
-		frigatePath := r.frigateCameraPath(&c, u, p) // rtsp://...
 
 		// Frigate's name validator: ^[a-zA-Z0-9_-]+$
 		// The slug is uniquified against the other cameras so two
@@ -1387,12 +1435,7 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 			Name:    slug,
 			Enabled: camEnabled,
 			Ffmpeg: FrigateFfmpeg{
-				Inputs: []FrigateInput{
-					{
-						Path:  frigatePath,
-						Roles: []string{"detect", "record"},
-					},
-				},
+				Inputs: r.frigateInputs(&c, u, p),
 			},
 			Detect: FrigateDetect{Enabled: camEnabled, FPS: 2},
 			Record: FrigateRecord{Enabled: camEnabled},
@@ -1400,7 +1443,23 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		// go2rtc stream key keeps the original friendly name so
 		// the existing stream URLs (e.g. /api/stream.m3u8?src=前门)
 		// continue to work.
-		go2rtcStreams[c.StreamName] = go2rtcURL
+		if cameraHasTwoWayAudio(&c) {
+			go2rtcStreams[c.StreamName] = []string{
+				go2rtcURL,
+				r.rtspBackchannelURL(&c, u, p),
+			}
+		} else {
+			go2rtcStreams[c.StreamName] = go2rtcURL
+		}
+		stream1080pURL := r.rtsp1080pURL(&c, u, p)
+		if cameraHasTwoWayAudio(&c) {
+			go2rtcStreams[c.StreamName+"_1080p"] = []string{
+				stream1080pURL,
+				r.rtspBackchannelURL(&c, u, p),
+			}
+		} else {
+			go2rtcStreams[c.StreamName+"_1080p"] = stream1080pURL
+		}
 		if cameraIsNativeHEVC(&c) {
 			go2rtcStreams[hevcStreamName(c.StreamName)] = r.hevcPassthroughURL(&c, u, p)
 		}
@@ -1442,6 +1501,22 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 	return lastErr
 }
 
+// retryPushFrigateConfigInBackground retries pushFrigateConfig periodically in the background
+// until Frigate's REST API is ready (covering cold-start delays or transient Frigate restarts).
+func (r *Registry) retryPushFrigateConfigInBackground(maxAttempts int, interval time.Duration) {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		time.Sleep(interval)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err := r.pushFrigateConfig(ctx)
+		cancel()
+		if err == nil {
+			log.Printf("camera: background frigate config push succeeded on attempt %d", attempt)
+			return
+		}
+		log.Printf("camera: background frigate config push attempt %d/%d failed: %v", attempt, maxAttempts, err)
+	}
+}
+
 // frigateCameraPath builds the URL Frigate's OWN ffmpeg child
 // process (for AI detection) expects. Unlike go2rtc, Frigate does
 // not honour the `ffmpeg:` scheme prefix — it passes the path
@@ -1470,6 +1545,48 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 func (r *Registry) frigateCameraPath(cam *model.Camera, user, pass string) string {
 	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+}
+
+// frigateSubstreamPath returns the RTSP URL for the camera's lower-resolution
+// substream (e.g. 640x360), optimal for AI object detection without saturating
+// CPU/GPU resources with 2.5K/4K decoding.
+func (r *Registry) frigateSubstreamPath(cam *model.Camera, user, pass string) string {
+	subChannel := cam.ChannelID
+	if subChannel%10 == 1 {
+		subChannel++
+	} else if subChannel == 1 {
+		subChannel = 102
+	} else {
+		return ""
+	}
+	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+		user, pass, cam.Host, cam.RTSPPort, subChannel)
+}
+
+// frigateInputs builds the dual-stream input list for Frigate.
+// High-resolution main stream is assigned role "record" (lossless copy),
+// while lower-resolution substream is assigned role "detect" (low-overhead AI decode).
+func (r *Registry) frigateInputs(cam *model.Camera, user, pass string) []FrigateInput {
+	mainPath := r.frigateCameraPath(cam, user, pass)
+	subPath := r.frigateSubstreamPath(cam, user, pass)
+	if subPath != "" && subPath != mainPath {
+		return []FrigateInput{
+			{
+				Path:  mainPath,
+				Roles: []string{"record"},
+			},
+			{
+				Path:  subPath,
+				Roles: []string{"detect"},
+			},
+		}
+	}
+	return []FrigateInput{
+		{
+			Path:  mainPath,
+			Roles: []string{"detect", "record"},
+		},
+	}
 }
 
 // uniqueSlug returns base if it is not yet taken, otherwise the first
@@ -1697,8 +1814,38 @@ func cameraIsNativeHEVC(cam *model.Camera) bool {
 // camera's configured servicing codec: the video track is handed
 // through untouched (native HEVC via `rtsp://` scheme, or
 // `#video=copy` when audio must be transcoded to AAC), so the fanout
-// incurs no video transcode cost. Mirrors the passthrough branch of
-// rtspURL.
+// rtsp1080pURL builds the 1080p H.264 stream URL for WebRTC / high-res live view.
+// It keeps video encoded as H.264 (width=1920) so Android and desktop browsers
+// can decode via WebRTC without crashing on unsupported HEVC RTP streams.
+func (r *Registry) rtsp1080pURL(cam *model.Camera, user, pass string) string {
+	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
+		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	stopFrag := "#stop=30"
+	if r.StopTimeout > 0 {
+		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
+	}
+	audioFrag := ""
+	if cameraHasAudio(cam) {
+		audioFrag = "#audio=opus#audio=aac#async=1000"
+	}
+	return "ffmpeg:" + raw + "#video=h264#width=1920#hardware=vaapi" + audioFrag + stopFrag
+}
+
+// add1080pStream registers the camera's 1080p H.264 stream (<name>_1080p).
+func (r *Registry) add1080pStream(ctx context.Context, cam *model.Camera, user, pass string) {
+	if r.Go2 == nil {
+		return
+	}
+	streamName := cam.StreamName + "_1080p"
+	streamURL := r.rtsp1080pURL(cam, user, pass)
+	if err := r.Go2.AddStream(ctx, streamName, streamURL); err != nil {
+		log.Printf("camera: add 1080p stream %q (non-fatal): %v", streamName, err)
+	}
+}
+
+// hevcPassthroughURL builds the go2rtc source for a camera's native
+// HEVC companion stream. It forces passthrough regardless of the
+// camera's configured servicing codec.
 func (r *Registry) hevcPassthroughURL(cam *model.Camera, user, pass string) string {
 	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
@@ -1766,6 +1913,50 @@ func cameraHasAudio(cam *model.Camera) bool {
 	return false
 }
 
+// cameraHasTwoWayAudio reports whether the camera was registered with
+// two-way audio / talkback capability.
+func cameraHasTwoWayAudio(cam *model.Camera) bool {
+	if cam.Capabilities == nil {
+		return false
+	}
+	for _, key := range []string{"two_way_audio", "talkback", "audio_back"} {
+		if v, ok := cam.Capabilities[key]; ok && v != nil {
+			switch t := v.(type) {
+			case bool:
+				if t {
+					return true
+				}
+			case float64:
+				if t != 0 {
+					return true
+				}
+			case int:
+				if t != 0 {
+					return true
+				}
+			case string:
+				if t != "" && t != "false" && t != "0" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+func (r *Registry) rtspBackchannelURL(cam *model.Camera, user, pass string) string {
+	vendor := strings.ToLower(cam.Vendor)
+	if vendor == "" || strings.Contains(vendor, "hik") || strings.Contains(vendor, "haikang") {
+		port := cam.ONVIFPort
+		if port <= 0 {
+			port = 80
+		}
+		return fmt.Sprintf("isapi://%s:%s@%s:%d/", user, pass, cam.Host, port)
+	}
+	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d#backchannel=1",
+		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+}
+
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
@@ -1783,7 +1974,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 			// + audio=opus#audio=aac (transcode audio to Opus for WebRTC
 			// and AAC for HLS). Adds negligible CPU for the audio encoder
 			// while preserving the camera's native video codec (no quality loss).
-			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac" + stopFrag
+			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=1000" + stopFrag
 		}
 		// Native path: no ffmpeg, no transcode. Camera
 		// delivers whatever codec it has (H.264 / H.265)
@@ -1801,7 +1992,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// pipeline. `video=<codec>` selects a go2rtc ffmpeg
 	// preset (h264: H.264 high@4.1 superfast/zerolatency;
 	// h265: libx265). When audio is enabled we append
-	// `#audio=opus#audio=aac` so ffmpeg encodes the camera's PCMA
+	// `#audio=opus#audio=aac#async=1000` so ffmpeg encodes the camera's PCMA
 	// audio to Opus for WebRTC and AAC for HLS alongside the video transcode.
 	// Without the audio directive, parseArgs injects `-an` so
 	// ffmpeg drops the camera's PCMA track entirely.
@@ -1821,7 +2012,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	// software decode.
 	audioFrag := ""
 	if audioOn {
-		audioFrag = "#audio=opus#audio=aac"
+		audioFrag = "#audio=opus#audio=aac#async=1000"
 	}
 	if codec == "h265" {
 		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + stopFrag
