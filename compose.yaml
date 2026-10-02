@@ -134,7 +134,7 @@ services:
       # direct mode then both work. Update this value if the ISP
       # rotates the IPv6 prefix (find via: ip -6 addr show enp4s0 |
       # grep "scope global" | grep -v temporary).
-      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:37ad:6870:62be:b4ff:fe08:bd09}
+      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:266c:92a1:f34d:e904:cd7f:2830}
       # v1.8.24: NAS LAN IPv4 address. The container runs on a Docker
       # bridge (172.x.x.x) and cannot infer the host's physical LAN IP.
       # This value is used by SetWebRTCCandidates() to build the go2rtc
@@ -308,6 +308,21 @@ services:
     # /dev/shm management. Frigate is a complex third-party NVR
     # image; stripping all capabilities breaks its startup.
     # no-new-privileges:true still provides defense-in-depth.
+    # v1.9.3: preflight check — auto-heal empty/corrupt config.yml on power outage / sudden reboot.
+    # Frigate's internal writer truncates before dump; if the host crashes during dump,
+    # config.yml is left at 0 bytes, crashing Frigate on startup. If config.yml is < 100 bytes,
+    # auto-restore from the read-only mounted backup before exec /init.
+    entrypoint:
+      - "/bin/bash"
+      - "-c"
+      - |
+        if [ ! -s /config/config.yml ] || [ $$(stat -c %s /config/config.yml 2>/dev/null || echo 0) -lt 100 ]; then
+          if [ -s /config/config.yml.bak ]; then
+            echo "[PREFLIGHT] /config/config.yml is empty or corrupt (<100B). Auto-restoring from /config/config.yml.bak..."
+            cp /config/config.yml.bak /config/config.yml
+          fi
+        fi
+        exec /init
     environment:
       - SET_CONFIG_BY_API=true
       - FRIGATE_RTSP_PASSWORD=${FRIGATE_RTSP_PASSWORD:-}
@@ -353,6 +368,7 @@ services:
       # this directory, so config pushes still work as before.
       - ./data/frigate/config:/config
       - ./deploy/frigate/config.yml:/config/config.yml
+      - ./deploy/frigate/config.yml.bak:/config/config.yml.bak:ro
       - ./data/frigate:/media/frigate
       - ./data/recordings:/data/recordings
     # Shared memory for Frigate's inter-process frame passing
@@ -468,6 +484,9 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    dns:
+      - 223.5.5.5
+      - 119.29.29.29
     # No published ports — the container is egress-only (pushes to
     # Bitiful over HTTPS). It never listens.
     volumes:
@@ -484,6 +503,57 @@ services:
       - BITIFUL_ACCESS_KEY=${BITIFUL_ACCESS_KEY:-}
       - BITIFUL_SECRET_KEY=${BITIFUL_SECRET_KEY:-}
       - BITIFUL_SYNC_INTERVAL=${BITIFUL_SYNC_INTERVAL:-21600}
+    networks:
+      - home-net
+
+  # alist — multi-cloud storage driver and WebDAV server (v1.8.34).
+  # Connects Quark Cloud Drive (夸克网盘) and exposes WebDAV on
+  # home-net (http://home-alist:5244/dav) for offsite video archiving.
+  # Web UI exposed on port 5244 for admin configuration and token refreshes.
+  alist:
+    image: xhofe/alist:latest
+    container_name: home-alist
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./data/alist:/opt/alist/data
+    ports:
+      - "5244:5244"
+    environment:
+      - PUID=0
+      - PGID=0
+      - UMASK=022
+      - TZ=Asia/Shanghai
+    networks:
+      - home-net
+
+  # recordings-archive — surveillance video cold archiving to Quark Drive (v1.8.34).
+  # Periodically syncs completed Frigate recordings (./data/frigate/recordings)
+  # to Quark Cloud Drive via Alist's internal WebDAV endpoint.
+  recordings-archive:
+    image: rclone/rclone:1.68
+    container_name: home-recordings-archive
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./data/frigate/recordings:/recordings:ro
+      - ./data/backup-state:/state
+      - ./deploy/recordings-archive/entrypoint.sh:/entrypoint.sh:ro
+    entrypoint: [ "sh", "/entrypoint.sh" ]
+    environment:
+      - TZ=Asia/Shanghai
+      - ALIST_WEBDAV_URL=http://home-alist:5244/dav
+      - ALIST_WEBDAV_USER=admin
+      - ALIST_WEBDAV_PASS=FtdPTQaBA9gREissIN0CLrQ0To-42lCF_1dcgGDz
+      - QUARK_REMOTE_PATH=quark/Surveillance/Recordings
+      - ARCHIVE_MIN_AGE=2h
+      - ARCHIVE_INTERVAL=21600
+    depends_on:
+      - alist
     networks:
       - home-net
 
