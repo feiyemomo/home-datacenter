@@ -565,10 +565,14 @@ services:
 
   # frpc — Lolia FRP client for low-latency domestic NAT traversal (v1.8.36).
   # Exposes the home-web gateway (http://127.0.0.1:8088) via Lolia FRP tunnel.
+  # Placed under the "frp" profile so it stays dormant by default (no auto-start).
+  # To enable:  docker compose --profile frp up -d frpc
+  # To disable: docker compose stop frpc
   frpc:
     image: alpine:latest
     container_name: home-frpc
     restart: unless-stopped
+    profiles: [ "frp" ]
     logging: *default-logging
     network_mode: host
     volumes:
