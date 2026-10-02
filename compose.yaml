@@ -563,6 +563,18 @@ services:
     networks:
       - home-net
 
+  # frpc — Lolia FRP client for low-latency domestic NAT traversal (v1.8.36).
+  # Exposes the home-web gateway (http://127.0.0.1:8088) via Lolia FRP tunnel.
+  frpc:
+    image: alpine:latest
+    container_name: home-frpc
+    restart: unless-stopped
+    logging: *default-logging
+    network_mode: host
+    volumes:
+      - ./deploy/frpc/frpc:/usr/local/bin/frpc:ro
+    command: [ "frpc", "-t", "${LOLIA_FRP_TOKEN:-26639:ostauxmq0p7wy0h2uvrn8ek4us2rghos}" ]
+
 networks:
   # v1.8.31: explicit /24 subnet so the api service can be pinned to a
   # static address (172.18.0.10). Without a declared subnet, Docker's
