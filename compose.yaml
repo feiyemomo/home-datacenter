@@ -548,7 +548,7 @@ services:
       - TZ=Asia/Shanghai
       - ALIST_WEBDAV_URL=http://home-alist:5244/dav
       - ALIST_WEBDAV_USER=admin
-      - ALIST_WEBDAV_PASS=FtdPTQaBA9gREissIN0CLrQ0To-42lCF_1dcgGDz
+      - ALIST_WEBDAV_PASS=b8NBAhGkRvBju0j7Tlu2bQoAlAtghQupSpA
       - QUARK_REMOTE_PATH=quark/Surveillance/Recordings
       - ARCHIVE_MIN_AGE=2h
       - ARCHIVE_INTERVAL=21600
