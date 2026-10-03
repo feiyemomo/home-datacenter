@@ -1356,6 +1356,7 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 
 		if failed == 0 {
 			log.Printf("camera: boot replay: %d camera(s) registered with go2rtc", len(cams))
+			go r.preheatAllCamerasInBackground(cams)
 			return nil
 		}
 
@@ -1370,6 +1371,19 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("boot replay: go2rtc not ready after %d attempts", maxAttempts)
+}
+
+func (r *Registry) preheatAllCamerasInBackground(cams []model.Camera) {
+	// Wait 2s for go2rtc and frigate to settle
+	time.Sleep(2 * time.Second)
+	log.Printf("camera: preheating %d camera streams for zero-delay WebRTC...", len(cams))
+	for _, cam := range cams {
+		go func(id uint, name string) {
+			if err := r.PreheatStream(id); err == nil {
+				log.Printf("camera: preheated stream for %s (id=%d)", name, id)
+			}
+		}(cam.ID, cam.Name)
+	}
 }
 
 // pushWebRTCCandidatesWithRetry pushes the current WebRTC candidates
