@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,6 +53,11 @@ func ErrorLogMiddleware(db *gorm.DB, bus *eventbus.Bus) gin.HandlerFunc {
 		c.Next()
 
 		if w.status < 500 {
+			return
+		}
+
+		// Don't log external weather service outages as critical system errors.
+		if strings.HasPrefix(c.Request.URL.Path, "/api/v1/weather") {
 			return
 		}
 

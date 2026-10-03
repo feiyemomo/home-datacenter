@@ -60,7 +60,7 @@ param(
 # ============== CONFIG (edit to match your NAS) ==============
 # v1.8.24: NAS migrated back to 192.168.31.235 (single NIC on the AC
 # router). Keep this in sync with compose.yaml NAS_LAN_IP.
-$NAS_HOST   = "192.168.31.235"
+$NAS_HOST   = if ($env:NAS_HOST) { $env:NAS_HOST } else { "100.90.67.71" }
 $NAS_USER   = "fnos-momo"
 $NAS_PORT   = 22
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
@@ -123,7 +123,9 @@ function Invoke-NasSSH {
     $sshOpts = @("-p", "$NAS_PORT",
                  "-o", "StrictHostKeyChecking=no",
                  "-o", "UserKnownHostsFile=NUL",
-                 "-o", "ConnectTimeout=10")
+                 "-o", "ConnectTimeout=10",
+                 "-o", "ServerAliveInterval=15",
+                 "-o", "ServerAliveCountMax=3")
     if ($Password) {
         $sshOpts += @("-o", "PreferredAuthentications=password",
                       "-o", "PubkeyAuthentication=no",
@@ -150,7 +152,9 @@ function Invoke-NasSCP {
     $scpOpts = @("-P", "$NAS_PORT",
                  "-o", "StrictHostKeyChecking=no",
                  "-o", "UserKnownHostsFile=NUL",
-                 "-o", "ConnectTimeout=10")
+                 "-o", "ConnectTimeout=10",
+                 "-o", "ServerAliveInterval=15",
+                 "-o", "ServerAliveCountMax=3")
     if ($Password) {
         $scpOpts += @("-o", "PreferredAuthentications=password",
                       "-o", "PubkeyAuthentication=no",
@@ -225,7 +229,12 @@ $Excludes = @(
     # rationale as excluding .env. Generate on the NAS with:
     #   docker run --rm -v ./deploy/mosquitto:/work eclipse-mosquitto:2 \
     #     mosquitto_passwd -c -b /work/passwd home-datacenter <password>
-    "./deploy/mosquitto/passwd"
+    "./deploy/mosquitto/passwd",
+    # Frigate config contains production camera RTSP credentials and
+    # dynamically pushed streams. Must NEVER overwrite NAS's live config
+    # with local sanitized templates.
+    "./deploy/frigate/config.yml",
+    "./deploy/frigate/config.yml.bak"
 )
 
 # ---- Dry run: pack + list, don't touch NAS ----
@@ -307,7 +316,7 @@ if ($exitCode -ne 0) {
 # ---- Step 4: refuse to deploy if .env missing on NAS ----
 # Without .env, docker compose substitutes empty strings and the API
 # refuses to start (jwt.secret < 32 chars). Fail loudly here.
-Write-Host "==> [4/5] Verifying .env exists on NAS" -ForegroundColor Cyan
+Write-Host "==> [4/5] Verifying environment and Frigate config on NAS" -ForegroundColor Cyan
 $exitCode = Invoke-NasSSH -RemoteCmd "test -f '$REMOTE_PATH/.env'"
 if ($exitCode -ne 0) {
     Write-Host "ERROR: $REMOTE_PATH/.env NOT found on NAS." -ForegroundColor Red
@@ -324,11 +333,20 @@ if ($exitCode -ne 0) {
     exit 1
 }
 
+# Verify Frigate config integrity (prevent 0-byte crashes from sudden power outages)
+$frigateVerifyCmd = "bash -c 'if [ ! -s ""{0}/deploy/frigate/config.yml"" ]; then if [ -s ""{0}/deploy/frigate/config.yml.bak"" ]; then echo ""[WARN] Auto-restoring config.yml from backup""; cp ""{0}/deploy/frigate/config.yml.bak"" ""{0}/deploy/frigate/config.yml""; else echo ""[ERROR] Frigate config missing""; exit 1; fi; else cp ""{0}/deploy/frigate/config.yml"" ""{0}/deploy/frigate/config.yml.bak""; fi'" -f $REMOTE_PATH
+$exitCode = Invoke-NasSSH -RemoteCmd $frigateVerifyCmd
+if ($exitCode -ne 0) {
+    Write-Error "ERROR: Frigate config validation failed on NAS."
+    Remove-Askpass
+    exit 1
+}
+
 # ---- Step 5: build + start services on the NAS ----
 $buildCmd = ""
 if (-not $NoBuild) {
     $cacheFlag = if ($NoCache) { "--no-cache" } else { "" }
-    $buildCmd = "docker compose build $cacheFlag api vision web && "
+    $buildCmd = "docker compose build $cacheFlag api vision web h3c-keepalive && "
 }
 Write-Host "==> [5/5] Building and starting services on NAS (docker compose up -d $BuildFlag)" -ForegroundColor Cyan
 $composeCmd = "cd '$REMOTE_PATH' && ${buildCmd}docker compose up -d $BuildFlag 2>&1"

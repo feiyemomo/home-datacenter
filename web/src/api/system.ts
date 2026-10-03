@@ -68,3 +68,30 @@ export async function cleanTranscodeCache(): Promise<CleanCacheResponse> {
     const { data } = await client.post<CleanCacheResponse>("/system/clean-cache");
     return data;
 }
+
+export interface StorageConfig {
+    quota_gb: number;
+    retention_days: number;
+    reduced_retention_days: number;
+    archive_schedule_hour: number;
+    archive_min_age_days: number;
+    archive_retention_days: number;
+    last_sync_timestamp: number;
+    last_sync_ok: boolean;
+    last_sync_error: string;
+}
+
+export async function getStorageConfig(): Promise<StorageConfig> {
+    const { data } = await client.get<StorageConfig>("/system/storage/config");
+    return data;
+}
+
+export async function updateStorageConfig(cfg: Partial<StorageConfig>): Promise<StorageConfig> {
+    const { data } = await client.put<StorageConfig>("/system/storage/config", cfg);
+    return data;
+}
+
+export async function triggerArchiveSync(): Promise<{ message: string; ts: number }> {
+    const { data } = await client.post<{ message: string; ts: number }>("/system/storage/sync-archive");
+    return data;
+}

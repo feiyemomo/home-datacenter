@@ -118,6 +118,16 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		log.Printf("[handler] weather service unavailable: %v", err)
+		h.mu.RLock()
+		cached := h.cache
+		h.mu.RUnlock()
+		if cached != "" {
+			var data interface{}
+			if err := json.Unmarshal([]byte(cached), &data); err == nil {
+				utils.Success(c, data)
+				return
+			}
+		}
 		utils.Fail(c, http.StatusBadGateway, "weather service unavailable")
 		return
 	}
@@ -126,6 +136,16 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 		log.Printf("[handler] weather service returned status %d: %s", resp.StatusCode, string(body))
+		h.mu.RLock()
+		cached := h.cache
+		h.mu.RUnlock()
+		if cached != "" {
+			var data interface{}
+			if err := json.Unmarshal([]byte(cached), &data); err == nil {
+				utils.Success(c, data)
+				return
+			}
+		}
 		utils.Fail(c, http.StatusBadGateway,
 			fmt.Sprintf("weather service returned status %d", resp.StatusCode))
 		return

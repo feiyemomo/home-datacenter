@@ -4,7 +4,7 @@ import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, LayoutGrid, Li
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
-import { listCameras, deleteCamera, updateCodec } from "@/api/camera";
+import { listCameras, deleteCamera, updateCodec, updateCameraDetectFPS } from "@/api/camera";
 import type { Camera, WsMessage } from "@/types";
 import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
@@ -350,6 +350,29 @@ function CamCard({
                             {codecLoading && (
                                 <Loader2 size={11} className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 animate-spin text-fg-muted" />
                             )}
+                        </div>
+                    )}
+                    {isAdmin && (
+                        <div className="relative">
+                            <Select
+                                value={String((cam as any).detect_fps || 2)}
+                                onChange={async (e) => {
+                                    const nextFps = parseInt(e.target.value, 10);
+                                    try {
+                                        await updateCameraDetectFPS(cam.id, nextFps);
+                                        await onRefresh();
+                                    } catch (err: any) {
+                                        alert(err?.message || "更新抽样检测频率失败");
+                                    }
+                                }}
+                                aria-label="AI 抽样频率"
+                                title="AI 目标抽样检测频率（Frigate detect.fps）"
+                                className="glass-subtle rounded-lg h-7 w-[85px] px-1.5 py-0 text-[11px] transition-all hover:glass"
+                            >
+                                <option value="1">AI 1fps</option>
+                                <option value="2">AI 2fps</option>
+                                <option value="5">AI 5fps</option>
+                            </Select>
                         </div>
                     )}
                     <Badge variant={statusVariant} className="text-[10px] shadow-sm gap-1">

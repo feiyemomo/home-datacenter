@@ -232,6 +232,12 @@ func main() {
 	// <RecordingDir>/.transcode-cache.
 	camHandler.StartCacheCleaner(filepath.Join(cfg.Camera.RecordingDir, ".transcode-cache"), 7*24*time.Hour, 6*time.Hour)
 
+	// v1.13.15: Wire AlertPretranscoder so real-time and past alerts get their
+	// 60s recordings pre-transcoded into .transcode-cache in the background,
+	// enabling instant 0-second playback when clicking alerts or scrubbing the timeline.
+	mqttHandler.SetAlertPretranscoder(camHandler)
+	camHandler.StartAlertPretranscoder()
+
 	// v1.8.27: background maintenance loops — SQLite WAL checkpoint +
 	// daily backup, and disk-space monitoring with SystemLog alerts.
 	// These keep the box healthy on long-running deployments: the WAL
@@ -615,6 +621,7 @@ func main() {
 			// "client.error" SystemLog rows so they surface in the
 			// log pane (see ClientErrorHandler).
 			system.POST("/client-errors", clientErrorHandler.Report)
+			system.GET("/storage/config", systemHandler.GetStorageConfig)
 		}
 		// Admin-only system routes. DELETE /logs/:id requires admin
 		// so a non-admin authenticated user can read audit logs but
@@ -633,6 +640,9 @@ func main() {
 			systemAdmin.PATCH("/logs/:id", systemLogHandler.Verify)
 			// v1.11.0: clean-cache purges /data/recordings/.transcode-cache.
 			systemAdmin.POST("/clean-cache", systemHandler.CleanCache)
+			// Storage quota and cloud archive management
+			systemAdmin.PUT("/storage/config", systemHandler.UpdateStorageConfig)
+			systemAdmin.POST("/storage/sync-archive", systemHandler.TriggerArchiveSync)
 		}
 
 		// v1.11.0: Security Guard arm/disarm modes.
@@ -678,6 +688,10 @@ func main() {
 		// (auth users only — no anonymous weather queries).
 		weatherHandler := handler.NewWeatherHandler()
 		api.GET("/weather", middleware.JWTAuth(deviceRepo), weatherHandler.Weather)
+
+		// Alert snapshot & thumbnail aliases (allows /api/v1/alerts/:id/snapshot as well as /cameras/alerts/:id/snapshot)
+		api.GET("/alerts/:id/snapshot", middleware.JWTAuth(deviceRepo), camHandler.AlertSnapshot)
+		api.GET("/alerts/:id/thumbnail", middleware.JWTAuth(deviceRepo), camHandler.AlertThumbnail)
 
 		mqttGroup := api.Group("/mqtt")
 		mqttGroup.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
@@ -756,6 +770,7 @@ func main() {
 				adminCam.PUT(":id/recording", camHandler.SetRecordingPlan)
 				adminCam.PUT(":id/codec", camHandler.UpdateCodec)
 				adminCam.PUT(":id/audio", camHandler.UpdateAudio)
+				adminCam.PUT(":id/detect-fps", camHandler.UpdateDetectFPS)
 				adminCam.DELETE(":id/recordings/:recId", camHandler.DeleteRecording)
 			}
 		}

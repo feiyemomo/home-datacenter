@@ -19,6 +19,45 @@ export const TOKEN_UPDATED_EVENT = "hd_token_updated";
  */
 export function getToken(): string | null {
     try {
+        // v1.8.45: Cross-origin SSO token handoff (e.g. jumping from dashboard.feiyemomo.top to H3C domestic tunnel)
+        if (typeof window !== "undefined") {
+            let ssoToken: string | null = null;
+            if (window.location.hash && window.location.hash.includes("token=")) {
+                const hashContent = window.location.hash.startsWith("#")
+                    ? window.location.hash.substring(1)
+                    : window.location.hash;
+                const params = new URLSearchParams(hashContent);
+                ssoToken = params.get("token");
+                if (ssoToken) {
+                    params.delete("token");
+                    const remaining = params.toString();
+                    window.history.replaceState(
+                        null,
+                        "",
+                        window.location.pathname + (remaining ? "#" + remaining : "") + window.location.search
+                    );
+                }
+            } else if (window.location.search && window.location.search.includes("token=")) {
+                const params = new URLSearchParams(window.location.search);
+                ssoToken = params.get("token");
+                if (ssoToken) {
+                    params.delete("token");
+                    const remaining = params.toString();
+                    window.history.replaceState(
+                        null,
+                        "",
+                        window.location.pathname + (remaining ? "?" + remaining : "") + window.location.hash
+                    );
+                }
+            }
+
+            if (ssoToken) {
+                try {
+                    localStorage.setItem(TOKEN_KEY, ssoToken);
+                } catch {}
+                return ssoToken;
+            }
+        }
         return localStorage.getItem(TOKEN_KEY);
     } catch {
         return null;

@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -166,4 +168,127 @@ func isAllowedTopic(topic string) bool {
 		return false
 	}
 	return strings.HasPrefix(topic, mqttPrefix)
+}
+
+type StorageConfig struct {
+	QuotaGB              int    `json:"quota_gb"`
+	RetentionDays        int    `json:"retention_days"`
+	ReducedRetentionDays int    `json:"reduced_retention_days"`
+	ArchiveScheduleHour  int    `json:"archive_schedule_hour"`
+	ArchiveMinAgeDays    int    `json:"archive_min_age_days"`
+	ArchiveRetentionDays int    `json:"archive_retention_days"`
+	LastSyncTimestamp    int64  `json:"last_sync_timestamp"`
+	LastSyncOK           bool   `json:"last_sync_ok"`
+	LastSyncError        string `json:"last_sync_error"`
+}
+
+const (
+	storageConfigFile  = "/data/backup-state/storage-config.json"
+	archiveStateFile   = "/data/backup-state/recordings-archive.json"
+	archiveTriggerFile = "/data/backup-state/trigger"
+)
+
+// GetStorageConfig — GET /api/v1/system/storage/config
+func (h *SystemHandler) GetStorageConfig(c *gin.Context) {
+	cfg := StorageConfig{
+		QuotaGB:              int(h.quotaBytes / (1024 * 1024 * 1024)),
+		RetentionDays:        7,
+		ReducedRetentionDays: 3,
+		ArchiveScheduleHour:  3,
+		ArchiveMinAgeDays:    7,
+		ArchiveRetentionDays: 0,
+	}
+	if cfg.QuotaGB <= 0 {
+		cfg.QuotaGB = 400
+	}
+
+	if data, err := os.ReadFile(storageConfigFile); err == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+
+	if data, err := os.ReadFile(archiveStateFile); err == nil {
+		var state struct {
+			TS    int64  `json:"ts"`
+			OK    bool   `json:"ok"`
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal(data, &state); err == nil {
+			cfg.LastSyncTimestamp = state.TS
+			cfg.LastSyncOK = state.OK
+			cfg.LastSyncError = state.Error
+		}
+	}
+
+	utils.Success(c, cfg)
+}
+
+// UpdateStorageConfig — PUT /api/v1/system/storage/config
+func (h *SystemHandler) UpdateStorageConfig(c *gin.Context) {
+	var req struct {
+		QuotaGB              int `json:"quota_gb"`
+		ArchiveScheduleHour  int `json:"archive_schedule_hour"`
+		ArchiveMinAgeDays    int `json:"archive_min_age_days"`
+		ArchiveRetentionDays int `json:"archive_retention_days"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if req.QuotaGB < 50 || req.QuotaGB > 5000 {
+		utils.Fail(c, http.StatusBadRequest, "quota_gb must be between 50 and 5000")
+		return
+	}
+	if req.ArchiveScheduleHour < 0 || req.ArchiveScheduleHour > 23 {
+		utils.Fail(c, http.StatusBadRequest, "archive_schedule_hour must be between 0 and 23")
+		return
+	}
+	if req.ArchiveMinAgeDays < 1 || req.ArchiveMinAgeDays > 365 {
+		req.ArchiveMinAgeDays = 7
+	}
+
+	// Update in-memory metrics quota
+	h.quotaBytes = uint64(req.QuotaGB) * 1024 * 1024 * 1024
+
+	cfg := StorageConfig{
+		QuotaGB:              req.QuotaGB,
+		RetentionDays:        7,
+		ReducedRetentionDays: 3,
+		ArchiveScheduleHour:  req.ArchiveScheduleHour,
+		ArchiveMinAgeDays:    req.ArchiveMinAgeDays,
+		ArchiveRetentionDays: req.ArchiveRetentionDays,
+	}
+
+	data, _ := json.MarshalIndent(cfg, "", "  ")
+	_ = os.WriteFile(storageConfigFile, data, 0644)
+
+	if h.bus != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"quota_gb":              req.QuotaGB,
+			"archive_schedule_hour": req.ArchiveScheduleHour,
+			"archive_min_age_days":  req.ArchiveMinAgeDays,
+			"user_id":               c.GetUint("user_id"),
+			"ts":                    time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    eventbus.TopicSystemLog,
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityInfo,
+			Payload:  payload,
+		})
+	}
+
+	utils.Success(c, cfg)
+}
+
+// TriggerArchiveSync — POST /api/v1/system/storage/sync-archive
+func (h *SystemHandler) TriggerArchiveSync(c *gin.Context) {
+	if err := os.WriteFile(archiveTriggerFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, "failed to create trigger file")
+		return
+	}
+	utils.Success(c, gin.H{
+		"message": "archive sync triggered",
+		"ts":      time.Now().Unix(),
+	})
 }

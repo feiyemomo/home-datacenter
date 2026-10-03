@@ -367,7 +367,7 @@ func Load(path string) error {
 	v.SetDefault("camera.health_timeout_seconds", 3)
 	v.SetDefault("camera.recording_dir", "/data/recordings")
 	v.SetDefault("camera.webrtc_public_base", "")
-	v.SetDefault("camera.ice_servers", "")
+	v.SetDefault("camera.ice_servers", `[{"urls":"stun:stun.qq.com:3478"},{"urls":"stun:stun.miwifi.com:3478"},{"urls":"stun:stun.cloudflare.com:3478"}]`)
 
 	// Phase 10 defaults — network capability detection
 	v.SetDefault("network.check_interval_seconds", 60)

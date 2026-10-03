@@ -54,7 +54,7 @@ func NewRegistry(db *gorm.DB, g *Go2RTCClient, fr *FrigateClient, box *utils.Sec
 		Box:         box,
 		ONVIF:       onvif,
 		WebRTCURL:   webRTCURL,
-		StopTimeout: 120,
+		StopTimeout: 600,
 		Cloud:       NewCloudArchiveClient(),
 	}
 }
@@ -613,6 +613,53 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 	return nil
 }
 
+// CameraDetectFPS returns the configured AI detection sampling rate in fps (1-10, default 2).
+func CameraDetectFPS(c *model.Camera) int {
+	if c.Meta != nil {
+		if raw, ok := c.Meta["detect_fps"]; ok {
+			switch v := raw.(type) {
+			case float64:
+				if v >= 1 && v <= 10 {
+					return int(v)
+				}
+			case int:
+				if v >= 1 && v <= 10 {
+					return v
+				}
+			}
+		}
+	}
+	return 2
+}
+
+// UpdateDetectFPS updates the camera's AI detection sample rate in Frigate (1-10 fps).
+func (r *Registry) UpdateDetectFPS(ctx context.Context, id uint, fps int) (*model.Camera, error) {
+	if fps < 1 || fps > 10 {
+		return nil, fmt.Errorf("detect fps must be between 1 and 10")
+	}
+	var cam model.Camera
+	if err := r.DB.First(&cam, id).Error; err != nil {
+		return nil, err
+	}
+	if cam.Meta == nil {
+		cam.Meta = model.JSON{}
+	}
+	cam.Meta["detect_fps"] = fps
+	if err := r.DB.Model(&cam).Updates(map[string]any{
+		"meta":       cam.Meta,
+		"updated_at": time.Now(),
+	}).Error; err != nil {
+		return nil, err
+	}
+
+	// Push config to Frigate with restart to apply new pipeline fps
+	if err := r.pushFrigateConfig(ctx); err != nil {
+		log.Printf("camera: update detect fps to %d for cam %d push config error: %v", fps, id, err)
+	}
+
+	return &cam, nil
+}
+
 func (r *Registry) List() []model.Camera {
 	var cs []model.Camera
 	r.DB.Find(&cs)
@@ -733,7 +780,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: r.frigateInputs(&c, u, p),
 			},
-			Detect: FrigateDetect{Enabled: c.Status != "offline", FPS: 2},
+			Detect: FrigateDetect{Enabled: c.Status != "offline", FPS: CameraDetectFPS(&c)},
 			Record: FrigateRecord{Enabled: recEnabled && c.Status != "offline"},
 		})
 		if cameraHasTwoWayAudio(&c) {
@@ -1437,7 +1484,7 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: r.frigateInputs(&c, u, p),
 			},
-			Detect: FrigateDetect{Enabled: camEnabled, FPS: 2},
+			Detect: FrigateDetect{Enabled: camEnabled, FPS: CameraDetectFPS(&c)},
 			Record: FrigateRecord{Enabled: camEnabled},
 		})
 		// go2rtc stream key keeps the original friendly name so

@@ -71,6 +71,13 @@ type Handler struct {
 	retryMu      sync.Mutex
 	pendingRetry map[uint]*pendingPoseRetry
 	sampleCPU    func() float64
+
+	pretranscoder AlertPretranscoder
+}
+
+// AlertPretranscoder schedules background pre-transcoding of recordings for alert periods.
+type AlertPretranscoder interface {
+	QueueAlertPretranscode(cameraID uint, startTime, endTime int64)
 }
 
 // GuardModeProvider returns the active security arming mode.
@@ -82,6 +89,7 @@ type GuardModeProvider interface {
 // Returns (0, false) if no matching camera is found.
 type SlugLookup interface {
 	LookupByFrigateSlug(slug string) (uint, bool)
+	LookupCameraName(id uint) string
 	AllFrigateSlugs() []string
 }
 
@@ -116,6 +124,11 @@ func (h *Handler) SetGuardProvider(gp GuardModeProvider) {
 	h.guardProvider = gp
 }
 
+// SetAlertPretranscoder attaches an AlertPretranscoder to the handler.
+func (h *Handler) SetAlertPretranscoder(p AlertPretranscoder) {
+	h.pretranscoder = p
+}
+
 // SetVision attaches vision AI client and Frigate client for intelligent frame analysis.
 func (h *Handler) SetVision(vc *vision.Client, fc *camera.FrigateClient) {
 	h.visionClient = vc
@@ -136,6 +149,7 @@ func (h *Handler) SetVision(vc *vision.Client, fc *camera.FrigateClient) {
 type noopSlugLookup struct{}
 
 func (n *noopSlugLookup) LookupByFrigateSlug(slug string) (uint, bool) { return 0, false }
+func (n *noopSlugLookup) LookupCameraName(id uint) string              { return "" }
 func (n *noopSlugLookup) AllFrigateSlugs() []string                    { return nil }
 
 // OnMessage is the paho.mqtt message callback. It inspects the topic
@@ -272,6 +286,22 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		return
 	}
 
+	// React to "end" events (when detection finishes) by scheduling pre-transcoding
+	// for the entire event duration so viewing recordings from the alert is instantaneous.
+	if frigEv.Type == "end" {
+		if h.pretranscoder != nil && !frigEv.After.FalsePositive {
+			slug := frigEv.After.Camera
+			if cid, ok := h.slugLookup.LookupByFrigateSlug(slug); ok {
+				endTs := int64(0)
+				if frigEv.After.EndTime != nil {
+					endTs = int64(*frigEv.After.EndTime)
+				}
+				h.pretranscoder.QueueAlertPretranscode(cid, int64(frigEv.After.StartTime), endTs)
+			}
+		}
+		return
+	}
+
 	// Only react to "new" events (initial detection) to avoid
 	// flooding. "update" events fire on every zone change or
 	// snapshot improvement; "end" fires when the object leaves.
@@ -290,6 +320,11 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 	// real detections.
 	if frigEv.After.FalsePositive {
 		return
+	}
+
+	// Schedule pre-transcoding for this alert's initial minute
+	if h.pretranscoder != nil {
+		h.pretranscoder.QueueAlertPretranscode(cameraID, int64(frigEv.After.StartTime), int64(frigEv.After.StartTime)+60)
 	}
 
 	confidence := frigEv.After.TopScore
@@ -331,9 +366,13 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 
 	muted := (guardMode == model.GuardModeDisarmed)
 
+	camName := h.slugLookup.LookupCameraName(cameraID)
 	canonical, _ := json.Marshal(struct {
+		ID          string   `json:"id"`
 		EventID     string   `json:"event_id"`
 		CameraID    uint     `json:"camera_id"`
+		CameraSlug  string   `json:"camera_slug"`
+		CameraName  string   `json:"camera_name"`
 		Type        string   `json:"type"`
 		Label       string   `json:"label"`
 		Confidence  float64  `json:"confidence"`
@@ -341,10 +380,15 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		HasSnapshot bool     `json:"has_snapshot"`
 		HasClip     bool     `json:"has_clip"`
 		Muted       bool     `json:"muted"`
+		StartTime   float64  `json:"start_time"`
+		EndTime     float64  `json:"end_time"`
 		TS          int64    `json:"ts"`
 	}{
+		ID:          frigEv.After.ID,
 		EventID:     frigEv.After.ID,
 		CameraID:    cameraID,
+		CameraSlug:  slug,
+		CameraName:  camName,
 		Type:        "detection",
 		Label:       frigEv.After.Label,
 		Confidence:  confidence,
@@ -352,6 +396,8 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		HasSnapshot: frigEv.After.HasSnapshot,
 		HasClip:     frigEv.After.HasClip,
 		Muted:       muted,
+		StartTime:   frigEv.After.StartTime,
+		EndTime:     safeDerefFloat(frigEv.After.EndTime),
 		TS:          ts,
 	})
 
@@ -416,12 +462,18 @@ func (h *Handler) processVisionTask(task visionTask) {
 	// 离家布防模式 (armed_away):
 	// 任何人在屋内均为异常闯入！无需耗费算力跑人脸对比，直接触发入侵人员告警
 	if task.guardMode == model.GuardModeArmedAway {
+		camName := h.slugLookup.LookupCameraName(task.cameraID)
 		payload, _ := json.Marshal(map[string]any{
-			"event_id":    task.eventID,
-			"camera_id":   task.cameraID,
-			"camera_slug": task.slug,
-			"persons":     []string{"离家布防异常入侵人员"},
-			"ts":          ts,
+			"id":           task.eventID,
+			"event_id":     task.eventID,
+			"camera_id":    task.cameraID,
+			"camera_slug":  task.slug,
+			"camera_name":  camName,
+			"persons":      []string{"离家布防异常入侵人员"},
+			"name":         "离家布防异常入侵人员",
+			"is_intrusion": true,
+			"ts":           ts,
+			"start_time":   float64(ts),
 		})
 		h.bus.Publish(eventbus.Event{
 			Topic:    eventbus.TopicCameraPersonRecognized,
@@ -488,13 +540,19 @@ func (h *Handler) processVisionTask(task visionTask) {
 
 	// Emit person recognized event if any registered face matched
 	if len(res.Data.MatchedPersons) > 0 {
+		camName := h.slugLookup.LookupCameraName(task.cameraID)
 		payload, _ := json.Marshal(map[string]any{
-			"event_id":    task.eventID,
-			"camera_id":   task.cameraID,
-			"camera_slug": task.slug,
-			"persons":     res.Data.MatchedPersons,
-			"faces":       res.Data.Faces,
-			"ts":          ts,
+			"id":           task.eventID,
+			"event_id":     task.eventID,
+			"camera_id":    task.cameraID,
+			"camera_slug":  task.slug,
+			"camera_name":  camName,
+			"persons":      res.Data.MatchedPersons,
+			"name":         res.Data.MatchedPersons[0],
+			"faces":        res.Data.Faces,
+			"is_intrusion": false,
+			"ts":           ts,
+			"start_time":   float64(ts),
 		})
 		h.bus.Publish(eventbus.Event{
 			Topic:    eventbus.TopicCameraPersonRecognized,
@@ -507,12 +565,16 @@ func (h *Handler) processVisionTask(task visionTask) {
 
 	// Emit fall detected event if fall is detected
 	if res.Data.HasFall {
+		camName := h.slugLookup.LookupCameraName(task.cameraID)
 		payload, _ := json.Marshal(map[string]any{
+			"id":          task.eventID,
 			"event_id":    task.eventID,
 			"camera_id":   task.cameraID,
 			"camera_slug": task.slug,
+			"camera_name": camName,
 			"poses":       res.Data.Poses,
 			"ts":          ts,
+			"start_time":  float64(ts),
 		})
 		h.bus.Publish(eventbus.Event{
 			Topic:    eventbus.TopicCameraFallDetected,
@@ -1060,4 +1122,11 @@ func (h *Handler) publish(topic string, payload []byte, qos byte) error {
 	token := h.client.Publish(topic, qos, false, payload)
 	token.Wait()
 	return token.Error()
+}
+
+func safeDerefFloat(p *float64) float64 {
+	if p == nil {
+		return 0.0
+	}
+	return *p
 }

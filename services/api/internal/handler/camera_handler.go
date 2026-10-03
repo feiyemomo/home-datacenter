@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -487,6 +488,62 @@ func (h *CameraHandler) UpdateAudio(c *gin.Context) {
 		})
 	}
 	utils.Success(c, gin.H{"id": id, "audio": body.Enabled})
+}
+
+// UpdateDetectFPS — PUT /api/v1/cameras/:id/detect-fps
+//
+//	{ "fps": 5 }
+func (h *CameraHandler) UpdateDetectFPS(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if _, isAdmin, ok := h.callerIsAdmin(c); !ok || !isAdmin {
+		utils.Fail(c, http.StatusForbidden, "admin only")
+		return
+	}
+
+	var body struct {
+		FPS int `json:"fps" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "fps is required and must be an integer (1-10)")
+		return
+	}
+	if body.FPS < 1 || body.FPS > 10 {
+		utils.Fail(c, http.StatusBadRequest, "fps must be between 1 and 10")
+		return
+	}
+
+	updatedCam, err := h.Reg.UpdateDetectFPS(c.Request.Context(), uint(id), body.FPS)
+	if err != nil {
+		log.Printf("[handler] failed to update detect fps: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to update detect fps")
+		return
+	}
+
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: updatedCam.Name,
+			Action:     "update_detect_fps",
+			Detail:     fmt.Sprintf("更新抽样检测频率为 %d fps", body.FPS),
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
+
+	utils.Success(c, gin.H{
+		"id":         updatedCam.ID,
+		"detect_fps": body.FPS,
+		"meta":       updatedCam.Meta,
+	})
 }
 
 // SetRecordingPlan — PUT /api/v1/cameras/:id/recording
@@ -1744,6 +1801,154 @@ func cleanTranscodeCache(root string, maxAge time.Duration) {
 	}
 }
 
+// PretranscodeMinute transcodes the given minuteStart into the cache volume
+// in the background if it is not already cached.
+func (h *CameraHandler) PretranscodeMinute(cam *model.Camera, minuteStart int64) error {
+	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
+	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d.mp4", minuteStart))
+
+	// Serve/skip from cache if present and non-empty.
+	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {
+		return nil
+	}
+
+	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
+	if err != nil || len(paths) == 0 {
+		// Fallback to Quark Cloud Archive via Alist WebDAV
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		paths, err = h.Reg.RecordingSegmentsFromCloud(ctx, cam, minuteStart)
+		cancel()
+	}
+	if err != nil || len(paths) == 0 {
+		return nil // No recordings for this minute yet
+	}
+
+	tmpDir, err := os.MkdirTemp("", "pretrans_")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	var listBuilder strings.Builder
+	for _, p := range paths {
+		escaped := strings.ReplaceAll(p, "'", "'\\''")
+		listBuilder.WriteString(fmt.Sprintf("file '%s'\n", escaped))
+	}
+	listPath := filepath.Join(tmpDir, "list.txt")
+	if err := os.WriteFile(listPath, []byte(listBuilder.String()), 0o644); err != nil {
+		return fmt.Errorf("write concat list: %w", err)
+	}
+
+	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
+	tmpOut := filepath.Join(tmpDir, fmt.Sprintf("%d.mp4", minuteStart))
+
+	// Serialize transcode through the global transcode slot
+	h.transcodeSem <- struct{}{}
+	defer func() {
+		select {
+		case <-h.transcodeSem:
+		default:
+		}
+	}()
+
+	cmd := buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+	if output, err := cmd.CombinedOutput(); err != nil {
+		if vaapiAvailable() {
+			cmd = buildTranscodeCmd(listPath, tmpOut, false)
+			if out2, err2 := cmd.CombinedOutput(); err2 != nil {
+				return fmt.Errorf("software transcode failed: %v (%s)", err2, string(out2))
+			}
+		} else {
+			return fmt.Errorf("transcode failed: %v (%s)", err, string(output))
+		}
+	}
+
+	// Promote to cache
+	if err := copyToCache(tmpOut, cacheFile); err != nil {
+		return fmt.Errorf("promote to cache: %w", err)
+	}
+	log.Printf("[camera_handler] Pre-transcoded and cached minute %d for camera %d (%s)", minuteStart, cam.ID, cam.Name)
+	return nil
+}
+
+// QueueAlertPretranscode enqueues a background job to pre-transcode the minute(s)
+// corresponding to an alert. If the minute is currently ongoing, it waits until
+// the minute rolls over so full 10s recording segments are finalized.
+func (h *CameraHandler) QueueAlertPretranscode(camID uint, startTime, endTime int64) {
+	go func() {
+		cam, err := h.Reg.Get(camID)
+		if err != nil {
+			return
+		}
+		startMin := (startTime / 60) * 60
+		endMin := startMin
+		if endTime > 0 {
+			endMin = (endTime / 60) * 60
+		}
+		// Also include the minute before if the alert occurred in the first 15s of the minute
+		var targetMinutes []int64
+		if startTime-startMin < 15 {
+			targetMinutes = append(targetMinutes, startMin-60)
+		}
+		for m := startMin; m <= endMin; m += 60 {
+			targetMinutes = append(targetMinutes, m)
+		}
+
+		for _, m := range targetMinutes {
+			now := time.Now().Unix()
+			targetTime := m + 65 // wait until 5s after the minute closes
+			if targetTime > now {
+				waitSec := targetTime - now
+				if waitSec > 180 {
+					waitSec = 65
+				}
+				time.Sleep(time.Duration(waitSec) * time.Second)
+			}
+			if err := h.PretranscodeMinute(cam, m); err != nil {
+				log.Printf("[camera_handler] pretranscode error for camera %d, minute %d: %v", camID, m, err)
+			}
+		}
+	}()
+}
+
+// StartAlertPretranscoder warms up recent alerts from Frigate (past 24 hours)
+// so that clicking alert clips in the app or dashboard is instant from the start.
+func (h *CameraHandler) StartAlertPretranscoder() {
+	go func() {
+		// Wait for Frigate to stabilize after startup
+		time.Sleep(15 * time.Second)
+		for retries := 0; retries < 6; retries++ {
+			events, err := h.Reg.Frigate.ListEventsFiltered(context.Background(), camera.EventFilter{
+				Limit: 50,
+				After: time.Now().Add(-24 * time.Hour).Unix(),
+			})
+			if err != nil {
+				log.Printf("[camera_handler] StartAlertPretranscoder: retry %d/6 listing events: %v", retries+1, err)
+				time.Sleep(10 * time.Second)
+				continue
+			}
+			log.Printf("[camera_handler] StartAlertPretranscoder: warming up %d recent alerts...", len(events))
+			for _, ev := range events {
+				camID, ok := h.Reg.LookupByFrigateSlug(ev.Camera)
+				if !ok {
+					continue
+				}
+				cam, err := h.Reg.Get(camID)
+				if err != nil {
+					continue
+				}
+				startMin := (int64(ev.StartTime) / 60) * 60
+				_ = h.PretranscodeMinute(cam, startMin)
+				time.Sleep(200 * time.Millisecond) // gentle pacing
+			}
+			log.Printf("[camera_handler] StartAlertPretranscoder: warm up completed")
+			break
+		}
+	}()
+}
+
 // humanSize is exposed at handler scope (mirrors camera.humanSize).
 func humanSize(n int64) string {
 	const k = 1024
@@ -1865,22 +2070,26 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
 	}
 	if err != nil {
-		// v1.7.3: retry once after 3s to cover ffmpeg cold start
-		log.Printf("webrtc: first SDP exchange failed for %s, retrying in 3s: %v", streamName, err)
-		select {
-		case <-time.After(3 * time.Second):
-		case <-c.Request.Context().Done():
-			log.Printf("[handler] failed to exchange SDP: %v", err)
-			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP")
-			return
+		for attempt := 1; attempt <= 2; attempt++ {
+			backoff := time.Duration(attempt*250) * time.Millisecond
+			log.Printf("webrtc: SDP exchange attempt %d failed for %s (%v), retrying in %v", attempt, streamName, err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-c.Request.Context().Done():
+				utils.Fail(c, http.StatusBadGateway, "client canceled SDP exchange")
+				return
+			}
+			answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
+			if err == nil {
+				log.Printf("webrtc: retry %d succeeded for %s", attempt, streamName)
+				break
+			}
 		}
-		answer, err = h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
 		if err != nil {
-			log.Printf("[handler] failed to exchange SDP: %v", err)
-			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP")
+			log.Printf("[handler] failed to exchange SDP for %s: %v", streamName, err)
+			utils.Fail(c, http.StatusBadGateway, "failed to exchange SDP: "+err.Error())
 			return
 		}
-		log.Printf("webrtc: retry succeeded for %s", streamName)
 	}
 
 	// go2rtc returns the SDP answer as the response body. We
@@ -2218,7 +2427,7 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 
 	speed := req.Speed
 	if speed == 0 {
-		speed = 0.5
+		speed = 0.25
 	}
 
 	if err := h.ONVIF.ContinuousMove(
@@ -2265,6 +2474,7 @@ func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool
 		"capabilities": cam.Capabilities,
 		"can_ptz":      canPTZ,
 		"meta":         cam.Meta,
+		"detect_fps":   camera.CameraDetectFPS(cam),
 		"stream":       stream,
 		"transcode":    cam.Transcode,
 		"codec":        cam.Codec,

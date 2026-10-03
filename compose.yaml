@@ -94,7 +94,7 @@ services:
       # v1.8.29: off-NAS backup status file, written by the backup
       # container and read (read-only) by the api's BackupMonitor to
       # alert on failed/stalled syncs and bucket retention.
-      - ./data/backup-state:/data/backup-state:ro
+      - ./data/backup-state:/data/backup-state
     depends_on:
       mosquitto:
         condition: service_started
@@ -140,17 +140,19 @@ services:
       # This value is used by SetWebRTCCandidates() to build the go2rtc
       # webrtc.candidates list — without it, WebRTC is unreachable from
       # LAN clients. Update when the NAS IP changes.
-      - NAS_LAN_IP=${NAS_LAN_IP:-192.168.31.235}
+      - NAS_LAN_IP=${NAS_LAN_IP:-192.168.31.234}
+      # Public WebRTC TCP Candidate mapped via H3C Oasis Tunnel (TCP proxy)
+      - WEBRTC_TCP_CANDIDATE=${WEBRTC_TCP_CANDIDATE:-154.8.195.220:37635}
       # v1.8.24: Set to "true" in offline LAN environments (no Internet)
       # to disable IPv6 reporting. Without this, NAS_IPV6_ADDRESS above
       # would cause CheckIPv6() to report reachable=true, making the
       # mobile app waste time on IPv6 direct mode that can never succeed.
-      - NAS_IPV6_DISABLED=${NAS_IPV6_DISABLED:-false}
+      - NAS_IPV6_DISABLED=${NAS_IPV6_DISABLED:-true}
       # v1.8.35: Quark Cloud Drive archive integration via Alist WebDAV
       - ALIST_WEBDAV_URL=${ALIST_WEBDAV_URL:-http://home-alist:5244/dav}
       - ALIST_WEBDAV_USER=${ALIST_WEBDAV_USER:-admin}
       - ALIST_WEBDAV_PASS=${ALIST_WEBDAV_PASS:-wm10050817}
-      - ALIST_RECORDINGS_PATH=${ALIST_RECORDINGS_PATH:-quark/Surveillance/Recordings}
+      - ALIST_RECORDINGS_PATH=${ALIST_RECORDINGS_PATH:-lanzou/Surveillance/Recordings}
     # v1.8.31: static IP for the api service. nginx's
     # `upstream api_backend { server api:8080; }` in web/nginx.conf
     # resolves the `api` hostname ONCE at nginx startup and keeps
@@ -242,7 +244,10 @@ services:
       - "0.0.0.0:8088:80"
       - "[::]:8088:80"
     depends_on:
-      - api
+      api:
+        condition: service_started
+      h3c-keepalive:
+        condition: service_started
     # v1.8.28: healthcheck. nginx:alpine bundles busybox wget, so we
     # probe the SPA root. A 200/40x from nginx means the server is up
     # and serving (it returns 200 for /; the app is a static SPA).
@@ -326,6 +331,9 @@ services:
             echo "[PREFLIGHT] /config/config.yml is empty or corrupt (<100B). Auto-restoring from /config/config.yml.bak..."
             cp /config/config.yml.bak /config/config.yml
           fi
+        fi
+        if [ -n "$$NAS_LAN_IP" ]; then
+          sed -i "s|<YOUR_NAS_LAN_IP>|$$NAS_LAN_IP|g" /config/config.yml 2>/dev/null || true
         fi
         exec /init
     environment:
@@ -553,11 +561,11 @@ services:
       - TZ=Asia/Shanghai
       - ALIST_WEBDAV_URL=http://home-alist:5244/dav
       - ALIST_WEBDAV_USER=admin
-      - ALIST_WEBDAV_PASS=b8NBAhGkRvBju0j7Tlu2bQoAlAtghQupSpA
-      - QUARK_REMOTE_PATH=quark/Surveillance/Recordings
-      - ARCHIVE_MIN_AGE=2h
-      - ARCHIVE_INTERVAL=21600
-      - QUARK_RETENTION_DAYS=${QUARK_RETENTION_DAYS:-60}
+      - ALIST_WEBDAV_PASS=wm10050817
+      - ARCHIVE_REMOTE_PATH=lanzou/Surveillance/Recordings
+      - ARCHIVE_MIN_AGE=7d
+      - SCHEDULE_HOUR=03
+      - ARCHIVE_RETENTION_DAYS=${ARCHIVE_RETENTION_DAYS:-0}
     depends_on:
       - alist
     networks:
@@ -578,6 +586,36 @@ services:
     volumes:
       - ./deploy/frpc/frpc:/usr/local/bin/frpc:ro
     command: [ "frpc", "-t", "${LOLIA_FRP_TOKEN:-26639:ostauxmq0p7wy0h2uvrn8ek4us2rghos}" ]
+
+  # h3c-keepalive — automated tunnel renewal and 302 redirect for H3C Oasis NAT traversal (v1.8.36).
+  # Eliminates the 3-hour lease expiration and provides a fixed redirect endpoint (/fast & /h3c).
+  h3c-keepalive:
+    build:
+      context: ./deploy/h3c-keepalive
+    container_name: home-h3c-keepalive
+    restart: unless-stopped
+    logging: *default-logging
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    volumes:
+      - ./data/h3c:/data/h3c
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - TZ=Asia/Shanghai
+      - H3C_USERNAME=${H3C_USERNAME:-momo324}
+      - H3C_PASSWORD=${H3C_PASSWORD:-@Momo324}
+      - H3C_APP_NAME=${H3C_APP_NAME:-home}
+      - H3C_APP_NAMES=${H3C_APP_NAMES:-home,webrtc_test}
+      - FRIGATE_URL=http://home-frigate:5000
+      - CHECK_INTERVAL=60
+      - MIN_REMAINING_MINUTES=25
+      - HTTP_PORT=8087
+      - DATA_DIR=/data/h3c
+    networks:
+      home-net:
+        ipv4_address: 172.18.0.18
 
 networks:
   # v1.8.31: explicit /24 subnet so the api service can be pinned to a

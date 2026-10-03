@@ -487,6 +487,32 @@ func detectLANIP() string {
 // behavior which hardcoded a stale IP (192.168.1.3) that silently broke
 // WebRTC after any NAS IP change.
 //
+func detectH3CTCPCandidate() string {
+	keepaliveURL := os.Getenv("H3C_KEEPALIVE_URL")
+	if keepaliveURL == "" {
+		keepaliveURL = "http://home-h3c-keepalive:8087/status"
+	}
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	resp, err := client.Get(keepaliveURL)
+	if err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			var st struct {
+				Tunnels map[string]struct {
+					ExternalAddr string `json:"externalAddr"`
+					Status       string `json:"status"`
+				} `json:"tunnels"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&st); err == nil {
+				if t, ok := st.Tunnels["webrtc_test"]; ok && t.ExternalAddr != "" && t.Status == "ESTABLISHED" {
+					return t.ExternalAddr
+				}
+			}
+		}
+	}
+	return os.Getenv("WEBRTC_TCP_CANDIDATE")
+}
+
 // Returns an error if the Frigate API call fails. The caller
 // (PrefixWatcher, BootReplay) logs the error but doesn't block subsequent checks.
 func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string) error {
@@ -502,6 +528,12 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 	if ipv6Addr != "" {
 		candidates = append(candidates, fmt.Sprintf("[%s]:8555", ipv6Addr))
 	}
+
+	if tcpCandidate := detectH3CTCPCandidate(); tcpCandidate != "" {
+		candidates = append(candidates, tcpCandidate)
+	}
+
+	candidates = append(candidates, "stun:8555")
 
 	partial := map[string]any{
 		"go2rtc": map[string]any{
@@ -546,6 +578,31 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 	if resp.StatusCode >= 400 {
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1*1024*1024))
 		return fmt.Errorf("frigate returned %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Also push directly to go2rtc active primary config and trigger runtime reload
+	if c.Go2rtcBase != "" {
+		go func(cands []string) {
+			go2Payload, err := json.Marshal(map[string]any{
+				"webrtc": map[string]any{
+					"candidates": cands,
+				},
+			})
+			if err == nil {
+				req, err := http.NewRequest(http.MethodPost, c.Go2rtcBase+"/api/config", bytes.NewReader(go2Payload))
+				if err == nil {
+					req.Header.Set("Content-Type", "application/json")
+					if resp, err := c.HC.Do(req); err == nil {
+						resp.Body.Close()
+					}
+				}
+				if req, err := http.NewRequest(http.MethodPost, c.Go2rtcBase+"/api/restart", nil); err == nil {
+					if resp, err := c.HC.Do(req); err == nil {
+						resp.Body.Close()
+					}
+				}
+			}
+		}(candidates)
 	}
 
 	return nil

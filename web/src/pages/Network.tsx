@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
 import {
     Globe,
@@ -13,8 +13,14 @@ import {
     XCircle,
     Smartphone,
     Server,
+    Zap,
+    ExternalLink,
+    Copy,
+    Check,
+    Clock,
 } from "lucide-react";
 import { getNetworkStatus, checkClientIPv6 } from "@/api/network";
+import { getToken } from "@/api/client";
 import type { ConnectionStrategy } from "@/types";
 import {
     Card,
@@ -65,17 +71,80 @@ export default function Network() {
         relay: "中继（隧道）",
     };
 
+    const [h3cData, setH3cData] = useState<{
+        status: string;
+        externalAddr?: string;
+        tunnelId?: string;
+        closeTime?: string;
+        remainingMinutes?: number;
+        lastChecked?: string;
+    } | null>(null);
+    const [h3cLoading, setH3cLoading] = useState(false);
+    const [h3cError, setH3cError] = useState(false);
+    const [copied, setCopied] = useState(false);
+
+    const fetchH3c = useCallback(async () => {
+        try {
+            const controller = new AbortController();
+            const timer = setTimeout(() => controller.abort(), 6000);
+            const res = await fetch("/fast-status", { signal: controller.signal });
+            clearTimeout(timer);
+            if (res.ok) {
+                const data = await res.json();
+                setH3cData(data);
+                setH3cError(false);
+            } else {
+                setH3cError(true);
+            }
+        } catch {
+            setH3cError(true);
+        }
+    }, []);
+
+    useEffect(() => {
+        fetchH3c();
+        const interval = setInterval(fetchH3c, 30000);
+        return () => clearInterval(interval);
+    }, [fetchH3c]);
+
+    const handleRefreshH3c = async () => {
+        setH3cLoading(true);
+        try {
+            const res = await fetch("/fast-refresh", { method: "POST" });
+            if (res.ok) {
+                const data = await res.json();
+                setH3cData(data);
+                setH3cError(false);
+            }
+        } catch (e) {
+            console.error(e);
+            setH3cError(true);
+        } finally {
+            setH3cLoading(false);
+        }
+    };
+
+    const handleCopy = (text: string) => {
+        navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 2000);
+    };
+
     // Whether an upgrade from relay is available.
     const hasUpgrade = status != null && status.strategy !== status.initial;
 
+    // IPv6 feature flag: upstream optical modem has no IPv6 enabled currently.
+    // Kept dormant for future re-enablement.
+    const SHOW_IPV6 = false;
+
     // IPv6 direct is possible only if BOTH server and client have IPv6.
     const ipv6DirectPossible =
-        status?.ipv6?.reachable === true && clientIPv6 === true;
+        SHOW_IPV6 && status?.ipv6?.reachable === true && clientIPv6 === true;
 
     // Whether to show the clickable "switch to IPv6 direct" link.
     // Requires: user is on relay, server has IPv6, client has IPv6.
     const canSwitchToIPv6Direct =
-        isOnRelay() && ipv6DirectPossible && status?.ipv6?.address != null;
+        SHOW_IPV6 && isOnRelay() && ipv6DirectPossible && status?.ipv6?.address != null;
 
     return (
         <div className="animate-fade-in space-y-6">
@@ -214,98 +283,213 @@ export default function Network() {
                 </CardContent>
             </Card>
 
-            {/* IPv6 side-by-side: Server vs Client */}
-            <Card>
-                <CardHeader>
-                    <CardTitle className="flex items-center gap-2">
-                        <Globe size={16} /> IPv6 连通性
-                    </CardTitle>
-                    <CardDescription>
-                        IPv6 直连要求服务器和客户端都具备公网 IPv6。
-                    </CardDescription>
-                </CardHeader>
-                <CardContent>
-                    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-                        {/* Server side */}
-                        <div className="glass-subtle rounded-xl p-4">
-                            <div className="mb-2 flex items-center gap-2">
-                                <Server size={14} className="text-fg-muted" />
-                                <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
-                                    服务器
-                                </span>
+            {/* IPv6 side-by-side: Server vs Client (Hidden while upstream IPv6 is unavailable) */}
+            {SHOW_IPV6 && (
+                <Card>
+                    <CardHeader>
+                        <CardTitle className="flex items-center gap-2">
+                            <Globe size={16} /> IPv6 连通性
+                        </CardTitle>
+                        <CardDescription>
+                            IPv6 直连要求服务器和客户端都具备公网 IPv6。
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent>
+                        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                            {/* Server side */}
+                            <div className="glass-subtle rounded-xl p-4">
+                                <div className="mb-2 flex items-center gap-2">
+                                    <Server size={14} className="text-fg-muted" />
+                                    <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
+                                        服务器
+                                    </span>
+                                </div>
+                                {status?.ipv6 ? (
+                                    <div className="space-y-2">
+                                        <div className="flex items-center gap-2">
+                                            {status.ipv6.reachable ? (
+                                                <CheckCircle2 size={16} className="text-[rgb(var(--accent-success))]" />
+                                            ) : (
+                                                <XCircle size={16} className="text-[rgb(var(--accent-danger))]" />
+                                            )}
+                                            <span className="text-sm text-fg">
+                                                {status.ipv6.reachable
+                                                    ? "公网 IPv6 可达"
+                                                    : status.ipv6.enabled
+                                                        ? "IPv6 已启用但公网不可达"
+                                                        : "IPv6 不可用"}
+                                            </span>
+                                        </div>
+                                        {status.ipv6.address && (
+                                            <div className="space-y-1">
+                                                <code className="font-mono text-xs text-fg-muted">
+                                                    {status.ipv6.address}
+                                                </code>
+                                                <div className="rounded-lg bg-[rgb(var(--accent-success)/0.08)] px-2.5 py-1.5">
+                                                    <p className="text-[11px] text-fg-muted">IPv6 直连地址：</p>
+                                                    <code className="font-mono text-[11px] text-[rgb(var(--accent-success))] break-all">
+                                                        http://[{status.ipv6.address}]:8088/
+                                                    </code>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                ) : (
+                                    <div className="text-sm text-fg-muted">加载中...</div>
+                                )}
                             </div>
-                            {status?.ipv6 ? (
+
+                            {/* Client side */}
+                            <div className="glass-subtle rounded-xl p-4">
+                                <div className="mb-2 flex items-center gap-2">
+                                    <Smartphone size={14} className="text-fg-muted" />
+                                    <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
+                                        您的设备
+                                    </span>
+                                </div>
                                 <div className="space-y-2">
                                     <div className="flex items-center gap-2">
-                                        {status.ipv6.reachable ? (
+                                        {clientIPv6 === null ? (
+                                            <RefreshCw size={16} className="animate-spin text-fg-subtle" />
+                                        ) : clientIPv6 ? (
                                             <CheckCircle2 size={16} className="text-[rgb(var(--accent-success))]" />
                                         ) : (
                                             <XCircle size={16} className="text-[rgb(var(--accent-danger))]" />
                                         )}
                                         <span className="text-sm text-fg">
-                                            {status.ipv6.reachable
-                                                ? "公网 IPv6 可达"
-                                                : status.ipv6.enabled
-                                                    ? "IPv6 已启用但公网不可达"
+                                            {clientIPv6 === null
+                                                ? "检查中..."
+                                                : clientIPv6
+                                                    ? "IPv6 可用"
                                                     : "IPv6 不可用"}
                                         </span>
                                     </div>
-                                    {status.ipv6.address && (
-                                        <div className="space-y-1">
-                                            <code className="font-mono text-xs text-fg-muted">
-                                                {status.ipv6.address}
-                                            </code>
-                                            <div className="rounded-lg bg-[rgb(var(--accent-success)/0.08)] px-2.5 py-1.5">
-                                                <p className="text-[11px] text-fg-muted">IPv6 直连地址：</p>
-                                                <code className="font-mono text-[11px] text-[rgb(var(--accent-success))] break-all">
-                                                    http://[{status.ipv6.address}]:8088/
-                                                </code>
-                                            </div>
-                                        </div>
-                                    )}
+                                    <p className="text-xs text-fg-muted">
+                                        {clientIPv6 === false
+                                            ? "您的网络无 IPv6 — 只能使用中继"
+                                            : clientIPv6 === true && !status?.ipv6?.reachable
+                                                ? "您具备 IPv6，但服务器没有 — IPv6 直连被服务器阻挡"
+                                                : ipv6DirectPossible
+                                                    ? "双方都具备 IPv6 — 可以直连"
+                                                    : ""}
+                                    </p>
                                 </div>
-                            ) : (
-                                <div className="text-sm text-fg-muted">加载中...</div>
-                            )}
+                            </div>
                         </div>
+                    </CardContent>
+                </Card>
+            )}
 
-                        {/* Client side */}
-                        <div className="glass-subtle rounded-xl p-4">
-                            <div className="mb-2 flex items-center gap-2">
-                                <Smartphone size={14} className="text-fg-muted" />
-                                <span className="text-xs font-medium uppercase tracking-wider text-fg-muted">
-                                    您的设备
-                                </span>
-                            </div>
-                            <div className="space-y-2">
-                                <div className="flex items-center gap-2">
-                                    {clientIPv6 === null ? (
-                                        <RefreshCw size={16} className="animate-spin text-fg-subtle" />
-                                    ) : clientIPv6 ? (
-                                        <CheckCircle2 size={16} className="text-[rgb(var(--accent-success))]" />
-                                    ) : (
-                                        <XCircle size={16} className="text-[rgb(var(--accent-danger))]" />
-                                    )}
-                                    <span className="text-sm text-fg">
-                                        {clientIPv6 === null
-                                            ? "检查中..."
-                                            : clientIPv6
-                                                ? "IPv6 可用"
-                                                : "IPv6 不可用"}
-                                    </span>
+            {/* H3C Oasis Domestic High-Speed Gateway */}
+            <Card className="border-[rgb(var(--accent-primary)/0.3)] bg-gradient-to-r from-[rgb(var(--accent-primary)/0.03)] to-transparent">
+                <CardHeader className="flex-row items-center justify-between pb-3">
+                    <div>
+                        <CardTitle className="flex items-center gap-2">
+                            <Zap size={18} className="text-[rgb(var(--accent-primary))]" /> H3C 简优云国内高速通道
+                        </CardTitle>
+                        <CardDescription>
+                            基于 H3C 路由器的国内极速中继穿透，告别海外隧道高延迟，千兆全速直连。
+                        </CardDescription>
+                    </div>
+                    {h3cData && (
+                        <Badge variant={h3cData.status === "online" ? "success" : "danger"}>
+                            {h3cData.status === "online" ? "在线运行" : "重连中"}
+                        </Badge>
+                    )}
+                    {h3cError && !h3cData && (
+                        <Badge variant="outline">稍有延迟</Badge>
+                    )}
+                </CardHeader>
+                <CardContent>
+                    {h3cData && h3cData.status === "online" ? (
+                        <div className="space-y-4">
+                            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                                <div className="glass-subtle rounded-xl p-3.5 space-y-1.5">
+                                    <div className="flex items-center justify-between">
+                                        <span className="text-xs text-fg-muted">当前动态外网直连地址</span>
+                                        <div className="flex items-center gap-1">
+                                            <Button
+                                                variant="ghost"
+                                                size="sm"
+                                                className="h-6 px-2 text-[11px]"
+                                                onClick={() => handleCopy(h3cData.externalAddr || "")}
+                                            >
+                                                {copied ? <Check size={12} className="text-[rgb(var(--accent-success))]" /> : <Copy size={12} />}
+                                                {copied ? "已复制" : "复制"}
+                                            </Button>
+                                        </div>
+                                    </div>
+                                    <code className="block font-mono text-sm font-semibold text-[rgb(var(--accent-primary))] break-all">
+                                        {h3cData.externalAddr}
+                                    </code>
+                                    <div className="flex items-center gap-1.5 text-[11px] text-fg-subtle pt-1">
+                                        <Clock size={12} />
+                                        <span>剩余有效期：<b className="text-fg font-medium">{h3cData.remainingMinutes} 分钟</b>（NAS后台自动化循环保活，永不中断）</span>
+                                    </div>
                                 </div>
-                                <p className="text-xs text-fg-muted">
-                                    {clientIPv6 === false
-                                        ? "您的网络无 IPv6 — 只能使用中继"
-                                        : clientIPv6 === true && !status?.ipv6?.reachable
-                                            ? "您具备 IPv6，但服务器没有 — IPv6 直连被服务器阻挡"
-                                            : ipv6DirectPossible
-                                                ? "双方都具备 IPv6 — 可以直连"
-                                                : ""}
-                                </p>
+
+                                <div className="glass-subtle rounded-xl p-3.5 space-y-2 flex flex-col justify-between">
+                                    <div>
+                                        <span className="text-xs text-fg-muted">永久固定重定向入口（推荐书签）</span>
+                                        <code className="block font-mono text-xs text-fg mt-1">
+                                            https://dashboard.feiyemomo.top/fast
+                                        </code>
+                                        <p className="text-[11px] text-fg-subtle mt-1">
+                                            访问此固定链接将自动 302 秒级重定向至最新的高速端口。
+                                        </p>
+                                    </div>
+                                    <div className="flex items-center gap-2 pt-1">
+                                        <a
+                                            href={h3cData?.externalAddr ? `${h3cData.externalAddr}/#token=${encodeURIComponent(getToken() || "")}` : `/fast`}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="inline-flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-[rgb(var(--accent-primary))] px-3 py-1.5 text-xs font-semibold text-white shadow-sm hover:opacity-90 transition-opacity"
+                                        >
+                                            <Zap size={14} /> 立即进入高速通道 <ExternalLink size={12} />
+                                        </a>
+                                        <Button
+                                            variant="outline"
+                                            size="sm"
+                                            className="h-8 text-xs"
+                                            disabled={h3cLoading}
+                                            onClick={handleRefreshH3c}
+                                        >
+                                            <RefreshCw size={12} className={h3cLoading ? "animate-spin" : ""} />
+                                            刷新租期
+                                        </Button>
+                                    </div>
+                                </div>
                             </div>
                         </div>
-                    </div>
+                    ) : h3cError ? (
+                        <div className="glass-subtle rounded-xl p-4 flex flex-col sm:flex-row items-center justify-between gap-3 text-sm">
+                            <span className="text-xs text-fg-muted">
+                                海外中继查询穿透状态稍有延迟，后台保活仍常态运行中。您可直接点击进入高速通道：
+                            </span>
+                            <div className="flex items-center gap-2">
+                                <a
+                                    href="/fast"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1.5 rounded-lg bg-[rgb(var(--accent-primary))] px-3 py-1.5 text-xs font-semibold text-white hover:opacity-90 transition-opacity"
+                                >
+                                    <Zap size={13} /> 立即进入高速通道 <ExternalLink size={11} />
+                                </a>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    onClick={() => { setH3cError(false); fetchH3c(); }}
+                                >
+                                    <RefreshCw size={12} className="mr-1" /> 重试
+                                </Button>
+                            </div>
+                        </div>
+                    ) : (
+                        <div className="text-sm text-fg-muted flex items-center gap-2 py-2">
+                            <RefreshCw size={14} className="animate-spin" /> 正在获取 H3C 高速穿透状态...
+                        </div>
+                    )}
                 </CardContent>
             </Card>
 

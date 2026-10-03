@@ -247,7 +247,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
         setBusy(true);
         setPtzError(null);
         try {
-            await ptzMove(camera.id, command as never, 0.5);
+            await ptzMove(camera.id, command as never, 0.25);
         } catch (e) {
             setPtzError(e instanceof Error ? e.message : String(e));
         } finally {
@@ -259,7 +259,7 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
         setBusy(true);
         setPtzError(null);
         try {
-            await gotoPreset(camera.id, alias, 0.5);
+            await gotoPreset(camera.id, alias, 0.25);
         } catch (e) {
             setPtzError(e instanceof Error ? e.message : String(e));
         } finally {

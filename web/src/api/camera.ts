@@ -342,3 +342,13 @@ export function alertThumbnailUrl(eventId: string): string {
 export function cameraFrameUrl(cameraId: number): string {
 	return `/api/v1/cameras/${cameraId}/frame`;
 }
+
+/**
+ * Update the camera's AI detection sample rate in Frigate (1-10 fps). Admin only.
+ *
+ * PUT /api/v1/cameras/:id/detect-fps
+ */
+export async function updateCameraDetectFPS(id: number, fps: number): Promise<{ id: number; detect_fps: number }> {
+    const { data } = await client.put<{ id: number; detect_fps: number }>(`/cameras/${id}/detect-fps`, { fps });
+    return data;
+}
