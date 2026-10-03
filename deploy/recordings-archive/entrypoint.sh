@@ -17,7 +17,7 @@ ALIST_URL="${ALIST_WEBDAV_URL:-http://home-alist:5244/dav}"
 ALIST_USER="${ALIST_WEBDAV_USER:-admin}"
 ALIST_PASS="${ALIST_WEBDAV_PASS:-wm10050817}"
 REMOTE_PATH="${ARCHIVE_REMOTE_PATH:-${QUARK_REMOTE_PATH:-lanzou/Surveillance/Recordings}}"
-MIN_AGE="${ARCHIVE_MIN_AGE:-7d}"
+MIN_AGE="${ARCHIVE_MIN_AGE:-6d}"
 RETENTION_DAYS="${ARCHIVE_RETENTION_DAYS:-${QUARK_RETENTION_DAYS:-0}}"
 STATE_FILE="${STATE_FILE:-/state/recordings-archive.json}"
 ONCE="${ONCE:-0}"
@@ -56,33 +56,89 @@ cleanup_old_recordings() {
 }
 
 archive_once() {
+    # Refresh dynamic configuration right before archiving
+    if [ -f "/state/storage-config.json" ]; then
+        DYN_MIN_AGE="$(grep -o '"archive_min_age_days":[0-9]*' /state/storage-config.json 2>/dev/null | cut -d: -f2 || true)"
+        if [ -n "$DYN_MIN_AGE" ] && [ "$DYN_MIN_AGE" -gt 0 ] 2>/dev/null; then
+            MIN_AGE="${DYN_MIN_AGE}d"
+        fi
+    fi
+
     log "Starting archive of recordings older than ${MIN_AGE} to ${REMOTE_PATH}..."
     ts="$(date +%s)"
     
-    if rclone copy "$SOURCE_DIR" ":webdav:${REMOTE_PATH}" \
-        --webdav-url "$ALIST_URL" \
-        --webdav-vendor other \
-        --webdav-user "$ALIST_USER" \
-        --webdav-pass "$OBSCURED_PASS" \
-        --include "*.mp4" \
-        --min-age "$MIN_AGE" \
-        --transfers 2 \
-        --checkers 4 \
-        --fast-list \
-        --config /dev/null \
-        --verbose 2>&1; then
-        log "Archive completed successfully."
-        tmp="${STATE_FILE}.tmp.$$"
-        printf '{"ts":%s,"ok":true,"error":""}\n' "$ts" > "$tmp"
-        mv -f "$tmp" "$STATE_FILE"
+    DAYS="$(echo "$MIN_AGE" | tr -dc '0-9')"
+    [ -z "$DAYS" ] && DAYS=6
+
+    STAGING_DIR="$SOURCE_DIR/.archive-staging"
+    rm -rf "$STAGING_DIR" 2>/dev/null || true
+    mkdir -p "$STAGING_DIR"
+
+    NOW_TS="$(date +%s)"
+    CUTOFF_DATE="$(date -d "@$(( NOW_TS - DAYS * 86400 ))" +%Y-%m-%d 2>/dev/null)"
+    log "Evaluating recording dates older than or equal to ${CUTOFF_DATE} (cutoff DAYS=${DAYS})..."
+
+    COUNT=0
+    for date_path in "$SOURCE_DIR"/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
+        [ -d "$date_path" ] || continue
+        DATE="$(basename "$date_path")"
+        if [ "$DATE" \< "$CUTOFF_DATE" ] || [ "$DATE" = "$CUTOFF_DATE" ]; then
+            log "Found eligible archive date folder: $DATE"
+            TARGET_DIR="$STAGING_DIR/$DATE"
+            mkdir -p "$TARGET_DIR"
+
+            for hour_path in "$date_path"/*; do
+                [ -d "$hour_path" ] || continue
+                HOUR="$(basename "$hour_path")"
+                for cam_path in "$hour_path"/*; do
+                    [ -d "$cam_path" ] || continue
+                    SLUG="$(basename "$cam_path")"
+                    for f in "$cam_path"/*.mp4; do
+                        [ -f "$f" ] || continue
+                        FILE="$(basename "$f")"
+                        TARGET_FILE="$TARGET_DIR/${SLUG}_${HOUR}_${FILE}"
+                        ln -f "$f" "$TARGET_FILE" 2>/dev/null || cp "$f" "$TARGET_FILE" 2>/dev/null || true
+                        COUNT=$((COUNT + 1))
+                    done
+                done
+            done
+        fi
+    done
+
+    log "Prepared ${COUNT} segment hardlinks for remote transfer (flattened 3-level format)..."
+
+    if [ "$COUNT" -gt 0 ]; then
+        if rclone copy "$STAGING_DIR" ":webdav:${REMOTE_PATH}" \
+            --webdav-url "$ALIST_URL" \
+            --webdav-vendor other \
+            --webdav-user "$ALIST_USER" \
+            --webdav-pass "$OBSCURED_PASS" \
+            --ignore-size \
+            --transfers 4 \
+            --checkers 8 \
+            --fast-list \
+            --config /dev/null \
+            --verbose 2>&1; then
+            log "Archive completed successfully (${COUNT} segments transferred/synced)."
+            tmp="${STATE_FILE}.tmp.$$"
+            printf '{"ts":%s,"ok":true,"error":"","count":%d}\n' "$ts" "$COUNT" > "$tmp"
+            mv -f "$tmp" "$STATE_FILE"
+        else
+            log "Archive encountered errors. Will retry next run."
+            tmp="${STATE_FILE}.tmp.$$"
+            printf '{"ts":%s,"ok":false,"error":"rclone copy failed"}\n' "$ts" > "$tmp"
+            mv -f "$tmp" "$STATE_FILE"
+            rm -rf "$STAGING_DIR" 2>/dev/null || true
+            return 1
+        fi
     else
-        log "Archive encountered errors. Will retry next run."
+        log "No recordings older than ${MIN_AGE} to archive."
         tmp="${STATE_FILE}.tmp.$$"
-        printf '{"ts":%s,"ok":false,"error":"rclone copy failed"}\n' "$ts" > "$tmp"
+        printf '{"ts":%s,"ok":true,"error":"","count":0}\n' "$ts" > "$tmp"
         mv -f "$tmp" "$STATE_FILE"
-        return 1
     fi
 
+    rm -rf "$STAGING_DIR" 2>/dev/null || true
     cleanup_old_recordings
 }
 

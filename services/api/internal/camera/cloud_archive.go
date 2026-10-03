@@ -204,6 +204,38 @@ func (c *CloudArchiveClient) ListRecordingMinutesFromCloud(ctx context.Context, 
 		}
 
 		for _, he := range hourEntries {
+			// Fast path for flattened format: <slug>_<HH>_<MM.SS>.mp4 directly under dateStr
+			if !he.IsDir && strings.HasSuffix(he.Name, ".mp4") && strings.HasPrefix(he.Name, slug+"_") {
+				stem := strings.TrimSuffix(strings.TrimPrefix(he.Name, slug+"_"), ".mp4")
+				// stem is like "09_15.32"
+				pParts := strings.SplitN(stem, "_", 2)
+				if len(pParts) == 2 {
+					hVal, errH := strconv.Atoi(pParts[0])
+					subParts := strings.SplitN(pParts[1], ".", 2)
+					if errH == nil && hVal >= 0 && hVal <= 23 && len(subParts) == 2 {
+						minVal, errM := strconv.Atoi(subParts[0])
+						secVal, errS := strconv.Atoi(subParts[1])
+						if errM == nil && errS == nil && minVal >= 0 && minVal <= 59 && secVal >= 0 && secVal <= 59 {
+							hourStart := time.Date(dateStart.Year(), dateStart.Month(),
+								dateStart.Day(), hVal, 0, 0, 0, time.UTC).Unix()
+							segStartUnix := hourStart + int64(minVal)*60 + int64(secVal)
+							if (afterUnix <= 0 || segStartUnix >= afterUnix) && (beforeUnix <= 0 || segStartUnix <= beforeUnix) {
+								minuteStart := (segStartUnix / 60) * 60
+								if !localSet[minuteStart] {
+									b, ok := buckets[minuteStart]
+									if !ok {
+										b = &bucket{startUnix: minuteStart, endUnix: minuteStart + 60, count: 0}
+										buckets[minuteStart] = b
+									}
+									b.count++
+								}
+							}
+						}
+					}
+				}
+				continue
+			}
+
 			if !he.IsDir {
 				continue
 			}
@@ -314,17 +346,30 @@ func (c *CloudArchiveClient) FetchMinuteSegments(ctx context.Context, slug strin
 		return cachedPaths, nil
 	}
 
-	// Query WebDAV for segments in this hour
-	remoteSlugPath := fmt.Sprintf("%s/%s/%s/%s", c.RemotePath, dateStr, hourStr, slug)
-	items, err := c.propfind(ctx, remoteSlugPath)
-	if err != nil {
-		return nil, err
+	// 1. Try flattened WebDAV path: ${c.RemotePath}/${dateStr}/${slug}_${hourStr}_${minStr}.*.mp4
+	remoteDatePath := fmt.Sprintf("%s/%s", c.RemotePath, dateStr)
+	dateItems, _ := c.propfind(ctx, remoteDatePath)
+	var toDownload []WebdavItem
+	flatPrefix := fmt.Sprintf("%s_%s_%s.", slug, hourStr, minStr)
+	useFlat := false
+
+	for _, item := range dateItems {
+		if !item.IsDir && strings.HasPrefix(item.Name, flatPrefix) && strings.HasSuffix(item.Name, ".mp4") {
+			toDownload = append(toDownload, item)
+			useFlat = true
+		}
 	}
 
-	var toDownload []WebdavItem
-	for _, item := range items {
-		if !item.IsDir && strings.HasPrefix(item.Name, minStr+".") && strings.HasSuffix(item.Name, ".mp4") {
-			toDownload = append(toDownload, item)
+	// 2. Fallback to nested path if flattened path has no matching segments
+	remoteSlugPath := fmt.Sprintf("%s/%s/%s/%s", c.RemotePath, dateStr, hourStr, slug)
+	if len(toDownload) == 0 {
+		items, err := c.propfind(ctx, remoteSlugPath)
+		if err == nil {
+			for _, item := range items {
+				if !item.IsDir && strings.HasPrefix(item.Name, minStr+".") && strings.HasSuffix(item.Name, ".mp4") {
+					toDownload = append(toDownload, item)
+				}
+			}
 		}
 	}
 
@@ -334,9 +379,18 @@ func (c *CloudArchiveClient) FetchMinuteSegments(ctx context.Context, slug strin
 
 	var downloadedPaths []string
 	for _, item := range toDownload {
-		dstPath := filepath.Join(cacheHourDir, item.Name)
+		var localName string
+		var downloadURL string
+		if useFlat {
+			// strip prefix "front_door_09_" -> "15.32.mp4"
+			localName = strings.TrimPrefix(item.Name, fmt.Sprintf("%s_%s_", slug, hourStr))
+			downloadURL = fmt.Sprintf("%s/%s/%s", c.BaseURL, remoteDatePath, item.Name)
+		} else {
+			localName = item.Name
+			downloadURL = fmt.Sprintf("%s/%s/%s", c.BaseURL, remoteSlugPath, item.Name)
+		}
+		dstPath := filepath.Join(cacheHourDir, localName)
 		// Download file
-		downloadURL := fmt.Sprintf("%s/%s/%s", c.BaseURL, remoteSlugPath, item.Name)
 		req, err := http.NewRequestWithContext(ctx, "GET", downloadURL, nil)
 		if err != nil {
 			continue

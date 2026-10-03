@@ -553,7 +553,7 @@ services:
     cap_drop:
       - ALL
     volumes:
-      - ./data/frigate/recordings:/recordings:ro
+      - ./data/frigate/recordings:/recordings:rw
       - ./data/backup-state:/state
       - ./deploy/recordings-archive/entrypoint.sh:/entrypoint.sh:ro
     entrypoint: [ "sh", "/entrypoint.sh" ]

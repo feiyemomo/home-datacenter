@@ -2009,57 +2009,23 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 	codec := effectiveCodec(cam)
 	audioOn := cameraHasAudio(cam)
-	stopFrag := "#stop=30"
+	// v1.13.19: Keep RTSP ffmpeg upstream permanently active (#stop=0)
+	// so reconnection never suffers a 2-4s cold-start handshake delay.
+	// Increased async buffer from 1000ms to 3000ms to absorb public network jitter
+	// and prevent video frame drops that freeze the MediaCodec decoder.
+	stopFrag := "#stop=0"
 	if r.StopTimeout > 0 {
 		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
 	}
 	if codec == "passthrough" {
 		if audioOn {
-			// Audio requested but we're on the passthrough path —
-			// the rtsp:// scheme cannot transcode PCMA to AAC/Opus, so
-			// switch to ffmpeg with video=copy (passthrough video)
-			// + audio=opus#audio=aac (transcode audio to Opus for WebRTC
-			// and AAC for HLS). Adds negligible CPU for the audio encoder
-			// while preserving the camera's native video codec (no quality loss).
-			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=1000" + stopFrag
+			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=3000" + stopFrag
 		}
-		// Native path: no ffmpeg, no transcode. Camera
-		// delivers whatever codec it has (H.264 / H.265)
-		// and we hope the consumer supports it. HLS
-		// always works (hls.js transcodes on the fly
-		// via Media Source Extensions for H.265 on
-		// supporting browsers), WebRTC only works for
-		// H.264 in Chrome. The `audio=0` directive
-		// tells go2rtc to drop the camera's PCMA track
-		// from the SDP — go2rtc exposes a PCMU/PCMA
-		// audio track that the browser cannot decode.
 		return raw + "#audio=0" + stopFrag
 	}
-	// Transcode path: route through go2rtc's ffmpeg
-	// pipeline. `video=<codec>` selects a go2rtc ffmpeg
-	// preset (h264: H.264 high@4.1 superfast/zerolatency;
-	// h265: libx265). When audio is enabled we append
-	// `#audio=opus#audio=aac#async=1000` so ffmpeg encodes the camera's PCMA
-	// audio to Opus for WebRTC and AAC for HLS alongside the video transcode.
-	// Without the audio directive, parseArgs injects `-an` so
-	// ffmpeg drops the camera's PCMA track entirely.
-	//
-	// `width=1280` downscales to 720p for h264 (bandwidth
-	// optimization for Cloudflare Tunnel). h265 keeps
-	// native resolution since it's used for high-quality
-	// HLS recording, not live WebRTC.
-	//
-	// `hardware=vaapi` tells go2rtc to use Intel VAAPI for
-	// decoding the camera's native H.265 stream on the GPU
-	// instead of software decoding on CPU. go2rtc expands
-	// this to `-hwaccel vaapi -hwaccel_output_format vaapi`
-	// before the -i flag. Requires /dev/dri mounted in the
-	// Frigate container (see compose.yaml). On hosts without
-	// an Intel GPU, omit this directive to fall back to
-	// software decode.
 	audioFrag := ""
 	if audioOn {
-		audioFrag = "#audio=opus#audio=aac#async=1000"
+		audioFrag = "#audio=opus#audio=aac#async=3000"
 	}
 	if codec == "h265" {
 		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + stopFrag
