@@ -25,6 +25,13 @@ TARGET_HOUR="${SCHEDULE_HOUR:-03}"
 
 log() { echo "[recordings-archive] $(date '+%F %T') $*"; }
 
+# Automatically obscure password for rclone webdav backend
+if echo "$ALIST_PASS" | grep -q '^[a-zA-Z0-9_-]\{20,\}$' 2>/dev/null; then
+    OBSCURED_PASS="$ALIST_PASS"
+else
+    OBSCURED_PASS="$(rclone obscure "$ALIST_PASS" 2>/dev/null || echo "$ALIST_PASS")"
+fi
+
 cleanup_old_recordings() {
     if [ -n "${RETENTION_DAYS:-}" ] && [ "$RETENTION_DAYS" -gt 0 ] 2>/dev/null; then
         log "Lifecycle check: pruning remote recordings older than ${RETENTION_DAYS} days..."
@@ -32,7 +39,7 @@ cleanup_old_recordings() {
             --webdav-url "$ALIST_URL" \
             --webdav-vendor other \
             --webdav-user "$ALIST_USER" \
-            --webdav-pass "$ALIST_PASS" \
+            --webdav-pass "$OBSCURED_PASS" \
             --min-age "${RETENTION_DAYS}d" \
             --config /dev/null \
             --verbose 2>&1 || true
@@ -41,7 +48,7 @@ cleanup_old_recordings() {
             --webdav-url "$ALIST_URL" \
             --webdav-vendor other \
             --webdav-user "$ALIST_USER" \
-            --webdav-pass "$ALIST_PASS" \
+            --webdav-pass "$OBSCURED_PASS" \
             --leave-root \
             --config /dev/null 2>/dev/null || true
         log "Lifecycle pruning completed."
@@ -49,14 +56,15 @@ cleanup_old_recordings() {
 }
 
 archive_once() {
-    log "Starting daily archive of recordings older than ${MIN_AGE} to ${REMOTE_PATH}..."
+    log "Starting archive of recordings older than ${MIN_AGE} to ${REMOTE_PATH}..."
     ts="$(date +%s)"
     
     if rclone copy "$SOURCE_DIR" ":webdav:${REMOTE_PATH}" \
         --webdav-url "$ALIST_URL" \
         --webdav-vendor other \
         --webdav-user "$ALIST_USER" \
-        --webdav-pass "$ALIST_PASS" \
+        --webdav-pass "$OBSCURED_PASS" \
+        --include "*.mp4" \
         --min-age "$MIN_AGE" \
         --transfers 2 \
         --checkers 4 \
