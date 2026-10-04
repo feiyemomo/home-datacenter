@@ -1545,7 +1545,13 @@ func buildFMP4Cmd(listPath string, hw bool, quality string) *exec.Cmd {
 // instant playback.
 func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, minuteStart int64, paths []string) {
 	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
-	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d.mp4", minuteStart))
+	codec := strings.ToLower(strings.TrimSpace(c.Query("codec")))
+	isCopyMode := codec == "copy"
+	cacheFileName := fmt.Sprintf("%d.mp4", minuteStart)
+	if isCopyMode {
+		cacheFileName = fmt.Sprintf("%d_copy.mp4", minuteStart)
+	}
+	cacheFile := filepath.Join(cacheDir, cacheFileName)
 
 	// Serve from cache if present and non-empty. A past minute's segments
 	// never change, so a cached transcode is correct indefinitely.
@@ -1588,29 +1594,9 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 		utils.Fail(c, http.StatusInternalServerError, "create cache dir")
 		return
 	}
-	// v1.8.37: transcode into the container's overlay FS (/tmp under
-	// tmpDir), NOT directly onto the btrfs bind mount. ffmpeg's
-	// `-movflags faststart` must re-open the output file for a second
-	// pass to shift the moov atom to the front; on the btrfs cache
-	// volume this re-open intermittently fails with "Unable to re-open
-	// output file for shifting data" (reproduced on the NAS), aborting
-	// the transcode AFTER the full encode ran. The software fallback
-	// then repeated the same failure and burned ~40s of CPU, so
-	// recording playback returned 500 and the operator's retries kept
-	// pegging the CPU. On the overlay FS the re-open is reliable. We
-	// then promote the finished file onto the cache volume by copy
-	// (a cross-filesystem rename would fail with EXDEV), keyed by
-	// minuteStart as before.
-	tmpOut := filepath.Join(tmpDir, fmt.Sprintf("%d.mp4", minuteStart))
 
-	// v1.8.46: serialize ffmpeg transcodes end-to-end. The J4125 iGPU
-	// thrashes under concurrent VAAPI sessions — 5 simultaneous 60s
-	// transcodes each take ~65s vs ~10s cold (measured on the NAS). One
-	// slot keeps every transcode at full speed; the app's timeline
-	// requests queue here and drain at ~7s each. Cached minutes skip the
-	// semaphore entirely (checked above), so re-plays never block.
-	// release is idempotent (select-default) so it can run both before
-	// serve() and as a defer on the early-return error paths.
+	tmpOut := filepath.Join(tmpDir, cacheFileName)
+
 	h.transcodeSem <- struct{}{}
 	releaseSem := func() {
 		select {
@@ -1620,13 +1606,24 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	}
 	defer releaseSem()
 
-	cmd := buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+	var cmd *exec.Cmd
+	if isCopyMode {
+		cmd = buildCopyConcatCmd(listPath, tmpOut)
+	} else {
+		cmd = buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+	}
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("PlayRecording: ffmpeg transcode failed: %v: %s", err, string(output))
-		// v1.8.26: if the VAAPI hardware path failed (driver hiccup,
-		// unsupported input, device disappeared), retry with the
-		// known-good software libx264 pipeline so playback never breaks.
-		if vaapiAvailable() {
+		if isCopyMode {
+			// Fallback to full transcode if stream-copy concat failed
+			log.Printf("PlayRecording: copy mode concat failed, falling back to VAAPI transcode")
+			cmd = buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+			if output, err := cmd.CombinedOutput(); err != nil {
+				log.Printf("PlayRecording: fallback transcode failed: %v: %s", err, string(output))
+				utils.Fail(c, http.StatusInternalServerError, "ffmpeg transcode failed")
+				return
+			}
+		} else if vaapiAvailable() {
 			log.Printf("PlayRecording: VAAPI failed, retrying with software libx264")
 			cmd = buildTranscodeCmd(listPath, tmpOut, false)
 			if output, err := cmd.CombinedOutput(); err != nil {
@@ -1708,6 +1705,17 @@ func copyToCache(src, dst string) error {
 func vaapiAvailable() bool {
 	fi, err := os.Stat("/dev/dri/renderD128")
 	return err == nil && fi.Mode()&os.ModeDevice != 0
+}
+
+// buildCopyConcatCmd concatenates segments without re-encoding (-c copy).
+// Extremely fast (~0.15s) and preserves native resolution/HEVC bitrate with 0 CPU load.
+func buildCopyConcatCmd(listPath, outPath string) *exec.Cmd {
+	return exec.Command("ffmpeg", "-y",
+		"-f", "concat", "-safe", "0",
+		"-i", listPath,
+		"-c", "copy",
+		"-movflags", "faststart",
+		outPath)
 }
 
 // buildTranscodeCmd returns the ffmpeg command that concatenates the

@@ -21,7 +21,7 @@ logger = logging.getLogger("keepalive")
 
 H3C_USERNAME = os.environ.get("H3C_USERNAME", "momo324")
 H3C_PASSWORD = os.environ.get("H3C_PASSWORD", "@Momo324")
-H3C_APP_NAMES = [a.strip() for a in os.environ.get("H3C_APP_NAMES", os.environ.get("H3C_APP_NAME", "home,webrtc_test")).split(",") if a.strip()]
+H3C_APP_NAMES = [a.strip() for a in os.environ.get("H3C_APP_NAMES", os.environ.get("H3C_APP_NAME", "home,webrtc_test,nas_ssh")).split(",") if a.strip()]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 MIN_REMAINING_MINUTES = int(os.environ.get("MIN_REMAINING_MINUTES", "25"))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8087"))
@@ -216,6 +216,13 @@ def run_check(force_renew=False):
                 except Exception as ex:
                     logger.warning(f"Failed to write webrtc_url.txt: {ex}")
                 sync_webrtc_to_frigate(res.get("externalAddr"))
+            if app == "nas_ssh" and res.get("externalAddr"):
+                try:
+                    os.makedirs(DATA_DIR, exist_ok=True)
+                    with open(os.path.join(DATA_DIR, "ssh_url.txt"), "w", encoding="utf-8") as f:
+                        f.write(res.get("externalAddr"))
+                except Exception as ex:
+                    logger.warning(f"Failed to write ssh_url.txt: {ex}")
         except Exception as e:
             logger.error(f"Error during tunnel check for '{app}': {e}", exc_info=True)
             results[app] = {"status": "error", "error": str(e)}
