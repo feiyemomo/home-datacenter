@@ -605,10 +605,23 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 	// disabled).
 	user, pass, err := r.DecryptCredentials(&cam)
 	if err == nil {
-		rtspURL := r.rtspURL(&cam, user, pass)
-		_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
-		r.add1080pStream(ctx, &cam, user, pass)
-		r.addHEVCStream(ctx, &cam, user, pass)
+		if r.Go2 != nil {
+			_ = r.Go2.RemoveStream(ctx, cam.StreamName)
+			_ = r.Go2.RemoveStream(ctx, cam.StreamName+"_1080p")
+			_ = r.Go2.RemoveStream(ctx, hevcStreamName(cam.StreamName))
+			rtspURL := r.rtspURL(&cam, user, pass)
+			if cameraHasTwoWayAudio(&cam) {
+				_ = r.Go2.AddStreamSources(ctx, cam.StreamName, []string{
+					rtspURL,
+					r.rtspBackchannelURL(&cam, user, pass),
+				})
+			} else {
+				_ = r.Go2.AddStream(ctx, cam.StreamName, rtspURL)
+			}
+			r.add1080pStream(ctx, &cam, user, pass)
+			r.addHEVCStream(ctx, &cam, user, pass)
+		}
+		go SetCameraMicEnabled(ctx, cam.Host, cam.ONVIFPort, user, pass, enabled)
 	}
 	return nil
 }
@@ -1893,15 +1906,27 @@ func cameraIsNativeHEVC(cam *model.Camera) bool {
 func (r *Registry) rtsp1080pURL(cam *model.Camera, user, pass string) string {
 	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
 		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
-	stopFrag := "#stop=30"
+	stopFrag := "#stop=0"
 	if r.StopTimeout > 0 {
 		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
 	}
+	audioOn := cameraHasAudio(cam)
 	audioFrag := ""
-	if cameraHasAudio(cam) {
-		audioFrag = "#audio=opus#audio=aac#async=1000"
+	if audioOn {
+		audioFrag = "#audio=opus#audio=aac#async=3000"
 	}
-	return "ffmpeg:" + raw + "#video=h264#width=1920#hardware=vaapi" + audioFrag + stopFrag
+	codec := effectiveCodec(cam)
+	// If the camera is on passthrough (native H.264), pass video through untouched with #video=copy.
+	// This uses ZERO GPU/CPU transcoding, avoids J4125 bottleneck, and provides buttery-smooth 1080p stream!
+	if codec == "passthrough" {
+		if audioOn {
+			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=3000" + stopFrag
+		}
+		return raw + "#audio=0" + stopFrag
+	}
+	// For cameras requiring H.264 transcoding (native HEVC sources):
+	// v1.13.30: async=3000 absorbs network jitter to eliminate stuttering, stop=0 avoids cold-start delay
+	return "ffmpeg:" + raw + "#video=h264#width=1920#hardware=vaapi#async=3000" + audioFrag + stopFrag
 }
 
 // add1080pStream registers the camera's 1080p H.264 stream (<name>_1080p).
@@ -1911,7 +1936,16 @@ func (r *Registry) add1080pStream(ctx context.Context, cam *model.Camera, user, 
 	}
 	streamName := cam.StreamName + "_1080p"
 	streamURL := r.rtsp1080pURL(cam, user, pass)
-	if err := r.Go2.AddStream(ctx, streamName, streamURL); err != nil {
+	var err error
+	if cameraHasTwoWayAudio(cam) {
+		err = r.Go2.AddStreamSources(ctx, streamName, []string{
+			streamURL,
+			r.rtspBackchannelURL(cam, user, pass),
+		})
+	} else {
+		err = r.Go2.AddStream(ctx, streamName, streamURL)
+	}
+	if err != nil {
 		log.Printf("camera: add 1080p stream %q (non-fatal): %v", streamName, err)
 	}
 }

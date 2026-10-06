@@ -111,6 +111,38 @@ func (c *Go2RTCClient) AddStream(ctx context.Context, name, rtspURL string) erro
 	return fmt.Errorf("go2rtc add stream: %s", resp.Status)
 }
 
+// AddStreamSources registers a stream with multiple sources (e.g. video + two-way backchannel).
+func (c *Go2RTCClient) AddStreamSources(ctx context.Context, name string, sources []string) error {
+	if len(sources) == 0 {
+		return nil
+	}
+	if len(sources) == 1 {
+		return c.AddStream(ctx, name, sources[0])
+	}
+	v := url.Values{}
+	v.Set("name", name)
+	for _, s := range sources {
+		v.Add("src", s)
+	}
+	u := fmt.Sprintf("%s/api/streams?%s", c.Base, v.Encode())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 300 {
+		return nil
+	}
+	if c.streamExists(ctx, name) {
+		return nil
+	}
+	return fmt.Errorf("go2rtc add stream sources: %s", resp.Status)
+}
+
 // streamExists checks whether a stream with the given name is
 // registered in go2rtc's in-memory state via GET /api/streams.
 func (c *Go2RTCClient) streamExists(ctx context.Context, name string) bool {

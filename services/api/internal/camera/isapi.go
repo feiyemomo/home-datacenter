@@ -153,3 +153,81 @@ func randomHex(n int) string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// SetCameraMicEnabled attempts to enable or disable the onboard microphone (audio pickup)
+// on Hikvision or compatible ISAPI cameras via hardware REST calls.
+func SetCameraMicEnabled(ctx context.Context, host string, port int, user, pass string, enabled bool) {
+	if host == "" || user == "" {
+		return
+	}
+	if port <= 0 {
+		port = 80
+	}
+
+	vol := 100
+	if !enabled {
+		vol = 0
+	}
+
+	endpoints := []struct {
+		path string
+		body string
+	}{
+		{
+			path: "/ISAPI/System/Audio/channels/1",
+			body: fmt.Sprintf(`<AudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><enabled>%t</enabled><audioInputVolume>%d</audioInputVolume></AudioChannel>`, enabled, vol),
+		},
+		{
+			path: "/ISAPI/Streaming/channels/101/audio",
+			body: fmt.Sprintf(`<AudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><enabled>%t</enabled></AudioChannel>`, enabled),
+		},
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+
+	for _, ep := range endpoints {
+		urlStr := fmt.Sprintf("http://%s:%d%s", host, port, ep.path)
+		go func(targetURL, reqBody, path string) {
+			reqCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			req, err := http.NewRequestWithContext(reqCtx, http.MethodPut, targetURL, strings.NewReader(reqBody))
+			if err != nil {
+				return
+			}
+			req.Header.Set("Content-Type", "application/xml")
+			req.SetBasicAuth(user, pass)
+			resp, err := client.Do(req)
+			if err != nil {
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusNoContent {
+				log.Printf("isapi: camera %s:%d %s micEnabled set to %t (HTTP %d)", host, port, path, enabled, resp.StatusCode)
+				return
+			}
+
+			if resp.StatusCode == http.StatusUnauthorized {
+				authHeader := resp.Header.Get("WWW-Authenticate")
+				if strings.HasPrefix(strings.ToLower(authHeader), "digest ") {
+					digestHeader := buildDigestAuthHeader(http.MethodPut, path, user, pass, authHeader)
+					if digestHeader != "" {
+						req2, err := http.NewRequestWithContext(reqCtx, http.MethodPut, targetURL, strings.NewReader(reqBody))
+						if err == nil {
+							req2.Header.Set("Content-Type", "application/xml")
+							req2.Header.Set("Authorization", digestHeader)
+							resp2, err := client.Do(req2)
+							if err == nil {
+								defer resp2.Body.Close()
+								if resp2.StatusCode == http.StatusOK || resp2.StatusCode == http.StatusNoContent {
+									log.Printf("isapi: camera %s:%d %s micEnabled set to %t via Digest (HTTP %d)", host, port, path, enabled, resp2.StatusCode)
+								}
+							}
+						}
+					}
+				}
+			}
+		}(urlStr, ep.body, ep.path)
+	}
+}
