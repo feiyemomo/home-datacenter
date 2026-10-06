@@ -623,6 +623,11 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 		}
 		go SetCameraMicEnabled(ctx, cam.Host, cam.ONVIFPort, user, pass, enabled)
 	}
+	if r.Frigate != nil {
+		if err := r.pushFrigateConfig(ctx); err != nil {
+			log.Printf("camera: update audio: push frigate config (non-fatal): %v", err)
+		}
+	}
 	return nil
 }
 
@@ -792,11 +797,18 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
 			detectEnabled = false
 		}
+		recordOutputArgs := "preset-record-generic-audio-aac"
+		if !cameraHasAudio(&c) {
+			recordOutputArgs = "preset-record-generic"
+		}
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: c.Status != "offline",
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: r.frigateInputs(&c, u, p),
+				OutputArgs: map[string]string{
+					"record": recordOutputArgs,
+				},
 			},
 			Detect: FrigateDetect{Enabled: detectEnabled, FPS: CameraDetectFPS(&c)},
 			Record: FrigateRecord{Enabled: recEnabled && c.Status != "offline"},
@@ -1516,11 +1528,18 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
 			detectEnabled = false
 		}
+		recordOutputArgs := "preset-record-generic-audio-aac"
+		if !cameraHasAudio(&c) {
+			recordOutputArgs = "preset-record-generic"
+		}
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: camEnabled,
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: r.frigateInputs(&c, u, p),
+				OutputArgs: map[string]string{
+					"record": recordOutputArgs,
+				},
 			},
 			Detect: FrigateDetect{Enabled: detectEnabled, FPS: CameraDetectFPS(&c)},
 			Record: FrigateRecord{Enabled: camEnabled},
@@ -1995,12 +2014,12 @@ func (r *Registry) preheatHEVCStream(cam *model.Camera) {
 	}(hevcStreamName(cam.StreamName))
 }
 
-// cameraHasAudio reports whether the camera was registered with
-// audio capability. The flag is stored as a generic JSON value in
-// Capabilities, so we tolerate bool / numeric / string forms
+// CameraHasAudio reports whether the camera was registered with
+// audio capability (microphone pickup enabled). The flag is stored as
+// a generic JSON value in Capabilities, so we tolerate bool / numeric / string forms
 // defensively (any non-empty truthy value counts).
-func cameraHasAudio(cam *model.Camera) bool {
-	if cam.Capabilities == nil {
+func CameraHasAudio(cam *model.Camera) bool {
+	if cam == nil || cam.Capabilities == nil {
 		return false
 	}
 	v, ok := cam.Capabilities["audio"]
@@ -2018,6 +2037,10 @@ func cameraHasAudio(cam *model.Camera) bool {
 		return t != "" && t != "false" && t != "0"
 	}
 	return false
+}
+
+func cameraHasAudio(cam *model.Camera) bool {
+	return CameraHasAudio(cam)
 }
 
 // cameraHasTwoWayAudio reports whether the camera was registered with

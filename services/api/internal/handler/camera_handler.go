@@ -1543,9 +1543,17 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
 	codec := strings.ToLower(strings.TrimSpace(c.Query("codec")))
 	isCopyMode := codec == "copy"
+	audioOn := camera.CameraHasAudio(cam)
 	cacheFileName := fmt.Sprintf("%d.mp4", minuteStart)
 	if isCopyMode {
 		cacheFileName = fmt.Sprintf("%d_copy.mp4", minuteStart)
+	}
+	if !audioOn {
+		if isCopyMode {
+			cacheFileName = fmt.Sprintf("%d_copy_noaudio.mp4", minuteStart)
+		} else {
+			cacheFileName = fmt.Sprintf("%d_noaudio.mp4", minuteStart)
+		}
 	}
 	cacheFile := filepath.Join(cacheDir, cacheFileName)
 
@@ -1604,16 +1612,16 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 
 	var cmd *exec.Cmd
 	if isCopyMode {
-		cmd = buildCopyConcatCmd(listPath, tmpOut)
+		cmd = buildCopyConcatCmd(listPath, tmpOut, audioOn)
 	} else {
-		cmd = buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+		cmd = buildTranscodeCmd(listPath, tmpOut, vaapiAvailable(), audioOn)
 	}
 	if output, err := cmd.CombinedOutput(); err != nil {
 		log.Printf("PlayRecording: ffmpeg transcode failed: %v: %s", err, string(output))
 		if isCopyMode {
 			// Fallback to full transcode if stream-copy concat failed
 			log.Printf("PlayRecording: copy mode concat failed, falling back to VAAPI transcode")
-			cmd = buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+			cmd = buildTranscodeCmd(listPath, tmpOut, vaapiAvailable(), audioOn)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				log.Printf("PlayRecording: fallback transcode failed: %v: %s", err, string(output))
 				utils.Fail(c, http.StatusInternalServerError, "ffmpeg transcode failed")
@@ -1621,7 +1629,7 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 			}
 		} else if vaapiAvailable() {
 			log.Printf("PlayRecording: VAAPI failed, retrying with software libx264")
-			cmd = buildTranscodeCmd(listPath, tmpOut, false)
+			cmd = buildTranscodeCmd(listPath, tmpOut, false, audioOn)
 			if output, err := cmd.CombinedOutput(); err != nil {
 				log.Printf("PlayRecording: ffmpeg software transcode failed: %v: %s", err, string(output))
 				utils.Fail(c, http.StatusInternalServerError, "ffmpeg transcode failed")
@@ -1705,13 +1713,15 @@ func vaapiAvailable() bool {
 
 // buildCopyConcatCmd concatenates segments without re-encoding (-c copy).
 // Extremely fast (~0.15s) and preserves native resolution/HEVC bitrate with 0 CPU load.
-func buildCopyConcatCmd(listPath, outPath string) *exec.Cmd {
-	return exec.Command("ffmpeg", "-y",
-		"-f", "concat", "-safe", "0",
-		"-i", listPath,
-		"-c", "copy",
-		"-movflags", "faststart",
-		outPath)
+func buildCopyConcatCmd(listPath, outPath string, audioOn bool) *exec.Cmd {
+	args := []string{"-y", "-f", "concat", "-safe", "0", "-i", listPath}
+	if audioOn {
+		args = append(args, "-c", "copy")
+	} else {
+		args = append(args, "-c:v", "copy", "-an")
+	}
+	args = append(args, "-movflags", "faststart", outPath)
+	return exec.Command("ffmpeg", args...)
 }
 
 // buildTranscodeCmd returns the ffmpeg command that concatenates the
@@ -1719,7 +1729,11 @@ func buildCopyConcatCmd(listPath, outPath string) *exec.Cmd {
 // is true it uses the VAAPI hardware pipeline (h264_vaapi); otherwise
 // the software libx264 pipeline. Both produce browser-compatible
 // output; hardware is ~10x faster on the J4125 iGPU.
-func buildTranscodeCmd(listPath, outPath string, hw bool) *exec.Cmd {
+func buildTranscodeCmd(listPath, outPath string, hw bool, audioOn bool) *exec.Cmd {
+	audioArgs := []string{"-c:a", "aac", "-b:a", "96k"}
+	if !audioOn {
+		audioArgs = []string{"-an"}
+	}
 	// v1.8.46: cap the encode at 1280x720 (downscale only, aspect kept).
 	// Recordings are monitored in a small player where 1440p is wasted;
 	// halving pixels cuts both decode and encode work, trimming a tmp
@@ -1732,7 +1746,8 @@ func buildTranscodeCmd(listPath, outPath string, hw bool) *exec.Cmd {
 		// concat segment on the iGPU and hands VAAPI surfaces straight
 		// to h264_vaapi, avoiding a GPU→RAM→GPU round trip. -qp 24 is
 		// the VAAPI equivalent of a CRF around 23-24.
-		return exec.Command("ffmpeg", "-y",
+		args := []string{
+			"-y",
 			"-vaapi_device", "/dev/dri/renderD128",
 			"-hwaccel", "vaapi",
 			"-hwaccel_output_format", "vaapi",
@@ -1740,22 +1755,21 @@ func buildTranscodeCmd(listPath, outPath string, hw bool) *exec.Cmd {
 			"-i", listPath,
 			"-vf", "scale_vaapi=w=min(1280\\,iw):h=min(720\\,ih):force_original_aspect_ratio=decrease",
 			"-c:v", "h264_vaapi", "-qp", "24",
-			"-c:a", "aac", "-b:a", "96k",
-			"-fflags", "+genpts",
-			"-avoid_negative_ts", "make_zero",
-			"-movflags", "faststart",
-			outPath)
+		}
+		args = append(args, audioArgs...)
+		args = append(args, "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-movflags", "faststart", outPath)
+		return exec.Command("ffmpeg", args...)
 	}
-	return exec.Command("ffmpeg", "-y",
+	args := []string{
+		"-y",
 		"-f", "concat", "-safe", "0",
 		"-i", listPath,
 		"-vf", "scale=min(1280\\,iw):min(720\\,ih):force_original_aspect_ratio=decrease",
 		"-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
-		"-c:a", "aac", "-b:a", "96k",
-		"-fflags", "+genpts",
-		"-avoid_negative_ts", "make_zero",
-		"-movflags", "faststart",
-		outPath)
+	}
+	args = append(args, audioArgs...)
+	args = append(args, "-fflags", "+genpts", "-avoid_negative_ts", "make_zero", "-movflags", "faststart", outPath)
+	return exec.Command("ffmpeg", args...)
 }
 
 // StartCacheCleaner launches a background goroutine that periodically
@@ -1809,7 +1823,12 @@ func cleanTranscodeCache(root string, maxAge time.Duration) {
 // in the background if it is not already cached.
 func (h *CameraHandler) PretranscodeMinute(cam *model.Camera, minuteStart int64) error {
 	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
-	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d.mp4", minuteStart))
+	audioOn := camera.CameraHasAudio(cam)
+	cacheFileName := fmt.Sprintf("%d.mp4", minuteStart)
+	if !audioOn {
+		cacheFileName = fmt.Sprintf("%d_noaudio.mp4", minuteStart)
+	}
+	cacheFile := filepath.Join(cacheDir, cacheFileName)
 
 	// Serve/skip from cache if present and non-empty.
 	if fi, err := os.Stat(cacheFile); err == nil && fi.Size() > 0 {
@@ -1846,7 +1865,7 @@ func (h *CameraHandler) PretranscodeMinute(cam *model.Camera, minuteStart int64)
 	if err := os.MkdirAll(cacheDir, 0o755); err != nil {
 		return fmt.Errorf("create cache dir: %w", err)
 	}
-	tmpOut := filepath.Join(tmpDir, fmt.Sprintf("%d.mp4", minuteStart))
+	tmpOut := filepath.Join(tmpDir, cacheFileName)
 
 	// Serialize transcode through the global transcode slot
 	h.transcodeSem <- struct{}{}
@@ -1857,10 +1876,10 @@ func (h *CameraHandler) PretranscodeMinute(cam *model.Camera, minuteStart int64)
 		}
 	}()
 
-	cmd := buildTranscodeCmd(listPath, tmpOut, vaapiAvailable())
+	cmd := buildTranscodeCmd(listPath, tmpOut, vaapiAvailable(), audioOn)
 	if output, err := cmd.CombinedOutput(); err != nil {
 		if vaapiAvailable() {
-			cmd = buildTranscodeCmd(listPath, tmpOut, false)
+			cmd = buildTranscodeCmd(listPath, tmpOut, false, audioOn)
 			if out2, err2 := cmd.CombinedOutput(); err2 != nil {
 				return fmt.Errorf("software transcode failed: %v (%s)", err2, string(out2))
 			}

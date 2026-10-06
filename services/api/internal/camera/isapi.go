@@ -174,6 +174,10 @@ func SetCameraMicEnabled(ctx context.Context, host string, port int, user, pass 
 		body string
 	}{
 		{
+			path: "/ISAPI/System/TwoWayAudio/channels/1",
+			body: fmt.Sprintf(`<TwoWayAudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><micVolume>%d</micVolume></TwoWayAudioChannel>`, vol),
+		},
+		{
 			path: "/ISAPI/System/Audio/channels/1",
 			body: fmt.Sprintf(`<AudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><enabled>%t</enabled><audioInputVolume>%d</audioInputVolume></AudioChannel>`, enabled, vol),
 		},

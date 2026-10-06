@@ -243,7 +243,8 @@ type FrigateCameraConfig struct {
 }
 
 type FrigateFfmpeg struct {
-	Inputs []FrigateInput `yaml:"inputs" json:"inputs"`
+	Inputs     []FrigateInput    `yaml:"inputs" json:"inputs"`
+	OutputArgs map[string]string `yaml:"output_args,omitempty" json:"output_args,omitempty"`
 }
 
 type FrigateInput struct {
