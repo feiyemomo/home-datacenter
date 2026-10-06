@@ -560,6 +560,7 @@ func main() {
 			// No auth is required to *call* /auth/verify — you just
 			// need a valid bearer token in the Authorization header.
 			auth.GET("/verify", authHandler.Verify)
+			auth.POST("/verify", authHandler.Verify)
 			// POST /auth/logout clears the home_token cookie server-side.
 			// The cookie is HttpOnly so JS cannot delete it — the
 			// frontend must call this endpoint to expire it properly.

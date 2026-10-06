@@ -1192,13 +1192,18 @@ func (h *CameraHandler) StreamMP4(c *gin.Context) {
 		return
 	}
 
+	targetStream := cam.StreamName
+	if c.Query("quality") == "1080p" {
+		targetStream = targetStream + "_1080p"
+	}
+
 	// Use the request's context so the upstream connection is
 	// cancelled when the client disconnects (ExoPlayer stops, the
 	// user navigates away, etc.) — without this go2rtc would keep
 	// the RTSP source connection alive indefinitely.
-	body, contentType, err := h.Reg.Go2.StreamMP4(c.Request.Context(), cam.StreamName)
+	body, contentType, err := h.Reg.Go2.StreamMP4(c.Request.Context(), targetStream)
 	if err != nil {
-		log.Printf("[handler] failed to open stream: %v", err)
+		log.Printf("[handler] failed to open stream for %s: %v", targetStream, err)
 		utils.Fail(c, http.StatusBadGateway, "failed to open stream")
 		return
 	}

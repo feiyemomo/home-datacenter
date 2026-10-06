@@ -73,12 +73,27 @@ def docker_exec_frigate(cmd):
         logger.warning(f"docker_exec_frigate failed for {cmd}: {e}")
         return None
 
+def check_addr_reachable(addr):
+    if not addr:
+        return False
+    clean = addr.replace("http://", "").replace("https://", "").strip("/")
+    if ":" not in clean:
+        return False
+    try:
+        host, port_str = clean.split(":")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(3.0)
+        s.connect((host, int(port_str)))
+        s.close()
+        return True
+    except Exception as e:
+        logger.warning(f"Reachability check for {addr} failed: {e}")
+        return False
+
 last_synced_webrtc_addr = None
 
 def sync_webrtc_to_frigate(external_addr):
     global last_synced_webrtc_addr
-    if not external_addr or external_addr == last_synced_webrtc_addr:
-        return
     try:
         req = urllib.request.Request(f"{FRIGATE_URL}/api/config")
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -90,11 +105,15 @@ def sync_webrtc_to_frigate(external_addr):
             if c.startswith("154.8.195.220:"):
                 continue
             new_candidates.append(c)
-        if external_addr not in new_candidates:
+        if external_addr and external_addr not in new_candidates:
             new_candidates.append(external_addr)
         
         if "127.0.0.1:8555" not in new_candidates:
             new_candidates.insert(0, "127.0.0.1:8555")
+        if "192.168.31.235:8555" not in new_candidates:
+            new_candidates.append("192.168.31.235:8555")
+        if "192.168.31.234:8555" not in new_candidates:
+            new_candidates.append("192.168.31.234:8555")
         if "stun:8555" not in new_candidates:
             new_candidates.append("stun:8555")
 
@@ -204,6 +223,10 @@ def run_check(force_renew=False):
         try:
             logger.info(f"Checking H3C tunnel status for '{app}' (force_renew={force_renew})...")
             res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=min_min)
+            if res.get("externalAddr") and not force_renew:
+                if not check_addr_reachable(res.get("externalAddr")):
+                    logger.warning(f"Tunnel '{app}' ({res.get('externalAddr')}) is unreachable via TCP! Forcing recreation...")
+                    res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=180)
             results[app] = res
             logger.info(f"Active tunnel URL for '{app}': {res.get('externalAddr')} (expires {res.get('closeTime')}, remaining {res.get('remainingMinutes', 0):.1f}m)")
             if app == "home" or primary_res is None:
