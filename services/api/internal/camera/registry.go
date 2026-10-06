@@ -634,9 +634,21 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 		go SetCameraMicEnabled(context.WithoutCancel(ctx), cam.Host, cam.ONVIFPort, user, pass, enabled, cam.ChannelID)
 	}
 	if r.Frigate != nil {
-		if err := r.pushFrigateConfig(ctx); err != nil {
-			log.Printf("camera: update audio: push frigate config (non-fatal): %v", err)
-		}
+		// Run the Frigate push (config set + restart, with up to 3
+		// attempts and 2s/4s backoff) in the background. It routinely
+		// outlives the server's 15s WriteTimeout, which used to hand
+		// the app a spurious "拾音切换失败" even though the change
+		// had been applied. The camera mic and the go2rtc streams are
+		// already updated above, so the recording preset catching up a
+		// few seconds later is fine — and anything still muxed into a
+		// segment is silent at the source either way.
+		go func() {
+			rctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
+			if err := r.pushFrigateConfig(rctx); err != nil {
+				log.Printf("camera: update audio: push frigate config (non-fatal): %v", err)
+			}
+		}()
 	}
 	return nil
 }
