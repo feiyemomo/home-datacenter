@@ -758,6 +758,8 @@ func main() {
 			camGroup.POST(":id/shares", camHandler.ShareCamera)
 			camGroup.DELETE(":id/shares/:user_id", camHandler.UnshareCamera)
 			camGroup.GET(":id/shares", camHandler.ListShares)
+			// Audio toggle (pickup on/off) is accessible to all authorized camera users
+			camGroup.PUT(":id/audio", camHandler.UpdateAudio)
 			// Mutating endpoints are admin-only.
 			adminCam := camGroup.Group("")
 			adminCam.Use(middleware.RequireAdmin(database.DB))
@@ -769,7 +771,6 @@ func main() {
 				adminCam.POST(":id/preset/:alias", camHandler.GotoPreset)
 				adminCam.PUT(":id/recording", camHandler.SetRecordingPlan)
 				adminCam.PUT(":id/codec", camHandler.UpdateCodec)
-				adminCam.PUT(":id/audio", camHandler.UpdateAudio)
 				adminCam.PUT(":id/detect-fps", camHandler.UpdateDetectFPS)
 				adminCam.DELETE(":id/recordings/:recId", camHandler.DeleteRecording)
 			}

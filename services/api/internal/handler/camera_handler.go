@@ -441,15 +441,11 @@ func (h *CameraHandler) UpdateCodec(c *gin.Context) {
 // the audio track at the source (saves bandwidth). Re-pushes the
 // go2rtc stream so the change is live immediately.
 func (h *CameraHandler) UpdateAudio(c *gin.Context) {
-	if _, isAdmin, ok := h.callerIsAdmin(c); !ok || !isAdmin {
-		utils.Fail(c, http.StatusForbidden, "admin only")
+	cam, ok := h.requireCanRead(c)
+	if !ok {
 		return
 	}
-	id, err := strconv.Atoi(c.Param("id"))
-	if err != nil {
-		utils.Fail(c, http.StatusBadRequest, "invalid id")
-		return
-	}
+	id := int(cam.ID)
 	var body struct {
 		Enabled bool `json:"enabled"`
 	}
