@@ -1339,6 +1339,14 @@ func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minut
 	if quality == "1080p" {
 		cacheSuffix = "_1080p"
 	}
+	// v1.14.x: include the audio state in the cache key. The transcode
+	// below drops the audio track when pickup is disabled, but a cache
+	// entry produced while audio was still enabled would otherwise be
+	// replayed after the user turned pickup off — the "I disabled
+	// pickup but playback still has sound" report.
+	if !camera.CameraHasAudio(cam) {
+		cacheSuffix += "_noaudio"
+	}
 	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d%s.fmp4", minuteStart, cacheSuffix))
 	// Cache hit: serve the fragmented MP4 directly (http.ServeFile gives
 	// Content-Length + Range, which the MSE client tolerates fine).

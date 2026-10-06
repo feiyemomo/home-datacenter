@@ -2,6 +2,44 @@
 
 ## 更新日志
 
+### 摄像头拾音开关真正切断录音（ISAPI 通道级写入 + 录像预设联动）(2026-10-06)
+
+> **背景**：App 里关闭「摄像头拾音」后，回放该时间段的录像仍然能听到完整声音。
+> 排查发现两层都没生效：① 服务端用于关麦的 ISAPI 写入打在了固件根本不接受的端点上，
+> 摄像头麦克风一直开着；② NAS 上运行的 API 镜像比源码落后若干提交，录像侧
+> 「关闭拾音即去掉录音音轨」的逻辑压根没部署。两层叠加就是「关了拾音照样有声音」。
+
+**摄像头麦克风真正关闭**（`services/api/internal/camera/isapi.go`）：
+- **写入路径改为整文档读改写**：实测海康 DS-2CD 固件上 `PUT /ISAPI/Streaming/channels/101/audio`
+  与 `PUT /ISAPI/System/Audio/channels/1` 均返回 403 `Invalid Operation`（部分机型直接 404），
+  旧实现三个端点全被拒绝却静默返回，麦克风从未被关闭。
+  新实现先 `GET /ISAPI/Streaming/channels/<id>` 取整份 `<StreamingChannel>` 文档，
+  只改写 `<Audio><enabled>` 节点后整份 PUT 回去，返回 `<statusCode>1</statusCode>` 即生效。
+- **覆盖全部码流通道**：自动枚举 `/ISAPI/Streaming/channels`，对主码流（101）与子码流（102）
+  同时改写，避免直播走子码流时仍有声音。
+- **实测验证**：关闭后 RTSP 流的 `pcm_alaw` 音轨立即消失（ffprobe 只剩 `hevc` 视频轨），
+  重新开启后音轨恢复。
+
+**录像音轨随拾音开关联动**（`registry.go` / `frigate.go` / `camera_handler.go`）：
+- `UpdateAudio` 现在同时完成四件事：写 `capabilities.audio`、关/开摄像头麦克风、
+  重建 go2rtc 直播流（含 `_1080p` 与 `_hevc` 伴生流）、并把 Frigate 的
+  `ffmpeg.output_args.record` 切到 `preset-record-generic`（`-an`，录音无音轨）
+  或 `preset-record-generic-audio-aac`（AAC 音轨），带 `requires_restart` 保证录像进程真正重启。
+- `.stream-cache` 缓存键加入 `_noaudio` 后缀，避免拾音关闭后仍命中旧的带声音缓存。
+- 新增单元测试 `isapi_audio_test.go`（真实机型抓取的 `StreamingChannel` XML 作为夹具），
+  覆盖音轨开关改写与录像预设映射。
+
+**部署一致性**：NAS 源码树此前落后于本地提交（`isapi.go` 在 NAS 上根本不存在），
+本次整棵 `services/api` Go 源码同步后重建镜像，源码与镜像恢复一致。
+
+**验证结果**（现场实测，前后各 45 秒）：
+
+| 状态 | 摄像头 `Audio.enabled` | RTSP 音轨 | 录像 ffmpeg | 落盘新分片 |
+|---|---|---|---|---|
+| 拾音开启 | `true` | `audio` | `-c:v copy -c:a aac` | `aac,audio` |
+| 拾音关闭 | `false` | 无 | `-c copy -an` | 仅 `hevc` 视频轨 |
+| 再次开启 | `true` | `audio` | `-c:v copy -c:a aac` | `aac,audio` |
+
 ### v1.9.4 — H3C 简优云运维通道扩展 (SSH 22 端口隧道) 与录像流媒体极速秒开优化 (2026-10-04)
 
 > **背景**：① 扩展 H3C 简优云国内高速穿透能力，将 NAS 宿主机底层 SSH 调试端口（22）纳入自动化保活与租期巡检体系（`nas_ssh`），免去公网海外穿透或手动开放端口的繁琐流程，外出时可直接通过极速低延迟国内中继 SSH 登录 NAS；② 优化摄像头录像回放性能，在服务端引入智能流探测与 `-c copy` 极速直拼接模式，将录像加载等待时间从数秒直接降至 ~0.15s 秒开级别；同时增强 Android 端全屏报警大图弹窗与降级兜底。

@@ -574,16 +574,19 @@ func (r *Registry) UpdateCodec(ctx context.Context, id uint, codec string) error
 //
 //	{ "enabled": true }
 //
-// Toggles the audio capability flag on a camera. When enabled, the
-// next go2rtc stream push (performed inline here) rewrites the source
-// URL to include `#audio=aac` so the camera's PCMA track is transcoded
-// to AAC and exposed in the HLS/MP4 stream. ExoPlayer and modern
-// browsers decode AAC natively; the original PCMA from Hikvision
-// cameras is not browser-decodable.
+// Toggles the camera's audio pickup end to end:
 //
-// This endpoint does NOT touch Frigate's recording config — Frigate
-// records the camera's native stream and is unaffected by the live
-// audio toggle. Audio is only added to live HLS/MP4/WebRTC playback.
+//  1. The `capabilities.audio` flag on the camera row.
+//  2. The camera's onboard microphone, via ISAPI
+//     (see SetCameraMicEnabled). Disabling it removes the audio track
+//     from the RTSP source itself, so nothing downstream — live preview
+//     or Frigate's recorder — can pick up sound.
+//  3. The go2rtc stream URLs, which gain `#audio=opus#audio=aac` when
+//     enabled (the camera's PCMA track is not browser-decodable).
+//  4. Frigate's per-camera `ffmpeg.output_args.record` preset, which
+//     switches to the `-an` variant so new recording segments are
+//     written without an audio track (and pushes the config with
+//     requires_restart=true so the recorder actually respawns).
 func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error {
 	var cam model.Camera
 	if err := r.DB.First(&cam, id).Error; err != nil {
@@ -621,7 +624,14 @@ func (r *Registry) UpdateAudio(ctx context.Context, id uint, enabled bool) error
 			r.add1080pStream(ctx, &cam, user, pass)
 			r.addHEVCStream(ctx, &cam, user, pass)
 		}
-		go SetCameraMicEnabled(ctx, cam.Host, cam.ONVIFPort, user, pass, enabled)
+		// Toggle the camera's onboard microphone. This runs the
+		// GET-merge-PUT against /ISAPI/Streaming/channels/<id> which
+		// actually removes the audio track from the RTSP source; the
+		// previous per-path PUTs were rejected by the firmware and
+		// silently left the mic live (pickup "off" still recorded
+		// audio). `cam.ChannelID` is the 1-based camera channel, so
+		// pass it through and let the ISAPI helper derive 101/102.
+		go SetCameraMicEnabled(context.WithoutCancel(ctx), cam.Host, cam.ONVIFPort, user, pass, enabled, cam.ChannelID)
 	}
 	if r.Frigate != nil {
 		if err := r.pushFrigateConfig(ctx); err != nil {
@@ -797,10 +807,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
 			detectEnabled = false
 		}
-		recordOutputArgs := "preset-record-generic-audio-aac"
-		if !cameraHasAudio(&c) {
-			recordOutputArgs = "preset-record-generic"
-		}
+		recordOutputArgs := RecordOutputArgsFor(cameraHasAudio(&c))
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: c.Status != "offline",
@@ -1528,10 +1535,7 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
 			detectEnabled = false
 		}
-		recordOutputArgs := "preset-record-generic-audio-aac"
-		if !cameraHasAudio(&c) {
-			recordOutputArgs = "preset-record-generic"
-		}
+		recordOutputArgs := RecordOutputArgsFor(cameraHasAudio(&c))
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: camEnabled,

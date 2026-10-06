@@ -226,6 +226,28 @@ func (c *FrigateClient) LatestFrame(ctx context.Context, cameraSlug string) (io.
 	return resp.Body, ct, nil
 }
 
+// RecordOutputArgsFor returns the Frigate `ffmpeg.output_args.record`
+// value for a camera.
+//
+// Frigate selects the recording ffmpeg arguments by preset NAME
+// (frigate/ffmpeg_presets.py). `preset-record-generic` ends in `-an`, so
+// it drops the audio track at the RECORDING stage without re-encoding,
+// while `preset-record-generic-audio-aac` keeps audio and transcodes the
+// camera's PCMA track to AAC.
+//
+// We pick the silent preset whenever audio pickup is disabled so new
+// recording segments are genuinely audio-free: the per-camera
+// StreamConfig callback that maps preset names to argument lists only
+// re-runs on a config reload, and the API pushes the config with
+// requires_restart=true + an explicit /api/restart, which respawns the
+// recorder with the new arguments.
+func RecordOutputArgsFor(audioOn bool) string {
+	if audioOn {
+		return "preset-record-generic-audio-aac"
+	}
+	return "preset-record-generic"
+}
+
 // FrigateCameraConfig is the per-camera section in Frigate's config.yml.
 //
 // Frigate's Pydantic model validates each camera name with a strict
