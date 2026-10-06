@@ -793,6 +793,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 				go2rtcURL,
 				r.rtspBackchannelURL(&c, u, p),
 			}
+			go BoostSpeakerVolume(ctx, c.Host, c.ONVIFPort, u, p)
 		} else {
 			go2rtcStreams[c.StreamName] = go2rtcURL
 		}
@@ -1519,6 +1520,7 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 				go2rtcURL,
 				r.rtspBackchannelURL(&c, u, p),
 			}
+			go BoostSpeakerVolume(ctx, c.Host, c.ONVIFPort, u, p)
 		} else {
 			go2rtcStreams[c.StreamName] = go2rtcURL
 		}
