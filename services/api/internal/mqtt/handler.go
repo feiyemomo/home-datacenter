@@ -401,15 +401,21 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		TS:          ts,
 	})
 
+	log.Printf("mqtt: frigate detection: camera=%s id=%d label=%s confidence=%.2f guard=%s muted=%v",
+		slug, cameraID, frigEv.After.Label, confidence, guardMode, muted)
+
+	// If disarmed (撤防免打扰), do not broadcast camera.motion to clients and skip AI analysis
+	if muted {
+		log.Printf("mqtt: frigate detection suppressed in disarmed mode: camera=%s label=%s", slug, frigEv.After.Label)
+		return
+	}
+
 	h.bus.Publish(eventbus.Event{
 		Topic:    eventbus.TopicCameraMotion,
 		Source:   eventbus.SourceMQTT,
 		Severity: eventbus.SeverityInfo,
 		Payload:  canonical,
 	})
-
-	log.Printf("mqtt: frigate detection: camera=%s id=%d label=%s confidence=%.2f guard=%s muted=%v",
-		slug, cameraID, frigEv.After.Label, confidence, guardMode, muted)
 
 	// Trigger asynchronous Vision AI pipeline:
 	// - 撤防免打扰 (disarmed): 完全跳过 AI 视觉检测，保护 CPU 并不产生告警
@@ -1033,11 +1039,18 @@ func (h *Handler) SyncFrigateDetection(guardMode string) {
 	}
 	slugs := h.slugLookup.AllFrigateSlugs()
 	for _, slug := range slugs {
-		topic := fmt.Sprintf("frigate/%s/detect/set", slug)
-		if err := h.Publish(topic, payload, 1); err != nil {
-			log.Printf("mqtt: failed to set frigate detect for %s: %v", slug, err)
-		} else {
-			log.Printf("mqtt: set frigate detect for %s -> %s (guardMode=%s)", slug, payload, guardMode)
+		detectTopic := fmt.Sprintf("frigate/%s/detect/set", slug)
+		motionTopic := fmt.Sprintf("frigate/%s/motion/set", slug)
+		if h.client != nil {
+			t1 := h.client.Publish(detectTopic, 1, true, []byte(payload))
+			t1.Wait()
+			if err := t1.Error(); err != nil {
+				log.Printf("mqtt: failed to set frigate detect for %s: %v", slug, err)
+			} else {
+				log.Printf("mqtt: set frigate detect for %s -> %s (guardMode=%s, retained=true)", slug, payload, guardMode)
+			}
+			t2 := h.client.Publish(motionTopic, 1, true, []byte(payload))
+			t2.Wait()
 		}
 	}
 }

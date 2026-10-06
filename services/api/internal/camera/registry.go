@@ -774,13 +774,18 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 			}
 		}
 
+		detectEnabled := c.Status != "offline"
+		var sec model.SecurityState
+		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
+			detectEnabled = false
+		}
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: c.Status != "offline",
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: r.frigateInputs(&c, u, p),
 			},
-			Detect: FrigateDetect{Enabled: c.Status != "offline", FPS: CameraDetectFPS(&c)},
+			Detect: FrigateDetect{Enabled: detectEnabled, FPS: CameraDetectFPS(&c)},
 			Record: FrigateRecord{Enabled: recEnabled && c.Status != "offline"},
 		})
 		if cameraHasTwoWayAudio(&c) {
@@ -1492,13 +1497,18 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		// reconnect attempts and "video stream offline" errors. When the
 		// camera comes back online, the next config push re-enables it.
 		camEnabled := c.Status != "offline"
+		detectEnabled := camEnabled
+		var sec model.SecurityState
+		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
+			detectEnabled = false
+		}
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
 			Enabled: camEnabled,
 			Ffmpeg: FrigateFfmpeg{
 				Inputs: r.frigateInputs(&c, u, p),
 			},
-			Detect: FrigateDetect{Enabled: camEnabled, FPS: CameraDetectFPS(&c)},
+			Detect: FrigateDetect{Enabled: detectEnabled, FPS: CameraDetectFPS(&c)},
 			Record: FrigateRecord{Enabled: camEnabled},
 		})
 		// go2rtc stream key keeps the original friendly name so
@@ -2019,8 +2029,16 @@ func (r *Registry) rtspBackchannelURL(cam *model.Camera, user, pass string) stri
 }
 
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
+	channel := cam.ChannelID
+	if cam.TranscodeUseSubstream {
+		if channel%10 == 1 {
+			channel++
+		} else if channel == 1 {
+			channel = 102
+		}
+	}
 	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+		user, pass, cam.Host, cam.RTSPPort, channel)
 	codec := effectiveCodec(cam)
 	audioOn := cameraHasAudio(cam)
 	// v1.13.19: Keep RTSP ffmpeg upstream permanently active (#stop=0)
@@ -2031,7 +2049,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	if r.StopTimeout > 0 {
 		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
 	}
-	if codec == "passthrough" {
+	if codec == "passthrough" || cam.TranscodeUseSubstream {
 		if audioOn {
 			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=3000" + stopFrag
 		}

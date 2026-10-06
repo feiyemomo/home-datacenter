@@ -394,6 +394,18 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 	if len(go2rtcStreams) > 0 {
 		partial["go2rtc"] = map[string]any{
 			"streams": go2rtcStreams,
+			"webrtc": map[string]any{
+				"listen": ":8555",
+				"candidates": []string{
+					"127.0.0.1:8555",
+					"192.168.31.234:8555",
+					"154.8.195.220:32510",
+				},
+			},
+			"hls": map[string]any{
+				"segment": 1.5,
+				"window":  8,
+			},
 		}
 	}
 
