@@ -94,6 +94,11 @@ last_synced_webrtc_addr = None
 
 def sync_webrtc_to_frigate(external_addr):
     global last_synced_webrtc_addr
+    # Only sync when the tunnel address actually changed. Every sync restarts
+    # go2rtc (live streams drop), so syncing on each 60s check would break
+    # live view continuously.
+    if not external_addr or external_addr == last_synced_webrtc_addr:
+        return
     try:
         req = urllib.request.Request(f"{FRIGATE_URL}/api/config")
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -108,12 +113,11 @@ def sync_webrtc_to_frigate(external_addr):
         if external_addr and external_addr not in new_candidates:
             new_candidates.append(external_addr)
         
+        # LAN / Tailscale candidates are owned by home-api
+        # (BuildWebRTCCandidates); keep whatever is already configured and
+        # only swap the H3C tunnel address.
         if "127.0.0.1:8555" not in new_candidates:
             new_candidates.insert(0, "127.0.0.1:8555")
-        if "192.168.31.235:8555" not in new_candidates:
-            new_candidates.append("192.168.31.235:8555")
-        if "192.168.31.234:8555" not in new_candidates:
-            new_candidates.append("192.168.31.234:8555")
         if "stun:8555" not in new_candidates:
             new_candidates.append("stun:8555")
 

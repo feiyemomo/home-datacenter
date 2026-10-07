@@ -2,6 +2,25 @@
 
 ## 更新日志
 
+### WebRTC 候选地址动态生成 + H3C 隧道地址同步加固 + 回放保留录制音轨 (2026-10-07)
+
+> **背景**：NAS 改用 Tailscale 地址 `100.90.67.71` 后 WebRTC 看不了；关闭拾音后，之前开着拾音录到的片段回放也被强制静音。
+
+**WebRTC 候选地址**（`services/api/internal/camera/frigate.go`、`compose.yaml`）：
+- `PushConfig` 以前写死了 `192.168.31.234` 和早已失效的 H3C 端口 `154.8.195.220:32510`。每次带 `requires_restart` 的全量推送（例如切换拾音）都会把候选地址覆盖回这组旧值。
+- 新增 `BuildWebRTCCandidates`，全量推送和 `SetWebRTCCandidates` 共用这一份。来源依次为：回环地址、`NAS_LAN_IP` 或自动探测到的局域网 IP、API 被访问过的所有内网及 100.64/10（Tailscale）地址、`WEBRTC_EXTRA_CANDIDATES`、IPv6、H3C TCP 隧道地址、`stun:8555`。
+- `compose.yaml` 新增 `WEBRTC_EXTRA_CANDIDATES=100.90.67.71`。
+- 查询 H3C 隧道地址的超时从 500ms 放宽到 2s。查询失败时改用上次查到的有效地址，不再退回已失效的 `WEBRTC_TCP_CANDIDATE` 环境变量。
+
+**H3C 保活同步**（`deploy/h3c-keepalive/main.py`）：
+- 补回「地址没变就不同步」的判断。仓库版本缺少这个判断，部署后会每 60 秒重启一次 go2rtc。
+- 去掉写死的 `192.168.31.234/.235`。局域网和 Tailscale 候选地址由 home-api 负责，保活服务只替换 H3C 隧道地址。
+
+**回放保留录制音轨**（`camera_handler.go`，App 端 `RecordingsDialog.kt`）：
+- 回放和缓存不再按当前拾音开关决定是否去掉音轨（`-an` / `_noaudio`），App 也不再强制静音。拾音开关只控制录制：关闭期间录下的片段本身就没有音轨，开启期间录下的片段保留声音。
+
+**App**（`WebRtcClient.kt`）：基础地址是 100.64/10（Tailscale）地址时保留 TCP ICE 候选。NAS 上的 tailscaled 运行在 userspace 模式，UDP 不一定能进来。
+
 ### 摄像头拾音开关真正切断录音（ISAPI 通道级写入 + 录像预设联动）(2026-10-06)
 
 > **背景**：App 里关闭「摄像头拾音」后，回放该时间段的录像仍然能听到完整声音。

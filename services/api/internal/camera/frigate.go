@@ -554,30 +554,60 @@ func detectLANIP() string {
 // behavior which hardcoded a stale IP (192.168.1.3) that silently broke
 // WebRTC after any NAS IP change.
 //
+// lastH3CTCPCandidate caches the most recent tunnel address reported by
+// the keepalive service. When the keepalive lookup fails (timeout during
+// a restart, transient DNS), we fall back to it instead of the static
+// WEBRTC_TCP_CANDIDATE env var, which goes stale after the first H3C
+// port rotation (~2.5h).
+var (
+	lastH3CTCPMu        sync.Mutex
+	lastH3CTCPCandidate string
+)
+
 func detectH3CTCPCandidate() string {
 	keepaliveURL := os.Getenv("H3C_KEEPALIVE_URL")
 	if keepaliveURL == "" {
 		keepaliveURL = "http://home-h3c-keepalive:8087/status"
 	}
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	resp, err := client.Get(keepaliveURL)
-	if err == nil {
-		defer resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			var st struct {
-				Tunnels map[string]struct {
-					ExternalAddr string `json:"externalAddr"`
-					Status       string `json:"status"`
-				} `json:"tunnels"`
-			}
-			if err := json.NewDecoder(resp.Body).Decode(&st); err == nil {
-				if t, ok := st.Tunnels["webrtc_test"]; ok && t.ExternalAddr != "" && t.Status == "ESTABLISHED" {
-					return t.ExternalAddr
-				}
-			}
-		}
+	client := &http.Client{Timeout: 2 * time.Second}
+	if addr := fetchH3CTCPCandidate(client, keepaliveURL); addr != "" {
+		lastH3CTCPMu.Lock()
+		lastH3CTCPCandidate = addr
+		lastH3CTCPMu.Unlock()
+		return addr
+	}
+	lastH3CTCPMu.Lock()
+	cached := lastH3CTCPCandidate
+	lastH3CTCPMu.Unlock()
+	if cached != "" {
+		log.Printf("frigate: h3c keepalive lookup failed; using last known tunnel candidate %s", cached)
+		return cached
 	}
 	return os.Getenv("WEBRTC_TCP_CANDIDATE")
+}
+
+func fetchH3CTCPCandidate(client *http.Client, keepaliveURL string) string {
+	resp, err := client.Get(keepaliveURL)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	var st struct {
+		Tunnels map[string]struct {
+			ExternalAddr string `json:"externalAddr"`
+			Status       string `json:"status"`
+		} `json:"tunnels"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&st); err != nil {
+		return ""
+	}
+	if t, ok := st.Tunnels["webrtc_test"]; ok && t.ExternalAddr != "" && t.Status == "ESTABLISHED" {
+		return t.ExternalAddr
+	}
+	return ""
 }
 
 // BuildWebRTCCandidates returns the go2rtc webrtc.candidates list. It is
