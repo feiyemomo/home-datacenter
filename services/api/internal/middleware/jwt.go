@@ -54,7 +54,7 @@ func JWTAuth(
 			}
 		}
 		if tokenString == "" {
-			utils.Fail(c, http.StatusUnauthorized, "missing authorization header")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthMissing, "missing authorization header")
 			c.Abort()
 			return
 		}
@@ -62,7 +62,7 @@ func JWTAuth(
 		// 3. Parse and verify the JWT
 		claims, err := utils.ParseToken(tokenString)
 		if err != nil {
-			utils.Fail(c, http.StatusUnauthorized, "invalid token")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthTokenInvalid, "invalid token")
 			c.Abort()
 			return
 		}
@@ -73,11 +73,11 @@ func JWTAuth(
 		device, err := deviceRepo.GetByID(claims.DeviceID)
 		if err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
-				utils.Fail(c, http.StatusUnauthorized, "device not found")
+				utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceNotFound, "device not found")
 			} else {
 				// Real DB / scan error — surface a generic 500-ish
 				// auth failure rather than misleading "not found".
-				utils.Fail(c, http.StatusUnauthorized, "device lookup failed")
+				utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceLookupFailed, "device lookup failed")
 			}
 			c.Abort()
 			return
@@ -86,7 +86,7 @@ func JWTAuth(
 		// 5. Enforce revocation. NullTime.Valid is true when
 		// revoked_at is not NULL, i.e. the device has been revoked.
 		if device.RevokedAt.Valid {
-			utils.Fail(c, http.StatusUnauthorized, "device revoked")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceRevoked, "device revoked")
 			c.Abort()
 			return
 		}
@@ -96,7 +96,7 @@ func JWTAuth(
 		// against the old version. The client detects "token version
 		// mismatch" in the response and re-binds with its access_key.
 		if claims.TokenVersion < device.TokenVersion {
-			utils.Fail(c, http.StatusUnauthorized, "token version mismatch")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthTokenVersionMismatch, "token version mismatch")
 			c.Abort()
 			return
 		}

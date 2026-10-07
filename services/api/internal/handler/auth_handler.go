@@ -74,7 +74,7 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 
 	token, device, err := h.authService.Bind(req.UserID, req.AccessKey)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, "invalid credentials")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthInvalidCredentials, "invalid credentials")
 		return
 	}
 
@@ -200,13 +200,13 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 		}
 	}
 	if tokenString == "" {
-		utils.Fail(c, http.StatusUnauthorized, "missing or invalid Authorization header")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthMissing, "missing or invalid Authorization header")
 		return
 	}
 
 	claims, err := utils.ParseToken(tokenString)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, "invalid token")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthTokenInvalid, "invalid token")
 		return
 	}
 
@@ -217,18 +217,18 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 	// otherwise nginx forwards the request to go2rtc.
 	device, err := h.authService.GetDeviceForAuth(claims.DeviceID)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, "device lookup failed")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceLookupFailed, "device lookup failed")
 		return
 	}
 	if device.RevokedAt.Valid {
-		utils.Fail(c, http.StatusUnauthorized, "device revoked")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceRevoked, "device revoked")
 		return
 	}
 
 	// Token version check: if the admin has rotated the token, reject
 	// old tokens here too (mirrors the JWTAuth middleware check).
 	if claims.TokenVersion < device.TokenVersion {
-		utils.Fail(c, http.StatusUnauthorized, "token version mismatch")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthTokenVersionMismatch, "token version mismatch")
 		return
 	}
 
@@ -237,7 +237,7 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 	userName := ""
 	user, err := h.authService.GetUserByID(claims.UserID)
 	if err != nil || user == nil {
-		utils.Fail(c, http.StatusUnauthorized, "user lookup failed")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthUserNotFound, "user lookup failed")
 		return
 	}
 	userName = user.Name
@@ -257,7 +257,6 @@ func (h *AuthHandler) Verify(c *gin.Context) {
 			return
 		}
 	}
-
 
 	utils.Success(c, gin.H{
 		"user_id":   claims.UserID,
@@ -291,13 +290,24 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 	userID := c.GetUint("user_id")
 	deviceID := c.GetUint("device_id")
 	if userID == 0 || deviceID == 0 {
-		utils.Fail(c, http.StatusUnauthorized, "unauthorized")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthMissing, "unauthorized")
 		return
 	}
 
 	token, device, err := h.authService.Refresh(userID, deviceID)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, err.Error())
+		// Map service errors to stable error codes. Unknown errors are
+		// treated as transient (lookup failed) so clients never log out
+		// on a server-side hiccup.
+		msg := err.Error()
+		errCode := utils.ErrAuthDeviceLookupFailed
+		switch {
+		case msg == "device revoked":
+			errCode = utils.ErrAuthDeviceRevoked
+		case msg == "device does not belong to user", strings.Contains(msg, "record not found"):
+			errCode = utils.ErrAuthDeviceNotFound
+		}
+		utils.FailWithCode(c, http.StatusUnauthorized, errCode, msg)
 		return
 	}
 
@@ -314,4 +324,3 @@ func (h *AuthHandler) Refresh(c *gin.Context) {
 		"device_id": device.ID,
 	})
 }
-

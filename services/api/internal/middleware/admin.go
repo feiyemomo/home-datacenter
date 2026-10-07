@@ -34,7 +34,7 @@ func RequireAdmin(db *gorm.DB) gin.HandlerFunc {
 		}
 		var u model.User
 		if err := db.First(&u, uid).Error; err != nil {
-			utils.Fail(c, http.StatusUnauthorized, "user not found")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthUserNotFound, "user not found")
 			c.Abort()
 			return
 		}

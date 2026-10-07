@@ -44,6 +44,22 @@ type Response struct {
 	Code    int         `json:"code"`
 	Message string      `json:"message"`
 	Data    interface{} `json:"data"`
+	// ErrorCode is a stable, machine-readable error identifier (see
+	// errcodes.go). Omitted when zero so existing payloads are unchanged.
+	// Clients should branch on this instead of the free-text Message.
+	ErrorCode int `json:"error_code,omitempty"`
+}
+
+// FailWithCode is Fail plus a stable machine-readable error_code.
+// `code` keeps mirroring the HTTP status for backward compatibility.
+func FailWithCode(c *gin.Context, status int, errorCode int, message string) {
+	applySecurityHeaders(c)
+	c.JSON(status, Response{
+		Code:      status,
+		Message:   message,
+		Data:      nil,
+		ErrorCode: errorCode,
+	})
 }
 
 // Success sends HTTP 200 with { code: 0, message: "success", data: <data> }.

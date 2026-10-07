@@ -2,6 +2,17 @@
 
 ## 更新日志
 
+### 登录失效错误码 (2026-10-07)
+
+> **背景**：App 端按 401 的 `message` 文本判断是否需要重新登录，后端改动提示文字就会让失效处理悄悄失效。
+
+**固定错误码**（`services/api/internal/utils/errcodes.go`、`response.go`）：
+- 响应信封新增可选字段 `error_code`（为 0 时省略，旧响应不变），新增 `utils.FailWithCode`。`code` 仍等于 HTTP 状态码，保持兼容。
+- 错误码：`40101` 缺少凭证、`40102` token 无效、`40103` 设备不存在、`40104` 设备已吊销、`40105` token 版本不匹配、`40106` 设备查询失败（暂时性）、`40107` 绑定凭证无效、`40108` 用户不存在。
+- 客户端语义：40102/40105 可静默重新绑定；40101/40103/40104/40107/40108 清除登录并跳转登录页；40106 为服务端暂时故障，不得登出。
+- 已接入 `middleware/jwt.go`、`middleware/admin.go`、`handler/auth_handler.go`（bind / verify / refresh）、`handler/ws_handler.go`。
+- 已部署 home-api，实测 `missing authorization header` → 40101、`invalid token` → 40102。
+
 ### WebRTC 候选地址动态生成 + H3C 隧道地址同步加固 + 回放保留录制音轨 (2026-10-07)
 
 > **背景**：NAS 改用 Tailscale 地址 `100.90.67.71` 后 WebRTC 看不了；关闭拾音后，之前开着拾音录到的片段回放也被强制静音。

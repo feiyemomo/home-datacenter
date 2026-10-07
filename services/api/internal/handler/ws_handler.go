@@ -205,14 +205,14 @@ func (h *WebSocketHandler) Handle(c *gin.Context) {
 	}
 
 	if tokenString == "" {
-		utils.Fail(c, http.StatusUnauthorized, "missing token")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthMissing, "missing token")
 		return
 	}
 
 	// 2. Verify JWT and extract claims.
 	claims, err := utils.ParseToken(tokenString)
 	if err != nil {
-		utils.Fail(c, http.StatusUnauthorized, "invalid token")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthTokenInvalid, "invalid token")
 		return
 	}
 
@@ -220,14 +220,14 @@ func (h *WebSocketHandler) Handle(c *gin.Context) {
 	dev, err := h.deviceRepo.GetByID(claims.DeviceID)
 	if err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
-			utils.Fail(c, http.StatusUnauthorized, "device not found")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceNotFound, "device not found")
 		} else {
-			utils.Fail(c, http.StatusUnauthorized, "device lookup failed")
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceLookupFailed, "device lookup failed")
 		}
 		return
 	}
 	if dev.RevokedAt.Valid {
-		utils.Fail(c, http.StatusUnauthorized, "device revoked")
+		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceRevoked, "device revoked")
 		return
 	}
 
