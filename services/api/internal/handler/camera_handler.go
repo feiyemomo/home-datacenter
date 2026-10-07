@@ -1339,14 +1339,11 @@ func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minut
 	if quality == "1080p" {
 		cacheSuffix = "_1080p"
 	}
-	// v1.14.x: include the audio state in the cache key. The transcode
-	// below drops the audio track when pickup is disabled, but a cache
-	// entry produced while audio was still enabled would otherwise be
-	// replayed after the user turned pickup off — the "I disabled
-	// pickup but playback still has sound" report.
-	if !camera.CameraHasAudio(cam) {
-		cacheSuffix += "_noaudio"
-	}
+	// Playback keeps whatever audio the segments actually contain. The
+	// pickup toggle controls RECORDING (camera mic + Frigate -an preset),
+	// so minutes recorded while pickup was off are already silent, and
+	// minutes recorded while it was on keep their sound even after the
+	// user later turns pickup off.
 	cacheFile := filepath.Join(cacheDir, fmt.Sprintf("%d%s.fmp4", minuteStart, cacheSuffix))
 	// Cache hit: serve the fragmented MP4 directly (http.ServeFile gives
 	// Content-Length + Range, which the MSE client tolerates fine).
@@ -1556,17 +1553,12 @@ func (h *CameraHandler) transcodeRecording(c *gin.Context, cam *model.Camera, mi
 	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
 	codec := strings.ToLower(strings.TrimSpace(c.Query("codec")))
 	isCopyMode := codec == "copy"
-	audioOn := camera.CameraHasAudio(cam)
+	// Keep the segments' own audio: the pickup toggle governs recording,
+	// not playback of footage that was recorded with sound.
+	audioOn := true
 	cacheFileName := fmt.Sprintf("%d.mp4", minuteStart)
 	if isCopyMode {
 		cacheFileName = fmt.Sprintf("%d_copy.mp4", minuteStart)
-	}
-	if !audioOn {
-		if isCopyMode {
-			cacheFileName = fmt.Sprintf("%d_copy_noaudio.mp4", minuteStart)
-		} else {
-			cacheFileName = fmt.Sprintf("%d_noaudio.mp4", minuteStart)
-		}
 	}
 	cacheFile := filepath.Join(cacheDir, cacheFileName)
 
@@ -1836,11 +1828,8 @@ func cleanTranscodeCache(root string, maxAge time.Duration) {
 // in the background if it is not already cached.
 func (h *CameraHandler) PretranscodeMinute(cam *model.Camera, minuteStart int64) error {
 	cacheDir := fmt.Sprintf("/data/recordings/.transcode-cache/%d", cam.ID)
-	audioOn := camera.CameraHasAudio(cam)
+	audioOn := true // keep the segments' own audio (see transcodeRecording)
 	cacheFileName := fmt.Sprintf("%d.mp4", minuteStart)
-	if !audioOn {
-		cacheFileName = fmt.Sprintf("%d_noaudio.mp4", minuteStart)
-	}
 	cacheFile := filepath.Join(cacheDir, cacheFileName)
 
 	// Serve/skip from cache if present and non-empty.

@@ -143,6 +143,11 @@ services:
       - NAS_LAN_IP=${NAS_LAN_IP:-192.168.31.234}
       # Public WebRTC TCP Candidate mapped via H3C Oasis Tunnel (TCP proxy)
       - WEBRTC_TCP_CANDIDATE=${WEBRTC_TCP_CANDIDATE:-154.8.195.220:37635}
+      # Extra WebRTC host candidates (comma separated, port defaults to
+      # 8555). 100.90.67.71 is the NAS's Tailscale address; listing it
+      # here keeps WebRTC working over Tailscale right after a restart,
+      # before any request has arrived on that address.
+      - WEBRTC_EXTRA_CANDIDATES=${WEBRTC_EXTRA_CANDIDATES:-100.90.67.71}
       # v1.8.24: Set to "true" in offline LAN environments (no Internet)
       # to disable IPv6 reporting. Without this, NAS_IPV6_ADDRESS above
       # would cause CheckIPv6() to report reachable=true, making the

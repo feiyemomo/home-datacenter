@@ -13,6 +13,7 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +34,7 @@ import (
 type lanIPDetector struct {
 	mu       sync.RWMutex
 	detected string
+	seen     map[string]bool
 	onChange func(newIP string)
 }
 
@@ -53,16 +55,26 @@ func (d *lanIPDetector) UpdateFromHost(host string) {
 	if ip == nil || ip.To4() == nil {
 		return
 	}
-	if !ip.IsPrivate() {
-		return // only accept RFC 1918 private addresses
+	if !ip.IsPrivate() && !cgnatNet.Contains(ip) {
+		return // RFC 1918 private, or RFC 6598 100.64/10 (Tailscale / overlay / CGNAT)
 	}
 	d.mu.Lock()
-	prev := d.detected
-	if prev == h {
+	if d.detected == h {
 		d.mu.Unlock()
 		return
 	}
 	d.detected = h
+	if d.seen == nil {
+		d.seen = map[string]bool{}
+	}
+	if d.seen[h] {
+		// Already advertised as a WebRTC candidate. Clients alternating
+		// between the LAN address and the overlay address must not
+		// trigger a candidates push (and go2rtc restart) on every switch.
+		d.mu.Unlock()
+		return
+	}
+	d.seen[h] = true
 	cb := d.onChange
 	d.mu.Unlock()
 	log.Printf("frigate: LAN IP auto-detected from request Host: %s", h)
@@ -81,6 +93,27 @@ func (d *lanIPDetector) Get() string {
 	defer d.mu.RUnlock()
 	return d.detected
 }
+
+// Seen returns every LAN/overlay IP the API has been reached on since
+// startup (sorted). All of them are advertised as WebRTC host
+// candidates so the media path works whichever address the client used.
+func (d *lanIPDetector) Seen() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]string, 0, len(d.seen))
+	for ip := range d.seen {
+		out = append(out, ip)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// cgnatNet is RFC 6598 shared address space (100.64.0.0/10), used by
+// Tailscale / ZeroTier-style overlays and carrier-grade NAT.
+var cgnatNet = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("100.64.0.0/10")
+	return n
+}()
 
 // SetOnChange registers a callback invoked when the auto-detected
 // LAN IP changes. Called asynchronously from UpdateFromHost.
@@ -419,11 +452,10 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 			"streams": go2rtcStreams,
 			"webrtc": map[string]any{
 				"listen": ":8555",
-				"candidates": []string{
-					"127.0.0.1:8555",
-					"192.168.31.234:8555",
-					"154.8.195.220:32510",
-				},
+				// Same dynamic list as SetWebRTCCandidates. This push runs
+				// with requires_restart, so a hardcoded list here used to
+				// overwrite config.yml with stale addresses on every restart.
+				"candidates": BuildWebRTCCandidates(WebRTCIPv6FromEnv()),
 			},
 			"hls": map[string]any{
 				"segment": 1.5,
@@ -548,27 +580,78 @@ func detectH3CTCPCandidate() string {
 	return os.Getenv("WEBRTC_TCP_CANDIDATE")
 }
 
+// BuildWebRTCCandidates returns the go2rtc webrtc.candidates list. It is
+// the single source of truth for both the full config push (PushConfig)
+// and the partial candidates push. The full push used to hardcode
+// 192.168.31.234 and a long-dead H3C port (154.8.195.220:32510). Because
+// it runs with requires_restart (for example on every audio toggle),
+// go2rtc came back up advertising stale addresses and WebRTC media never
+// connected.
+//
+// Sources, de-duplicated in order:
+//   - 127.0.0.1 (same-host browser)
+//   - NAS_LAN_IP env / auto-detected LAN IP
+//   - every private or 100.64/10 overlay IP the API was reached on
+//   - WEBRTC_EXTRA_CANDIDATES env (comma separated; port defaults to 8555)
+//   - public IPv6 (when not disabled)
+//   - the H3C tunnel TCP candidate
+//   - stun:8555
+func BuildWebRTCCandidates(ipv6Addr string) []string {
+	seen := map[string]bool{}
+	out := []string{}
+	add := func(s string) {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	withPort := func(s string) string {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return ""
+		}
+		if _, _, err := net.SplitHostPort(s); err == nil {
+			return s
+		}
+		return net.JoinHostPort(strings.Trim(s, "[]"), "8555")
+	}
+
+	add("127.0.0.1:8555")
+	if lanIP := detectLANIP(); lanIP != "" {
+		add(withPort(lanIP))
+	} else {
+		log.Printf("frigate: webrtc candidates: NAS_LAN_IP not set and no LAN IP detected yet; WebRTC will not work from LAN clients")
+	}
+	for _, ip := range GlobalLanIP.Seen() {
+		add(withPort(ip))
+	}
+	for _, extra := range strings.Split(os.Getenv("WEBRTC_EXTRA_CANDIDATES"), ",") {
+		add(withPort(extra))
+	}
+	if ipv6Addr != "" {
+		add(net.JoinHostPort(ipv6Addr, "8555"))
+	}
+	if tcp := detectH3CTCPCandidate(); tcp != "" {
+		add(tcp)
+	}
+	add("stun:8555")
+	return out
+}
+
+// WebRTCIPv6FromEnv returns NAS_IPV6_ADDRESS unless NAS_IPV6_DISABLED is set.
+func WebRTCIPv6FromEnv() string {
+	if d := os.Getenv("NAS_IPV6_DISABLED"); d == "true" || d == "1" || d == "yes" {
+		return ""
+	}
+	return os.Getenv("NAS_IPV6_ADDRESS")
+}
+
 // Returns an error if the Frigate API call fails. The caller
 // (PrefixWatcher, BootReplay) logs the error but doesn't block subsequent checks.
 func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string) error {
-	candidates := []string{"127.0.0.1:8555"}
-
-	lanIP := detectLANIP()
-	if lanIP != "" {
-		candidates = append(candidates, lanIP+":8555")
-	} else {
-		log.Printf("frigate: SetWebRTCCandidates: NAS_LAN_IP env var not set; WebRTC will not work from LAN clients")
-	}
-
-	if ipv6Addr != "" {
-		candidates = append(candidates, fmt.Sprintf("[%s]:8555", ipv6Addr))
-	}
-
-	if tcpCandidate := detectH3CTCPCandidate(); tcpCandidate != "" {
-		candidates = append(candidates, tcpCandidate)
-	}
-
-	candidates = append(candidates, "stun:8555")
+	candidates := BuildWebRTCCandidates(ipv6Addr)
 
 	partial := map[string]any{
 		"go2rtc": map[string]any{
