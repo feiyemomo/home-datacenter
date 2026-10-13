@@ -23,6 +23,48 @@ PORT = int(os.environ.get("PORT", "8090"))
 face_engine = FaceEngine(model_dir=MODEL_DIR, data_dir=DATA_DIR)
 pose_engine = PoseEngine(model_dir=MODEL_DIR)
 
+def is_safe_url(url_str):
+    try:
+        parsed = urllib.parse.urlparse(url_str)
+        # Strictly require http or https
+        if parsed.scheme not in ("http", "https"):
+            logger.warning(f"SSRF blocked: invalid scheme '{parsed.scheme}' in {url_str}")
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        # Block localhost and link-local addresses
+        if hostname.lower() in ("localhost", "127.0.0.1", "::1"):
+            logger.warning(f"SSRF blocked: loopback target {hostname}")
+            return False
+        # Resolve IP and check if it's private or reserved
+        import ipaddress
+        import socket
+        try:
+            ip_obj = ipaddress.ip_address(hostname)
+        except ValueError:
+            # Domain name: resolve it
+            addr_info = socket.getaddrinfo(hostname, None)
+            if not addr_info:
+                return False
+            resolved_ip = addr_info[0][4][0]
+            ip_obj = ipaddress.ip_address(resolved_ip)
+
+        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
+            # Allow internal home-datacenter services if explicitly allowed, but block local loopback and cloud metadata
+            # 169.254.169.254 is cloud metadata
+            if str(ip_obj).startswith("169.254."):
+                logger.warning(f"SSRF blocked: cloud metadata target {ip_obj}")
+                return False
+            # Block internal gateway / loopback probes
+            if ip_obj.is_loopback or str(ip_obj) in ("127.0.0.1", "192.168.31.1"):
+                logger.warning(f"SSRF blocked: restricted internal IP {ip_obj}")
+                return False
+        return True
+    except Exception as e:
+        logger.warning(f"SSRF check exception for {url_str}: {e}")
+        return False
+
 def decode_image(payload):
     if "image" in payload and payload["image"]:
         b64_str = payload["image"]
@@ -34,6 +76,9 @@ def decode_image(payload):
 
     if "image_url" in payload and payload["image_url"]:
         url = payload["image_url"]
+        if not is_safe_url(url):
+            logger.warning(f"Rejected unsafe image_url: {url}")
+            return None
         req = urllib.request.Request(url, headers={"User-Agent": "HomeDatacenter-Vision/1.0"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             img_bytes = resp.read()
