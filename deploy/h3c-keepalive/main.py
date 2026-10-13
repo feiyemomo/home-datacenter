@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import html
 from datetime import datetime
 from h3c_client import H3CClient
 
@@ -20,7 +21,7 @@ logging.basicConfig(
 logger = logging.getLogger("keepalive")
 
 H3C_USERNAME = os.environ.get("H3C_USERNAME", "momo324")
-H3C_PASSWORD = os.environ.get("H3C_PASSWORD", "@Momo324")
+H3C_PASSWORD = os.environ.get("H3C_PASSWORD", "")
 H3C_APP_NAMES = [a.strip() for a in os.environ.get("H3C_APP_NAMES", os.environ.get("H3C_APP_NAME", "home,webrtc_test,nas_ssh")).split(",") if a.strip()]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 MIN_REMAINING_MINUTES = int(os.environ.get("MIN_REMAINING_MINUTES", "25"))
@@ -309,11 +310,15 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
 
             dest_path = ""
             if "path" in query and query["path"]:
-                dest_path = query["path"][0]
+                clean_path = query["path"][0].replace("\r", "").replace("\n", "").strip()
+                dest_path = urllib.parse.quote(clean_path, safe="/?#&=_-.!~*'")
             
             target_url = addr.rstrip("/") + ("/" + dest_path.lstrip("/") if dest_path else "/")
             if "token" in query and query["token"]:
-                target_url += f"#token={urllib.parse.quote(query['token'][0])}"
+                clean_token = query["token"][0].replace("\r", "").replace("\n", "").strip()
+                target_url += f"#token={urllib.parse.quote(clean_token)}"
+
+            escaped_url = html.escape(target_url, quote=True)
 
             self.send_response(302)
             self.send_header("Location", target_url)
@@ -323,7 +328,7 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Expires", "0")
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
-            fallback = f"<html><head><meta http-equiv='refresh' content='0;url={target_url}'><script>location.replace('{target_url}');</script></head><body>Redirecting to <a href='{target_url}'>{target_url}</a></body></html>"
+            fallback = f"<html><head><meta http-equiv='refresh' content='0;url={escaped_url}'></head><body>Redirecting to <a href='{escaped_url}'>{escaped_url}</a></body></html>"
             self.wfile.write(fallback.encode("utf-8"))
             return
 
