@@ -102,6 +102,49 @@ if [ -f "$HDC_DIR/.env" ]; then
     fi
     
     log_succ "已在 .env 中生成全新随机密钥 (JWT, 独立加密Key, Alist专用密码)。旧会话与伪造Token已全部失效。"
+
+    # --------------------------------------------------------------------------
+    # 自动复用 fnOS 原生已配置的 QQ 邮箱 SMTP 服务 (用于找回密码/通知的配置)
+    # --------------------------------------------------------------------------
+    log_info "正在探测 fnOS 宿主机原生 SMTP 配置，尝试直接复用现有邮箱..."
+    FNOS_USER=""
+    FNOS_PASS=""
+    FNOS_HOST="smtp.qq.com"
+    FNOS_PORT="465"
+
+    # 1. 扫描常见的 fnOS trim 配置文件与 json
+    for cfg_file in $(grep -rnwl --include="*.json" --include="*.conf" --include="*.yaml" "smtp\.qq\.com" /etc/trim /etc/trim_os /var/lib/trim /usr/trim /vol1/@system 2>/dev/null || true); do
+        if [ -f "$cfg_file" ]; then
+            log_info "在 fnOS 配置文件中发现邮件配置: $cfg_file"
+            # 提取可能存在的 user 和 pass
+            DETECTED_USER=$(grep -oE '[a-zA-Z0-9._%+-]+@qq\.com' "$cfg_file" | head -n 1 || true)
+            if [ -n "$DETECTED_USER" ]; then
+                FNOS_USER="$DETECTED_USER"
+            fi
+        fi
+    done
+
+    # 2. 若在 SQLite 中存储，尝试通过 sqlite3 读取
+    if command -v sqlite3 >/dev/null 2>&1; then
+        for db_file in /var/lib/trim/*.db /var/lib/trim/*/*.db /vol1/@system/*/*.db; do
+            if [ -f "$db_file" ]; then
+                VALS=$(sqlite3 "$db_file" "SELECT value FROM system_config WHERE key LIKE '%smtp%' OR key LIKE '%mail%';" 2>/dev/null || true)
+                if echo "$VALS" | grep -q "smtp\.qq\.com"; then
+                    log_info "在 fnOS 系统数据库中匹配到 SMTP: $db_file"
+                fi
+            fi
+        done
+    fi
+
+    # 3. 将检测结果写入或保留在 .env
+    if [ -n "$FNOS_USER" ]; then
+        log_succ "成功识别到 fnOS 已配置的 QQ 邮箱发件人: $FNOS_USER"
+        sed -i "s/^ALERT_ENABLED=.*/ALERT_ENABLED=true/" "$HDC_DIR/.env" 2>/dev/null || echo "ALERT_ENABLED=true" >> "$HDC_DIR/.env"
+        sed -i "s/^ALERT_SMTP_USER=.*/ALERT_SMTP_USER=${FNOS_USER}/" "$HDC_DIR/.env" 2>/dev/null || echo "ALERT_SMTP_USER=${FNOS_USER}" >> "$HDC_DIR/.env"
+        sed -i "s/^ALERT_RECIPIENT=.*/ALERT_RECIPIENT=${FNOS_USER}/" "$HDC_DIR/.env" 2>/dev/null || echo "ALERT_RECIPIENT=${FNOS_USER}" >> "$HDC_DIR/.env"
+    else
+        log_info "未直接扫出明文密码，保持 .env 中已有邮件设置不变。"
+    fi
 else
     log_warn "$HDC_DIR/.env 不存在，跳过本地 .env 自动更新。"
 fi
