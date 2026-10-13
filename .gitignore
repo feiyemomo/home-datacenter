@@ -134,3 +134,13 @@ fix-dns-and-deploy.sh
 fix-eno1-ipv6.sh
 fix-routing.sh
 *-git-backup/
+check_*.py
+nas_*.py
+inspect_candidates.py
+find_frigate_config_set.py
+test_isapi_camera.py
+update_lanzou_db.py
+update_policy.py
+update-api.*
+updated_part1.txt
+

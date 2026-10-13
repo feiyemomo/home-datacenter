@@ -158,6 +158,14 @@ services:
       - ALIST_WEBDAV_USER=${ALIST_WEBDAV_USER:-admin}
       - ALIST_WEBDAV_PASS=${ALIST_WEBDAV_PASS}
       - ALIST_RECORDINGS_PATH=${ALIST_RECORDINGS_PATH:-lanzou/Surveillance/Recordings}
+      # v1.12.0: Security response & emergency SMTP alerts
+      - ALERT_ENABLED=${ALERT_ENABLED:-false}
+      - ALERT_SMTP_HOST=${ALERT_SMTP_HOST:-smtp.qq.com}
+      - ALERT_SMTP_PORT=${ALERT_SMTP_PORT:-465}
+      - ALERT_SMTP_USER=${ALERT_SMTP_USER:-}
+      - ALERT_SMTP_PASS=${ALERT_SMTP_PASS:-}
+      - ALERT_SMTP_SENDER=${ALERT_SMTP_SENDER:-}
+      - ALERT_RECIPIENT=${ALERT_RECIPIENT:-}
     # v1.8.31: static IP for the api service. nginx's
     # `upstream api_backend { server api:8080; }` in web/nginx.conf
     # resolves the `api` hostname ONCE at nginx startup and keeps

@@ -44,7 +44,13 @@ func NewCloudArchiveClient() *CloudArchiveClient {
 	}
 	remPath := strings.Trim(os.Getenv("ALIST_RECORDINGS_PATH"), "/")
 	if remPath == "" {
-		remPath = "quark/Surveillance/Recordings"
+		remPath = strings.Trim(os.Getenv("ARCHIVE_REMOTE_PATH"), "/")
+	}
+	if remPath == "" {
+		remPath = strings.Trim(os.Getenv("QUARK_REMOTE_PATH"), "/")
+	}
+	if remPath == "" {
+		remPath = "lanzou/Surveillance/Recordings"
 	}
 	cacheDir := os.Getenv("CLOUD_CACHE_DIR")
 	if cacheDir == "" {
@@ -224,10 +230,15 @@ func (c *CloudArchiveClient) ListRecordingMinutesFromCloud(ctx context.Context, 
 								if !localSet[minuteStart] {
 									b, ok := buckets[minuteStart]
 									if !ok {
-										b = &bucket{startUnix: minuteStart, endUnix: minuteStart + 60, count: 0}
+										b = &bucket{startUnix: minuteStart, endUnix: segStartUnix + 10, count: 1}
 										buckets[minuteStart] = b
+									} else {
+										b.count++
+										end := segStartUnix + 10
+										if end > b.endUnix {
+											b.endUnix = end
+										}
 									}
-									b.count++
 								}
 							}
 						}

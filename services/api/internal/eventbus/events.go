@@ -37,6 +37,7 @@ const (
 
 	// --- Security events (v1.11.0) ---
 	TopicSecurityGuardMode = "security.guard_mode"
+	TopicSecurityAlert     = "security.alert"
 
 	// --- User auth events ---
 	// Emitted by the auth handler on /auth/bind success and by the
@@ -238,3 +239,15 @@ type DeviceManagePayload struct {
 	Action     string `json:"action"` // "hard_delete" | "token_rotate"
 	Ts         int64  `json:"ts"`
 }
+
+// SecurityAlertPayload is the JSON shape for TopicSecurityAlert events.
+// Emitted when intrusion detection or brute-force mitigation blocks an IP.
+type SecurityAlertPayload struct {
+	IP        string `json:"ip"`
+	AlertType string `json:"alert_type"`
+	Message   string `json:"message"`
+	Action    string `json:"action"`
+	Detail    string `json:"detail"`
+	Ts        int64  `json:"ts"`
+}
+

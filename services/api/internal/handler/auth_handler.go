@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/service"
 	"home-datacenter-api/internal/utils"
 )
@@ -17,15 +19,18 @@ import (
 type AuthHandler struct {
 	authService *service.AuthService
 	bus         *eventbus.Bus
+	defenseMgr  *security.DefenseManager
 }
 
 func NewAuthHandler(
 	authService *service.AuthService,
 	bus *eventbus.Bus,
+	defenseMgr *security.DefenseManager,
 ) *AuthHandler {
 	return &AuthHandler{
 		authService: authService,
 		bus:         bus,
+		defenseMgr:  defenseMgr,
 	}
 }
 
@@ -74,8 +79,23 @@ func (h *AuthHandler) Bind(c *gin.Context) {
 
 	token, device, err := h.authService.Bind(req.UserID, req.AccessKey)
 	if err != nil {
+		if h.defenseMgr != nil {
+			clientIP := c.GetString("real_client_ip")
+			if clientIP == "" {
+				clientIP = c.ClientIP()
+			}
+			h.defenseMgr.RecordAuthFailure(clientIP, fmt.Sprintf("bind失败(user_id=%d)", req.UserID), c.Request.UserAgent())
+		}
 		utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthInvalidCredentials, "invalid credentials")
 		return
+	}
+
+	if h.defenseMgr != nil {
+		clientIP := c.GetString("real_client_ip")
+		if clientIP == "" {
+			clientIP = c.ClientIP()
+		}
+		h.defenseMgr.RecordAuthSuccess(clientIP)
 	}
 
 	// Publish user.login so the log subscriber can persist a

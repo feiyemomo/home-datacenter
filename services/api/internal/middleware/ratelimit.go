@@ -8,6 +8,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"golang.org/x/time/rate"
 
+	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -106,15 +107,20 @@ func (l *IPLimiter) gc() {
 }
 
 // RateLimitByIP returns a Gin middleware that throttles requests
-// per c.ClientIP(). Rejected requests get a generic 429 — the
-// message is deliberately identical to the "invalid credentials"
-// error /auth/bind returns, so a probing attacker cannot tell
-// rate limiting apart from auth failure (a useful little bit of
-// noise).
+// per c.ClientIP(). Rejected requests get a generic 429.
 func RateLimitByIP(l *IPLimiter) gin.HandlerFunc {
+	return RateLimitByIPWithDefense(l, nil)
+}
+
+// RateLimitByIPWithDefense throttles requests per client IP and feeds violations
+// into the intrusion defense engine to detect automated scanners.
+func RateLimitByIPWithDefense(l *IPLimiter, dm *security.DefenseManager) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		ip := c.ClientIP()
+		ip := ExtractRealClientIP(c)
 		if !l.Allow(ip) {
+			if dm != nil {
+				dm.RecordAuthFailure(ip, "接口调用超频(RateLimit)", c.Request.UserAgent())
+			}
 			utils.Fail(c, http.StatusTooManyRequests, "invalid credentials")
 			c.Abort()
 			return
@@ -122,3 +128,4 @@ func RateLimitByIP(l *IPLimiter) gin.HandlerFunc {
 		c.Next()
 	}
 }
+

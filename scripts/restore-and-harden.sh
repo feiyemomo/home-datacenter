@@ -126,6 +126,14 @@ log_info "Step 6: 执行本地健康与安全基线校验..."
 sleep 5
 docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
 
+# ------------------------------------------------------------------------------
+# 步骤 7：为自动化运维及测试预置独立专用测试设备凭证 (tester_agent)
+# ------------------------------------------------------------------------------
+log_info "Step 7: 检查并签发独立测试凭据 (tester_agent)..."
+if docker compose ps -q api >/dev/null 2>&1; then
+    docker compose exec -T api go run cmd/mkdevice/main.go tester_agent || true
+fi
+
 echo ""
 echo "=================================================================="
 log_succ "修复流水线已全部执行完成！"
@@ -133,4 +141,6 @@ echo "遗留修复注意事项："
 echo "1. 请在路由器后台 (192.168.31.1) 修改管理员登录密码，并关闭 Telnet (23)。"
 echo "2. 请前往海康威视摄像头管理后台修改摄像头的弱口令 Haikangcam。"
 echo "3. 请在 Cloudflare 与 亿安云 (Bitiful) 控制台分别重新签发并更新 Tunnel 与 S3 AK/SK。"
+echo "4. 如需启用 QQ 邮箱 SMTP 安全告警，请在 .env 中设置 ALERT_ENABLED=true 并填入 ALERT_SMTP_USER、ALERT_SMTP_PASS 及 ALERT_RECIPIENT。"
 echo "=================================================================="
+

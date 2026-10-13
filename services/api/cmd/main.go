@@ -178,11 +178,14 @@ func main() {
 	logSub.Start()
 
 	// ---- Services & Handlers ----
+	alertMgr := security.NewAlertManager(cfg.Security.Alert)
+	defenseMgr := security.NewDefenseManager(cfg.Security.Defense, alertMgr, bus)
+
 	authService := service.NewAuthService(userRepo, deviceRepo)
 	userService := service.NewUserService(userRepo, deviceRepo)
 	deviceService := service.NewDeviceService(deviceRepo)
 
-	authHandler := handler.NewAuthHandler(authService, bus)
+	authHandler := handler.NewAuthHandler(authService, bus, defenseMgr)
 	userHandler := handler.NewUserHandler(userService, deviceService, deviceMgr, deviceRepo, bus)
 	deviceHandler := handler.NewDeviceHandler(deviceService, userService, bus)
 
@@ -203,7 +206,7 @@ func main() {
 	}
 	guardMgr := security.NewGuardManager(database.DB, bus)
 	mqttHandler.SetGuardProvider(guardMgr)
-	securityHandler := handler.NewSecurityHandler(guardMgr)
+	securityHandler := handler.NewSecurityHandler(guardMgr, defenseMgr, alertMgr)
 
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 	recMetricsDir := cfg.Maintenance.RecordingsRoot
@@ -477,6 +480,9 @@ func main() {
 	// container stderr). See internal/middleware/errorlog.go.
 	r.Use(middleware.ErrorLogMiddleware(database.DB, bus))
 
+	// Active intrusion defense & real IP resolution middleware
+	r.Use(middleware.SecurityDefenseMiddleware(defenseMgr))
+
 	// Health check (kept simple for Docker / Cloudflare probes)
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
@@ -546,7 +552,7 @@ func main() {
 		defer bindLimiter.Stop()
 		bindLimit := gin.HandlerFunc(func(c *gin.Context) { c.Next() })
 		if cfg.Auth.RateLimit.Enabled != nil && *cfg.Auth.RateLimit.Enabled {
-			bindLimit = middleware.RateLimitByIP(bindLimiter)
+			bindLimit = middleware.RateLimitByIPWithDefense(bindLimiter, defenseMgr)
 		}
 
 		auth := api.Group("/auth")
@@ -646,12 +652,23 @@ func main() {
 			systemAdmin.POST("/storage/sync-archive", systemHandler.TriggerArchiveSync)
 		}
 
-		// v1.11.0: Security Guard arm/disarm modes.
+		// v1.11.0: Security Guard & Intrusion Defense
 		securityGroup := api.Group("/security")
 		securityGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
 			securityGroup.GET("/guard", securityHandler.GetGuard)
 			securityGroup.PUT("/guard", middleware.RequireAdmin(database.DB), securityHandler.SetGuard)
+			securityGroup.GET("/overview", securityHandler.GetOverview)
+			securityGroup.GET("/banned", securityHandler.ListBanned)
+		}
+
+		// Admin-only security emergency response operations
+		securityAdmin := api.Group("/security")
+		securityAdmin.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		{
+			securityAdmin.POST("/ban", securityHandler.ManualBan)
+			securityAdmin.DELETE("/ban/:ip", securityHandler.ManualUnban)
+			securityAdmin.POST("/test-alert", securityHandler.TestAlertEmail)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so

@@ -104,9 +104,12 @@ def sync_webrtc_to_frigate(external_addr):
         with urllib.request.urlopen(req, timeout=5) as resp:
             cfg = json.loads(resp.read().decode())
         
+        ext_host = external_addr.split(":")[0] if external_addr else ""
         current_candidates = cfg.get("go2rtc", {}).get("webrtc", {}).get("candidates", [])
         new_candidates = []
         for c in current_candidates:
+            if ext_host and c.startswith(ext_host + ":"):
+                continue
             if c.startswith("154.8.195.220:"):
                 continue
             new_candidates.append(c)

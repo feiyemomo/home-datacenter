@@ -77,6 +77,7 @@ func (s *Subscriber) Start() {
 		eventbus.TopicDeviceTokenRotate,
 		// System security mode & vision person audit events:
 		eventbus.TopicSecurityGuardMode,
+		eventbus.TopicSecurityAlert,
 		eventbus.TopicVisionPersonRegister,
 		eventbus.TopicVisionPersonDelete,
 	}
@@ -554,6 +555,20 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 			message = fmt.Sprintf("摄像头 %s 警报: 监测到疑似跌倒事件（负载恢复后补偿确认）！", cameraName)
 		} else {
 			message = fmt.Sprintf("摄像头 %s 警报: 监测到疑似跌倒事件！", cameraName)
+		}
+		level = model.LevelCritical
+
+	case eventbus.TopicSecurityAlert:
+		var p eventbus.SecurityAlertPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			return nil
+		}
+		if p.Ts > 0 {
+			ts = p.Ts
+		}
+		message = fmt.Sprintf("安全防御拦截: [%s] 来自 %s - %s", p.AlertType, p.IP, p.Action)
+		if p.Message != "" {
+			message = p.Message
 		}
 		level = model.LevelCritical
 

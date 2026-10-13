@@ -61,8 +61,8 @@ param(
 # v1.8.24: NAS migrated back to 192.168.31.235 (single NIC on the AC
 # router). Keep this in sync with compose.yaml NAS_LAN_IP.
 $NAS_HOST   = if ($env:NAS_HOST) { $env:NAS_HOST } else { "100.90.67.71" }
-$NAS_USER   = "fnos-momo"
-$NAS_PORT   = 22
+$NAS_USER   = if ($env:NAS_USER) { $env:NAS_USER } else { "momo" }
+$NAS_PORT   = if ($env:NAS_PORT) { [int]$env:NAS_PORT } else { 22 }
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
 # =============================================================
 

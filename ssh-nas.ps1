@@ -32,9 +32,9 @@ param(
 )
 
 # ============== CONFIG (keep in sync with deploy-nas.ps1) ==============
-$NAS_HOST   = "192.168.31.235"
-$NAS_USER   = "fnos-momo"
-$NAS_PORT   = 22
+$NAS_HOST   = if ($env:NAS_HOST) { $env:NAS_HOST } else { "100.90.67.71" }
+$NAS_USER   = if ($env:NAS_USER) { $env:NAS_USER } else { "momo" }
+$NAS_PORT   = if ($env:NAS_PORT) { [int]$env:NAS_PORT } else { 22 }
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
 # =======================================================================
 

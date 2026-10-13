@@ -82,8 +82,8 @@ archive_once() {
     for date_path in "$SOURCE_DIR"/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]; do
         [ -d "$date_path" ] || continue
         DATE="$(basename "$date_path")"
-        if [ "$DATE" \< "$CUTOFF_DATE" ] || [ "$DATE" = "$CUTOFF_DATE" ]; then
-            log "Found eligible archive date folder: $DATE"
+        if [ "$DATE" \< "$CUTOFF_DATE" ]; then
+            log "Found eligible archive date folder: $DATE (older than ${CUTOFF_DATE})"
             TARGET_DIR="$STAGING_DIR/$DATE"
             mkdir -p "$TARGET_DIR"
 

@@ -32,6 +32,7 @@ type Config struct {
 	Releases    ReleasesConfig    `mapstructure:"releases"`
 	Maintenance MaintenanceConfig `mapstructure:"maintenance"`
 	Vision      VisionConfig      `mapstructure:"vision"`
+	Security    SecurityConfig    `mapstructure:"security"`
 }
 
 // ServerConfig holds HTTP server settings.
@@ -138,6 +139,31 @@ type VisionConfig struct {
 	// var to override without editing the YAML.
 	BaseURL string `mapstructure:"base_url"`
 	Enabled bool   `mapstructure:"enabled"`
+}
+
+// SecurityConfig holds alert and intrusion defense parameters.
+type SecurityConfig struct {
+	Alert   AlertConfig   `mapstructure:"alert"`
+	Defense DefenseConfig `mapstructure:"defense"`
+}
+
+// AlertConfig holds SMTP options for emergency security email notifications.
+type AlertConfig struct {
+	Enabled   bool   `mapstructure:"enabled"`
+	Host      string `mapstructure:"host"`     // e.g. "smtp.qq.com"
+	Port      int    `mapstructure:"port"`     // e.g. 465 (SSL) or 587
+	Username  string `mapstructure:"username"` // e.g. "xxxxxx@qq.com"
+	Password  string `mapstructure:"password"` // SMTP Auth Code / App password
+	Sender    string `mapstructure:"sender"`   // e.g. "xxxxxx@qq.com"
+	Recipient string `mapstructure:"recipient"`// Admin recipient email
+}
+
+// DefenseConfig holds automated intrusion mitigation and IP ban parameters.
+type DefenseConfig struct {
+	MaxAuthFailures   int      `mapstructure:"max_auth_failures"`   // default 5 attempts
+	FailureWindowMins int      `mapstructure:"failure_window_mins"` // default 5 mins
+	BanDurationMins   int      `mapstructure:"ban_duration_mins"`   // default 30 mins
+	WhitelistIPs      []string `mapstructure:"whitelist_ips"`       // IPs exempt from ban (LAN/gateway)
 }
 
 // CameraConfig holds the camera platform settings.
@@ -417,6 +443,20 @@ func Load(path string) error {
 	v.SetDefault("vision.base_url", "http://home-vision:8090")
 	v.SetDefault("vision.enabled", true)
 
+	// Security defaults — automated attack mitigation & QQ SMTP email alerts
+	v.SetDefault("security.alert.enabled", false)
+	v.SetDefault("security.alert.host", "smtp.qq.com")
+	v.SetDefault("security.alert.port", 465)
+	v.SetDefault("security.alert.username", "")
+	v.SetDefault("security.alert.password", "")
+	v.SetDefault("security.alert.sender", "")
+	v.SetDefault("security.alert.recipient", "")
+
+	v.SetDefault("security.defense.max_auth_failures", 5)
+	v.SetDefault("security.defense.failure_window_mins", 5)
+	v.SetDefault("security.defense.ban_duration_mins", 30)
+	v.SetDefault("security.defense.whitelist_ips", []string{"127.0.0.1", "::1", "192.168.31.0/24"})
+
 	// Secret material may be supplied via env var instead of the YAML
 	// file. This is the preferred path for production (Docker secret /
 	// .env): the value never lands in the committed config file.
@@ -442,6 +482,32 @@ func Load(path string) error {
 	}
 	if envPass := os.Getenv("MQTT_PASSWORD"); envPass != "" {
 		v.Set("mqtt.password", envPass)
+	}
+
+	// Security & Alert env vars
+	if envAlert := os.Getenv("ALERT_ENABLED"); envAlert != "" {
+		v.Set("security.alert.enabled", envAlert == "true" || envAlert == "1")
+	}
+	if envHost := os.Getenv("ALERT_SMTP_HOST"); envHost != "" {
+		v.Set("security.alert.host", envHost)
+	}
+	if envPort := os.Getenv("ALERT_SMTP_PORT"); envPort != "" {
+		var p int
+		if _, err := fmt.Sscanf(envPort, "%d", &p); err == nil {
+			v.Set("security.alert.port", p)
+		}
+	}
+	if envUser := os.Getenv("ALERT_SMTP_USER"); envUser != "" {
+		v.Set("security.alert.username", envUser)
+	}
+	if envPass := os.Getenv("ALERT_SMTP_PASS"); envPass != "" {
+		v.Set("security.alert.password", envPass)
+	}
+	if envSender := os.Getenv("ALERT_SMTP_SENDER"); envSender != "" {
+		v.Set("security.alert.sender", envSender)
+	}
+	if envRcpt := os.Getenv("ALERT_RECIPIENT"); envRcpt != "" {
+		v.Set("security.alert.recipient", envRcpt)
 	}
 
 	v.SetConfigFile(path)

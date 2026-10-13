@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -270,6 +271,8 @@ func (m *RecordingSizeMonitor) emitQuotaEvent(level, busSev string, msg string) 
 func dirSize(root string) (uint64, int, error) {
 	var total uint64
 	var count int
+	seenInodes := make(map[[2]uint64]bool)
+
 	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			// If the root itself is missing, surface that; otherwise
@@ -280,13 +283,30 @@ func dirSize(root string) (uint64, int, error) {
 			return nil
 		}
 		if d.IsDir() {
+			// Prune staging and internal cache directories so temporary
+			// hardlinks or transcodes aren't double-counted against the recording pool.
+			name := d.Name()
+			if path != root && (name == ".archive-staging" || strings.HasPrefix(name, ".")) {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		info, iErr := d.Info()
 		if iErr != nil {
 			return nil
 		}
-		total += uint64(info.Size())
+
+		// Hardlink deduplication: if multiple path entries reference the same inode,
+		// count physical disk bytes only once.
+		if dev, ino, ok := fileDeviceAndInode(info); ok && ino > 0 {
+			key := [2]uint64{dev, ino}
+			if seenInodes[key] {
+				return nil
+			}
+			seenInodes[key] = true
+		}
+
+		total += allocatedSize(info)
 		count++
 		return nil
 	})

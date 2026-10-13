@@ -41,7 +41,7 @@ func TestAuthVerifyRoleAndAdminEnforcement(t *testing.T) {
 	userRepo := repository.NewUserRepository(db)
 	deviceRepo := repository.NewDeviceRepository(db)
 	authSvc := service.NewAuthService(userRepo, deviceRepo)
-	authH := NewAuthHandler(authSvc, nil)
+	authH := NewAuthHandler(authSvc, nil, nil)
 
 	// Create an admin user and a regular user
 	adminUser := &model.User{Name: "admin_user", IsAdmin: true}

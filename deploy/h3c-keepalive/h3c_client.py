@@ -127,7 +127,7 @@ class H3CClient:
             "userName": self.username,
             "projectId": str(app_info["projectId"]),
             "projectName": app_info.get("projectName", "home"),
-            "internalIp": app_info.get("internalIp", "192.168.31.234"),
+            "internalIp": app_info.get("internalIp") or os.environ.get("NAS_LAN_IP") or "192.168.31.234",
             "internalPort": int(app_info.get("internalPort", 8088)),
             "proxyType": app_info.get("proxyType", "HTTP"),
             "tunnelAppId": app_info["tunnelAppId"],

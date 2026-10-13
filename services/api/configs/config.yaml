@@ -208,3 +208,24 @@ maintenance:
   cpu_crit_pct: 95
   mem_warn_pct: 80
   mem_crit_pct: 90
+
+# 安全响应与应急防御引擎 (v1.12.0)
+# 针对网络渗透、暴力破解的自动识别、临时封禁、白名单保护及 QQ 邮箱 (SMTP 465 SSL) 应急报警
+security:
+  alert:
+    enabled: false               # 启用紧急安全告警邮件 (设置为 true 时需填写以下参数)
+    host: smtp.qq.com            # QQ 邮箱 SMTP 服务器
+    port: 465                    # QQ 邮箱 SSL 端口 (推荐 465)
+    username: ""                 # QQ 邮箱地址，如 123456@qq.com (通过 ALERT_SMTP_USER 环境变量注入)
+    password: ""                 # QQ 邮箱授权码/应用专属密码 (通过 ALERT_SMTP_PASS 环境变量注入)
+    sender: ""                   # 发件人 (留空默认同 username)
+    recipient: ""                # 接收告警的管理员邮箱地址 (通过 ALERT_RECIPIENT 注入)
+  defense:
+    max_auth_failures: 5         # 5分钟内连续失败达到 5 次触发自动阻断
+    failure_window_mins: 5       # 统计滑动窗口（分钟）
+    ban_duration_mins: 30        # 自动封禁持续时间（分钟）
+    whitelist_ips:               # 白名单免封禁 IP (路由器网关触发异常时仅发告警邮件，不阻断网络)
+      - 127.0.0.1
+      - "::1"
+      - 192.168.31.0/24
+
