@@ -4,7 +4,7 @@ WORKDIR /app
 
 # Install dependencies first for better layer caching.
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm config set registry https://registry.npmmirror.com && npm ci
 
 # Build the production bundle.
 COPY . .

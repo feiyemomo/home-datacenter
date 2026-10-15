@@ -234,7 +234,8 @@ $Excludes = @(
     # dynamically pushed streams. Must NEVER overwrite NAS's live config
     # with local sanitized templates.
     "./deploy/frigate/config.yml",
-    "./deploy/frigate/config.yml.bak"
+    "./deploy/frigate/config.yml.bak",
+    "./test_ssh.ps1"
 )
 
 # ---- Dry run: pack + list, don't touch NAS ----

@@ -20,7 +20,7 @@
 param(
     # v1.8.44: NAS migrated back to 192.168.31.235 (single NIC on the AC
     # router) — was 192.168.1.3. Keep in sync with deploy-nas.ps1.
-    [string]$BaseUrl = if ($env:NAS_HOST) { "http://$($env:NAS_HOST):8080" } else { "http://100.90.67.71:8080" },
+    [string]$BaseUrl = $(if ($env:NAS_HOST) { "http://$($env:NAS_HOST):8080" } else { "http://100.90.67.71:8080" }),
     [switch]$Copy
 )
 

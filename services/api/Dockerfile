@@ -44,7 +44,8 @@ WORKDIR /
 # ~3s per 60s clip). The device node is passed in by compose.yaml
 # (devices + group_add render); camera_handler.go falls back to
 # libx264 automatically if the device is absent or the driver errors.
-RUN apk add --no-cache ffmpeg tzdata intel-media-driver libva
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories && \
+    apk add --no-cache ffmpeg tzdata intel-media-driver libva
 
 COPY --from=builder /app/server .
 COPY --from=builder /app/configs ./configs
