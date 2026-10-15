@@ -483,6 +483,30 @@ export interface SecurityGuardState {
     updated_at: number;
 }
 
+// -------------------- Intrusion Defense & Firewall Management --------------------
+
+export interface BanEntry {
+    ip: string;
+    reason: string;
+    banned_at: string;
+    expires_at: string;
+    permanent: boolean;
+}
+
+export interface DefenseOverview {
+    total_banned_count: number;
+    total_blocked_hits: number;
+    active_bans: BanEntry[];
+    smtp_enabled: boolean;
+    recipient: string;
+}
+
+export interface ManualBanRequest {
+    ip: string;
+    duration_minutes: number;
+    reason?: string;
+}
+
 // -------------------- Datacenter Ops & Metrics (v1.11.0) --------------------
 
 export interface SystemMetrics {

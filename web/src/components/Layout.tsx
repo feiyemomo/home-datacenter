@@ -49,6 +49,12 @@ const NAV_ITEMS: NavItem[] = [
         adminOnly: true,
     },
     {
+        to: "/security",
+        label: "安全防御",
+        icon: <ShieldAlert size={18} />,
+        adminOnly: true,
+    },
+    {
         to: "/users",
         label: "用户",
         icon: <UserCog size={18} />,

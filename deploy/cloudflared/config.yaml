@@ -31,6 +31,4 @@ ingress:
     service: http://home-web:80
   - hostname: api.feiyemomo.top
     service: http://home-web:80
-  - hostname: cam.feiyemomo.top
-    service: http://home-web:80
   - service: http_status:404

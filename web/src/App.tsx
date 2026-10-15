@@ -40,6 +40,7 @@ const MqttDebug = lazy(() => import("@/pages/MqttDebug"));
 const Profile = lazy(() => import("@/pages/Profile"));
 const Users = lazy(() => import("@/pages/Users"));
 const Automations = lazy(() => import("@/pages/Automations"));
+const Security = lazy(() => import("@/pages/Security"));
 
 /**
  * Application routes.
@@ -113,6 +114,7 @@ function AppRoutes() {
                         {/* Admin-only routes */}
                         <Route element={<ProtectedRoute adminOnly />}>
                             <Route path="/logs" element={<Logs />} />
+                            <Route path="/security" element={<Security />} />
                             <Route path="/cameras/new" element={<DeviceCreate />} />
                             <Route path="/users" element={<Users />} />
                             <Route path="/automations" element={<Automations />} />
