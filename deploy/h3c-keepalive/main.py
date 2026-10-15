@@ -278,6 +278,9 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
         if args and str(args[1]) in ("404", "500", "503"):
             super().log_message(format, *args)
 
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -303,9 +306,8 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
                 self.send_response(503)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Refresh", "3")
-                self.end_headers()
-                html = "<html><head><meta http-equiv='refresh' content='3'></head><body><h3>H3C Tunnel is initializing/reconnecting...</h3><p>Please wait...</p></body></html>"
-                self.wfile.write(html.encode("utf-8"))
+                init_html = "<html><head><meta http-equiv='refresh' content='3'></head><body><h3>H3C Tunnel is initializing/reconnecting...</h3><p>Please wait...</p></body></html>"
+                self.wfile.write(init_html.encode("utf-8"))
                 return
 
             dest_path = ""
