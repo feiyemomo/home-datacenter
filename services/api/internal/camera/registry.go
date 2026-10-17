@@ -147,8 +147,7 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 	// probe fails (camera offline, ffprobe missing) we keep the requested
 	// default rather than fail the registration.
 	if in.Codec == "" && !in.Transcode {
-		raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-			in.Username, in.Password, in.Host, in.RTSPPort, in.ChannelID)
+		raw := buildRTSPURL(in.Username, in.Password, in.Host, in.RTSPPort, in.ChannelID)
 		probed := probeVideoCodec(ctx, raw)
 		if codec, trans := codecFromProbe(probed); trans {
 			in.Codec, in.Transcode = codec, true
@@ -1664,8 +1663,7 @@ func (r *Registry) retryPushFrigateConfigInBackground(maxAttempts int, interval 
 // fragment), so they were harmless but useless. Keeping the URL
 // clean avoids confusion about which directives apply where.
 func (r *Registry) frigateCameraPath(cam *model.Camera, user, pass string) string {
-	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	return buildRTSPURL(user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 }
 
 // frigateSubstreamPath returns the RTSP URL for the camera's lower-resolution
@@ -1680,8 +1678,7 @@ func (r *Registry) frigateSubstreamPath(cam *model.Camera, user, pass string) st
 	} else {
 		return ""
 	}
-	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, subChannel)
+	return buildRTSPURL(user, pass, cam.Host, cam.RTSPPort, subChannel)
 }
 
 // frigateInputs builds the dual-stream input list for Frigate.
@@ -1802,7 +1799,29 @@ func slugifyName(name string) string {
 	return out
 }
 
-// --- credential helpers (also used by the ONVIF controller) ---
+// --- credential & stream URL helpers ---
+
+// buildRTSPURL constructs a canonical RTSP URL with RFC 3986 percent-encoded
+// user credentials (via url.UserPassword). This guarantees that special characters
+// in passwords (e.g. '@', '#', ':', '/', '?', '&', '%', spaces) do NOT break
+// URL grammar when consumed by FFmpeg, ffprobe, go2rtc, or Frigate.
+// Both FFmpeg and go2rtc's URL parsers correctly decode percent-encoded userinfo.
+func buildRTSPURL(user, pass, host string, port, channel int) string {
+	if user != "" || pass != "" {
+		userInfo := url.UserPassword(user, pass).String()
+		return fmt.Sprintf("rtsp://%s@%s:%d/Streaming/Channels/%d", userInfo, host, port, channel)
+	}
+	return fmt.Sprintf("rtsp://%s:%d/Streaming/Channels/%d", host, port, channel)
+}
+
+// buildISAPIURL constructs an isapi:// URL with RFC 3986 percent-encoded user credentials.
+func buildISAPIURL(user, pass, host string, port int) string {
+	if user != "" || pass != "" {
+		userInfo := url.UserPassword(user, pass).String()
+		return fmt.Sprintf("isapi://%s@%s:%d/", userInfo, host, port)
+	}
+	return fmt.Sprintf("isapi://%s:%d/", host, port)
+}
 
 // rtspURL builds the canonical Hikvision-style URL:
 //
@@ -1811,18 +1830,6 @@ func slugifyName(name string) string {
 // Most Dahua / Uniview / Ezviz devices accept the same shape; for
 // vendors that diverge (Reolink, TP-Link) we add per-vendor paths
 // later. For now this is the 90% case.
-//
-// IMPORTANT: we deliberately do NOT use net/url's UserPassword
-// helper here. Go's url.UserPassword percent-encodes reserved chars
-// in the userinfo (e.g. "@" → "%40"), which is standards-correct —
-// but go2rtc's RTSP client does NOT URL-decode the password before
-// sending it to the camera. So a password "pass@word" becomes
-// "pass%40word" on the wire, and the camera rejects it with
-// "wrong user/pass". Building the URL as a plain string with the
-// raw password avoids this. The go2rtc URL parser splits at the
-// last "@" before the host, so a password containing "@" (e.g.
-// "pass@word") produces "rtsp://admin:pass@word@host..." which
-// go2rtc parses correctly as user=admin, pass=pass@word.
 //
 // Audio handling: the platform's HLS path defaults to dropping
 // audio at the source. Camera audio codecs (G726 / PCMU /
@@ -1939,8 +1946,7 @@ func cameraIsNativeHEVC(cam *model.Camera) bool {
 // It keeps video encoded as H.264 (width=1920) so Android and desktop browsers
 // can decode via WebRTC without crashing on unsupported HEVC RTP streams.
 func (r *Registry) rtsp1080pURL(cam *model.Camera, user, pass string) string {
-	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	raw := buildRTSPURL(user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 	stopFrag := "#stop=0"
 	if r.StopTimeout > 0 {
 		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
@@ -1989,8 +1995,7 @@ func (r *Registry) add1080pStream(ctx context.Context, cam *model.Camera, user, 
 // HEVC companion stream. It forces passthrough regardless of the
 // camera's configured servicing codec.
 func (r *Registry) hevcPassthroughURL(cam *model.Camera, user, pass string) string {
-	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	raw := buildRTSPURL(user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
 	stopFrag := "#stop=30"
 	if r.StopTimeout > 0 {
 		stopFrag = "#stop=" + strconv.Itoa(r.StopTimeout)
@@ -2097,10 +2102,9 @@ func (r *Registry) rtspBackchannelURL(cam *model.Camera, user, pass string) stri
 		if port <= 0 {
 			port = 80
 		}
-		return fmt.Sprintf("isapi://%s:%s@%s:%d/", user, pass, cam.Host, port)
+		return buildISAPIURL(user, pass, cam.Host, port)
 	}
-	return fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d#backchannel=1",
-		user, pass, cam.Host, cam.RTSPPort, cam.ChannelID)
+	return buildRTSPURL(user, pass, cam.Host, cam.RTSPPort, cam.ChannelID) + "#backchannel=1"
 }
 
 func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
@@ -2112,8 +2116,7 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 			channel = 102
 		}
 	}
-	raw := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d",
-		user, pass, cam.Host, cam.RTSPPort, channel)
+	raw := buildRTSPURL(user, pass, cam.Host, cam.RTSPPort, channel)
 	codec := effectiveCodec(cam)
 	audioOn := cameraHasAudio(cam)
 	// v1.13.19: Keep RTSP ffmpeg upstream permanently active (#stop=0)

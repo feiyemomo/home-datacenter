@@ -172,7 +172,7 @@ func (h *UserHandler) List(c *gin.Context) {
 type createUserRequest struct {
     Name     string `json:"name"`
     IsAdmin  bool   `json:"is_admin"`
-    Password string `json:"password"` // v1.10.1: manual password (letters+digits); empty keeps legacy random access_key
+    Password string `json:"password"` // v1.10.1: manual password; empty keeps legacy random access_key
 }
 
 // Create inserts a new user. Admin-only.

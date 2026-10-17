@@ -127,8 +127,9 @@ func main() {
 				log.Printf("cam %d: decrypt pass: %v", c.ID, err)
 				continue
 			}
-			rtsp := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d#audio=0",
-				user, pass, c.Host, c.RTSPPort, c.ChannelID)
+			userInfo := url.UserPassword(user, pass).String()
+			rtsp := fmt.Sprintf("rtsp://%s@%s:%d/Streaming/Channels/%d#audio=0",
+				userInfo, c.Host, c.RTSPPort, c.ChannelID)
 			if err := go2.AddStream(ctx, c.Name, rtsp); err != nil {
 				log.Printf("cam %d: add %s to go2rtc: %v", c.ID, c.Name, err)
 				continue
@@ -192,8 +193,9 @@ func main() {
 		// add #video=H264 any more — the go2rtc image dropped
 		// the server-side transcoder and we rely on HLS
 		// passthrough of the camera's native codec (HEVC).
-		rtsp := fmt.Sprintf("rtsp://%s:%s@%s:%d/Streaming/Channels/%d#audio=0",
-			user, *newPass, c.Host, c.RTSPPort, c.ChannelID)
+		userInfo := url.UserPassword(user, *newPass).String()
+		rtsp := fmt.Sprintf("rtsp://%s@%s:%d/Streaming/Channels/%d#audio=0",
+			userInfo, c.Host, c.RTSPPort, c.ChannelID)
 		log.Printf("cam %d: pushing %s", c.ID, redactPass(rtsp))
 		if err := go2.AddStream(ctx, c.StreamName, rtsp); err != nil {
 			log.Printf("cam %d: go2rtc add: %v", c.ID, err)

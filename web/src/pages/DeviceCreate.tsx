@@ -157,7 +157,7 @@ export default function DeviceCreate() {
     // that tells go2rtc to run the source through ffmpeg, output
     // H.264 (escape for HEVC cameras on Chromium WebRTC).
     const rtspPreview = useMemo(() => {
-        const u = draft.username || "<user>";
+        const u = draft.username ? encodeURIComponent(draft.username) : "<user>";
         const p = draft.password ? "•••" : "<pass>";
         const ch = draft.channel_id || 1;
         const frag = draft.transcode

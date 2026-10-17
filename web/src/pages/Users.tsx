@@ -75,15 +75,11 @@ export default function Users() {
             setError("请输入名称");
             return;
         }
-            const password = newPassword.trim();
-            if (!password) {
-                setError("请设置密码");
-                return;
-            }
-            if (!/^[A-Za-z0-9]+$/.test(password)) {
-                setError("密码仅限字母和数字");
-                return;
-            }
+        const password = newPassword.trim();
+        if (!password) {
+            setError("请设置密码");
+            return;
+        }
         setCreating(true);
         setError(null);
         try {
@@ -265,7 +261,7 @@ export default function Users() {
                                 autoFocus
                             />
                             <Input
-                                placeholder="密码（仅限字母和数字）"
+                                placeholder="密码（支持特殊符号）"
                                 value={newPassword}
                                 onChange={(e) => setNewPassword(e.target.value)}
                                 maxLength={64}

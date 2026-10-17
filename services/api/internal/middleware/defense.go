@@ -13,7 +13,25 @@ import (
 
 // ExtractRealClientIP resolves client IP respecting proxies and edge headers safely.
 func ExtractRealClientIP(c *gin.Context) string {
-	// 1. Prefer X-Forwarded-For if populated
+	// 1. Direct Cloudflare header if present (Tunnel / Proxy)
+	cfIP := strings.TrimSpace(c.GetHeader("CF-Connecting-IP"))
+	if cfIP != "" && net.ParseIP(cfIP) != nil {
+		return cfIP
+	}
+
+	// 2. Verified X-Real-IP set by nginx reverse proxy
+	xri := strings.TrimSpace(c.GetHeader("X-Real-IP"))
+	if xri != "" && net.ParseIP(xri) != nil {
+		return xri
+	}
+
+	// 3. Fall back to Gin's trusted client IP (respects SetTrustedProxies)
+	clientIP := c.ClientIP()
+	if clientIP != "" {
+		return clientIP
+	}
+
+	// 4. Fall back to X-Forwarded-For if populated
 	xff := c.GetHeader("X-Forwarded-For")
 	if xff != "" {
 		parts := strings.Split(xff, ",")
@@ -26,14 +44,7 @@ func ExtractRealClientIP(c *gin.Context) string {
 		}
 	}
 
-	// 2. Fall back to X-Real-IP
-	xri := strings.TrimSpace(c.GetHeader("X-Real-IP"))
-	if xri != "" && net.ParseIP(xri) != nil {
-		return xri
-	}
-
-	// 3. Fall back to Gin's trusted client IP
-	return c.ClientIP()
+	return ""
 }
 
 // SecurityDefenseMiddleware enforces active IP blocklists across endpoints.
