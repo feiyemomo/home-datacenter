@@ -74,17 +74,18 @@ def docker_exec_frigate(cmd):
         logger.warning(f"docker_exec_frigate failed for {cmd}: {e}")
         return None
 
-def check_addr_reachable(addr):
+def check_addr_reachable(addr, default_port=80):
     if not addr:
         return False
-    clean = addr.replace("http://", "").replace("https://", "").strip("/")
-    if ":" not in clean:
-        return False
     try:
-        host, port_str = clean.split(":")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(3.0)
-        s.connect((host, int(port_str)))
+        is_https = addr.lower().startswith("https://")
+        clean = addr if "://" in addr else "http://" + addr
+        parsed = urllib.parse.urlparse(clean)
+        host = parsed.hostname
+        if not host:
+            return False
+        port = parsed.port or (443 if is_https else default_port)
+        s = socket.create_connection((host, port), timeout=3.0)
         s.close()
         return True
     except Exception as e:
@@ -181,10 +182,15 @@ def update_state(primary_data, all_tunnels=None, error=None):
     with state_lock:
         if all_tunnels:
             tunnel_state["tunnels"] = all_tunnels
-        if error and not primary_data:
+        if not primary_data:
             tunnel_state["status"] = "error"
-            tunnel_state["error"] = str(error)
-        elif primary_data:
+            tunnel_state["error"] = str(error) if error else "Primary 'home' tunnel is not established"
+            tunnel_state["externalAddr"] = ""
+            tunnel_state["tunnelId"] = ""
+            tunnel_state["closeTime"] = ""
+            tunnel_state["remainingMinutes"] = 0
+            tunnel_state["lastChecked"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        else:
             tunnel_state["status"] = "online"
             tunnel_state["externalAddr"] = primary_data.get("externalAddr", "")
             tunnel_state["tunnelId"] = primary_data.get("tunnelId", "")
@@ -237,7 +243,9 @@ def run_check(force_renew=False):
                     res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=180)
             results[app] = res
             logger.info(f"Active tunnel URL for '{app}': {res.get('externalAddr')} (expires {res.get('closeTime')}, remaining {res.get('remainingMinutes', 0):.1f}m)")
-            if app == "home" or primary_res is None:
+            # primary_res is ONLY assigned from the "home" tunnel if it's ESTABLISHED.
+            # NEVER fallback to "webrtc_test" (8555) or "nas_ssh" (22).
+            if app == "home" and res.get("status") == "ESTABLISHED" and res.get("externalAddr"):
                 primary_res = res
             if app == "webrtc_test" and res.get("externalAddr"):
                 try:
@@ -258,8 +266,26 @@ def run_check(force_renew=False):
             logger.error(f"Error during tunnel check for '{app}': {e}", exc_info=True)
             results[app] = {"status": "error", "error": str(e)}
 
-    update_state(primary_res, all_tunnels=results)
+    home_err = None
+    if not primary_res:
+        home_entry = results.get("home")
+        if isinstance(home_entry, dict) and home_entry.get("error"):
+            home_err = home_entry.get("error")
+        else:
+            home_err = "Primary 'home' tunnel is not established"
+
+    update_state(primary_res, all_tunnels=results, error=home_err)
     return primary_res
+
+def get_sanitized_state():
+    with state_lock:
+        state_copy = dict(tunnel_state)
+        if "tunnels" in state_copy and isinstance(state_copy["tunnels"], dict):
+            # Sanitize external view: omit "nas_ssh" (Finding #60 fix), keep "home" and "webrtc_test"
+            state_copy["tunnels"] = {
+                k: v for k, v in state_copy["tunnels"].items() if k != "nas_ssh"
+            }
+        return state_copy
 
 def keepalive_worker():
     logger.info("Keepalive worker thread started.")
@@ -287,8 +313,7 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(parsed.query)
 
         if path in ("/status", "/api/status", "/api/v1/h3c/status"):
-            with state_lock:
-                body = json.dumps(tunnel_state, ensure_ascii=False, indent=2).encode("utf-8")
+            body = json.dumps(get_sanitized_state(), ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
@@ -341,10 +366,10 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path in ("/refresh", "/api/v1/h3c/refresh"):
             res = run_check(force_renew=True)
-            with state_lock:
-                body = json.dumps(tunnel_state, ensure_ascii=False, indent=2).encode("utf-8")
+            body = json.dumps(get_sanitized_state(), ensure_ascii=False, indent=2).encode("utf-8")
             self.send_response(200 if res else 500)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Access-Control-Allow-Origin", "*")
             self.end_headers()
             self.wfile.write(body)
             return

@@ -23,7 +23,7 @@ PORT = int(os.environ.get("PORT", "8090"))
 face_engine = FaceEngine(model_dir=MODEL_DIR, data_dir=DATA_DIR)
 pose_engine = PoseEngine(model_dir=MODEL_DIR)
 
-def is_safe_url(url_str):
+def is_safe_url(url_str, allow_loopback=False):
     try:
         parsed = urllib.parse.urlparse(url_str)
         # Strictly require http or https
@@ -33,33 +33,42 @@ def is_safe_url(url_str):
         hostname = parsed.hostname
         if not hostname:
             return False
-        # Block localhost and link-local addresses
-        if hostname.lower() in ("localhost", "127.0.0.1", "::1"):
-            logger.warning(f"SSRF blocked: loopback target {hostname}")
-            return False
+
+        if not allow_loopback and os.environ.get("VISION_ALLOW_LOOPBACK", "false").lower() in ("true", "1"):
+            allow_loopback = True
+
         # Resolve IP and check if it's private or reserved
         import ipaddress
         import socket
         try:
             ip_obj = ipaddress.ip_address(hostname)
+            resolved_ips = [ip_obj]
         except ValueError:
-            # Domain name: resolve it
+            # Domain name: resolve all addresses
             addr_info = socket.getaddrinfo(hostname, None)
             if not addr_info:
                 return False
-            resolved_ip = addr_info[0][4][0]
-            ip_obj = ipaddress.ip_address(resolved_ip)
+            resolved_ips = [ipaddress.ip_address(item[4][0]) for item in addr_info]
 
-        if ip_obj.is_private or ip_obj.is_loopback or ip_obj.is_link_local or ip_obj.is_reserved:
-            # Allow internal home-datacenter services if explicitly allowed, but block local loopback and cloud metadata
-            # 169.254.169.254 is cloud metadata
-            if str(ip_obj).startswith("169.254."):
-                logger.warning(f"SSRF blocked: cloud metadata target {ip_obj}")
+        for ip in resolved_ips:
+            # Block cloud metadata (e.g. 169.254.169.254) and link-local
+            if ip.is_link_local or str(ip).startswith("169.254."):
+                logger.warning(f"SSRF blocked: cloud metadata / link-local target {ip}")
                 return False
-            # Block internal gateway / loopback probes
-            if ip_obj.is_loopback or str(ip_obj) in ("127.0.0.1", "192.168.31.1"):
-                logger.warning(f"SSRF blocked: restricted internal IP {ip_obj}")
+
+            # Check loopback
+            if ip.is_loopback or hostname.lower() in ("localhost", "127.0.0.1", "::1"):
+                if not allow_loopback:
+                    logger.warning(f"SSRF blocked: loopback target {hostname} ({ip})")
+                    return False
+            elif ip.is_reserved:
+                logger.warning(f"SSRF blocked: reserved IP target {ip}")
                 return False
+            elif ip.is_private:
+                # Block all private IPs by default to prevent internal Docker/subnet SSRF (Finding #55)
+                logger.warning(f"SSRF blocked: private network IP {ip}")
+                return False
+
         return True
     except Exception as e:
         logger.warning(f"SSRF check exception for {url_str}: {e}")

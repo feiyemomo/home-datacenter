@@ -110,11 +110,21 @@ export default function Network() {
     const handleRefreshH3c = async () => {
         setH3cLoading(true);
         try {
-            const res = await fetch("/fast-refresh", { method: "POST" });
+            const token = getToken();
+            const headers: Record<string, string> = {};
+            if (token) {
+                headers["Authorization"] = `Bearer ${token}`;
+            }
+            const res = await fetch("/fast-refresh", {
+                method: "POST",
+                headers,
+            });
             if (res.ok) {
                 const data = await res.json();
                 setH3cData(data);
                 setH3cError(false);
+            } else {
+                setH3cError(true);
             }
         } catch (e) {
             console.error(e);
