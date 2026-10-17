@@ -16,7 +16,19 @@ var (
 	// ErrInvalidDeviceName — device name was empty or longer than 64
 	// runes after trimming.
 	ErrInvalidDeviceName = errors.New("device name must be 1-64 chars")
+
+	// ErrWeakAccessKey — a caller-supplied access key (the admin-set
+	// "password" on the create-user path) is too short to survive an
+	// online guessing attack. Previously any string was accepted, and
+	// several deployments ended up with keys like "tmp" / "test" /
+	// "momo324", which were recovered from a leaked database backup
+	// and replayed against /api/v1/auth/bind (detail.txt #21/#38).
+	ErrWeakAccessKey = errors.New("access key must be at least 8 characters")
 )
+
+// MinAccessKeyLength is the shortest caller-supplied access key we
+// accept. Generated keys are 64 hex chars and are unaffected.
+const MinAccessKeyLength = 8
 
 type DeviceService struct {
 	deviceRepo *repository.DeviceRepository
@@ -51,7 +63,12 @@ func (s *DeviceService) CreateDevice(
     // 2. Manual password (keyOverride) becomes this device access key.
     //    The user-create path passes the admin-set password so the new
     //    user binds with it instead of a random 64-hex key. Only the
-    //    SHA256 hash is persisted; empty keeps the legacy generator.
+    //    salted PBKDF2 hash is persisted; empty keeps the legacy
+    //    generator.
+    //
+    //    v1.14.9: reject trivially guessable overrides. A 3-char key
+    //    cannot be made safe by any storage scheme, and such keys are
+    //    what made the leaked-backup recovery possible.
     accessKey := keyOverride
     if accessKey == "" {
         generated, err := utils.GenerateAccessKey()
@@ -59,9 +76,11 @@ func (s *DeviceService) CreateDevice(
             return nil, "", err
         }
         accessKey = generated
+    } else if utf8.RuneCountInString(accessKey) < MinAccessKeyLength {
+        return nil, "", ErrWeakAccessKey
     }
 
-	// 3. Persist only the SHA256 hash; revoked_at stays NULL.
+	// 3. Persist only the salted hash; revoked_at stays NULL.
 	device := &model.Device{
 		UserID:        userID,
 		DeviceName:    n,

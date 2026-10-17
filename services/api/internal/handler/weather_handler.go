@@ -104,7 +104,11 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 		Scheme:   "https",
 		Host:     "wttr.in",
 		Path:     "/" + url.PathEscape(target),
-		RawQuery: "format=j1",
+		// lang=zh asks wttr.in to localise weatherDesc / lang_zh
+		// fields. The app UI is Chinese, so without it the dashboard
+		// mixed an English "Clear " summary into an otherwise Chinese
+		// card. wttr.in falls back to English for unknown locales.
+		RawQuery: "format=j1&lang=zh",
 	}
 
 	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, u.String(), nil)

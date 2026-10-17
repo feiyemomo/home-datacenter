@@ -168,6 +168,10 @@ func (h *DeviceHandler) Create(c *gin.Context) {
 			utils.Fail(c, http.StatusBadRequest, "device_name must be 1-64 chars")
 			return
 		}
+		if errors.Is(err, service.ErrWeakAccessKey) {
+			utils.Fail(c, http.StatusBadRequest, err.Error())
+			return
+		}
 		utils.Fail(c, http.StatusInternalServerError, "failed to create device")
 		return
 	}

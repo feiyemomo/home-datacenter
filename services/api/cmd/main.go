@@ -88,12 +88,19 @@ func main() {
 	//
 	// The camera Registry must be created before the MQTT handler
 	// so it can serve as a slug lookup for Frigate event translation.
-	// SecretBox derives its AES-256-GCM key from the same JWT secret
-	// we already trust (one root secret to rotate, not two). The
-	// go2rtc client talks HTTP to Frigate's bundled go2rtc on port
+	// SecretBox derives its AES-256-GCM key from a dedicated
+	// ENCRYPTION_KEY (security.encryption_key) rather than the JWT
+	// signing secret, so rotating the JWT secret no longer renders
+	// every stored camera password undecryptable. jwt.secret is still
+	// registered as a legacy key: rows sealed before this change (or
+	// by a deployment with no ENCRYPTION_KEY) continue to open, and
+	// are re-sealed with the primary key on their next write.
+	//
+	// The go2rtc client talks HTTP to Frigate's bundled go2rtc on port
 	// 1984; the Frigate client talks to Frigate's REST API on port
 	// 5000 for config push (AI detection / recording pipeline).
-	box, err := utils.NewSecretBox(cfg.JWT.Secret)
+	encKey := cfg.Security.EncryptionKey
+	box, err := utils.NewAppSecretBox(encKey, cfg.JWT.Secret)
 	if err != nil {
 		log.Fatalf("camera: secret box init: %v", err)
 	}

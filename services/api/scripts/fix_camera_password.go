@@ -72,7 +72,7 @@ func main() {
 	}
 	database.InitDB(db)
 
-	box, err := utils.NewSecretBox(config.AppConfig.JWT.Secret)
+	box, err := utils.NewAppSecretBox(config.AppConfig.Security.EncryptionKey, config.AppConfig.JWT.Secret)
 	if err != nil {
 		log.Fatalf("secret box: %v", err)
 	}

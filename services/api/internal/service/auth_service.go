@@ -4,8 +4,6 @@ import (
 	"errors"
 	"time"
 
-	"gorm.io/gorm"
-
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/utils"
@@ -27,8 +25,16 @@ func NewAuthService(
 }
 
 // Bind exchanges an access_key for a long-lived JWT.
-// Flow: user lookup -> hash key -> find device -> revoke check ->
-// update last login -> sign JWT.
+// Flow: user lookup -> load the user's devices -> salted verification ->
+// revoke check -> (upgrade legacy hashes) -> update last login -> sign
+// JWT.
+//
+// Lookup is by (user_id, access_key) rather than by a deterministic
+// hash column: v1.14.9 hashes access keys with PBKDF2 and a per-row
+// random salt, which cannot be recomputed for an index probe. The
+// device fan-out per user is tiny (a handful of phones/tablets), so a
+// linear scan with one comparator per device is cheap and removes the
+// unsalted-digest weakness entirely.
 //
 // Returns the bound device alongside the token so callers (the auth
 // handler) can emit a user.login EventBus event with device_id and
@@ -43,21 +49,32 @@ func (s *AuthService) Bind(
 		return "", nil, err
 	}
 
-	// Hash the access key (DB stores only the hash)
-	hash := utils.HashAccessKey(accessKey)
-
-	// Find the device by (user_id, hash)
-	device, err := s.deviceRepo.GetByUserIDAndHash(userID, hash)
+	devices, err := s.deviceRepo.GetByUserID(userID)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return "", nil, errors.New("invalid access key")
-		}
 		return "", nil, err
+	}
+
+	var device *model.Device
+	for i := range devices {
+		if utils.VerifyAccessKey(accessKey, devices[i].AccessKeyHash) {
+			device = &devices[i]
+			break
+		}
+	}
+	if device == nil {
+		return "", nil, errors.New("invalid access key")
 	}
 
 	// Reject revoked devices
 	if device.RevokedAt.Valid {
 		return "", nil, errors.New("device revoked")
+	}
+
+	// Transparently upgrade rows still carrying the pre-1.14.9
+	// unsalted sha256 digest (or an older, cheaper cost) now that we
+	// hold the plaintext key and know which row it belongs to.
+	if utils.AccessKeyNeedsRehash(device.AccessKeyHash) {
+		device.AccessKeyHash = utils.HashAccessKey(accessKey)
 	}
 
 	// Update last login timestamp

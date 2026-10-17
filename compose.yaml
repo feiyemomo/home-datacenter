@@ -213,8 +213,19 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    # v1.14.9: publish the plain service name as a network alias.
+    # compose sets container_name: home-mosquitto, and with an explicit
+    # ipv4_address on home-net the service name "mosquitto" is NOT
+    # registered in Docker's DNS (verified: `getent hosts mosquitto`
+    # → NXDOMAIN, while home-mosquitto resolves). The API's
+    # config.local.yaml points at tcp://mosquitto:1883, so without this
+    # alias the API logged "lookup mosquitto on 127.0.0.11:53: no such
+    # host" and started with real-time features (MQTT + WebSocket
+    # bridge) disabled — the dashboard showed "MQTT 连接: 离线".
     networks:
-      - home-net
+      home-net:
+        aliases:
+          - mosquitto
 
   web:
     build:

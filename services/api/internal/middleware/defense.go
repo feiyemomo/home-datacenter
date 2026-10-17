@@ -11,40 +11,33 @@ import (
 	"home-datacenter-api/internal/utils"
 )
 
-// ExtractRealClientIP resolves client IP respecting proxies and edge headers safely.
+// ExtractRealClientIP resolves the client IP that rate limiting and the
+// intrusion-defense blocklist key on.
+//
+// It deliberately delegates to gin's Context.ClientIP, which walks
+// X-Forwarded-For right-to-left through the chain and stops at the first
+// hop that is not one of the trusted proxies configured via
+// SetTrustedProxies (see cmd/main.go). Headers are only consulted at all
+// when the immediate peer is a trusted proxy.
+//
+// Earlier revisions read CF-Connecting-IP, X-Real-IP and the left-most
+// X-Forwarded-For entry unconditionally, before any trust check. Because
+// the origin is also reachable directly over the H3C relay tunnel, an
+// attacker could send "CF-Connecting-IP: <anything>" (or a forged
+// X-Forwarded-For) and pick a brand-new rate-limit bucket for every
+// attempt, defeating the /auth/bind throttling entirely — detail.txt
+// finding #59. nginx now normalises those headers to a value derived
+// from its own TCP peer, and this function relies on gin's trust logic
+// rather than re-implementing it.
 func ExtractRealClientIP(c *gin.Context) string {
-	// 1. Direct Cloudflare header if present (Tunnel / Proxy)
-	cfIP := strings.TrimSpace(c.GetHeader("CF-Connecting-IP"))
-	if cfIP != "" && net.ParseIP(cfIP) != nil {
-		return cfIP
+	if ip := c.ClientIP(); ip != "" {
+		return ip
 	}
-
-	// 2. Verified X-Real-IP set by nginx reverse proxy
-	xri := strings.TrimSpace(c.GetHeader("X-Real-IP"))
-	if xri != "" && net.ParseIP(xri) != nil {
-		return xri
+	// ClientIP only returns "" when RemoteAddr cannot be parsed.
+	if host, _, err := net.SplitHostPort(c.Request.RemoteAddr); err == nil {
+		return strings.TrimSpace(host)
 	}
-
-	// 3. Fall back to Gin's trusted client IP (respects SetTrustedProxies)
-	clientIP := c.ClientIP()
-	if clientIP != "" {
-		return clientIP
-	}
-
-	// 4. Fall back to X-Forwarded-For if populated
-	xff := c.GetHeader("X-Forwarded-For")
-	if xff != "" {
-		parts := strings.Split(xff, ",")
-		for _, part := range parts {
-			ip := strings.TrimSpace(part)
-			parsed := net.ParseIP(ip)
-			if parsed != nil {
-				return ip
-			}
-		}
-	}
-
-	return ""
+	return strings.TrimSpace(c.Request.RemoteAddr)
 }
 
 // SecurityDefenseMiddleware enforces active IP blocklists across endpoints.

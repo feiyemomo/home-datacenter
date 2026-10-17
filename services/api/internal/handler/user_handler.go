@@ -179,7 +179,7 @@ type createUserRequest struct {
 //
 //	Route: POST /api/v1/user
 //	Status: 200 + user payload on success
-//	Status: 400 on invalid name
+//	Status: 400 on invalid name or a too-short manual password
 //	Status: 409 on duplicate name
 func (h *UserHandler) Create(c *gin.Context) {
 	var req createUserRequest
@@ -187,6 +187,19 @@ func (h *UserHandler) Create(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	// v1.14.9: validate the optional manual password up front. The
+	// password becomes the new user's device access key, and a weak one
+	// (the historically-compromised "tmp" / "test" / "momo324") cannot
+	// be protected by any storage scheme. Checking here means a bad
+	// password fails before the user row exists, instead of leaving an
+	// orphan user with no bound device (detail.txt #21/#38).
+	if req.Password != "" && len([]rune(req.Password)) < service.MinAccessKeyLength {
+		utils.Fail(c, http.StatusBadRequest,
+			fmt.Sprintf("password must be at least %d characters", service.MinAccessKeyLength))
+		return
+	}
+
 	result, err := h.userService.Create(req.Name, req.IsAdmin)
 	if err != nil {
 		writeUserServiceError(c, err)

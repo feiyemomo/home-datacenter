@@ -80,6 +80,13 @@ export default function Users() {
             setError("请设置密码");
             return;
         }
+        // v1.14.9: the password is the device access key. Short keys are
+        // trivially brute-forced online, and the backend rejects them
+        // (detail.txt #21/#38) — validate here for instant feedback.
+        if (newPassword.length < 8) {
+            setError("密码至少需要 8 个字符");
+            return;
+        }
         setCreating(true);
         setError(null);
         try {

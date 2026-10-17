@@ -29,6 +29,18 @@ type IPLimiter struct {
 	burst    int
 	ttl      time.Duration
 	stop     chan struct{}
+
+	// global is a process-wide backstop that every caller shares.
+	//
+	// The per-IP bucket alone is only as trustworthy as the client IP
+	// it is keyed on. On this deployment the origin is reachable both
+	// through Cloudflare Tunnel and directly over the H3C relay, and a
+	// caller that can influence the client-IP headers (or simply own a
+	// block of addresses) can rotate the key and thus get a fresh
+	// bucket per request — exactly the bypass reported in detail.txt
+	// #59. The global bucket caps total attempts no matter how the
+	// per-IP key varies.
+	global *rate.Limiter
 }
 
 type ipEntry struct {
@@ -43,12 +55,26 @@ type ipEntry struct {
 // The background garbage collector is started here and stops when
 // the first caller invokes Stop().
 func NewIPLimiter(rps float64, burst int) *IPLimiter {
+	// The global backstop is deliberately looser than the per-IP
+	// bucket: it exists to stop a bucket-rotating flood, not to shape
+	// normal traffic. A household only logs in a handful of times a
+	// minute, so burst*6 attempts with rps*4 sustained is comfortable.
+	globalRPS := rps * 4
+	if globalRPS < 0.2 {
+		globalRPS = 0.2
+	}
+	globalBurst := burst * 6
+	if globalBurst < 20 {
+		globalBurst = 20
+	}
+
 	l := &IPLimiter{
 		limiters: make(map[string]*ipEntry),
 		rps:      rate.Limit(rps),
 		burst:    burst,
 		ttl:      10 * time.Minute,
 		stop:     make(chan struct{}),
+		global:   rate.NewLimiter(rate.Limit(globalRPS), globalBurst),
 	}
 	go l.gc()
 	return l
@@ -58,7 +84,16 @@ func NewIPLimiter(rps float64, burst int) *IPLimiter {
 // reports whether the request is permitted. Touches lastSeen
 // even when the entry already exists, so the GC keeps recent
 // IPs alive.
+//
+// A request is allowed only if BOTH the per-IP bucket and the global
+// backstop have a token. Checking the global bucket first means a
+// rotation flood is rejected without also draining legitimate clients'
+// per-IP buckets.
 func (l *IPLimiter) Allow(ip string) bool {
+	if !l.global.Allow() {
+		return false
+	}
+
 	l.mu.Lock()
 	e, ok := l.limiters[ip]
 	if !ok {

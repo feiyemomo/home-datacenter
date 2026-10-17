@@ -145,6 +145,16 @@ type VisionConfig struct {
 type SecurityConfig struct {
 	Alert   AlertConfig   `mapstructure:"alert"`
 	Defense DefenseConfig `mapstructure:"defense"`
+
+	// EncryptionKey seeds the at-rest AES-256-GCM SecretBox that
+	// protects camera credentials. It is deliberately independent of
+	// jwt.secret: rotating the JWT signing key must not make stored
+	// camera passwords undecryptable. Sourced from the ENCRYPTION_KEY
+	// env var. When empty the API falls back to jwt.secret (legacy
+	// behaviour) so older deployments keep working, and jwt.secret is
+	// always registered as a legacy key so rows sealed before the
+	// switch still open.
+	EncryptionKey string `mapstructure:"encryption_key"`
 }
 
 // AlertConfig holds SMTP options for emergency security email notifications.
@@ -463,6 +473,11 @@ func Load(path string) error {
 	// JWT_SECRET takes precedence over the file value.
 	if envSecret := os.Getenv("JWT_SECRET"); envSecret != "" {
 		v.Set("jwt.secret", envSecret)
+	}
+	// ENCRYPTION_KEY seeds the at-rest SecretBox independently of the
+	// JWT signing secret (see SecurityConfig.EncryptionKey).
+	if envEnc := os.Getenv("ENCRYPTION_KEY"); envEnc != "" {
+		v.Set("security.encryption_key", envEnc)
 	}
 	if envURL := os.Getenv("GO2RTC_BASE_URL"); envURL != "" {
 		v.Set("go2rtc.base_url", envURL)
