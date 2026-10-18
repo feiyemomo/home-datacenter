@@ -586,6 +586,41 @@ func detectH3CTCPCandidate() string {
 	return os.Getenv("WEBRTC_TCP_CANDIDATE")
 }
 
+// h3cCandCacheTTL bounds how often a WebRTC negotiation is allowed to
+// ask the keepalive service for the current tunnel address. The tunnel
+// port only changes when H3C rotates it (every few hours), so a 30s
+// cache keeps the per-request cost at zero in practice while still
+// picking up a rotation almost immediately.
+const h3cCandCacheTTL = 30 * time.Second
+
+var (
+	h3cCandMu      sync.Mutex
+	h3cCandValue   string
+	h3cCandFetched time.Time
+)
+
+// H3CTCPCandidateCached returns the H3C tunnel address that is currently
+// established, using a short-lived cache so the SDP rewrite on the
+// WebRTC path does not add a keepalive round-trip to every request.
+func H3CTCPCandidateCached() string {
+	h3cCandMu.Lock()
+	value := h3cCandValue
+	fresh := time.Since(h3cCandFetched) < h3cCandCacheTTL
+	h3cCandMu.Unlock()
+
+	if fresh && value != "" {
+		return value
+	}
+	if addr := detectH3CTCPCandidate(); addr != "" {
+		h3cCandMu.Lock()
+		h3cCandValue = addr
+		h3cCandFetched = time.Now()
+		h3cCandMu.Unlock()
+		return addr
+	}
+	return value
+}
+
 func fetchH3CTCPCandidate(client *http.Client, keepaliveURL string) string {
 	resp, err := client.Get(keepaliveURL)
 	if err != nil {

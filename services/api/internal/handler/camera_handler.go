@@ -2125,6 +2125,17 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 	// standard {code,message,data} envelope, which is NOT what
 	// the browser expects for the SDP answer), so write the raw
 	// body instead.
+	//
+	// The running go2rtc keeps advertising whatever H3C relay port
+	// it was started with; the tunnel is re-created with a new
+	// public port every few hours and go2rtc only re-reads its
+	// config on a Frigate restart. Rewrite the relay candidates to
+	// the tunnel that is actually up so remote clients can complete
+	// ICE instead of falling back to MP4.
+	if current := camera.H3CTCPCandidateCached(); current != "" {
+		answer = []byte(camera.RewriteH3CCandidates(string(answer), current))
+	}
+
 	c.Header("Content-Type", "application/sdp")
 	c.Header("Cache-Control", "no-store")
 	c.Status(http.StatusOK)
