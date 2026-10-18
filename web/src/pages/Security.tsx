@@ -1,4 +1,4 @@
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
 import {
     ShieldAlert,
     ShieldCheck,
@@ -13,6 +13,10 @@ import {
     Globe,
     Plus,
     X,
+    Search,
+    Copy,
+    Download,
+    Clock,
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
@@ -58,6 +62,12 @@ export default function Security() {
     // Unbanning state per IP
     const [unbanningIP, setUnbanningIP] = useState<string | null>(null);
 
+    // v1.15.0 UI state: live polling, search/sort, ticker for countdowns
+    const [autoRefresh, setAutoRefresh] = useState(true);
+    const [search, setSearch] = useState("");
+    const [sortBy, setSortBy] = useState<"expiry" | "recent">("expiry");
+    const [nowMs, setNowMs] = useState(() => Date.now());
+
     // Fetch overview data
     const {
         data: overview,
@@ -69,8 +79,75 @@ export default function Security() {
         useCallback(async () => {
             return await getDefenseOverview();
         }, []),
-        { ttlMs: 10000 },
+        { ttlMs: 10000, refetchMs: autoRefresh ? 30000 : 0 },
     );
+
+    // Re-render every 15s so "剩余 X 分钟" stays truthful without
+    // hammering the API.
+    useEffect(() => {
+        const t = setInterval(() => setNowMs(Date.now()), 15_000);
+        return () => clearInterval(t);
+    }, []);
+
+    const activeBans: BanEntry[] = overview?.active_bans ?? [];
+
+    const expiryValue = (ban: BanEntry) =>
+        ban.permanent ? Number.MAX_SAFE_INTEGER : new Date(ban.expires_at).getTime() || Number.MAX_SAFE_INTEGER;
+
+    const remainingText = (ban: BanEntry) => {
+        if (ban.permanent) return "永久";
+        const ms = new Date(ban.expires_at).getTime() - nowMs;
+        if (!Number.isFinite(ms)) return "";
+        if (ms <= 0) return "即将解封";
+        const mins = Math.ceil(ms / 60000);
+        return mins < 60 ? `剩余 ${mins} 分钟` : `剩余 ${Math.floor(mins / 60)} 小时 ${mins % 60} 分`;
+    };
+
+    const filteredBans = useMemo(() => {
+        const q = search.trim().toLowerCase();
+        const list = activeBans.filter(
+            (b) =>
+                !q ||
+                b.ip.toLowerCase().includes(q) ||
+                (b.reason || "").toLowerCase().includes(q),
+        );
+        return [...list].sort((a, b) =>
+            sortBy === "expiry"
+                ? expiryValue(a) - expiryValue(b)
+                : new Date(b.banned_at).getTime() - new Date(a.banned_at).getTime(),
+        );
+    }, [activeBans, search, sortBy, nowMs]);
+
+    const handleCopyIP = async (ip: string) => {
+        try {
+            await navigator.clipboard.writeText(ip);
+            showToast("success", `已复制 IP ${ip}`);
+        } catch {
+            showToast("error", "复制失败，请手动选择文本");
+        }
+    };
+
+    const handleExportCsv = () => {
+        if (activeBans.length === 0) {
+            showToast("error", "当前没有封禁记录可导出");
+            return;
+        }
+        const header = "ip,reason,banned_at,expires_at,permanent\n";
+        const rows = activeBans
+            .map((b) =>
+                [b.ip, `"${(b.reason || "").replace(/"/g, '""')}"`, b.banned_at, b.expires_at, b.permanent]
+                    .join(","),
+            )
+            .join("\n");
+        const blob = new Blob([header + rows], { type: "text/csv;charset=utf-8" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `security-bans-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+        showToast("success", `已导出 ${activeBans.length} 条封禁记录`);
+    };
 
     const showToast = (type: "success" | "error", text: string) => {
         setActionMsg({ type, text });
@@ -95,6 +172,20 @@ export default function Security() {
         }
     };
 
+    const isValidIp = (raw: string) => {
+        if (!raw || /\s/.test(raw)) return false;
+        if (raw.includes(":")) {
+            return /^[0-9a-fA-F:]+$/.test(raw) && (raw.match(/:/g)?.length ?? 0) >= 2;
+        }
+        const parts = raw.split(".");
+        return (
+            parts.length === 4 &&
+            parts.every(
+                (p) => p.length > 0 && p.length <= 3 && /^\d+$/.test(p) && Number(p) <= 255,
+            )
+        );
+    };
+
     const handleManualBan = async (e: React.FormEvent) => {
         e.preventDefault();
         const trimmedIP = banIP.trim();
@@ -102,7 +193,12 @@ export default function Security() {
             showToast("error", "请输入要封禁的 IP 地址");
             return;
         }
-
+        // v1.15.0: reject hostnames/typos before they reach the server —
+        // a wrong entry can lock out the gateway.
+        if (!isValidIp(trimmedIP)) {
+            showToast("error", "IP 格式不合法，请输入 IPv4 或 IPv6 地址");
+            return;
+        }
         setSubmittingBan(true);
         try {
             await manualBan({
@@ -151,8 +247,6 @@ export default function Security() {
         );
     }
 
-    const activeBans: BanEntry[] = overview?.active_bans ?? [];
-
     return (
         <div className="space-y-6 animate-fade-in">
             {/* Header */}
@@ -172,6 +266,27 @@ export default function Security() {
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                    {/* v1.15.0: live polling toggle (30s) */}
+                    <button
+                        type="button"
+                        onClick={() => setAutoRefresh((v) => !v)}
+                        title={autoRefresh ? "每 30 秒自动同步，点击暂停" : "已暂停自动同步，点击开启"}
+                        className={cn(
+                            "inline-flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-[11px] font-medium transition-colors",
+                            autoRefresh
+                                ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600"
+                                : "border-[rgb(var(--border)/0.4)] bg-transparent text-fg-muted",
+                        )}
+                    >
+                        <span
+                            className={cn(
+                                "h-1.5 w-1.5 rounded-full",
+                                autoRefresh ? "bg-emerald-500 animate-pulse" : "bg-fg-muted/50",
+                            )}
+                        />
+                        {autoRefresh ? "自动同步中" : "自动同步已暂停"}
+                    </button>
+
                     <Button
                         variant="outline"
                         size="sm"
@@ -345,18 +460,53 @@ export default function Security() {
             {/* Active Banned IPs Table */}
             <Card className="glass border-[rgb(var(--border)/0.4)]">
                 <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                         <div>
                             <CardTitle className="text-base font-semibold flex items-center gap-2">
                                 <Ban size={18} className="text-rose-500" />
                                 <span>实时黑名单与拦截列表</span>
                                 <Badge variant="default" className="text-[11px]">
-                                    {activeBans.length} 个 IP
+                                    {filteredBans.length === activeBans.length
+                                        ? `${activeBans.length} 个 IP`
+                                        : `${filteredBans.length} / ${activeBans.length} 个 IP`}
                                 </Badge>
                             </CardTitle>
                             <CardDescription className="text-xs mt-0.5">
                                 被拦截的 IP 在所有业务路由（Web、API、流媒体）中均被阻断并记录审计日志
                             </CardDescription>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            <div className="relative">
+                                <Search
+                                    size={13}
+                                    className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-muted"
+                                />
+                                <Input
+                                    value={search}
+                                    onChange={(e) => setSearch(e.target.value)}
+                                    placeholder="搜索 IP / 原因"
+                                    className="h-8 w-44 pl-7 text-xs"
+                                />
+                            </div>
+                            <select
+                                value={sortBy}
+                                onChange={(e) => setSortBy(e.target.value as "expiry" | "recent")}
+                                className="h-8 rounded-lg border border-[rgb(var(--border)/0.4)] bg-transparent px-2 text-xs text-fg"
+                                aria-label="排序方式"
+                            >
+                                <option value="expiry">按剩余时长</option>
+                                <option value="recent">按拦截时间</option>
+                            </select>
+                            <Button
+                                variant="outline"
+                                size="sm"
+                                onClick={handleExportCsv}
+                                className="h-8 gap-1.5 text-xs"
+                                title="导出当前黑名单为 CSV"
+                            >
+                                <Download size={13} />
+                                <span>导出</span>
+                            </Button>
                         </div>
                     </div>
                 </CardHeader>
@@ -378,6 +528,16 @@ export default function Security() {
                                 安全防御引擎正在后台持续监控流量，若外部发起撞库爆破或恶意渗透将自动封锁。
                             </p>
                         </div>
+                    ) : filteredBans.length === 0 ? (
+                        <div className="flex flex-col items-center justify-center py-10 text-center">
+                            <p className="text-sm font-medium text-fg">没有匹配「{search}」的封禁记录</p>
+                            <button
+                                onClick={() => setSearch("")}
+                                className="mt-2 text-xs text-primary hover:underline"
+                            >
+                                清除搜索条件
+                            </button>
+                        </div>
                     ) : (
                         <div className="overflow-x-auto">
                             <table className="w-full text-left text-xs">
@@ -391,7 +551,7 @@ export default function Security() {
                                     </tr>
                                 </thead>
                                 <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
-                                    {activeBans.map((ban) => {
+                                    {filteredBans.map((ban) => {
                                         const isUnbanning = unbanningIP === ban.ip;
                                         return (
                                             <tr
@@ -402,6 +562,14 @@ export default function Security() {
                                                     <div className="flex items-center gap-2">
                                                         <span className="h-2 w-2 rounded-full bg-rose-500" />
                                                         <span>{ban.ip}</span>
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => handleCopyIP(ban.ip)}
+                                                            title="复制 IP"
+                                                            className="text-fg-muted/70 hover:text-fg transition-colors"
+                                                        >
+                                                            <Copy size={12} />
+                                                        </button>
                                                     </div>
                                                 </td>
                                                 <td className="py-3 px-4 text-fg-muted">
@@ -418,9 +586,15 @@ export default function Security() {
                                                             永久封禁
                                                         </Badge>
                                                     ) : (
-                                                        <span>
-                                                            至 {formatDateTime(ban.expires_at)} (自动到期解封)
-                                                        </span>
+                                                        <div className="flex flex-col gap-0.5">
+                                                            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-600">
+                                                                <Clock size={11} />
+                                                                {remainingText(ban)}
+                                                            </span>
+                                                            <span className="text-[11px] text-fg-muted/80">
+                                                                至 {formatDateTime(ban.expires_at)} 自动解封
+                                                            </span>
+                                                        </div>
                                                     )}
                                                 </td>
                                                 <td className="py-3 px-4 text-right">
@@ -552,19 +726,41 @@ export default function Security() {
                             </div>
 
                             <div>
-                                <label className="block text-xs font-medium text-fg mb-1">
-                                    封禁时长 (分钟)
+                                <label className="block text-xs font-medium text-fg mb-1.5">
+                                    封禁时长
                                 </label>
+                                <div className="flex flex-wrap gap-1.5 mb-2">
+                                    {[
+                                        { label: "30 分钟", value: 30 },
+                                        { label: "6 小时", value: 360 },
+                                        { label: "24 小时", value: 1440 },
+                                        { label: "永久", value: 0 },
+                                    ].map((opt) => (
+                                        <button
+                                            key={opt.value}
+                                            type="button"
+                                            onClick={() => setBanDuration(opt.value)}
+                                            className={cn(
+                                                "rounded-lg border px-2.5 py-1 text-[11px] font-medium transition-colors",
+                                                banDuration === opt.value
+                                                    ? "border-rose-500/50 bg-rose-500/10 text-rose-600"
+                                                    : "border-[rgb(var(--border)/0.4)] text-fg-muted hover:text-fg",
+                                            )}
+                                        >
+                                            {opt.label}
+                                        </button>
+                                    ))}
+                                </div>
                                 <Input
                                     type="number"
                                     min="0"
                                     value={banDuration}
                                     onChange={(e) => setBanDuration(Number(e.target.value))}
                                     className="text-xs"
-                                    placeholder="填 0 表示永久封禁"
+                                    placeholder="自定义分钟数，0 表示永久"
                                 />
                                 <p className="mt-1 text-[11px] text-fg-muted">
-                                    填 0 为永久封禁；默认为 30 分钟。
+                                    当前：{banDuration === 0 ? "永久封禁（需手动解封）" : `${banDuration} 分钟后自动解封`}
                                 </p>
                             </div>
 
