@@ -423,7 +423,7 @@ services:
       # repo file is mounted read-only as the seed template used by the
       # preflight check on a fresh/empty config.
       - ./data/frigate/config/config.yml:/config/config.yml
-      - ./deploy/frigate/config.yml:/config/config.template.yml:ro
+      - ./deploy/frigate/config.example.yml:/config/config.template.yml:ro
       - ./data/frigate:/media/frigate
       - ./data/recordings:/data/recordings
     # Shared memory for Frigate's inter-process frame passing

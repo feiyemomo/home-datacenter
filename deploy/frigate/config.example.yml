@@ -235,31 +235,19 @@ go2rtc:
 # boot window before home-api's first pushFrigateConfig() (the
 # JSON-encoded push is not subject to YAML's comment rules), but
 # quoting here is the durable fix.
-  streams:
-    前门:
-      ffmpeg:rtsp://<CAMERA_USER>:<CAMERA_PASSWORD>@<CAMERA_IP>:554/Streaming/Channels/101#video=h264#width=1280#hardware=vaapi
-cameras:
-  front_door:
-    name: front_door
-    enabled: true
-    ffmpeg:
-      inputs:
-        # Frigate's OWN ffmpeg path — plain RTSP without any `#`
-        # directives. go2rtc-specific directives (#video=, #hardware=)
-        # are silently ignored by Frigate's ffmpeg (treated as a URL
-        # fragment). Frigate records the camera's NATIVE stream
-        # (HEVC) with -c:v copy and decodes at 2 fps for detection.
-        # See home-api's frigateCameraPath().
-        - path:
-            rtsp://<CAMERA_USER>:<CAMERA_PASSWORD>@<CAMERA_IP>:554/Streaming/Channels/101
-          roles:
-            - detect
-            - record
-    detect:
-      enabled: true
-      fps: 2
-    record:
-      enabled: true
+#
+# v1.14.10: this file is no longer the LIVE config — it is only the
+# seed template mounted read-only at /config/config.template.yml, used
+# by the Frigate preflight entrypoint when /config/config.yml is
+# missing or truncated. The live config lives at
+# ./data/frigate/config/config.yml (outside the deploy tarball) and is
+# owned by home-api's PUT /api/config/set pushes. Both sections are
+# therefore intentionally EMPTY: this file used to be mounted AS the
+# live config, so a deploy extracted these placeholder URLs over it,
+# after which every ffmpeg producer failed with "Failed to resolve
+# hostname <CAMERA_IP>" and all camera streams went dark.
+  streams: {}
+cameras: {}
 
 # Recording is enabled globally. home-api toggles per-camera
 # record.enabled via PUT /api/config/set; the global block here
