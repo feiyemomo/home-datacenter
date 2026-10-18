@@ -354,7 +354,15 @@ services:
           if [ -s /config/config.yml.bak ]; then
             echo "[PREFLIGHT] /config/config.yml is empty or corrupt (<100B). Auto-restoring from /config/config.yml.bak..."
             cp /config/config.yml.bak /config/config.yml
+          elif [ -s /config/config.template.yml ]; then
+            echo "[PREFLIGHT] /config/config.yml is empty or corrupt (<100B). Seeding from /config/config.template.yml..."
+            cp /config/config.template.yml /config/config.yml
           fi
+        fi
+        # Keep a known-good copy so a truncated config.yml (power loss
+        # mid-write) can still be restored on the next boot.
+        if [ ! -s /config/config.yml.bak ] && [ -s /config/config.yml ]; then
+          cp /config/config.yml /config/config.yml.bak 2>/dev/null || true
         fi
         if [ -n "$$NAS_LAN_IP" ]; then
           sed -i "s|<YOUR_NAS_LAN_IP>|$$NAS_LAN_IP|g" /config/config.yml 2>/dev/null || true
@@ -400,12 +408,22 @@ services:
       # config.yml was mounted (read-only from the repo), so the
       # event database lived in the container's writable layer and
       # was LOST on every container recreate/upgrade — recordings
-      # survived but the event timeline/search index did not. The
-      # file mount below overlays the repo's config.yml on top of
-      # this directory, so config pushes still work as before.
+      # survived but the event timeline/search index did not.
       - ./data/frigate/config:/config
-      - ./deploy/frigate/config.yml:/config/config.yml
-      - ./deploy/frigate/config.yml.bak:/config/config.yml.bak:ro
+      # v1.14.10: the LIVE config.yml must not be a repo file.
+      # home-api pushes the camera definitions through Frigate's
+      # PUT /api/config/set, which rewrites whatever is mounted at
+      # /config/config.yml. While that was ./deploy/frigate/config.yml
+      # every `deploy-nas.ps1` (tarball extract) replaced the live,
+      # credential-bearing config with the repo's placeholder template
+      # (rtsp://<CAMERA_USER>:<CAMERA_PASSWORD>@<CAMERA_IP>) — ffmpeg
+      # then failed with "Failed to resolve hostname <CAMERA_IP>" and
+      # every stream went dark until home-api was restarted. The live
+      # file now lives under ./data (excluded from deploys) and the
+      # repo file is mounted read-only as the seed template used by the
+      # preflight check on a fresh/empty config.
+      - ./data/frigate/config/config.yml:/config/config.yml
+      - ./deploy/frigate/config.yml:/config/config.template.yml:ro
       - ./data/frigate:/media/frigate
       - ./data/recordings:/data/recordings
     # Shared memory for Frigate's inter-process frame passing
