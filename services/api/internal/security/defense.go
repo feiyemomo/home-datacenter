@@ -166,6 +166,15 @@ func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
 			// Whitelisted IP (such as Gateway 192.168.31.1). Do NOT ban network interface, but dispatch URGENT alert!
 			log.Printf("security: [GATEWAY WARNING] Whitelisted IP %s triggered %d failures (reason=%s). Not banning.", ip, currentCount, reason)
 
+			// Loopback failures can only originate on this host — the
+			// healthcheck, deploy scripts, a CLI curl, s6 probes. They
+			// are not the "H3C jump host is compromised" scenario this
+			// alert exists for, so keep them in the log without paging
+			// (and without flooding the in-app security feed).
+			if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil && parsed.IsLoopback() {
+				return
+			}
+
 			alertDetail := fmt.Sprintf("网关/白名单 IP %s 在 %v 内连续认证失败达到 %d 次！\nUser-Agent: %s\n触发原因: %s\n\n【注意】该 IP 为家庭网络网关/路由器，系统未予阻断网络。极有可能为外部渗透者经由 H3C 简优云隧道或路由器代理发起的穿透探测攻击，请立即登录路由器检查连接！",
 				ip, window, currentCount, userAgent, reason)
 

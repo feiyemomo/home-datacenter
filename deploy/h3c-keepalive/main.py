@@ -150,7 +150,18 @@ def sync_webrtc_to_frigate(external_addr):
         except Exception as fe:
             logger.warning(f"Could not sync WebRTC candidate to Frigate REST API: {fe}")
 
-        # 2. Update go2rtc active primary config and restart go2rtc runtime (takes ~50ms, zero impact to Frigate NVR)
+        # 2. Update go2rtc's in-memory config.
+        #
+        # NOTE: deliberately NO /api/restart here. go2rtc re-reads
+        # /dev/shm/go2rtc.yaml on restart, and Frigate only regenerates
+        # that file when its own container starts (create_config.py runs
+        # from the s6 boot sequence). Restarting go2rtc therefore threw
+        # the fresh candidate away and reloaded the previous H3C port —
+        # exactly what left every remote client stuck in ICE "checking"
+        # after a tunnel rotation. The candidate is picked up per
+        # session, so the POST alone is enough. The API also rewrites the
+        # relay candidate in the SDP answer it returns, which covers the
+        # window before Frigate's next restart.
         try:
             go2_payload = json.dumps({"webrtc": {"candidates": new_candidates}}).encode("utf-8")
             go2_req = urllib.request.Request(
@@ -161,10 +172,6 @@ def sync_webrtc_to_frigate(external_addr):
             )
             with urllib.request.urlopen(go2_req, timeout=5) as resp:
                 logger.info(f"Updated go2rtc active candidates: {new_candidates}")
-
-            restart_req = urllib.request.Request(f"{GO2RTC_URL}/api/restart", data=b"", method="POST")
-            with urllib.request.urlopen(restart_req, timeout=5) as resp:
-                logger.info("Successfully triggered go2rtc in-memory reload!")
         except Exception as ge:
             logger.warning(f"Could not reload go2rtc active config: {ge}")
 
