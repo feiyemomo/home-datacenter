@@ -220,7 +220,17 @@ func main() {
 	if recMetricsDir == "" {
 		recMetricsDir = cfg.Camera.RecordingDir
 	}
-	systemHandler.ConfigureMetrics(cfg.Maintenance.DiskPath, recMetricsDir, cfg.Maintenance.RecordingQuotaBytes, bus)
+	// The recording quota can be changed at runtime through
+	// PUT /api/v1/system/storage/config, which persists it to
+	// storage-config.json. Read it back so the dashboard card AND the
+	// quota-enforcement monitor agree with the settings screen instead
+	// of silently reverting to the static config default on restart.
+	recordingQuotaBytes := cfg.Maintenance.RecordingQuotaBytes
+	if persisted := handler.PersistedQuotaBytes(); persisted > 0 {
+		recordingQuotaBytes = persisted
+		log.Printf("maintenance: recording quota %d GiB (persisted, overrides config)", persisted/(1024*1024*1024))
+	}
+	systemHandler.ConfigureMetrics(cfg.Maintenance.DiskPath, recMetricsDir, recordingQuotaBytes, bus)
 	systemLogHandler := handler.NewSystemLogHandler(database.DB)
 	clientErrorHandler := handler.NewClientErrorHandler(database.DB)
 
@@ -335,7 +345,7 @@ func main() {
 		// normal window. Both pushes are best-effort (no restart), so
 		// live streams stay up. The quota monitor runs on the same
 		// interval as the size walk (default 1h).
-		RecordingQuotaBytes: cfg.Maintenance.RecordingQuotaBytes,
+		RecordingQuotaBytes: recordingQuotaBytes,
 		OnQuotaExceeded: func() error {
 			// v1.8.34: retry to ride out the transient Frigate restart
 			// that BootReplay triggers at api boot. The first size sample

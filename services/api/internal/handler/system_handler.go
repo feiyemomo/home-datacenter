@@ -188,6 +188,27 @@ const (
 	archiveTriggerFile = "/data/backup-state/trigger"
 )
 
+// PersistedQuotaBytes returns the recording quota written by a previous
+// PUT /api/v1/system/storage/config, read back from storage-config.json.
+// It returns 0 when the file is missing/unreadable or carries no quota,
+// so callers can fall back to the static config value.
+//
+// Without this, a runtime quota change only lived in memory: the
+// settings screen (which reads the file) showed the new value while the
+// dashboard card and the retention-shortening monitor kept enforcing
+// the boot-time default until the next PUT.
+func PersistedQuotaBytes() uint64 {
+	data, err := os.ReadFile(storageConfigFile)
+	if err != nil {
+		return 0
+	}
+	var cfg StorageConfig
+	if err := json.Unmarshal(data, &cfg); err != nil || cfg.QuotaGB <= 0 {
+		return 0
+	}
+	return uint64(cfg.QuotaGB) * 1024 * 1024 * 1024
+}
+
 // GetStorageConfig — GET /api/v1/system/storage/config
 func (h *SystemHandler) GetStorageConfig(c *gin.Context) {
 	cfg := StorageConfig{
