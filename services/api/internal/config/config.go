@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/viper"
 )
@@ -525,10 +526,31 @@ func Load(path string) error {
 		v.Set("security.alert.recipient", envRcpt)
 	}
 
-	v.SetConfigFile(path)
-
-	if err := v.ReadInConfig(); err != nil {
-		return fmt.Errorf("read config %q: %w", path, err)
+	if strings.Contains(path, "config.local.yaml") {
+		basePath := "configs/config.yaml"
+		if strings.HasPrefix(path, "/configs/") {
+			basePath = "/configs/config.yaml"
+		}
+		if _, err := os.Stat(basePath); err == nil {
+			v.SetConfigFile(basePath)
+			if err := v.ReadInConfig(); err != nil {
+				return fmt.Errorf("read base config %q: %w", basePath, err)
+			}
+			v.SetConfigFile(path)
+			if err := v.MergeInConfig(); err != nil {
+				return fmt.Errorf("merge local config %q: %w", path, err)
+			}
+		} else {
+			v.SetConfigFile(path)
+			if err := v.ReadInConfig(); err != nil {
+				return fmt.Errorf("read config %q: %w", path, err)
+			}
+		}
+	} else {
+		v.SetConfigFile(path)
+		if err := v.ReadInConfig(); err != nil {
+			return fmt.Errorf("read config %q: %w", path, err)
+		}
 	}
 
 	cfg := &Config{}

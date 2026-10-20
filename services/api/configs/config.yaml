@@ -175,12 +175,12 @@ maintenance:
   # When it drops back below, normal retention is restored.
   # 0 disables the automatic action (the tree is still size-alerted).
   # Set to 400 GiB (≈86% of the 466G data volume) so recordings can't
-  # silently fill the disk; on crossing, retention drops 7→3 days.
+  # silently fill the disk; on crossing, retention drops 7→4 days.
   recording_quota_bytes: 429496729600
   # Normal retention (days) applied by the full config push.
   recording_retention_days: 7
   # Retention (days) applied while over quota. Must be < normal.
-  recording_reduced_retention_days: 3
+  recording_reduced_retention_days: 4
 
   # Frigate's own SQLite database, backed up daily alongside app.db.
   # The api container sees it at /media/frigate/config/frigate.db.

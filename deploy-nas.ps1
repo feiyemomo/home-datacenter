@@ -224,6 +224,9 @@ $Excludes = @(
     "./read_db.py", "__pycache__",
     "*.exe", "./services/api/server",
     "./web/tsconfig.tsbuildinfo", "./web/tsconfig.node.tsbuildinfo",
+    # Developer local overrides must never overwrite NAS production configs.
+    "./services/api/configs/config.local.yaml",
+    "./services/api/configs/config.local.yaml.bak",
     # mosquitto passwd is environment-specific (each env has its own
     # MQTT_PASSWORD). Must NOT overwrite the NAS's passwd file — same
     # rationale as excluding .env. Generate on the NAS with:

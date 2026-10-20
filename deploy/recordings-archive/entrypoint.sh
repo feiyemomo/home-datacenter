@@ -95,6 +95,7 @@ archive_once() {
                     SLUG="$(basename "$cam_path")"
                     for f in "$cam_path"/*.mp4; do
                         [ -f "$f" ] || continue
+                        [ -s "$f" ] || continue
                         FILE="$(basename "$f")"
                         TARGET_FILE="$TARGET_DIR/${SLUG}_${HOUR}_${FILE}"
                         ln -f "$f" "$TARGET_FILE" 2>/dev/null || cp "$f" "$TARGET_FILE" 2>/dev/null || true

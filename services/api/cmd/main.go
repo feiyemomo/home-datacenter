@@ -331,7 +331,7 @@ func main() {
 		DiskCritPct:        cfg.Maintenance.DiskCritPct,
 		DiskInterval:       time.Duration(cfg.Maintenance.DiskIntervalMinutes) * time.Minute,
 
-		RecordingsRoot:         cfg.Maintenance.RecordingsRoot,
+		RecordingsRoot:         recMetricsDir,
 		RecordingStaleAfter:    time.Duration(cfg.Maintenance.RecordingStaleAfterMinutes) * time.Minute,
 		RecordingCheckInterval: time.Duration(cfg.Maintenance.RecordingCheckIntervalMinutes) * time.Minute,
 		RecordingTargets:       recordingTargets,
