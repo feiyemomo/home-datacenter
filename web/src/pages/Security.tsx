@@ -17,6 +17,10 @@ import {
     Copy,
     Download,
     Clock,
+    Activity,
+    Sliders,
+    Trash2,
+    Shield,
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
@@ -25,8 +29,18 @@ import {
     manualBan,
     manualUnban,
     testAlertEmail,
+    getSecurityEvents,
+    getSecurityWhitelist,
+    addSecurityWhitelist,
+    deleteSecurityWhitelist,
+    updateSecurityConfig,
 } from "@/api/security";
-import type { DefenseOverview, BanEntry } from "@/types";
+import type {
+    DefenseOverview,
+    BanEntry,
+    SecurityEvent,
+    SecurityWhitelistItem,
+} from "@/types";
 import { cn, formatDateTime } from "@/lib/utils";
 import {
     Card,
@@ -42,6 +56,9 @@ import { ErrorRetry } from "@/components/ErrorRetry";
 
 export default function Security() {
     const { isAdmin } = useAuth();
+
+    // Active tab: 'bans' | 'events' | 'whitelist' | 'config'
+    const [activeTab, setActiveTab] = useState<"bans" | "events" | "whitelist" | "config">("bans");
 
     // Feedback states
     const [actionMsg, setActionMsg] = useState<{
@@ -62,11 +79,28 @@ export default function Security() {
     // Unbanning state per IP
     const [unbanningIP, setUnbanningIP] = useState<string | null>(null);
 
-    // v1.15.0 UI state: live polling, search/sort, ticker for countdowns
+    // Live polling, search/sort, ticker for countdowns
     const [autoRefresh, setAutoRefresh] = useState(true);
     const [search, setSearch] = useState("");
-    const [sortBy, setSortBy] = useState<"expiry" | "recent">("expiry");
+    const [sortBy, setSortBy] = useState<"expiry" | "recent" | "hits">("expiry");
     const [nowMs, setNowMs] = useState(() => Date.now());
+
+    // Timeline events
+    const [events, setEvents] = useState<SecurityEvent[]>([]);
+    const [eventsLoading, setEventsLoading] = useState(false);
+
+    // Whitelist state
+    const [whitelist, setWhitelist] = useState<SecurityWhitelistItem[]>([]);
+    const [whitelistLoading, setWhitelistLoading] = useState(false);
+    const [newWLEntry, setNewWLEntry] = useState("");
+    const [newWLNote, setNewWLNote] = useState("");
+    const [addingWL, setAddingWL] = useState(false);
+
+    // Config form state
+    const [cfgFailures, setCfgFailures] = useState(5);
+    const [cfgWindow, setCfgWindow] = useState(5);
+    const [cfgBanDuration, setCfgBanDuration] = useState(30);
+    const [savingCfg, setSavingCfg] = useState(false);
 
     // Fetch overview data
     const {
@@ -82,12 +116,53 @@ export default function Security() {
         { ttlMs: 10000, refetchMs: autoRefresh ? 30000 : 0 },
     );
 
-    // Re-render every 15s so "剩余 X 分钟" stays truthful without
-    // hammering the API.
+    // Sync config state from overview
+    useEffect(() => {
+        if (overview?.config) {
+            setCfgFailures(overview.config.max_auth_failures);
+            setCfgWindow(overview.config.failure_window_mins);
+            setCfgBanDuration(overview.config.ban_duration_mins);
+        }
+    }, [overview]);
+
+    // Re-render ticker for countdowns
     useEffect(() => {
         const t = setInterval(() => setNowMs(Date.now()), 15_000);
         return () => clearInterval(t);
     }, []);
+
+    const fetchEventsData = useCallback(async () => {
+        setEventsLoading(true);
+        try {
+            const data = await getSecurityEvents(50);
+            setEvents(data);
+        } catch {
+            // non-fatal
+        } finally {
+            setEventsLoading(false);
+        }
+    }, []);
+
+    const fetchWhitelistData = useCallback(async () => {
+        setWhitelistLoading(true);
+        try {
+            const data = await getSecurityWhitelist();
+            setWhitelist(data);
+        } catch {
+            // non-fatal
+        } finally {
+            setWhitelistLoading(false);
+        }
+    }, []);
+
+    // Load tab-specific data on switch
+    useEffect(() => {
+        if (activeTab === "events") {
+            fetchEventsData();
+        } else if (activeTab === "whitelist") {
+            fetchWhitelistData();
+        }
+    }, [activeTab, fetchEventsData, fetchWhitelistData]);
 
     const activeBans: BanEntry[] = overview?.active_bans ?? [];
 
@@ -95,7 +170,7 @@ export default function Security() {
         ban.permanent ? Number.MAX_SAFE_INTEGER : new Date(ban.expires_at).getTime() || Number.MAX_SAFE_INTEGER;
 
     const remainingText = (ban: BanEntry) => {
-        if (ban.permanent) return "永久";
+        if (ban.permanent) return "永久封禁";
         const ms = new Date(ban.expires_at).getTime() - nowMs;
         if (!Number.isFinite(ms)) return "";
         if (ms <= 0) return "即将解封";
@@ -109,14 +184,24 @@ export default function Security() {
             (b) =>
                 !q ||
                 b.ip.toLowerCase().includes(q) ||
-                (b.reason || "").toLowerCase().includes(q),
+                (b.reason || "").toLowerCase().includes(q) ||
+                (b.source || "").toLowerCase().includes(q),
         );
-        return [...list].sort((a, b) =>
-            sortBy === "expiry"
-                ? expiryValue(a) - expiryValue(b)
-                : new Date(b.banned_at).getTime() - new Date(a.banned_at).getTime(),
-        );
+        return [...list].sort((a, b) => {
+            if (sortBy === "hits") {
+                return (b.hit_count || 0) - (a.hit_count || 0);
+            }
+            if (sortBy === "recent") {
+                return new Date(b.banned_at).getTime() - new Date(a.banned_at).getTime();
+            }
+            return expiryValue(a) - expiryValue(b);
+        });
     }, [activeBans, search, sortBy, nowMs]);
+
+    const showToast = (type: "success" | "error", text: string) => {
+        setActionMsg({ type, text });
+        setTimeout(() => setActionMsg(null), 5000);
+    };
 
     const handleCopyIP = async (ip: string) => {
         try {
@@ -132,11 +217,18 @@ export default function Security() {
             showToast("error", "当前没有封禁记录可导出");
             return;
         }
-        const header = "ip,reason,banned_at,expires_at,permanent\n";
+        const header = "ip,reason,source,hit_count,banned_at,expires_at,permanent\n";
         const rows = activeBans
             .map((b) =>
-                [b.ip, `"${(b.reason || "").replace(/"/g, '""')}"`, b.banned_at, b.expires_at, b.permanent]
-                    .join(","),
+                [
+                    b.ip,
+                    `"${(b.reason || "").replace(/"/g, '""')}"`,
+                    b.source || "auto",
+                    b.hit_count || 0,
+                    b.banned_at,
+                    b.expires_at,
+                    b.permanent,
+                ].join(","),
             )
             .join("\n");
         const blob = new Blob([header + rows], { type: "text/csv;charset=utf-8" });
@@ -147,11 +239,6 @@ export default function Security() {
         a.click();
         URL.revokeObjectURL(url);
         showToast("success", `已导出 ${activeBans.length} 条封禁记录`);
-    };
-
-    const showToast = (type: "success" | "error", text: string) => {
-        setActionMsg({ type, text });
-        setTimeout(() => setActionMsg(null), 5000);
     };
 
     const handleTestAlert = async () => {
@@ -193,8 +280,6 @@ export default function Security() {
             showToast("error", "请输入要封禁的 IP 地址");
             return;
         }
-        // v1.15.0: reject hostnames/typos before they reach the server —
-        // a wrong entry can lock out the gateway.
         if (!isValidIp(trimmedIP)) {
             showToast("error", "IP 格式不合法，请输入 IPv4 或 IPv6 地址");
             return;
@@ -213,7 +298,7 @@ export default function Security() {
             setBanDuration(30);
             refetch();
         } catch (err: any) {
-            showToast("error", `封禁操作失败: ${err.message || "请求异常"}`);
+            showToast("error", `封禁操作被拦截: ${err.response?.data?.message || err.message || "请求异常"}`);
         } finally {
             setSubmittingBan(false);
         }
@@ -232,6 +317,54 @@ export default function Security() {
         }
     };
 
+    const handleAddWhitelist = async (e: React.FormEvent) => {
+        e.preventDefault();
+        const entry = newWLEntry.trim();
+        if (!entry) return;
+        setAddingWL(true);
+        try {
+            await addSecurityWhitelist(entry, newWLNote.trim());
+            showToast("success", `已添加白名单豁免: ${entry}`);
+            setNewWLEntry("");
+            setNewWLNote("");
+            fetchWhitelistData();
+            refetch();
+        } catch (err: any) {
+            showToast("error", `添加白名单失败: ${err.message || "格式错误"}`);
+        } finally {
+            setAddingWL(false);
+        }
+    };
+
+    const handleDeleteWhitelist = async (entry: string) => {
+        try {
+            await deleteSecurityWhitelist(entry);
+            showToast("success", `已移除白名单: ${entry}`);
+            fetchWhitelistData();
+            refetch();
+        } catch (err: any) {
+            showToast("error", `移除失败: ${err.message}`);
+        }
+    };
+
+    const handleSaveConfig = async (e: React.FormEvent) => {
+        e.preventDefault();
+        setSavingCfg(true);
+        try {
+            await updateSecurityConfig({
+                max_auth_failures: Number(cfgFailures),
+                failure_window_mins: Number(cfgWindow),
+                ban_duration_mins: Number(cfgBanDuration),
+            });
+            showToast("success", "防御中心策略参数已热更新生效！");
+            refetch();
+        } catch (err: any) {
+            showToast("error", `保存策略失败: ${err.message}`);
+        } finally {
+            setSavingCfg(false);
+        }
+    };
+
     if (!isAdmin) {
         return (
             <div className="space-y-6">
@@ -247,6 +380,8 @@ export default function Security() {
         );
     }
 
+    const pendingAttempts = overview?.pending_attempts ?? [];
+
     return (
         <div className="space-y-6 animate-fade-in">
             {/* Header */}
@@ -261,12 +396,11 @@ export default function Security() {
                         </h2>
                     </div>
                     <p className="mt-1 text-xs text-fg-muted">
-                        多层入侵检测与自动化熔断系统：实时拦截恶意爆破、非法路径扫描与未授权探测
+                        多层入侵检测与自动化熔断系统：实时拦截恶意爆破、防自我锁死、持久化审计与白名单防护
                     </p>
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
-                    {/* v1.15.0: live polling toggle (30s) */}
                     <button
                         type="button"
                         onClick={() => setAutoRefresh((v) => !v)}
@@ -314,7 +448,11 @@ export default function Security() {
                     <Button
                         variant="ghost"
                         size="icon"
-                        onClick={() => refetch()}
+                        onClick={() => {
+                            refetch();
+                            if (activeTab === "events") fetchEventsData();
+                            if (activeTab === "whitelist") fetchWhitelistData();
+                        }}
                         disabled={loading}
                         aria-label="刷新状态"
                         title="刷新安全状态"
@@ -357,7 +495,7 @@ export default function Security() {
                 />
             )}
 
-            {/* 4 Overview metric cards */}
+            {/* Overview metric cards */}
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 {/* Metric 1 */}
                 <Card className="glass-subtle hover-glow border-[rgb(var(--border)/0.4)]">
@@ -372,10 +510,10 @@ export default function Security() {
                     <CardContent>
                         <div className="text-xl font-bold tracking-tight text-emerald-500 flex items-center gap-1.5">
                             <span className="h-2.5 w-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                            主动巡检中
+                            持久化主动防护
                         </div>
                         <p className="mt-1 text-[11px] text-fg-muted">
-                            5次验证失败触发自动熔断
+                            阈值: {overview?.config?.max_auth_failures ?? 5}次 / 窗口: {overview?.config?.failure_window_mins ?? 5}分钟
                         </p>
                     </CardContent>
                 </Card>
@@ -384,20 +522,21 @@ export default function Security() {
                 <Card className="glass-subtle hover-glow border-[rgb(var(--border)/0.4)]">
                     <CardHeader className="flex flex-row items-center justify-between pb-2">
                         <span className="text-xs font-medium text-fg-muted">
-                            当前封禁 IP 数
+                            当前生效封禁
                         </span>
                         <div className="rounded-lg p-2 bg-rose-500/10 text-rose-500">
                             <Ban size={18} />
                         </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="text-2xl font-bold tracking-tight text-fg">
-                            {overview?.total_banned_count ?? 0}
+                        <div className="text-2xl font-bold tracking-tight text-fg flex items-baseline gap-2">
+                            <span>{overview?.total_banned_count ?? 0}</span>
+                            <span className="text-[11px] font-normal text-fg-muted">
+                                今日 +{overview?.bans_today ?? 0}
+                            </span>
                         </div>
                         <p className="mt-1 text-[11px] text-fg-muted">
-                            {overview?.total_banned_count === 0
-                                ? "当前系统无攻击者滞留"
-                                : "处于全系统 403 阻断拦截状态"}
+                            7天内累计新封禁: {overview?.bans_7d ?? 0} 个来源
                         </p>
                     </CardContent>
                 </Card>
@@ -406,7 +545,7 @@ export default function Security() {
                 <Card className="glass-subtle hover-glow border-[rgb(var(--border)/0.4)]">
                     <CardHeader className="flex flex-row items-center justify-between pb-2">
                         <span className="text-xs font-medium text-fg-muted">
-                            累计阻断攻击次数
+                            累计阻断拦截
                         </span>
                         <div className="rounded-lg p-2 bg-amber-500/10 text-amber-500">
                             <ShieldAlert size={18} />
@@ -417,7 +556,7 @@ export default function Security() {
                             {overview?.total_blocked_hits ?? 0}
                         </div>
                         <p className="mt-1 text-[11px] text-fg-muted">
-                            阻断高危探测及非法穿透请求
+                            重启/重建不丢失，数据库持久化存储
                         </p>
                     </CardContent>
                 </Card>
@@ -426,202 +565,572 @@ export default function Security() {
                 <Card className="glass-subtle hover-glow border-[rgb(var(--border)/0.4)]">
                     <CardHeader className="flex flex-row items-center justify-between pb-2">
                         <span className="text-xs font-medium text-fg-muted">
-                            邮件紧急告警通道
+                            观察中可疑尝试
                         </span>
                         <div className="rounded-lg p-2 bg-blue-500/10 text-blue-500">
-                            <Mail size={18} />
+                            <Activity size={18} />
                         </div>
                     </CardHeader>
                     <CardContent>
-                        <div className="flex items-center gap-1.5 text-base font-semibold text-fg">
-                            {overview?.smtp_enabled ? (
-                                <Badge
-                                    variant="outline"
-                                    className="bg-emerald-500/10 text-emerald-600 border-emerald-500/30"
-                                >
-                                    QQ 邮箱 SSL 已连接
-                                </Badge>
-                            ) : (
-                                <Badge variant="outline" className="text-fg-muted">
-                                    未配置通知
-                                </Badge>
+                        <div className="text-2xl font-bold tracking-tight text-fg flex items-baseline gap-2">
+                            <span>{pendingAttempts.length}</span>
+                            {pendingAttempts.length > 0 && (
+                                <span className="text-[11px] font-medium text-amber-500">
+                                    正在探测
+                                </span>
                             )}
                         </div>
-                        <p
-                            className="mt-1.5 truncate text-[11px] text-fg-muted"
-                            title={overview?.recipient || "3318647421@qq.com"}
-                        >
-                            接收端: {overview?.recipient || "3318647421@qq.com"}
+                        <p className="mt-1 text-[11px] text-fg-muted">
+                            {pendingAttempts.length === 0 ? "暂无失败探测积累" : "窗口内失败正在累积"}
                         </p>
                     </CardContent>
                 </Card>
             </div>
 
-            {/* Active Banned IPs Table */}
-            <Card className="glass border-[rgb(var(--border)/0.4)]">
-                <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
-                    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                        <div>
-                            <CardTitle className="text-base font-semibold flex items-center gap-2">
-                                <Ban size={18} className="text-rose-500" />
-                                <span>实时黑名单与拦截列表</span>
-                                <Badge variant="default" className="text-[11px]">
-                                    {filteredBans.length === activeBans.length
-                                        ? `${activeBans.length} 个 IP`
-                                        : `${filteredBans.length} / ${activeBans.length} 个 IP`}
-                                </Badge>
-                            </CardTitle>
-                            <CardDescription className="text-xs mt-0.5">
-                                被拦截的 IP 在所有业务路由（Web、API、流媒体）中均被阻断并记录审计日志
-                            </CardDescription>
-                        </div>
-                        <div className="flex flex-wrap items-center gap-2">
-                            <div className="relative">
-                                <Search
-                                    size={13}
-                                    className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-muted"
-                                />
-                                <Input
-                                    value={search}
-                                    onChange={(e) => setSearch(e.target.value)}
-                                    placeholder="搜索 IP / 原因"
-                                    className="h-8 w-44 pl-7 text-xs"
-                                />
+            {/* Pending attempts banner if any */}
+            {pendingAttempts.length > 0 && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-xs">
+                    <div className="flex items-center gap-2 font-semibold text-amber-600 mb-1.5">
+                        <Activity size={14} />
+                        <span>观察窗口内可疑探测 IP ({pendingAttempts.length})</span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2">
+                        {pendingAttempts.map((pa) => (
+                            <div key={pa.ip} className="rounded-lg bg-bg-surface/60 p-2 border border-amber-500/20 flex justify-between items-center">
+                                <div>
+                                    <span className="font-mono font-medium text-fg">{pa.ip}</span>
+                                    <div className="text-[10px] text-fg-muted mt-0.5">{pa.reason || "认证失败"}</div>
+                                </div>
+                                <div className="text-right">
+                                    <Badge variant="outline" className="text-amber-600 border-amber-500/40 text-[10px]">
+                                        {pa.count} 次失败
+                                    </Badge>
+                                    <div className="text-[10px] text-fg-muted mt-0.5">剩余 {pa.window_left_sec}s</div>
+                                </div>
                             </div>
-                            <select
-                                value={sortBy}
-                                onChange={(e) => setSortBy(e.target.value as "expiry" | "recent")}
-                                className="h-8 rounded-lg border border-[rgb(var(--border)/0.4)] bg-transparent px-2 text-xs text-fg"
-                                aria-label="排序方式"
-                            >
-                                <option value="expiry">按剩余时长</option>
-                                <option value="recent">按拦截时间</option>
-                            </select>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* Tabs Navigation */}
+            <div className="flex border-b border-[rgb(var(--border)/0.3)] gap-2">
+                <button
+                    onClick={() => setActiveTab("bans")}
+                    className={cn(
+                        "py-2 px-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5",
+                        activeTab === "bans"
+                            ? "border-primary text-primary"
+                            : "border-transparent text-fg-muted hover:text-fg",
+                    )}
+                >
+                    <Ban size={14} />
+                    <span>封禁拦截黑名单 ({activeBans.length})</span>
+                </button>
+                <button
+                    onClick={() => setActiveTab("events")}
+                    className={cn(
+                        "py-2 px-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5",
+                        activeTab === "events"
+                            ? "border-primary text-primary"
+                            : "border-transparent text-fg-muted hover:text-fg",
+                    )}
+                >
+                    <Clock size={14} />
+                    <span>安全事件审计日志</span>
+                </button>
+                <button
+                    onClick={() => setActiveTab("whitelist")}
+                    className={cn(
+                        "py-2 px-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5",
+                        activeTab === "whitelist"
+                            ? "border-primary text-primary"
+                            : "border-transparent text-fg-muted hover:text-fg",
+                    )}
+                >
+                    <Shield size={14} />
+                    <span>安全白名单</span>
+                </button>
+                <button
+                    onClick={() => setActiveTab("config")}
+                    className={cn(
+                        "py-2 px-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5",
+                        activeTab === "config"
+                            ? "border-primary text-primary"
+                            : "border-transparent text-fg-muted hover:text-fg",
+                    )}
+                >
+                    <Sliders size={14} />
+                    <span>防御策略配置</span>
+                </button>
+            </div>
+
+            {/* TAB 1: ACTIVE BANS */}
+            {activeTab === "bans" && (
+                <Card className="glass border-[rgb(var(--border)/0.4)]">
+                    <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold flex items-center gap-2">
+                                    <Ban size={18} className="text-rose-500" />
+                                    <span>实时黑名单与拦截列表</span>
+                                    <Badge variant="default" className="text-[11px]">
+                                        {filteredBans.length === activeBans.length
+                                            ? `${activeBans.length} 个 IP`
+                                            : `${filteredBans.length} / ${activeBans.length} 个 IP`}
+                                    </Badge>
+                                </CardTitle>
+                                <CardDescription className="text-xs mt-0.5">
+                                    黑名单在数据库持久化保存，被拦截 IP 在所有业务路由（Web、API、流媒体）中均被阻断
+                                </CardDescription>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <div className="relative">
+                                    <Search
+                                        size={13}
+                                        className="pointer-events-none absolute left-2.5 top-1/2 -translate-y-1/2 text-fg-muted"
+                                    />
+                                    <Input
+                                        value={search}
+                                        onChange={(e) => setSearch(e.target.value)}
+                                        placeholder="搜索 IP / 原因 / 来源"
+                                        className="h-8 w-44 pl-7 text-xs"
+                                    />
+                                </div>
+                                <select
+                                    value={sortBy}
+                                    onChange={(e) => setSortBy(e.target.value as "expiry" | "recent" | "hits")}
+                                    className="h-8 rounded-lg border border-[rgb(var(--border)/0.4)] bg-transparent px-2 text-xs text-fg"
+                                    aria-label="排序方式"
+                                >
+                                    <option value="expiry">按剩余时长</option>
+                                    <option value="recent">按拦截时间</option>
+                                    <option value="hits">按阻断次数</option>
+                                </select>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={handleExportCsv}
+                                    className="h-8 gap-1.5 text-xs"
+                                    title="导出当前黑名单为 CSV"
+                                >
+                                    <Download size={13} />
+                                    <span>导出</span>
+                                </Button>
+                            </div>
+                        </div>
+                    </CardHeader>
+                    <CardContent className="p-0">
+                        {loading && !overview ? (
+                            <div className="flex items-center justify-center py-12 text-fg-muted text-xs gap-2">
+                                <Loader2 size={16} className="animate-spin text-primary" />
+                                正在载入防御黑名单...
+                            </div>
+                        ) : activeBans.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center py-12 text-center">
+                                <div className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-500 mb-3">
+                                    <ShieldCheck size={24} />
+                                </div>
+                                <p className="text-sm font-medium text-fg">
+                                    当前无活跃被拦截 IP
+                                </p>
+                                <p className="text-xs text-fg-muted max-w-sm mt-1">
+                                    安全防御引擎正在后台持续监控流量，若外部发起撞库爆破或恶意渗透将自动封锁。
+                                </p>
+                            </div>
+                        ) : filteredBans.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center py-10 text-center">
+                                <p className="text-sm font-medium text-fg">没有匹配「{search}」的封禁记录</p>
+                                <button
+                                    onClick={() => setSearch("")}
+                                    className="mt-2 text-xs text-primary hover:underline"
+                                >
+                                    清除搜索条件
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-xs">
+                                    <thead className="border-b border-[rgb(var(--border)/0.2)] bg-[rgb(var(--bg-subtle)/0.3)] text-fg-muted">
+                                        <tr>
+                                            <th className="py-3 px-4 font-medium">拦截 IP 地址</th>
+                                            <th className="py-3 px-4 font-medium">来源</th>
+                                            <th className="py-3 px-4 font-medium">触发原因 / 威胁类型</th>
+                                            <th className="py-3 px-4 font-medium">阻断次数</th>
+                                            <th className="py-3 px-4 font-medium">拦截时间</th>
+                                            <th className="py-3 px-4 font-medium">有效期限</th>
+                                            <th className="py-3 px-4 font-medium text-right">操作</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
+                                        {filteredBans.map((ban) => {
+                                            const isUnbanning = unbanningIP === ban.ip;
+                                            return (
+                                                <tr
+                                                    key={ban.ip}
+                                                    className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]"
+                                                >
+                                                    <td className="py-3 px-4 font-mono font-medium text-fg">
+                                                        <div className="flex items-center gap-2">
+                                                            <span className="h-2 w-2 rounded-full bg-rose-500" />
+                                                            <span>{ban.ip}</span>
+                                                            <button
+                                                                type="button"
+                                                                onClick={() => handleCopyIP(ban.ip)}
+                                                                title="复制 IP"
+                                                                className="text-fg-muted/70 hover:text-fg transition-colors"
+                                                            >
+                                                                <Copy size={12} />
+                                                            </button>
+                                                        </div>
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted">
+                                                        <Badge
+                                                            variant="outline"
+                                                            className={cn(
+                                                                "text-[10px]",
+                                                                ban.source === "manual"
+                                                                    ? "border-amber-500/40 text-amber-600 bg-amber-500/10"
+                                                                    : "border-rose-500/40 text-rose-600 bg-rose-500/10",
+                                                            )}
+                                                        >
+                                                            {ban.source === "manual" ? "手动封禁" : "自动熔断"}
+                                                        </Badge>
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted">
+                                                        <span className="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 bg-rose-500/10 text-rose-600 font-medium text-[11px] border border-rose-500/20">
+                                                            {ban.reason || "触发恶意访问策略"}
+                                                        </span>
+                                                    </td>
+                                                    <td className="py-3 px-4 font-mono font-medium text-fg">
+                                                        {ban.hit_count ?? 0} 次
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted">
+                                                        {formatDateTime(ban.banned_at)}
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted">
+                                                        {ban.permanent ? (
+                                                            <Badge variant="outline" className="border-rose-500/40 text-rose-500">
+                                                                永久封禁
+                                                            </Badge>
+                                                        ) : (
+                                                            <div className="flex flex-col gap-0.5">
+                                                                <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-600">
+                                                                    <Clock size={11} />
+                                                                    {remainingText(ban)}
+                                                                </span>
+                                                                <span className="text-[11px] text-fg-muted/80">
+                                                                    至 {formatDateTime(ban.expires_at)} 自动解封
+                                                                </span>
+                                                            </div>
+                                                        )}
+                                                    </td>
+                                                    <td className="py-3 px-4 text-right">
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            onClick={() => handleUnban(ban.ip)}
+                                                            disabled={isUnbanning}
+                                                            className="text-xs gap-1.5 text-fg-muted hover:text-emerald-500 hover:bg-emerald-500/10"
+                                                        >
+                                                            {isUnbanning ? (
+                                                                <Loader2 size={13} className="animate-spin" />
+                                                            ) : (
+                                                                <Unlock size={13} />
+                                                            )}
+                                                            <span>立即解封</span>
+                                                        </Button>
+                                                    </td>
+                                                </tr>
+                                            );
+                                        })}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            )}
+
+            {/* TAB 2: AUDIT EVENTS TIMELINE */}
+            {activeTab === "events" && (
+                <Card className="glass border-[rgb(var(--border)/0.4)]">
+                    <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold flex items-center gap-2">
+                                    <Clock size={18} className="text-blue-500" />
+                                    <span>安全事件审计时间线 (最近 50 条)</span>
+                                </CardTitle>
+                                <CardDescription className="text-xs mt-0.5">
+                                    详细记录每一次触发爆破、封禁、解封、策略热更新及测试操作
+                                </CardDescription>
+                            </div>
                             <Button
                                 variant="outline"
                                 size="sm"
-                                onClick={handleExportCsv}
+                                onClick={fetchEventsData}
+                                disabled={eventsLoading}
                                 className="h-8 gap-1.5 text-xs"
-                                title="导出当前黑名单为 CSV"
                             >
-                                <Download size={13} />
-                                <span>导出</span>
+                                <RefreshCw size={13} className={cn(eventsLoading && "animate-spin")} />
+                                <span>刷新日志</span>
                             </Button>
                         </div>
-                    </div>
-                </CardHeader>
-                <CardContent className="p-0">
-                    {loading && !overview ? (
-                        <div className="flex items-center justify-center py-12 text-fg-muted text-xs gap-2">
-                            <Loader2 size={16} className="animate-spin text-primary" />
-                            正在载入防御黑名单...
-                        </div>
-                    ) : activeBans.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center py-12 text-center">
-                            <div className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-500 mb-3">
-                                <ShieldCheck size={24} />
+                    </CardHeader>
+                    <CardContent className="p-0">
+                        {eventsLoading && events.length === 0 ? (
+                            <div className="flex items-center justify-center py-12 text-fg-muted text-xs gap-2">
+                                <Loader2 size={16} className="animate-spin text-primary" />
+                                正在加载安全审计日志...
                             </div>
-                            <p className="text-sm font-medium text-fg">
-                                当前无活跃被拦截 IP
-                            </p>
-                            <p className="text-xs text-fg-muted max-w-sm mt-1">
-                                安全防御引擎正在后台持续监控流量，若外部发起撞库爆破或恶意渗透将自动封锁。
-                            </p>
-                        </div>
-                    ) : filteredBans.length === 0 ? (
-                        <div className="flex flex-col items-center justify-center py-10 text-center">
-                            <p className="text-sm font-medium text-fg">没有匹配「{search}」的封禁记录</p>
-                            <button
-                                onClick={() => setSearch("")}
-                                className="mt-2 text-xs text-primary hover:underline"
-                            >
-                                清除搜索条件
-                            </button>
-                        </div>
-                    ) : (
-                        <div className="overflow-x-auto">
-                            <table className="w-full text-left text-xs">
-                                <thead className="border-b border-[rgb(var(--border)/0.2)] bg-[rgb(var(--bg-subtle)/0.3)] text-fg-muted">
-                                    <tr>
-                                        <th className="py-3 px-4 font-medium">拦截 IP 地址</th>
-                                        <th className="py-3 px-4 font-medium">触发原因 / 威胁类型</th>
-                                        <th className="py-3 px-4 font-medium">拦截时间</th>
-                                        <th className="py-3 px-4 font-medium">有效期限</th>
-                                        <th className="py-3 px-4 font-medium text-right">操作</th>
-                                    </tr>
-                                </thead>
-                                <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
-                                    {filteredBans.map((ban) => {
-                                        const isUnbanning = unbanningIP === ban.ip;
-                                        return (
-                                            <tr
-                                                key={ban.ip}
-                                                className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]"
-                                            >
-                                                <td className="py-3 px-4 font-mono font-medium text-fg">
-                                                    <div className="flex items-center gap-2">
-                                                        <span className="h-2 w-2 rounded-full bg-rose-500" />
-                                                        <span>{ban.ip}</span>
-                                                        <button
-                                                            type="button"
-                                                            onClick={() => handleCopyIP(ban.ip)}
-                                                            title="复制 IP"
-                                                            className="text-fg-muted/70 hover:text-fg transition-colors"
-                                                        >
-                                                            <Copy size={12} />
-                                                        </button>
-                                                    </div>
+                        ) : events.length === 0 ? (
+                            <div className="flex flex-col items-center justify-center py-12 text-center text-fg-muted text-xs">
+                                暂无安全事件记录
+                            </div>
+                        ) : (
+                            <div className="overflow-x-auto">
+                                <table className="w-full text-left text-xs">
+                                    <thead className="border-b border-[rgb(var(--border)/0.2)] bg-[rgb(var(--bg-subtle)/0.3)] text-fg-muted">
+                                        <tr>
+                                            <th className="py-3 px-4 font-medium">时间</th>
+                                            <th className="py-3 px-4 font-medium">相关来源</th>
+                                            <th className="py-3 px-4 font-medium">事件类型</th>
+                                            <th className="py-3 px-4 font-medium">执行处置</th>
+                                            <th className="py-3 px-4 font-medium">详情说明</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
+                                        {events.map((ev) => (
+                                            <tr key={ev.id} className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]">
+                                                <td className="py-3 px-4 text-fg-muted whitespace-nowrap">
+                                                    {formatDateTime(ev.created_at)}
                                                 </td>
-                                                <td className="py-3 px-4 text-fg-muted">
-                                                    <span className="inline-flex items-center gap-1.5 rounded-md px-2 py-0.5 bg-rose-500/10 text-rose-600 font-medium text-[11px] border border-rose-500/20">
-                                                        {ban.reason || "触发恶意访问策略"}
-                                                    </span>
+                                                <td className="py-3 px-4 font-mono font-medium text-fg whitespace-nowrap">
+                                                    {ev.ip}
                                                 </td>
-                                                <td className="py-3 px-4 text-fg-muted">
-                                                    {formatDateTime(ban.banned_at)}
-                                                </td>
-                                                <td className="py-3 px-4 text-fg-muted">
-                                                    {ban.permanent ? (
-                                                        <Badge variant="outline" className="border-rose-500/40 text-rose-500">
-                                                            永久封禁
-                                                        </Badge>
-                                                    ) : (
-                                                        <div className="flex flex-col gap-0.5">
-                                                            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-amber-600">
-                                                                <Clock size={11} />
-                                                                {remainingText(ban)}
-                                                            </span>
-                                                            <span className="text-[11px] text-fg-muted/80">
-                                                                至 {formatDateTime(ban.expires_at)} 自动解封
-                                                            </span>
-                                                        </div>
-                                                    )}
-                                                </td>
-                                                <td className="py-3 px-4 text-right">
-                                                    <Button
-                                                        variant="ghost"
-                                                        size="sm"
-                                                        onClick={() => handleUnban(ban.ip)}
-                                                        disabled={isUnbanning}
-                                                        className="text-xs gap-1.5 text-fg-muted hover:text-emerald-500 hover:bg-emerald-500/10"
-                                                    >
-                                                        {isUnbanning ? (
-                                                            <Loader2 size={13} className="animate-spin" />
-                                                        ) : (
-                                                            <Unlock size={13} />
+                                                <td className="py-3 px-4">
+                                                    <Badge
+                                                        variant="outline"
+                                                        className={cn(
+                                                            "text-[10px]",
+                                                            ev.type.includes("ban")
+                                                                ? "border-rose-500/40 text-rose-600 bg-rose-500/10"
+                                                                : ev.type.includes("unban")
+                                                                ? "border-emerald-500/40 text-emerald-600 bg-emerald-500/10"
+                                                                : "border-blue-500/40 text-blue-600 bg-blue-500/10",
                                                         )}
-                                                        <span>立即解封</span>
-                                                    </Button>
+                                                    >
+                                                        {ev.type}
+                                                    </Badge>
+                                                </td>
+                                                <td className="py-3 px-4 font-medium text-fg whitespace-nowrap">
+                                                    {ev.action}
+                                                </td>
+                                                <td className="py-3 px-4 text-fg-muted max-w-md break-all">
+                                                    {ev.detail}
                                                 </td>
                                             </tr>
-                                        );
-                                    })}
-                                </tbody>
-                            </table>
-                        </div>
-                    )}
-                </CardContent>
-            </Card>
+                                        ))}
+                                    </tbody>
+                                </table>
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            )}
+
+            {/* TAB 3: DYNAMIC WHITELIST */}
+            {activeTab === "whitelist" && (
+                <div className="space-y-4">
+                    <Card className="glass border-[rgb(var(--border)/0.4)]">
+                        <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                            <CardTitle className="text-base font-semibold flex items-center gap-2">
+                                <Plus size={16} className="text-emerald-500" />
+                                <span>添加白名单豁免</span>
+                            </CardTitle>
+                            <CardDescription className="text-xs">
+                                加入白名单的 IP 或 CIDR 网段不会被自动化入侵检测机制熔断封禁
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent className="pt-4">
+                            <form onSubmit={handleAddWhitelist} className="flex flex-col sm:flex-row gap-2">
+                                <Input
+                                    value={newWLEntry}
+                                    onChange={(e) => setNewWLEntry(e.target.value)}
+                                    placeholder="IP 或 CIDR，例如 192.168.1.100 或 10.0.0.0/8"
+                                    className="font-mono text-xs flex-1"
+                                    required
+                                />
+                                <Input
+                                    value={newWLNote}
+                                    onChange={(e) => setNewWLNote(e.target.value)}
+                                    placeholder="备注说明，例如：开发测试机"
+                                    className="text-xs sm:w-60"
+                                />
+                                <Button
+                                    type="submit"
+                                    disabled={addingWL}
+                                    className="bg-emerald-600 hover:bg-emerald-700 text-white text-xs gap-1.5"
+                                >
+                                    {addingWL ? <Loader2 size={13} className="animate-spin" /> : <Plus size={14} />}
+                                    <span>添加豁免</span>
+                                </Button>
+                            </form>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="glass border-[rgb(var(--border)/0.4)]">
+                        <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                            <CardTitle className="text-base font-semibold flex items-center gap-2">
+                                <Shield size={18} className="text-emerald-500" />
+                                <span>当前生效的白名单列表</span>
+                            </CardTitle>
+                        </CardHeader>
+                        <CardContent className="p-0">
+                            {whitelistLoading && whitelist.length === 0 ? (
+                                <div className="flex items-center justify-center py-10 text-fg-muted text-xs gap-2">
+                                    <Loader2 size={16} className="animate-spin text-primary" />
+                                    载入白名单列表中...
+                                </div>
+                            ) : (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-left text-xs">
+                                        <thead className="border-b border-[rgb(var(--border)/0.2)] bg-[rgb(var(--bg-subtle)/0.3)] text-fg-muted">
+                                            <tr>
+                                                <th className="py-3 px-4 font-medium">豁免地址 / 网段</th>
+                                                <th className="py-3 px-4 font-medium">备注说明</th>
+                                                <th className="py-3 px-4 font-medium">类型</th>
+                                                <th className="py-3 px-4 font-medium">添加时间</th>
+                                                <th className="py-3 px-4 font-medium text-right">操作</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
+                                            {/* Static config whitelists */}
+                                            {overview?.config?.whitelist?.map((entry) => (
+                                                <tr key={entry} className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]">
+                                                    <td className="py-3 px-4 font-mono font-medium text-fg">{entry}</td>
+                                                    <td className="py-3 px-4 text-fg-muted">配置文件全局预设</td>
+                                                    <td className="py-3 px-4">
+                                                        <Badge variant="outline" className="text-[10px]">静态预设</Badge>
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted">-</td>
+                                                    <td className="py-3 px-4 text-right text-fg-muted text-[11px]">系统保护</td>
+                                                </tr>
+                                            ))}
+                                            {/* Dynamic DB whitelists */}
+                                            {whitelist.map((w) => (
+                                                <tr key={w.entry} className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]">
+                                                    <td className="py-3 px-4 font-mono font-medium text-fg">{w.entry}</td>
+                                                    <td className="py-3 px-4 text-fg-muted">{w.note || "-"}</td>
+                                                    <td className="py-3 px-4">
+                                                        <Badge variant="outline" className="border-emerald-500/40 text-emerald-600 text-[10px]">动态配置</Badge>
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted">{formatDateTime(w.created_at)}</td>
+                                                    <td className="py-3 px-4 text-right">
+                                                        <Button
+                                                            variant="ghost"
+                                                            size="sm"
+                                                            onClick={() => handleDeleteWhitelist(w.entry)}
+                                                            className="text-xs text-rose-500 hover:bg-rose-500/10 h-7 px-2 gap-1"
+                                                        >
+                                                            <Trash2 size={12} />
+                                                            <span>移除</span>
+                                                        </Button>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                        </CardContent>
+                    </Card>
+                </div>
+            )}
+
+            {/* TAB 4: CONFIGURATION */}
+            {activeTab === "config" && (
+                <Card className="glass border-[rgb(var(--border)/0.4)] max-w-xl">
+                    <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                        <CardTitle className="text-base font-semibold flex items-center gap-2">
+                            <Sliders size={18} className="text-primary" />
+                            <span>主动入侵防御策略配置</span>
+                        </CardTitle>
+                        <CardDescription className="text-xs">
+                            参数修改后即时保存并热加载生效，无需重启服务
+                        </CardDescription>
+                    </CardHeader>
+                    <CardContent className="pt-4">
+                        <form onSubmit={handleSaveConfig} className="space-y-4 text-xs">
+                            <div>
+                                <label className="block font-medium text-fg mb-1">
+                                    最大连续认证失败次数 (阈值)
+                                </label>
+                                <Input
+                                    type="number"
+                                    min="3"
+                                    max="50"
+                                    value={cfgFailures}
+                                    onChange={(e) => setCfgFailures(Number(e.target.value))}
+                                    className="text-xs"
+                                    required
+                                />
+                                <p className="mt-1 text-[11px] text-fg-muted">
+                                    安全保护下限：不得低于 3 次（防止手误导致自己被误封）
+                                </p>
+                            </div>
+
+                            <div>
+                                <label className="block font-medium text-fg mb-1">
+                                    失败统计观察窗口 (分钟)
+                                </label>
+                                <Input
+                                    type="number"
+                                    min="1"
+                                    max="120"
+                                    value={cfgWindow}
+                                    onChange={(e) => setCfgWindow(Number(e.target.value))}
+                                    className="text-xs"
+                                    required
+                                />
+                                <p className="mt-1 text-[11px] text-fg-muted">
+                                    在此时间窗口内的连续失败将被累计计数，超时后自动重置。
+                                </p>
+                            </div>
+
+                            <div>
+                                <label className="block font-medium text-fg mb-1">
+                                    自动触发熔断封禁时长 (分钟)
+                                </label>
+                                <Input
+                                    type="number"
+                                    min="1"
+                                    max="10080"
+                                    value={cfgBanDuration}
+                                    onChange={(e) => setCfgBanDuration(Number(e.target.value))}
+                                    className="text-xs"
+                                    required
+                                />
+                                <p className="mt-1 text-[11px] text-fg-muted">
+                                    达到阈值后自动封禁的时长，默认 30 分钟。
+                                </p>
+                            </div>
+
+                            <div className="pt-3 border-t border-[rgb(var(--border)/0.2)]">
+                                <Button
+                                    type="submit"
+                                    disabled={savingCfg}
+                                    className="bg-primary hover:bg-primary/90 text-white text-xs gap-1.5"
+                                >
+                                    {savingCfg ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={14} />}
+                                    <span>保存并应用策略</span>
+                                </Button>
+                            </div>
+                        </form>
+                    </CardContent>
+                </Card>
+            )}
 
             {/* Defense Policies & Architecture Details */}
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
@@ -629,26 +1138,26 @@ export default function Security() {
                     <CardHeader className="pb-2.5">
                         <CardTitle className="text-sm font-semibold flex items-center gap-2">
                             <Lock size={16} className="text-amber-500" />
-                            <span>主动入侵防护策略</span>
+                            <span>主动入侵防护与自我保护</span>
                         </CardTitle>
                     </CardHeader>
                     <CardContent className="space-y-2 text-xs text-fg-muted leading-relaxed">
                         <div className="flex items-start gap-2">
-                            <span className="font-semibold text-fg">1. 身份认证防爆破:</span>
+                            <span className="font-semibold text-fg">1. 状态全量持久化:</span>
                             <span>
-                                5 分钟内连续 5 次设备绑定失败将立即熔断，默认封禁 30 分钟。
+                                黑名单、拦截计数及审计事件均写入 SQLite 数据库，服务升级重启不丢状态。
                             </span>
                         </div>
                         <div className="flex items-start gap-2">
-                            <span className="font-semibold text-fg">2. 真实 IP 穿透识别:</span>
+                            <span className="font-semibold text-fg">2. 管理员防自我锁死:</span>
                             <span>
-                                自动解析 Cloudflare `CF-Connecting-IP` 及受信任代理链路，防止代理掩护。
+                                严禁封禁回环地址、当前登录操作 IP 及白名单网关，杜绝误封失联。
                             </span>
                         </div>
                         <div className="flex items-start gap-2">
-                            <span className="font-semibold text-fg">3. 自动回收机制:</span>
+                            <span className="font-semibold text-fg">3. 告警去重与防风暴:</span>
                             <span>
-                                后台定时清理过期临时封禁记录，无需人工频繁清理黑名单。
+                                同一 IP 告警邮件设有 10 分钟冷却期；白名单设备告警后自动清零失败计数。
                             </span>
                         </div>
                     </CardContent>
@@ -665,20 +1174,20 @@ export default function Security() {
                         <div className="flex items-start gap-2">
                             <span className="font-semibold text-fg">安全白名单:</span>
                             <span>
-                                内网 `192.168.31.0/24`、`127.0.0.1` 及本机环回具备豁免权，杜绝家庭内部被误杀。
+                                静态配置与动态添加相结合，支持单 IP 或 CIDR 掩码段豁免。
                             </span>
                         </div>
                         <div className="flex items-start gap-2">
                             <span className="font-semibold text-fg">邮件即时通知:</span>
                             <span>
                                 触发黑名单熔断时，通过 QQ 邮箱 SMTP 即时推送 HTML 预警至{" "}
-                                <span className="font-mono text-fg">3318647421@qq.com</span>。
+                                <span className="font-mono text-fg">{overview?.recipient || "3318647421@qq.com"}</span>。
                             </span>
                         </div>
                         <div className="flex items-start gap-2">
                             <span className="font-semibold text-fg">事件总线联动:</span>
                             <span>
-                                威胁事件同步发布至 EventBus，前端仪表盘及系统日志实时呈现告警流。
+                                威胁事件同步发布至 EventBus，前端仪表盘及系统审计日志实时呈现告警流。
                             </span>
                         </div>
                     </CardContent>

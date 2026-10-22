@@ -1,18 +1,33 @@
 package security
 
 import (
+	"errors"
 	"testing"
+	"time"
+
+	"github.com/glebarez/sqlite"
+	"gorm.io/gorm"
 
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/model"
 )
 
-func TestDefenseManager_AutoBanAndAlert(t *testing.T) {
-	bus := eventbus.New()
-	alertCfg := config.AlertConfig{
-		Enabled: false, // Don't actually send SMTP in unit test
+func setupTestDB(t *testing.T) *gorm.DB {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("failed to open in-memory sqlite: %v", err)
 	}
-	alertMgr := NewAlertManager(alertCfg)
+	if err := db.AutoMigrate(&model.IPBan{}, &model.SecurityEvent{}, &model.SecurityWhitelist{}); err != nil {
+		t.Fatalf("failed to migrate schema: %v", err)
+	}
+	return db
+}
+
+func TestDefenseManager_AutoBanAndPersistence(t *testing.T) {
+	db := setupTestDB(t)
+	bus := eventbus.New()
+	alertMgr := NewAlertManager(config.AlertConfig{Enabled: false})
 
 	defenseCfg := config.DefenseConfig{
 		MaxAuthFailures:   3,
@@ -21,7 +36,7 @@ func TestDefenseManager_AutoBanAndAlert(t *testing.T) {
 		WhitelistIPs:      []string{"127.0.0.1", "192.168.31.0/24"},
 	}
 
-	dm := NewDefenseManager(defenseCfg, alertMgr, bus)
+	dm := NewDefenseManager(db, defenseCfg, alertMgr, bus)
 
 	testExternalIP := "203.0.113.50"
 	testGatewayIP := "192.168.31.1"
@@ -46,7 +61,26 @@ func TestDefenseManager_AutoBanAndAlert(t *testing.T) {
 		t.Fatalf("expected entry IP %s, got %s", testExternalIP, entry.IP)
 	}
 
-	// 2. Gateway IP (whitelisted)
+	// Verify persistence in DB
+	var dbBan model.IPBan
+	if err := db.Where("ip = ?", testExternalIP).First(&dbBan).Error; err != nil {
+		t.Fatalf("expected ban for %s to be persisted in DB, got error: %v", testExternalIP, err)
+	}
+	if dbBan.IP != testExternalIP || dbBan.Source != "auto" {
+		t.Fatalf("persisted ban mismatch: %+v", dbBan)
+	}
+
+	// 2. Restart simulation: create a new DefenseManager instance on the same DB
+	dm2 := NewDefenseManager(db, defenseCfg, alertMgr, bus)
+	banned2, entry2 := dm2.IsBanned(testExternalIP)
+	if !banned2 {
+		t.Fatalf("expected IP %s to still be banned after DM restart", testExternalIP)
+	}
+	if entry2.IP != testExternalIP {
+		t.Fatalf("expected restarted entry IP %s, got %s", testExternalIP, entry2.IP)
+	}
+
+	// 3. Gateway IP (whitelisted)
 	dm.RecordAuthFailure(testGatewayIP, "gateway probe 1", "python/3.10")
 	dm.RecordAuthFailure(testGatewayIP, "gateway probe 2", "python/3.10")
 	dm.RecordAuthFailure(testGatewayIP, "gateway probe 3", "python/3.10")
@@ -57,16 +91,125 @@ func TestDefenseManager_AutoBanAndAlert(t *testing.T) {
 		t.Fatalf("gateway IP %s is whitelisted and MUST NEVER be banned", testGatewayIP)
 	}
 
-	// 3. Manual unban
-	dm.ManualUnban(testExternalIP)
+	// 4. Manual unban
+	if err := dm.ManualUnban("admin", testExternalIP); err != nil {
+		t.Fatalf("failed manual unban: %v", err)
+	}
 	bannedAfterUnban, _ := dm.IsBanned(testExternalIP)
 	if bannedAfterUnban {
 		t.Fatalf("expected IP %s to be unbanned after ManualUnban", testExternalIP)
 	}
+	// Verify deleted from DB
+	var count int64
+	db.Model(&model.IPBan{}).Where("ip = ?", testExternalIP).Count(&count)
+	if count != 0 {
+		t.Fatalf("expected ban row to be deleted from DB, found %d", count)
+	}
 
-	// 4. Overview
+	// 5. Overview check
 	overview := dm.GetOverview()
-	if overview.TotalBlockedHits < 1 {
-		t.Logf("blocked hits: %d", overview.TotalBlockedHits)
+	if overview.BansToday < 1 {
+		t.Fatalf("expected bans_today >= 1, got %d", overview.BansToday)
+	}
+}
+
+func TestDefenseManager_SelfProtection(t *testing.T) {
+	db := setupTestDB(t)
+	bus := eventbus.New()
+	alertMgr := NewAlertManager(config.AlertConfig{Enabled: false})
+
+	defenseCfg := config.DefenseConfig{
+		MaxAuthFailures:   3,
+		FailureWindowMins: 5,
+		BanDurationMins:   10,
+		WhitelistIPs:      []string{"127.0.0.1", "192.168.31.1"},
+	}
+
+	dm := NewDefenseManager(db, defenseCfg, alertMgr, bus)
+
+	operatorIP := "192.168.31.100"
+
+	// 1. Loopback ban attempt
+	err := dm.ManualBan(operatorIP, "admin", "127.0.0.1", 30*time.Minute, "test loopback")
+	if !errors.Is(err, ErrLoopbackIP) {
+		t.Fatalf("expected ErrLoopbackIP, got %v", err)
+	}
+
+	// 2. Whitelist ban attempt
+	err = dm.ManualBan(operatorIP, "admin", "192.168.31.1", 30*time.Minute, "test gateway")
+	if !errors.Is(err, ErrWhitelistedIP) {
+		t.Fatalf("expected ErrWhitelistedIP, got %v", err)
+	}
+
+	// 3. Self-ban attempt
+	err = dm.ManualBan(operatorIP, "admin", operatorIP, 30*time.Minute, "test self")
+	if !errors.Is(err, ErrSelfIP) {
+		t.Fatalf("expected ErrSelfIP, got %v", err)
+	}
+
+	// 4. Valid external ban
+	err = dm.ManualBan(operatorIP, "admin", "198.51.100.22", 60*time.Minute, "test valid")
+	if err != nil {
+		t.Fatalf("expected valid ban to succeed, got %v", err)
+	}
+	banned, entry := dm.IsBanned("198.51.100.22")
+	if !banned || entry.Source != "manual" {
+		t.Fatalf("expected manual ban to be active, got %+v", entry)
+	}
+}
+
+func TestDefenseManager_AlertCooldownAndWhitelist(t *testing.T) {
+	db := setupTestDB(t)
+	bus := eventbus.New()
+	alertMgr := NewAlertManager(config.AlertConfig{Enabled: false})
+
+	defenseCfg := config.DefenseConfig{
+		MaxAuthFailures:   3,
+		FailureWindowMins: 5,
+		BanDurationMins:   10,
+		WhitelistIPs:      []string{"127.0.0.1"},
+	}
+
+	dm := NewDefenseManager(db, defenseCfg, alertMgr, bus)
+
+	testIP := "198.51.100.88"
+
+	// Check alert cooldown
+	if !dm.shouldSendAlert(testIP) {
+		t.Fatalf("first alert should be allowed")
+	}
+	if dm.shouldSendAlert(testIP) {
+		t.Fatalf("second alert within 10 minutes should be throttled")
+	}
+
+	// Dynamic whitelist add and remove
+	if err := dm.AddWhitelist("10.0.0.0/8", "internal VPN"); err != nil {
+		t.Fatalf("failed to add whitelist: %v", err)
+	}
+	if !dm.IsWhitelisted("10.1.2.3") {
+		t.Fatalf("expected 10.1.2.3 to be whitelisted under 10.0.0.0/8")
+	}
+
+	// List dynamic whitelist
+	wls, err := dm.ListWhitelist()
+	if err != nil || len(wls) != 1 {
+		t.Fatalf("expected 1 dynamic whitelist entry, got %d, err: %v", len(wls), err)
+	}
+
+	// Remove whitelist
+	if err := dm.RemoveWhitelist("10.0.0.0/8"); err != nil {
+		t.Fatalf("failed to remove whitelist: %v", err)
+	}
+	if dm.IsWhitelisted("10.1.2.3") {
+		t.Fatalf("expected 10.1.2.3 not to be whitelisted after removal")
+	}
+
+	// Dynamic config update
+	if err := dm.UpdateConfig(10, 15, 60); err != nil {
+		t.Fatalf("failed to update config: %v", err)
+	}
+	ov := dm.GetOverview()
+	if ov.Config.MaxAuthFailures != 10 || ov.Config.FailureWindowMins != 15 || ov.Config.BanDurationMins != 60 {
+		t.Fatalf("overview config mismatch: %+v", ov.Config)
 	}
 }

@@ -47,6 +47,9 @@ func InitDB(dbPath string) {
 		&model.Rule{},
 		&model.SystemLog{},
 		&model.SecurityState{},
+		&model.IPBan{},
+		&model.SecurityEvent{},
+		&model.SecurityWhitelist{},
 	)
 	if err != nil {
 		log.Fatalf("failed to migrate database: %v", err)

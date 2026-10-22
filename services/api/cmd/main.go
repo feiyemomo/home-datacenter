@@ -186,7 +186,7 @@ func main() {
 
 	// ---- Services & Handlers ----
 	alertMgr := security.NewAlertManager(cfg.Security.Alert)
-	defenseMgr := security.NewDefenseManager(cfg.Security.Defense, alertMgr, bus)
+	defenseMgr := security.NewDefenseManager(database.DB, cfg.Security.Defense, alertMgr, bus)
 
 	authService := service.NewAuthService(userRepo, deviceRepo)
 	userService := service.NewUserService(userRepo, deviceRepo)
@@ -677,6 +677,8 @@ func main() {
 			securityGroup.PUT("/guard", middleware.RequireAdmin(database.DB), securityHandler.SetGuard)
 			securityGroup.GET("/overview", securityHandler.GetOverview)
 			securityGroup.GET("/banned", securityHandler.ListBanned)
+			securityGroup.GET("/events", securityHandler.ListEvents)
+			securityGroup.GET("/whitelist", securityHandler.GetWhitelist)
 		}
 
 		// Admin-only security emergency response operations
@@ -684,7 +686,11 @@ func main() {
 		securityAdmin.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
 		{
 			securityAdmin.POST("/ban", securityHandler.ManualBan)
+			securityAdmin.PUT("/ban/:ip", securityHandler.UpdateBan)
 			securityAdmin.DELETE("/ban/:ip", securityHandler.ManualUnban)
+			securityAdmin.POST("/whitelist", securityHandler.AddWhitelist)
+			securityAdmin.DELETE("/whitelist/:entry", securityHandler.DeleteWhitelist)
+			securityAdmin.PUT("/config", securityHandler.UpdateConfig)
 			securityAdmin.POST("/test-alert", securityHandler.TestAlertEmail)
 		}
 

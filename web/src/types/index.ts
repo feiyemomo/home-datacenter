@@ -486,11 +486,54 @@ export interface SecurityGuardState {
 // -------------------- Intrusion Defense & Firewall Management --------------------
 
 export interface BanEntry {
+    id?: number;
     ip: string;
     reason: string;
+    source?: "auto" | "manual";
     banned_at: string;
     expires_at: string;
     permanent: boolean;
+    hit_count?: number;
+    last_hit_at?: { Time: string; Valid: boolean };
+}
+
+export interface PendingAttempt {
+    ip: string;
+    count: number;
+    window_left_sec: number;
+    first_seen: string;
+    last_seen: string;
+    reason: string;
+}
+
+export interface TopAttacker {
+    ip: string;
+    hits: number;
+    last_hit_at?: { Time: string; Valid: boolean };
+    reason: string;
+}
+
+export interface DefenseConfigSummary {
+    max_auth_failures: number;
+    failure_window_mins: number;
+    ban_duration_mins: number;
+    whitelist: string[];
+}
+
+export interface SecurityEvent {
+    id: number;
+    ip: string;
+    type: string;
+    detail: string;
+    action: string;
+    created_at: string;
+}
+
+export interface SecurityWhitelistItem {
+    id: number;
+    entry: string;
+    note: string;
+    created_at: string;
 }
 
 export interface DefenseOverview {
@@ -499,6 +542,14 @@ export interface DefenseOverview {
     active_bans: BanEntry[];
     smtp_enabled: boolean;
     recipient: string;
+    pending_attempts?: PendingAttempt[];
+    bans_today?: number;
+    bans_7d?: number;
+    blocked_hits_24h?: number[];
+    top_attackers?: TopAttacker[];
+    by_type?: Record<string, number>;
+    config?: DefenseConfigSummary;
+    last_event_at?: string | null;
 }
 
 export interface ManualBanRequest {

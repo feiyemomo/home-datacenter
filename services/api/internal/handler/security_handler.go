@@ -1,8 +1,10 @@
 package handler
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -97,7 +99,7 @@ type manualBanRequest struct {
 	Reason          string `json:"reason"`
 }
 
-// ManualBan manually adds an IP to the active ban list.
+// ManualBan manually adds an IP to the active ban list with self-protection.
 //
 //	Route: POST /api/v1/security/ban
 func (h *SecurityHandler) ManualBan(c *gin.Context) {
@@ -112,13 +114,31 @@ func (h *SecurityHandler) ManualBan(c *gin.Context) {
 		return
 	}
 
+	operatorIP := c.GetString("real_client_ip")
+	if operatorIP == "" {
+		operatorIP = c.ClientIP()
+	}
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+
 	duration := time.Duration(req.DurationMinutes) * time.Minute
 	reason := req.Reason
 	if reason == "" {
 		reason = "管理员手动拦截"
 	}
 
-	h.defenseMgr.ManualBan(req.IP, duration, reason)
+	if err := h.defenseMgr.ManualBan(operatorIP, operatorUser, req.IP, duration, reason); err != nil {
+		if errors.Is(err, security.ErrLoopbackIP) || errors.Is(err, security.ErrWhitelistedIP) ||
+			errors.Is(err, security.ErrSelfIP) || errors.Is(err, security.ErrInvalidIP) {
+			utils.Fail(c, http.StatusConflict, err.Error())
+			return
+		}
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	utils.Success(c, gin.H{"ip": req.IP, "status": "banned"})
 }
 
@@ -137,8 +157,159 @@ func (h *SecurityHandler) ManualUnban(c *gin.Context) {
 		return
 	}
 
-	h.defenseMgr.ManualUnban(ip)
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+
+	if err := h.defenseMgr.ManualUnban(operatorUser, ip); err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
 	utils.Success(c, gin.H{"ip": ip, "status": "unbanned"})
+}
+
+type updateBanRequest struct {
+	DurationMinutes int  `json:"duration_minutes"`
+	Permanent       bool `json:"permanent"`
+}
+
+// UpdateBan adjusts duration or permanent flag of an existing ban.
+//
+//	Route: PUT /api/v1/security/ban/:ip
+func (h *SecurityHandler) UpdateBan(c *gin.Context) {
+	ip := c.Param("ip")
+	if ip == "" {
+		utils.Fail(c, http.StatusBadRequest, "ip is required")
+		return
+	}
+
+	var req updateBanRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+
+	duration := time.Duration(req.DurationMinutes) * time.Minute
+	if err := h.defenseMgr.UpdateBan(ip, duration, req.Permanent); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"ip": ip, "status": "updated"})
+}
+
+// ListEvents queries the security events timeline.
+//
+//	Route: GET /api/v1/security/events
+func (h *SecurityHandler) ListEvents(c *gin.Context) {
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+	limit := 50
+	if l := c.Query("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	events, err := h.defenseMgr.ListEvents(limit)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, events)
+}
+
+// GetWhitelist returns all dynamic whitelist records.
+//
+//	Route: GET /api/v1/security/whitelist
+func (h *SecurityHandler) GetWhitelist(c *gin.Context) {
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+	list, err := h.defenseMgr.ListWhitelist()
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	utils.Success(c, list)
+}
+
+type addWhitelistRequest struct {
+	Entry string `json:"entry" binding:"required"`
+	Note  string `json:"note"`
+}
+
+// AddWhitelist registers a dynamic whitelist exemption.
+//
+//	Route: POST /api/v1/security/whitelist
+func (h *SecurityHandler) AddWhitelist(c *gin.Context) {
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+	var req addWhitelistRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.defenseMgr.AddWhitelist(req.Entry, req.Note); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"entry": req.Entry, "status": "whitelisted"})
+}
+
+// DeleteWhitelist removes a dynamic whitelist exemption.
+//
+//	Route: DELETE /api/v1/security/whitelist/:entry
+func (h *SecurityHandler) DeleteWhitelist(c *gin.Context) {
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+	entry := c.Param("entry")
+	if entry == "" {
+		utils.Fail(c, http.StatusBadRequest, "entry is required")
+		return
+	}
+	if err := h.defenseMgr.RemoveWhitelist(entry); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"entry": entry, "status": "removed"})
+}
+
+type updateDefenseConfigRequest struct {
+	MaxAuthFailures   int `json:"max_auth_failures"`
+	FailureWindowMins int `json:"failure_window_mins"`
+	BanDurationMins   int `json:"ban_duration_mins"`
+}
+
+// UpdateConfig updates runtime thresholds dynamically.
+//
+//	Route: PUT /api/v1/security/config
+func (h *SecurityHandler) UpdateConfig(c *gin.Context) {
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+	var req updateDefenseConfigRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if err := h.defenseMgr.UpdateConfig(req.MaxAuthFailures, req.FailureWindowMins, req.BanDurationMins); err != nil {
+		utils.Fail(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	utils.Success(c, gin.H{"status": "updated"})
 }
 
 // TestAlertEmail dispatches a test alert via QQ Mail SMTP to confirm delivery.

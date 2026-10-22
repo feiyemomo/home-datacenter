@@ -5,6 +5,8 @@ import type {
     ManualBanRequest,
     SecurityGuardState,
     SecurityMode,
+    SecurityEvent,
+    SecurityWhitelistItem,
 } from "@/types";
 
 /**
@@ -53,6 +55,22 @@ export async function manualBan(req: ManualBanRequest): Promise<{ ip: string; st
 }
 
 /**
+ * Update an existing IP ban.
+ * PUT /api/v1/security/ban/:ip
+ */
+export async function updateBan(
+    ip: string,
+    duration_minutes: number,
+    permanent: boolean,
+): Promise<{ ip: string; status: string }> {
+    const { data } = await client.put<{ ip: string; status: string }>(
+        `/security/ban/${encodeURIComponent(ip)}`,
+        { duration_minutes, permanent },
+    );
+    return data;
+}
+
+/**
  * Manually unban an IP.
  * DELETE /api/v1/security/ban/:ip
  */
@@ -69,3 +87,58 @@ export async function testAlertEmail(): Promise<{ status: string; recipient: str
     const { data } = await client.post<{ status: string; recipient: string }>("/security/test-alert");
     return data;
 }
+
+/**
+ * List recent security events timeline.
+ * GET /api/v1/security/events
+ */
+export async function getSecurityEvents(limit: number = 50): Promise<SecurityEvent[]> {
+    const { data } = await client.get<SecurityEvent[]>(`/security/events?limit=${limit}`);
+    return data;
+}
+
+/**
+ * Get dynamic security whitelist.
+ * GET /api/v1/security/whitelist
+ */
+export async function getSecurityWhitelist(): Promise<SecurityWhitelistItem[]> {
+    const { data } = await client.get<SecurityWhitelistItem[]>("/security/whitelist");
+    return data;
+}
+
+/**
+ * Add an IP or CIDR to the dynamic security whitelist.
+ * POST /api/v1/security/whitelist
+ */
+export async function addSecurityWhitelist(
+    entry: string,
+    note: string = "",
+): Promise<{ entry: string; status: string }> {
+    const { data } = await client.post<{ entry: string; status: string }>("/security/whitelist", { entry, note });
+    return data;
+}
+
+/**
+ * Remove an IP or CIDR from the dynamic security whitelist.
+ * DELETE /api/v1/security/whitelist/:entry
+ */
+export async function deleteSecurityWhitelist(entry: string): Promise<{ entry: string; status: string }> {
+    const { data } = await client.delete<{ entry: string; status: string }>(
+        `/security/whitelist/${encodeURIComponent(entry)}`,
+    );
+    return data;
+}
+
+/**
+ * Update dynamic defense policy configuration.
+ * PUT /api/v1/security/config
+ */
+export async function updateSecurityConfig(cfg: {
+    max_auth_failures: number;
+    failure_window_mins: number;
+    ban_duration_mins: number;
+}): Promise<{ status: string }> {
+    const { data } = await client.put<{ status: string }>("/security/config", cfg);
+    return data;
+}
+
