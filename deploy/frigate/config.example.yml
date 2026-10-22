@@ -265,9 +265,9 @@ cameras: {}
 record:
   enabled: true
   continuous:
-    days: 7
+    days: 90
   motion:
-    days: 7
+    days: 90
 snapshots:
   enabled: false
   retain:

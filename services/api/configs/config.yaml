@@ -178,9 +178,11 @@ maintenance:
   # silently fill the disk; on crossing, retention drops 7→4 days.
   recording_quota_bytes: 429496729600
   # Normal retention (days) applied by the full config push.
-  recording_retention_days: 7
+  # Set to 90 days (3 months) so Frigate does not truncate recordings;
+  # disk quota and hourly FIFO pruning handle real capacity management.
+  recording_retention_days: 90
   # Retention (days) applied while over quota. Must be < normal.
-  recording_reduced_retention_days: 4
+  recording_reduced_retention_days: 60
 
   # Frigate's own SQLite database, backed up daily alongside app.db.
   # The api container sees it at /media/frigate/config/frigate.db.
