@@ -41,8 +41,9 @@ import (
 type RecordingSizeMonitor struct {
 	db        *gorm.DB
 	bus       *eventbus.Bus
-	root      string // recordings root, e.g. /media/frigate/recordings
-	interval  time.Duration
+	root          string // recordings root, e.g. /media/frigate/recordings
+	frigateDBPath string
+	interval      time.Duration
 	warnBytes uint64
 	critBytes uint64
 
@@ -73,6 +74,13 @@ func NewRecordingSizeMonitor(db *gorm.DB, bus *eventbus.Bus, root string, interv
 		onExceed:   onExceed,
 		onRecover:  onRecover,
 	}
+}
+
+// SetFrigateDBPath configures the path to frigate.db so incremental pruning
+// also cleans up deleted recording records from Frigate's SQLite database.
+func (m *RecordingSizeMonitor) SetFrigateDBPath(p string) *RecordingSizeMonitor {
+	m.frigateDBPath = p
+	return m
 }
 
 // Run samples once immediately, then on every tick forever.
@@ -110,9 +118,36 @@ func (m *RecordingSizeMonitor) sample() {
 	// The callback closure is responsible for its own cancellation.
 	if m.quotaBytes > 0 {
 		over := size >= m.quotaBytes
+		if over {
+			// Incremental FIFO pruning: instead of abruptly dropping 24h
+			// full days or waiting for coarse daily retention cleanup, prune
+			// oldest hour segments in moderate chunks down to 95% of quota ceiling.
+			targetSize := uint64(float64(m.quotaBytes) * 0.95)
+			if targetSize > m.quotaBytes {
+				targetSize = m.quotaBytes
+			}
+			excess := size - targetSize
+			log.Printf("maintenance: recordings size %s over quota %s (excess %s) — FIFO pruning oldest hour segments",
+				humanBytes(size), humanBytes(m.quotaBytes), humanBytes(excess))
+
+			res, pruneErr := PruneOldestRecordings(m.root, m.frigateDBPath, excess, 12)
+			if pruneErr != nil {
+				log.Printf("maintenance: recordings FIFO prune failed: %v", pruneErr)
+			} else if res.ReclaimedBytes > 0 {
+				log.Printf("maintenance: FIFO pruned %d oldest hour segment(s) (%s), reclaimed %s (recordings size now ~%s)",
+					res.PrunedHours, strings.Join(res.PrunedDirs, ", "), humanBytes(res.ReclaimedBytes), humanBytes(size-res.ReclaimedBytes))
+				if size >= res.ReclaimedBytes {
+					size -= res.ReclaimedBytes
+				} else {
+					size = 0
+				}
+				over = size >= m.quotaBytes
+			}
+		}
+
 		if over && !m.quotaActive {
 			if m.onExceed != nil {
-				log.Printf("maintenance: recordings size %s over quota %s — triggering retention reduction",
+				log.Printf("maintenance: recordings size %s still over quota %s after prune — triggering retention reduction",
 					humanBytes(size), humanBytes(m.quotaBytes))
 				// v1.8.34: only commit the crossed state once the
 				// action succeeds. A transient failure (first sample

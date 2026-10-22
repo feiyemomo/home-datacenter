@@ -163,7 +163,11 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 		go NewRecordingMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingStaleAfter, cfg.RecordingCheckInterval, cfg.RecordingTargets).Run()
 	}
 	if cfg.RecordingsRoot != "" && cfg.RecordingSizeInterval > 0 {
-		go NewRecordingSizeMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingSizeInterval, cfg.RecordingSizeWarnBytes, cfg.RecordingSizeCritBytes, cfg.RecordingQuotaBytes, cfg.OnQuotaExceeded, cfg.OnQuotaRecovered).Run()
+		rsm := NewRecordingSizeMonitor(db, bus, cfg.RecordingsRoot, cfg.RecordingSizeInterval, cfg.RecordingSizeWarnBytes, cfg.RecordingSizeCritBytes, cfg.RecordingQuotaBytes, cfg.OnQuotaExceeded, cfg.OnQuotaRecovered)
+		if cfg.FrigateDBPath != "" {
+			rsm.SetFrigateDBPath(cfg.FrigateDBPath)
+		}
+		go rsm.Run()
 	}
 	if cfg.SysResourceInterval > 0 {
 		go NewSysResourceMonitor(db, bus, cfg.SysResourceInterval, cfg.CPUWarnPct, cfg.CPUCritPct, cfg.MemWarnPct, cfg.MemCritPct).Run()
