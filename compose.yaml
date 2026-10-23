@@ -132,9 +132,8 @@ services:
       # set, CheckIPv6() reports enabled+reachable=true and includes
       # this address — dashboard's network card and Android's IPv6
       # direct mode then both work. Update this value if the ISP
-      # rotates the IPv6 prefix (find via: ip -6 addr show enp4s0 |
-      # grep "scope global" | grep -v temporary).
-      - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:266c:92a1:f34d:e904:cd7f:2830}
+      # v1.15.1: IPv6 is unavailable in the current server environment, commented out.
+      # - NAS_IPV6_ADDRESS=${NAS_IPV6_ADDRESS:-2409:8a70:266c:92a1:f34d:e904:cd7f:2830}
       # v1.8.24: NAS LAN IPv4 address. The container runs on a Docker
       # bridge (172.x.x.x) and cannot infer the host's physical LAN IP.
       # This value is used by SetWebRTCCandidates() to build the go2rtc
@@ -266,7 +265,7 @@ services:
     # default bind address differs.
     ports:
       - "0.0.0.0:8088:80"
-      - "[::]:8088:80"
+      # - "[::]:8088:80" # IPv6 unavailable in current server environment
     depends_on:
       api:
         condition: service_started
