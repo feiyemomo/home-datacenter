@@ -162,8 +162,8 @@ maintenance:
   recording_stale_after_minutes: 10
   # Recording health scan interval (minutes).
   recording_check_interval_minutes: 5
-  # Recording tree size walk interval (hours). 0 disables.
-  recording_size_interval_hours: 1
+  # Recording tree size walk & FIFO pruning interval (minutes). 0 disables.
+  recording_size_interval_minutes: 10
   # Size thresholds for the recordings tree (bytes). 0 disables that
   # level. Example: warn at 400 GiB, crit at 450 GiB.
   recording_size_warn_bytes: 0
@@ -174,9 +174,9 @@ maintenance:
   # then deleted on Frigate's next cleanup cycle) and logs an alert.
   # When it drops back below, normal retention is restored.
   # 0 disables the automatic action (the tree is still size-alerted).
-  # Set to 400 GiB (≈86% of the 466G data volume) so recordings can't
+  # Set to 380 GiB (≈81.5% of the 466G data volume) so recordings can't
   # silently fill the disk; on crossing, retention drops 7→4 days.
-  recording_quota_bytes: 429496729600
+  recording_quota_bytes: 408021893120
   # Normal retention (days) applied by the full config push.
   # Set to 90 days (3 months) so Frigate does not truncate recordings;
   # disk quota and hourly FIFO pruning handle real capacity management.
@@ -230,4 +230,6 @@ security:
       - 127.0.0.1
       - "::1"
       - 192.168.31.0/24
+    host_auth_log_path: "/host/log/auth.log"           # NAS 宿主机认证日志 (Debian/fnOS /var/log/auth.log)
+    export_rules_path: "/data/security/blocked_ips.txt" # 导出供宿主机 iptables/ipset 消费的黑名单列表
 

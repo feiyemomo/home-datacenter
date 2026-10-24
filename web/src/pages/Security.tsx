@@ -21,25 +21,36 @@ import {
     Sliders,
     Trash2,
     Shield,
+    TrendingUp,
+    Flame,
+    PieChart,
+    ExternalLink,
+    Terminal,
+    Server,
 } from "lucide-react";
 import { useAuth } from "@/hooks/useAuth";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
+import { useWebSocket } from "@/hooks/useWebSocket";
 import {
     getDefenseOverview,
     manualBan,
     manualUnban,
+    updateBan,
     testAlertEmail,
     getSecurityEvents,
+    pruneSecurityEvents,
     getSecurityWhitelist,
     addSecurityWhitelist,
     deleteSecurityWhitelist,
     updateSecurityConfig,
+    getHostLogs,
 } from "@/api/security";
 import type {
     DefenseOverview,
     BanEntry,
     SecurityEvent,
     SecurityWhitelistItem,
+    HostLogStatusResponse,
 } from "@/types";
 import { cn, formatDateTime } from "@/lib/utils";
 import {
@@ -57,8 +68,8 @@ import { ErrorRetry } from "@/components/ErrorRetry";
 export default function Security() {
     const { isAdmin } = useAuth();
 
-    // Active tab: 'bans' | 'events' | 'whitelist' | 'config'
-    const [activeTab, setActiveTab] = useState<"bans" | "events" | "whitelist" | "config">("bans");
+    // Active tab: 'bans' | 'events' | 'whitelist' | 'config' | 'host'
+    const [activeTab, setActiveTab] = useState<"bans" | "events" | "whitelist" | "config" | "host">("bans");
 
     // Feedback states
     const [actionMsg, setActionMsg] = useState<{
@@ -88,6 +99,8 @@ export default function Security() {
     // Timeline events
     const [events, setEvents] = useState<SecurityEvent[]>([]);
     const [eventsLoading, setEventsLoading] = useState(false);
+    const [eventFilterType, setEventFilterType] = useState<string>("all");
+    const [pruningEvents, setPruningEvents] = useState(false);
 
     // Whitelist state
     const [whitelist, setWhitelist] = useState<SecurityWhitelistItem[]>([]);
@@ -96,11 +109,18 @@ export default function Security() {
     const [newWLNote, setNewWLNote] = useState("");
     const [addingWL, setAddingWL] = useState(false);
 
+    // Host OS log integration state
+    const [hostLogData, setHostLogData] = useState<HostLogStatusResponse | null>(null);
+    const [hostLogLoading, setHostLogLoading] = useState(false);
+
     // Config form state
     const [cfgFailures, setCfgFailures] = useState(5);
     const [cfgWindow, setCfgWindow] = useState(5);
     const [cfgBanDuration, setCfgBanDuration] = useState(30);
     const [savingCfg, setSavingCfg] = useState(false);
+
+    // WebSocket real-time alerts
+    const { lastMessage, subscribe } = useWebSocket(true);
 
     // Fetch overview data
     const {
@@ -115,6 +135,27 @@ export default function Security() {
         }, []),
         { ttlMs: 10000, refetchMs: autoRefresh ? 30000 : 0 },
     );
+
+    // Subscribe to EventBus security topics
+    useEffect(() => {
+        subscribe("security.alert");
+        subscribe("security.guard_mode");
+    }, [subscribe]);
+
+    // Handle incoming real-time security events
+    useEffect(() => {
+        if (!lastMessage) return;
+        if (lastMessage.topic === "security.alert") {
+            const payload = lastMessage.payload as any;
+            const msg = typeof payload === "object" && payload?.message ? payload.message : "检测到新的安全防护拦截事件";
+            setActionMsg({ type: "error", text: `[实时安全拦截] ${msg}` });
+            setTimeout(() => setActionMsg(null), 6000);
+            refetch();
+            if (activeTab === "events") fetchEventsData();
+        } else if (lastMessage.topic === "security.guard_mode") {
+            refetch();
+        }
+    }, [lastMessage, refetch, activeTab]);
 
     // Sync config state from overview
     useEffect(() => {
@@ -155,14 +196,28 @@ export default function Security() {
         }
     }, []);
 
+    const fetchHostLogData = useCallback(async () => {
+        setHostLogLoading(true);
+        try {
+            const data = await getHostLogs();
+            setHostLogData(data);
+        } catch {
+            // non-fatal
+        } finally {
+            setHostLogLoading(false);
+        }
+    }, []);
+
     // Load tab-specific data on switch
     useEffect(() => {
         if (activeTab === "events") {
             fetchEventsData();
         } else if (activeTab === "whitelist") {
             fetchWhitelistData();
+        } else if (activeTab === "host") {
+            fetchHostLogData();
         }
-    }, [activeTab, fetchEventsData, fetchWhitelistData]);
+    }, [activeTab, fetchEventsData, fetchWhitelistData, fetchHostLogData]);
 
     const activeBans: BanEntry[] = overview?.active_bans ?? [];
 
@@ -197,6 +252,36 @@ export default function Security() {
             return expiryValue(a) - expiryValue(b);
         });
     }, [activeBans, search, sortBy, nowMs]);
+
+    const filteredEvents = useMemo(() => {
+        if (eventFilterType === "all") return events;
+        return events.filter((e) => e.type === eventFilterType);
+    }, [events, eventFilterType]);
+
+    const handleUpgradeToPermanent = async (ip: string) => {
+        try {
+            await updateBan(ip, 0, true);
+            showToast("success", `已将 IP [${ip}] 升级为永久黑名单`);
+            refetch();
+        } catch (err: any) {
+            showToast("error", `升级失败: ${err.message || "请求异常"}`);
+        }
+    };
+
+    const handlePruneEvents = async (days = 30) => {
+        if (!window.confirm(`确定要清理 ${days} 天前的历史安全事件日志吗？此操作不可逆。`)) return;
+        setPruningEvents(true);
+        try {
+            const res = await pruneSecurityEvents(days);
+            showToast("success", `已成功清理 ${res.deleted} 条历史审计日志`);
+            fetchEventsData();
+            refetch();
+        } catch (err: any) {
+            showToast("error", `清理日志失败: ${err.message || "请求异常"}`);
+        } finally {
+            setPruningEvents(false);
+        }
+    };
 
     const showToast = (type: "success" | "error", text: string) => {
         setActionMsg({ type, text });
@@ -598,7 +683,18 @@ export default function Security() {
                         {pendingAttempts.map((pa) => (
                             <div key={pa.ip} className="rounded-lg bg-bg-surface/60 p-2 border border-amber-500/20 flex justify-between items-center">
                                 <div>
-                                    <span className="font-mono font-medium text-fg">{pa.ip}</span>
+                                    <div className="flex items-center gap-1.5">
+                                        <span className="font-mono font-medium text-fg">{pa.ip}</span>
+                                        <a
+                                            href={`https://ipinfo.io/${pa.ip}`}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="text-fg-muted hover:text-primary transition-colors"
+                                            title="在 ipinfo.io 查看情报"
+                                        >
+                                            <Globe size={11} />
+                                        </a>
+                                    </div>
                                     <div className="text-[10px] text-fg-muted mt-0.5">{pa.reason || "认证失败"}</div>
                                 </div>
                                 <div className="text-right">
@@ -606,6 +702,170 @@ export default function Security() {
                                         {pa.count} 次失败
                                     </Badge>
                                     <div className="text-[10px] text-fg-muted mt-0.5">剩余 {pa.window_left_sec}s</div>
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+                </div>
+            )}
+
+            {/* 24h Attack Trends & Threat Analysis Grid */}
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+                {/* 24h Activity Mini-Chart (takes 2 columns on lg) */}
+                <Card className="glass-subtle border-[rgb(var(--border)/0.4)] lg:col-span-2">
+                    <CardHeader className="pb-2 flex flex-row items-center justify-between">
+                        <div>
+                            <CardTitle className="text-xs font-semibold flex items-center gap-1.5">
+                                <TrendingUp size={15} className="text-primary" />
+                                <span>24 小时阻断走势与攻击峰值</span>
+                            </CardTitle>
+                            <CardDescription className="text-[11px] mt-0.5">
+                                过去 24 小时每个时间段的拦截阻断分布（近 24 小时活跃度）
+                            </CardDescription>
+                        </div>
+                        <Badge variant="outline" className="text-[10px] text-fg-muted">
+                            共计 24 小时数据
+                        </Badge>
+                    </CardHeader>
+                    <CardContent className="pt-2">
+                        {/* 24 bars chart */}
+                        <div className="h-28 flex items-end gap-1.5 pt-4 pb-1 border-b border-[rgb(var(--border)/0.2)]">
+                            {(overview?.blocked_hits_24h ?? Array(24).fill(0)).map((hits, idx) => {
+                                const maxHits = Math.max(1, ...(overview?.blocked_hits_24h ?? [1]));
+                                const heightPercent = Math.max(8, Math.round((hits / maxHits) * 100));
+                                const hourLabel = `${(new Date().getHours() - 23 + idx + 24) % 24}:00`;
+                                return (
+                                    <div
+                                        key={idx}
+                                        className="flex-1 flex flex-col items-center group relative h-full justify-end"
+                                    >
+                                        {/* Tooltip on hover */}
+                                        <div className="absolute -top-7 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-bg-surface/90 text-fg text-[10px] py-0.5 px-1.5 rounded shadow pointer-events-none whitespace-nowrap z-10 border border-[rgb(var(--border)/0.4)] font-mono">
+                                            {hourLabel}: {hits} 次阻断
+                                        </div>
+                                        <div
+                                            style={{ height: `${heightPercent}%` }}
+                                            className={cn(
+                                                "w-full rounded-t transition-all",
+                                                hits === 0
+                                                    ? "bg-[rgb(var(--bg-subtle)/0.5)]"
+                                                    : hits > 10
+                                                    ? "bg-rose-500 shadow-sm shadow-rose-500/30"
+                                                    : "bg-primary/70 hover:bg-primary",
+                                            )}
+                                        />
+                                    </div>
+                                );
+                            })}
+                        </div>
+                        <div className="flex justify-between items-center text-[10px] text-fg-muted mt-1.5 font-mono">
+                            <span>24 小时前</span>
+                            <span>12 小时前</span>
+                            <span>当前</span>
+                        </div>
+                    </CardContent>
+                </Card>
+
+                {/* Threat Type Breakdown (1 column on lg) */}
+                <Card className="glass-subtle border-[rgb(var(--border)/0.4)]">
+                    <CardHeader className="pb-2">
+                        <CardTitle className="text-xs font-semibold flex items-center gap-1.5">
+                            <PieChart size={15} className="text-amber-500" />
+                            <span>威胁分类分布 (近7天)</span>
+                        </CardTitle>
+                    </CardHeader>
+                    <CardContent className="space-y-2.5 pt-1 text-xs">
+                        {overview?.by_type && Object.keys(overview.by_type).length > 0 ? (
+                            Object.entries(overview.by_type).map(([type, count]) => {
+                                const total = Object.values(overview.by_type!).reduce((a, b) => a + b, 0) || 1;
+                                const pct = Math.round((count / total) * 100);
+                                const labelMap: Record<string, string> = {
+                                    auth_fail: "暴力破解与认证失败",
+                                    manual_ban: "管理员手动封禁",
+                                    manual_unban: "管理员主动解封",
+                                    config_change: "白名单及策略调整",
+                                    gateway_warning: "网关穿透异常警报",
+                                    test_alert: "测试警报邮件",
+                                    audit_prune: "审计日志清理维护",
+                                };
+                                return (
+                                    <div key={type} className="space-y-1">
+                                        <div className="flex justify-between text-[11px]">
+                                            <span className="text-fg font-medium">{labelMap[type] || type}</span>
+                                            <span className="text-fg-muted font-mono">{count} 次 ({pct}%)</span>
+                                        </div>
+                                        <div className="h-1.5 w-full bg-[rgb(var(--bg-subtle)/0.5)] rounded-full overflow-hidden">
+                                            <div
+                                                style={{ width: `${pct}%` }}
+                                                className={cn(
+                                                    "h-full rounded-full",
+                                                    type === "auth_fail"
+                                                        ? "bg-rose-500"
+                                                        : type.includes("ban")
+                                                        ? "bg-amber-500"
+                                                        : "bg-primary",
+                                                )}
+                                            />
+                                        </div>
+                                    </div>
+                                );
+                            })
+                        ) : (
+                            <div className="py-6 text-center text-fg-muted text-[11px]">
+                                暂无威胁分类统计
+                            </div>
+                        )}
+                    </CardContent>
+                </Card>
+            </div>
+
+            {/* Top Attackers Highlight */}
+            {overview?.top_attackers && overview.top_attackers.length > 0 && (
+                <div className="rounded-xl border border-[rgb(var(--border)/0.4)] bg-bg-surface/50 p-3 text-xs">
+                    <div className="flex items-center justify-between mb-2">
+                        <div className="flex items-center gap-1.5 font-semibold text-rose-500 text-xs">
+                            <Flame size={15} />
+                            <span>Top 5 频繁侵扰攻击源 (高频阻断目标)</span>
+                        </div>
+                        <span className="text-[11px] text-fg-muted">已根据历史累计阻断次数降序排列</span>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-2">
+                        {overview.top_attackers.map((ta, idx) => (
+                            <div
+                                key={ta.ip}
+                                className="rounded-lg bg-bg-surface/80 p-2.5 border border-rose-500/20 flex flex-col justify-between"
+                            >
+                                <div>
+                                    <div className="flex items-center justify-between">
+                                        <Badge variant="outline" className="text-[9px] px-1 py-0 h-4 border-rose-500/40 text-rose-600 bg-rose-500/10">
+                                            TOP {idx + 1}
+                                        </Badge>
+                                        <a
+                                            href={`https://ipinfo.io/${ta.ip}`}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="text-fg-muted hover:text-primary transition-colors flex items-center gap-0.5 text-[10px]"
+                                            title="查询威胁情报与归属地"
+                                        >
+                                            <Globe size={11} />
+                                            <span>情报</span>
+                                        </a>
+                                    </div>
+                                    <div className="font-mono font-medium text-fg mt-1 text-xs">{ta.ip}</div>
+                                    <div className="text-[10px] text-fg-muted line-clamp-1 mt-0.5" title={ta.reason}>
+                                        {ta.reason}
+                                    </div>
+                                </div>
+                                <div className="mt-2 pt-1.5 border-t border-[rgb(var(--border)/0.2)] flex items-center justify-between">
+                                    <span className="text-[10px] text-fg-muted font-mono">{ta.hits} 次阻断</span>
+                                    <button
+                                        type="button"
+                                        onClick={() => handleUpgradeToPermanent(ta.ip)}
+                                        className="text-[10px] text-amber-600 hover:text-amber-500 hover:underline"
+                                        title="将该高频攻击源转为永久封禁"
+                                    >
+                                        永久封锁
+                                    </button>
                                 </div>
                             </div>
                         ))}
@@ -662,6 +922,18 @@ export default function Security() {
                 >
                     <Sliders size={14} />
                     <span>防御策略配置</span>
+                </button>
+                <button
+                    onClick={() => setActiveTab("host")}
+                    className={cn(
+                        "py-2 px-3 text-xs font-medium border-b-2 transition-colors flex items-center gap-1.5",
+                        activeTab === "host"
+                            ? "border-primary text-primary"
+                            : "border-transparent text-fg-muted hover:text-fg",
+                    )}
+                >
+                    <Terminal size={14} />
+                    <span>NAS 宿主系统与 SSH 审计</span>
                 </button>
             </div>
 
@@ -782,6 +1054,15 @@ export default function Security() {
                                                             >
                                                                 <Copy size={12} />
                                                             </button>
+                                                            <a
+                                                                href={`https://ipinfo.io/${ban.ip}`}
+                                                                target="_blank"
+                                                                rel="noreferrer"
+                                                                title="在 ipinfo.io 查看威胁情报与地理位置"
+                                                                className="text-fg-muted/70 hover:text-primary transition-colors flex items-center"
+                                                            >
+                                                                <ExternalLink size={11} />
+                                                            </a>
                                                         </div>
                                                     </td>
                                                     <td className="py-3 px-4 text-fg-muted">
@@ -856,7 +1137,7 @@ export default function Security() {
             {activeTab === "events" && (
                 <Card className="glass border-[rgb(var(--border)/0.4)]">
                     <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
-                        <div className="flex items-center justify-between">
+                        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                             <div>
                                 <CardTitle className="text-base font-semibold flex items-center gap-2">
                                     <Clock size={18} className="text-blue-500" />
@@ -866,16 +1147,44 @@ export default function Security() {
                                     详细记录每一次触发爆破、封禁、解封、策略热更新及测试操作
                                 </CardDescription>
                             </div>
-                            <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={fetchEventsData}
-                                disabled={eventsLoading}
-                                className="h-8 gap-1.5 text-xs"
-                            >
-                                <RefreshCw size={13} className={cn(eventsLoading && "animate-spin")} />
-                                <span>刷新日志</span>
-                            </Button>
+                            <div className="flex flex-wrap items-center gap-2">
+                                <select
+                                    value={eventFilterType}
+                                    onChange={(e) => setEventFilterType(e.target.value)}
+                                    className="h-8 rounded-lg border border-[rgb(var(--border)/0.4)] bg-transparent px-2 text-xs text-fg"
+                                    aria-label="筛选事件类型"
+                                >
+                                    <option value="all">全部事件类型</option>
+                                    <option value="auth_fail">认证失败与自动熔断</option>
+                                    <option value="manual_ban">手动拦截封禁</option>
+                                    <option value="manual_unban">解封操作</option>
+                                    <option value="gateway_warning">网关穿透异常</option>
+                                    <option value="config_change">策略与白名单变更</option>
+                                    <option value="test_alert">测试警报</option>
+                                    <option value="audit_prune">审计日志维护</option>
+                                </select>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    disabled={pruningEvents}
+                                    onClick={() => handlePruneEvents(30)}
+                                    className="h-8 gap-1.5 text-xs text-rose-500 hover:bg-rose-500/10"
+                                    title="清理 30 天前的旧审计事件记录"
+                                >
+                                    <Trash2 size={13} />
+                                    <span>清理 30 天前日志</span>
+                                </Button>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={fetchEventsData}
+                                    disabled={eventsLoading}
+                                    className="h-8 gap-1.5 text-xs"
+                                >
+                                    <RefreshCw size={13} className={cn(eventsLoading && "animate-spin")} />
+                                    <span>刷新</span>
+                                </Button>
+                            </div>
                         </div>
                     </CardHeader>
                     <CardContent className="p-0">
@@ -884,9 +1193,9 @@ export default function Security() {
                                 <Loader2 size={16} className="animate-spin text-primary" />
                                 正在加载安全审计日志...
                             </div>
-                        ) : events.length === 0 ? (
+                        ) : filteredEvents.length === 0 ? (
                             <div className="flex flex-col items-center justify-center py-12 text-center text-fg-muted text-xs">
-                                暂无安全事件记录
+                                {events.length === 0 ? "暂无安全事件记录" : "没有符合当前筛选类型的事件"}
                             </div>
                         ) : (
                             <div className="overflow-x-auto">
@@ -901,13 +1210,26 @@ export default function Security() {
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
-                                        {events.map((ev) => (
+                                        {filteredEvents.map((ev) => (
                                             <tr key={ev.id} className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]">
                                                 <td className="py-3 px-4 text-fg-muted whitespace-nowrap">
                                                     {formatDateTime(ev.created_at)}
                                                 </td>
                                                 <td className="py-3 px-4 font-mono font-medium text-fg whitespace-nowrap">
-                                                    {ev.ip}
+                                                    <div className="flex items-center gap-1.5">
+                                                        <span>{ev.ip}</span>
+                                                        {isValidIp(ev.ip) && (
+                                                            <a
+                                                                href={`https://ipinfo.io/${ev.ip}`}
+                                                                target="_blank"
+                                                                rel="noreferrer"
+                                                                className="text-fg-muted hover:text-primary transition-colors"
+                                                                title="查询情报"
+                                                            >
+                                                                <ExternalLink size={10} />
+                                                            </a>
+                                                        )}
+                                                    </div>
                                                 </td>
                                                 <td className="py-3 px-4">
                                                     <Badge
@@ -918,6 +1240,8 @@ export default function Security() {
                                                                 ? "border-rose-500/40 text-rose-600 bg-rose-500/10"
                                                                 : ev.type.includes("unban")
                                                                 ? "border-emerald-500/40 text-emerald-600 bg-emerald-500/10"
+                                                                : ev.type.includes("alert")
+                                                                ? "border-amber-500/40 text-amber-600 bg-amber-500/10"
                                                                 : "border-blue-500/40 text-blue-600 bg-blue-500/10",
                                                         )}
                                                     >
@@ -1130,6 +1454,190 @@ export default function Security() {
                         </form>
                     </CardContent>
                 </Card>
+            )}
+
+            {/* TAB 5: HOST OS LOGS & SSH AUDIT */}
+            {activeTab === "host" && (
+                <div className="space-y-4">
+                    {/* Status & Sync Card */}
+                    <Card className="glass border-[rgb(var(--border)/0.4)]">
+                        <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                                <div>
+                                    <CardTitle className="text-base font-semibold flex items-center gap-2">
+                                        <Terminal size={18} className="text-purple-500" />
+                                        <span>NAS 宿主系统认证与网络层防火墙联动</span>
+                                    </CardTitle>
+                                    <CardDescription className="text-xs mt-0.5">
+                                        监听宿主机底层（Debian / fnOS）/var/log/auth.log 实时捕获 SSH 爆破，并导出规则供 iptables/ipset 消费
+                                    </CardDescription>
+                                </div>
+                                <Button
+                                    variant="outline"
+                                    size="sm"
+                                    onClick={fetchHostLogData}
+                                    disabled={hostLogLoading}
+                                    className="h-8 gap-1.5 text-xs"
+                                >
+                                    <RefreshCw size={13} className={cn(hostLogLoading && "animate-spin")} />
+                                    <span>刷新宿主日志</span>
+                                </Button>
+                            </div>
+                        </CardHeader>
+                        <CardContent className="pt-4">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-xs">
+                                <div className="rounded-xl border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-subtle)/0.3)] p-3">
+                                    <span className="text-fg-muted font-medium text-[11px]">宿主日志监听状态</span>
+                                    <div className="mt-1 flex items-center gap-1.5">
+                                        <span className={cn("h-2 w-2 rounded-full", hostLogData?.enabled ? "bg-emerald-500 animate-pulse" : "bg-amber-500")} />
+                                        <span className="font-semibold text-fg">
+                                            {hostLogData?.enabled ? "实时监听中 (Tail Active)" : "未挂载 / 待机模式"}
+                                        </span>
+                                    </div>
+                                    <p className="mt-1 text-[10px] text-fg-muted font-mono truncate" title={hostLogData?.source_path}>
+                                        源路径: {hostLogData?.source_path || "/host/log/auth.log"}
+                                    </p>
+                                </div>
+
+                                <div className="rounded-xl border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-subtle)/0.3)] p-3">
+                                    <span className="text-fg-muted font-medium text-[11px]">宿主防火墙规则导出</span>
+                                    <div className="mt-1 flex items-center gap-1.5">
+                                        <span className="h-2 w-2 rounded-full bg-blue-500" />
+                                        <span className="font-semibold text-fg">iptables / ipset 格式</span>
+                                    </div>
+                                    <p className="mt-1 text-[10px] text-fg-muted font-mono truncate" title={hostLogData?.export_path}>
+                                        目标: {hostLogData?.export_path || "/data/security/blocked_ips.txt"}
+                                    </p>
+                                </div>
+
+                                <div className="rounded-xl border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-subtle)/0.3)] p-3">
+                                    <span className="text-fg-muted font-medium text-[11px]">宿主网络层 (L3/L4) 联动</span>
+                                    <div className="mt-1 text-fg text-[11px]">
+                                        黑名单更新时同步写入文件，宿主机可通过计划任务自动丢包（DROP 拦截 22/5666 等全部端口）。
+                                    </div>
+                                </div>
+                            </div>
+                        </CardContent>
+                    </Card>
+
+                    {/* SSH Authentication Audit Table */}
+                    <Card className="glass border-[rgb(var(--border)/0.4)]">
+                        <CardHeader className="pb-3 border-b border-[rgb(var(--border)/0.2)]">
+                            <CardTitle className="text-base font-semibold flex items-center gap-2">
+                                <Server size={18} className="text-purple-500" />
+                                <span>宿主机 SSH 认证审计日志</span>
+                                <Badge variant="default" className="text-[11px]">
+                                    {hostLogData?.entries.length ?? 0} 条记录
+                                </Badge>
+                            </CardTitle>
+                            <CardDescription className="text-xs">
+                                实时捕获宿主机 SSH 登录成功与暴力破解尝试，失败多次将自动触发全系统阻断
+                            </CardDescription>
+                        </CardHeader>
+                        <CardContent className="p-0">
+                            {hostLogLoading && !hostLogData ? (
+                                <div className="flex items-center justify-center py-12 text-fg-muted text-xs gap-2">
+                                    <Loader2 size={16} className="animate-spin text-primary" />
+                                    正在读取宿主操作系统认证记录...
+                                </div>
+                            ) : !hostLogData || hostLogData.entries.length === 0 ? (
+                                <div className="flex flex-col items-center justify-center py-12 text-center text-fg-muted text-xs">
+                                    <div className="flex h-10 w-10 items-center justify-center rounded-full bg-[rgb(var(--bg-subtle)/0.5)] text-fg-muted mb-2">
+                                        <Terminal size={20} />
+                                    </div>
+                                    <p className="font-medium text-fg">暂无宿主机 SSH 认证记录</p>
+                                    <p className="text-[11px] text-fg-muted mt-1 max-w-sm">
+                                        {hostLogData?.enabled
+                                            ? "宿主机 auth.log 已连接，当前尚未捕获到新的 SSH 登录或暴力破解记录。"
+                                            : "宿主机 /var/log/auth.log 尚未挂载到容器，可在 compose.yaml 中启用宿主机认证日志挂载。"}
+                                    </p>
+                                </div>
+                            ) : (
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-left text-xs">
+                                        <thead className="border-b border-[rgb(var(--border)/0.2)] bg-[rgb(var(--bg-subtle)/0.3)] text-fg-muted">
+                                            <tr>
+                                                <th className="py-3 px-4 font-medium">捕获时间</th>
+                                                <th className="py-3 px-4 font-medium">来源 IP</th>
+                                                <th className="py-3 px-4 font-medium">尝试用户</th>
+                                                <th className="py-3 px-4 font-medium">目标端口</th>
+                                                <th className="py-3 px-4 font-medium">认证结果</th>
+                                                <th className="py-3 px-4 font-medium">底层详情</th>
+                                                <th className="py-3 px-4 font-medium text-right">处置</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-[rgb(var(--border)/0.15)]">
+                                            {hostLogData.entries.map((entry, idx) => (
+                                                <tr key={idx} className="transition-colors hover:bg-[rgb(var(--bg-subtle)/0.25)]">
+                                                    <td className="py-3 px-4 text-fg-muted whitespace-nowrap">
+                                                        {formatDateTime(entry.timestamp)}
+                                                    </td>
+                                                    <td className="py-3 px-4 font-mono font-medium text-fg whitespace-nowrap">
+                                                        <div className="flex items-center gap-1.5">
+                                                            <span>{entry.ip}</span>
+                                                            {isValidIp(entry.ip) && (
+                                                                <a
+                                                                    href={`https://ipinfo.io/${entry.ip}`}
+                                                                    target="_blank"
+                                                                    rel="noreferrer"
+                                                                    className="text-fg-muted hover:text-primary transition-colors"
+                                                                    title="查询情报"
+                                                                >
+                                                                    <ExternalLink size={10} />
+                                                                </a>
+                                                            )}
+                                                        </div>
+                                                    </td>
+                                                    <td className="py-3 px-4 font-mono text-fg">
+                                                        {entry.user}
+                                                    </td>
+                                                    <td className="py-3 px-4 font-mono text-fg-muted">
+                                                        {entry.port}
+                                                    </td>
+                                                    <td className="py-3 px-4 whitespace-nowrap">
+                                                        {entry.status === "accepted" ? (
+                                                            <Badge variant="outline" className="border-emerald-500/40 text-emerald-600 bg-emerald-500/10 text-[10px]">
+                                                                登录成功
+                                                            </Badge>
+                                                        ) : entry.status === "invalid_user" ? (
+                                                            <Badge variant="outline" className="border-amber-500/40 text-amber-600 bg-amber-500/10 text-[10px]">
+                                                                非法用户名
+                                                            </Badge>
+                                                        ) : (
+                                                            <Badge variant="outline" className="border-rose-500/40 text-rose-600 bg-rose-500/10 text-[10px]">
+                                                                密码错误
+                                                            </Badge>
+                                                        )}
+                                                    </td>
+                                                    <td className="py-3 px-4 text-fg-muted max-w-sm truncate" title={entry.raw_message}>
+                                                        {entry.raw_message}
+                                                    </td>
+                                                    <td className="py-3 px-4 text-right whitespace-nowrap">
+                                                        {entry.status !== "accepted" && (
+                                                            <Button
+                                                                variant="ghost"
+                                                                size="sm"
+                                                                onClick={() => {
+                                                                    setBanIP(entry.ip);
+                                                                    setBanReason(`宿主 SSH 恶意撞库 (尝试用户: ${entry.user})`);
+                                                                    setShowBanModal(true);
+                                                                }}
+                                                                className="text-xs text-rose-500 hover:bg-rose-500/10 h-7 px-2 gap-1"
+                                                            >
+                                                                <Ban size={12} />
+                                                                <span>封禁</span>
+                                                            </Button>
+                                                        )}
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            )}
+                        </CardContent>
+                    </Card>
+                </div>
             )}
 
             {/* Defense Policies & Architecture Details */}

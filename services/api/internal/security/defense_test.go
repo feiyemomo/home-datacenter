@@ -213,3 +213,50 @@ func TestDefenseManager_AlertCooldownAndWhitelist(t *testing.T) {
 		t.Fatalf("overview config mismatch: %+v", ov.Config)
 	}
 }
+
+func TestDefenseManager_ProgressiveBanAndPrune(t *testing.T) {
+	db := setupTestDB(t)
+	bus := eventbus.New()
+	alertMgr := NewAlertManager(config.AlertConfig{Enabled: false})
+
+	defenseCfg := config.DefenseConfig{
+		MaxAuthFailures:   2,
+		FailureWindowMins: 5,
+		BanDurationMins:   30,
+	}
+
+	dm := NewDefenseManager(db, defenseCfg, alertMgr, bus)
+	testIP := "198.51.100.99"
+
+	// 1st offense -> 30 minutes
+	dm.RecordAuthFailure(testIP, "fail 1", "curl/7.0")
+	dm.RecordAuthFailure(testIP, "fail 2", "curl/7.0")
+	banned, entry := dm.IsBanned(testIP)
+	if !banned || entry.Permanent {
+		t.Fatalf("expected 1st offense to be temporary ban")
+	}
+
+	// 2nd offense simulation -> 6 hours
+	dm.RecordAuthFailure(testIP, "fail 3", "curl/7.0")
+	dm.RecordAuthFailure(testIP, "fail 4", "curl/7.0")
+	dur, perm, count := dm.calculateEscalatedBan(testIP)
+	if count != 3 || dur != 24*time.Hour || perm {
+		t.Fatalf("expected 3rd offense calculation, got count=%d dur=%v perm=%v", count, dur, perm)
+	}
+
+	// 4th offense -> permanent
+	db.Create(&model.SecurityEvent{IP: testIP, Type: "auth_fail", CreatedAt: time.Now()})
+	dur, perm, count = dm.calculateEscalatedBan(testIP)
+	if !perm || count < 4 {
+		t.Fatalf("expected 4th offense to escalate to permanent, got count=%d perm=%v", count, perm)
+	}
+
+	// Test Pruning
+	pruned, err := dm.PruneEvents(0) // Default 30 days
+	if err != nil {
+		t.Fatalf("failed to prune events: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("expected 0 events pruned (created just now)")
+	}
+}

@@ -295,6 +295,36 @@ func (dm *DefenseManager) get24hHits(now time.Time) []int64 {
 	return buckets
 }
 
+// calculateEscalatedBan calculates the ban duration and escalation level for an IP based on past violations.
+func (dm *DefenseManager) calculateEscalatedBan(ip string) (duration time.Duration, permanent bool, offenseCount int64) {
+	baseDuration := time.Duration(dm.cfg.BanDurationMins) * time.Minute
+	if baseDuration <= 0 {
+		baseDuration = 30 * time.Minute
+	}
+
+	var pastCount int64
+	if dm.db != nil {
+		// Count previous auth_fail events for this IP within the past 30 days
+		since := time.Now().AddDate(0, 0, -30)
+		dm.db.Model(&model.SecurityEvent{}).
+			Where("ip = ? AND type = 'auth_fail' AND created_at >= ?", ip, since).
+			Count(&pastCount)
+	}
+
+	offenseCount = pastCount + 1
+
+	switch {
+	case offenseCount == 1:
+		return baseDuration, false, offenseCount
+	case offenseCount == 2:
+		return 6 * time.Hour, false, offenseCount
+	case offenseCount == 3:
+		return 24 * time.Hour, false, offenseCount
+	default:
+		return 10 * 365 * 24 * time.Hour, true, offenseCount
+	}
+}
+
 // RecordAuthFailure tallies authentication/API failures per IP, triggering ban & alert if threshold met.
 func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
 	now := time.Now()
@@ -349,19 +379,25 @@ func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
 			return
 		}
 
-		// Non-whitelisted IP: Ban and alert!
-		banDuration := time.Duration(dm.cfg.BanDurationMins) * time.Minute
-		if banDuration <= 0 {
-			banDuration = 30 * time.Minute
+		// Non-whitelisted IP: Progressive escalation ban and alert!
+		banDuration, permanent, offenseCount := dm.calculateEscalatedBan(ip)
+
+		var reasonText string
+		if permanent {
+			reasonText = fmt.Sprintf("认证失败达到 %d 次 (累计第 %d 次严重违规，升格为永久黑名单)", currentCount, offenseCount)
+		} else if offenseCount > 1 {
+			reasonText = fmt.Sprintf("认证失败达到 %d 次 (第 %d 次再犯，阶梯递增封禁 %v)", currentCount, offenseCount, banDuration)
+		} else {
+			reasonText = fmt.Sprintf("认证失败达到 %d 次 (%s)", currentCount, reason)
 		}
 
 		banEntry := BanEntry{
 			IP:        ip,
-			Reason:    fmt.Sprintf("认证失败达到 %d 次 (%s)", currentCount, reason),
+			Reason:    reasonText,
 			Source:    "auto",
 			BannedAt:  now,
 			ExpiresAt: now.Add(banDuration),
-			Permanent: false,
+			Permanent: permanent,
 		}
 
 		dm.mu.Lock()
@@ -376,16 +412,20 @@ func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
 				Source:    "auto",
 				BannedAt:  now,
 				ExpiresAt: banEntry.ExpiresAt,
-				Permanent: false,
+				Permanent: permanent,
 			}
 			dm.db.Where("ip = ?", ip).Assign(banModel).FirstOrCreate(&banModel)
 		}
 
-		log.Printf("security: [AUTO-BAN] IP %s banned for %v due to %d failures (reason=%s)", ip, banDuration, currentCount, reason)
+		log.Printf("security: [AUTO-BAN] IP %s banned for %v (permanent=%v, offense#=%d) due to %d failures (reason=%s)",
+			ip, banDuration, permanent, offenseCount, currentCount, reason)
 
-		alertDetail := fmt.Sprintf("外部来源 IP %s 在 %v 内连续认证失败达到 %d 次！\nUser-Agent: %s\n触发原因: %s",
-			ip, window, currentCount, userAgent, reason)
-		action := fmt.Sprintf("已自动加入黑名单，临时封禁 %v", banDuration)
+		alertDetail := fmt.Sprintf("外部来源 IP %s 在 %v 内连续认证失败达到 %d 次！\n阶梯封禁级别: 第 %d 次违规\nUser-Agent: %s\n触发原因: %s",
+			ip, window, currentCount, offenseCount, userAgent, reason)
+		action := fmt.Sprintf("已自动触发第 %d 级阶梯封禁 (时长: %v)", offenseCount, banDuration)
+		if permanent {
+			action = fmt.Sprintf("已自动触发第 %d 级阶梯封禁 (升格为永久封禁)", offenseCount)
+		}
 
 		dm.dispatchAlert("拦截暴力破解侵入", ip, "auth_fail", alertDetail, action)
 	}
@@ -674,6 +714,24 @@ func (dm *DefenseManager) ListEvents(limit int) ([]model.SecurityEvent, error) {
 	var events []model.SecurityEvent
 	err := dm.db.Order("created_at DESC").Limit(limit).Find(&events).Error
 	return events, err
+}
+
+// PruneEvents removes security events older than the specified retention days.
+func (dm *DefenseManager) PruneEvents(days int) (int64, error) {
+	if dm.db == nil {
+		return 0, nil
+	}
+	if days <= 0 {
+		days = 30
+	}
+	cutoff := time.Now().AddDate(0, 0, -days)
+	res := dm.db.Where("created_at < ?", cutoff).Delete(&model.SecurityEvent{})
+	return res.RowsAffected, res.Error
+}
+
+// RecordOperatorEvent logs an administrative audit event to the security timeline and EventBus.
+func (dm *DefenseManager) RecordOperatorEvent(operatorUser, ip, eventType, detail, action string) {
+	dm.dispatchAlert(fmt.Sprintf("管理员 %s: %s", operatorUser, eventType), ip, eventType, detail, action)
 }
 
 // ListWhitelist returns all dynamic whitelist records.

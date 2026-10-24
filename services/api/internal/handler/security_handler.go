@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,16 +15,18 @@ import (
 )
 
 type SecurityHandler struct {
-	guardMgr   *security.GuardManager
-	defenseMgr *security.DefenseManager
-	alertMgr   *security.AlertManager
+	guardMgr    *security.GuardManager
+	defenseMgr  *security.DefenseManager
+	alertMgr    *security.AlertManager
+	hostWatcher *security.HostLogWatcher
 }
 
-func NewSecurityHandler(gm *security.GuardManager, dm *security.DefenseManager, am *security.AlertManager) *SecurityHandler {
+func NewSecurityHandler(gm *security.GuardManager, dm *security.DefenseManager, am *security.AlertManager, hw *security.HostLogWatcher) *SecurityHandler {
 	return &SecurityHandler{
-		guardMgr:   gm,
-		defenseMgr: dm,
-		alertMgr:   am,
+		guardMgr:    gm,
+		defenseMgr:  dm,
+		alertMgr:    am,
+		hostWatcher: hw,
 	}
 }
 
@@ -139,6 +142,10 @@ func (h *SecurityHandler) ManualBan(c *gin.Context) {
 		return
 	}
 
+	if h.hostWatcher != nil {
+		h.hostWatcher.ExportFirewallRules()
+	}
+
 	utils.Success(c, gin.H{"ip": req.IP, "status": "banned"})
 }
 
@@ -166,6 +173,11 @@ func (h *SecurityHandler) ManualUnban(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	if h.hostWatcher != nil {
+		h.hostWatcher.ExportFirewallRules()
+	}
+
 	utils.Success(c, gin.H{"ip": ip, "status": "unbanned"})
 }
 
@@ -200,12 +212,24 @@ func (h *SecurityHandler) UpdateBan(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, err.Error())
 		return
 	}
+
+	if h.hostWatcher != nil {
+		h.hostWatcher.ExportFirewallRules()
+	}
+
 	utils.Success(c, gin.H{"ip": ip, "status": "updated"})
 }
 
-// ListEvents queries the security events timeline.
+// CheckIP is a lightweight endpoint for Nginx auth_request subrequests to verify if an IP is banned.
 //
-//	Route: GET /api/v1/security/events
+//	Route: GET /api/v1/security/check-ip
+func (h *SecurityHandler) CheckIP(c *gin.Context) {
+	// The SecurityDefenseMiddleware has already verified that the client IP is not banned.
+	// If it reached here, the IP is safe.
+	c.Status(http.StatusNoContent)
+}
+
+// ListEvents queries the security events timeline.
 func (h *SecurityHandler) ListEvents(c *gin.Context) {
 	if h.defenseMgr == nil {
 		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
@@ -223,6 +247,56 @@ func (h *SecurityHandler) ListEvents(c *gin.Context) {
 		return
 	}
 	utils.Success(c, events)
+}
+
+// PruneEvents cleans up old security events before retention days.
+//
+//	Route: DELETE /api/v1/security/events/prune
+func (h *SecurityHandler) PruneEvents(c *gin.Context) {
+	if h.defenseMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
+		return
+	}
+	days := 30
+	if d := c.Query("days"); d != "" {
+		if v, err := strconv.Atoi(d); err == nil && v > 0 {
+			days = v
+		}
+	}
+	deleted, err := h.defenseMgr.PruneEvents(days)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		return
+	}
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+	h.defenseMgr.RecordOperatorEvent(operatorUser, c.ClientIP(), "audit_prune",
+		fmt.Sprintf("清理 %d 天前的历史安全事件日志，共删除 %d 条记录", days, deleted), "审计日志维护完成")
+	utils.Success(c, gin.H{"deleted": deleted, "retention_days": days})
+}
+
+// GetHostLogs returns recent host authentication events and sync status.
+//
+//	Route: GET /api/v1/security/host-logs
+func (h *SecurityHandler) GetHostLogs(c *gin.Context) {
+	if h.hostWatcher == nil {
+		utils.Success(c, gin.H{
+			"enabled":     false,
+			"source_path": "",
+			"export_path": "",
+			"entries":     []any{},
+		})
+		return
+	}
+	running, logPath, exportPath, entries := h.hostWatcher.GetStatus()
+	utils.Success(c, gin.H{
+		"enabled":     running,
+		"source_path": logPath,
+		"export_path": exportPath,
+		"entries":     entries,
+	})
 }
 
 // GetWhitelist returns all dynamic whitelist records.
@@ -326,7 +400,12 @@ func (h *SecurityHandler) TestAlertEmail(c *gin.Context) {
 		clientIP = c.ClientIP()
 	}
 
-	err := h.alertMgr.SendSecurityEmail(
+	if missing := h.alertMgr.MissingFields(); len(missing) > 0 {
+		utils.Fail(c, http.StatusServiceUnavailable, fmt.Sprintf("邮件告警未配置，缺少: %s", strings.Join(missing, ", ")))
+		return
+	}
+
+	err := h.alertMgr.SendSecurityEmailSync(
 		"测试安全警报邮件连通性",
 		clientIP,
 		"系统管理员连通性测试",
@@ -335,13 +414,23 @@ func (h *SecurityHandler) TestAlertEmail(c *gin.Context) {
 	)
 
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("failed to trigger test email: %v", err))
+		utils.Fail(c, http.StatusBadGateway, fmt.Sprintf("测试邮件发送失败: %v", err))
 		return
 	}
 
 	cfg := h.alertMgr.GetConfig()
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+	if h.defenseMgr != nil {
+		h.defenseMgr.RecordOperatorEvent(operatorUser, clientIP, "test_alert",
+			fmt.Sprintf("管理员 %s 触发 QQ Mail SMTP 测试邮件，接收邮箱: %s", operatorUser, cfg.Recipient),
+			"测试邮件发送成功")
+	}
+
 	utils.Success(c, gin.H{
-		"message":   "测试警报邮件已加入发送队列",
+		"message":   "测试警报邮件已发送",
 		"recipient": cfg.Recipient,
 		"smtp_host": cfg.Host,
 		"enabled":   cfg.Enabled,

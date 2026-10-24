@@ -64,6 +64,7 @@ services:
       - /dev/dri/renderD128:/dev/dri/renderD128
     group_add:
       - "105"
+      - "4"
     # Bind to 0.0.0.0 so LAN devices can reach the API directly.
     # In production behind Cloudflare Tunnel, the tunnel reaches the
     # API by service name (home-api) on the internal network.
@@ -95,6 +96,10 @@ services:
       # container and read (read-only) by the api's BackupMonitor to
       # alert on failed/stalled syncs and bucket retention.
       - ./data/backup-state:/data/backup-state
+      # Host OS authentication log (read-only) for SSH brute-force detection & host audit
+      - /var/log/auth.log:/host/log/auth.log:ro
+      # Export directory for host-level firewall (iptables/ipset) blocklist synchronization
+      - ./data/security:/data/security
     depends_on:
       mosquitto:
         condition: service_started

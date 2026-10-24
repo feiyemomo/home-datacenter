@@ -2,8 +2,10 @@ package security
 
 import (
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/smtp"
 	"strings"
 	"sync"
@@ -11,6 +13,10 @@ import (
 
 	"home-datacenter-api/internal/config"
 )
+
+// ErrAlertNotConfigured is returned when SMTP alerting is disabled or
+// missing host / credentials / recipient.
+var ErrAlertNotConfigured = errors.New("SMTP alert not configured or disabled")
 
 // AlertManager handles sending security alerts via Email and other channels.
 type AlertManager struct {
@@ -38,17 +44,66 @@ func (am *AlertManager) GetConfig() config.AlertConfig {
 	return am.cfg
 }
 
-// SendSecurityEmail sends an HTML-formatted security alert to the administrator.
-func (am *AlertManager) SendSecurityEmail(subject, attackIP, alertType, detail, action string) error {
-	am.mu.RLock()
-	cfg := am.cfg
-	am.mu.RUnlock()
-
-	if !cfg.Enabled || cfg.Host == "" || cfg.Username == "" || cfg.Password == "" || cfg.Recipient == "" {
-		log.Printf("security: alert email skipped (SMTP not configured or disabled)")
-		return nil
+// MissingFields lists the SMTP settings that prevent alert delivery.
+func (am *AlertManager) MissingFields() []string {
+	cfg := am.GetConfig()
+	var missing []string
+	if !cfg.Enabled {
+		missing = append(missing, "ALERT_ENABLED")
 	}
+	if cfg.Host == "" {
+		missing = append(missing, "ALERT_SMTP_HOST")
+	}
+	if cfg.Username == "" {
+		missing = append(missing, "ALERT_SMTP_USER")
+	}
+	if cfg.Password == "" {
+		missing = append(missing, "ALERT_SMTP_PASS")
+	}
+	if cfg.Recipient == "" {
+		missing = append(missing, "ALERT_RECIPIENT")
+	}
+	return missing
+}
 
+// SendSecurityEmail sends an HTML-formatted security alert to the administrator
+// in the background. Returns ErrAlertNotConfigured when SMTP is not usable.
+func (am *AlertManager) SendSecurityEmail(subject, attackIP, alertType, detail, action string) error {
+	cfg := am.GetConfig()
+	if len(am.MissingFields()) > 0 {
+		log.Printf("security: alert email skipped (SMTP not configured or disabled)")
+		return ErrAlertNotConfigured
+	}
+	sender, message := buildSecurityMessage(cfg, subject, attackIP, alertType, detail, action)
+
+	// Sending in background to not block HTTP handlers
+	go func() {
+		if err := deliverMail(cfg, sender, message); err != nil {
+			log.Printf("security: send alert email to %s failed: %v", cfg.Recipient, err)
+		} else {
+			log.Printf("security: alert email successfully delivered to %s for threat IP %s", cfg.Recipient, attackIP)
+		}
+	}()
+	return nil
+}
+
+// SendSecurityEmailSync delivers the alert synchronously and returns the
+// SMTP error, so callers such as the test endpoint can report failures.
+func (am *AlertManager) SendSecurityEmailSync(subject, attackIP, alertType, detail, action string) error {
+	cfg := am.GetConfig()
+	if len(am.MissingFields()) > 0 {
+		return ErrAlertNotConfigured
+	}
+	sender, message := buildSecurityMessage(cfg, subject, attackIP, alertType, detail, action)
+	if err := deliverMail(cfg, sender, message); err != nil {
+		log.Printf("security: send alert email to %s failed: %v", cfg.Recipient, err)
+		return err
+	}
+	log.Printf("security: alert email successfully delivered to %s for threat IP %s", cfg.Recipient, attackIP)
+	return nil
+}
+
+func buildSecurityMessage(cfg config.AlertConfig, subject, attackIP, alertType, detail, action string) (string, string) {
 	body := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
@@ -103,68 +158,53 @@ func (am *AlertManager) SendSecurityEmail(subject, attackIP, alertType, detail, 
 		message += fmt.Sprintf("%s: %s\r\n", k, v)
 	}
 	message += "\r\n" + body
+	return sender, message
+}
 
+func deliverMail(cfg config.AlertConfig, sender, message string) error {
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
+	recipients := strings.Split(cfg.Recipient, ",")
 
-	// Sending in background to not block HTTP handlers
-	go func() {
-		var err error
-		auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
+	if cfg.Port != 465 {
+		// Standard STARTTLS connection (e.g. port 587 / 25)
+		return smtp.SendMail(addr, auth, sender, recipients, []byte(message))
+	}
 
-		if cfg.Port == 465 {
-			// SSL/TLS direct connection (Standard for QQ Mail port 465)
-			tlsconfig := &tls.Config{
-				InsecureSkipVerify: false,
-				ServerName:         cfg.Host,
-			}
-			conn, dialErr := tls.Dial("tcp", addr, tlsconfig)
-			if dialErr != nil {
-				log.Printf("security: TLS dial to %s failed: %v", addr, dialErr)
-				return
-			}
-			client, clientErr := smtp.NewClient(conn, cfg.Host)
-			if clientErr != nil {
-				log.Printf("security: SMTP client create failed: %v", clientErr)
-				return
-			}
-			defer client.Quit()
+	// SSL/TLS direct connection (Standard for QQ Mail port 465)
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: cfg.Host})
+	if err != nil {
+		return fmt.Errorf("TLS dial %s: %w", addr, err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	client, err := smtp.NewClient(conn, cfg.Host)
+	if err != nil {
+		conn.Close()
+		return fmt.Errorf("SMTP client create: %w", err)
+	}
+	defer client.Quit()
 
-			if err = client.Auth(auth); err != nil {
-				log.Printf("security: SMTP auth failed for %s: %v", cfg.Username, err)
-				return
-			}
-			if err = client.Mail(sender); err != nil {
-				log.Printf("security: SMTP MAIL FROM failed: %v", err)
-				return
-			}
-			if err = client.Rcpt(cfg.Recipient); err != nil {
-				log.Printf("security: SMTP RCPT TO failed: %v", err)
-				return
-			}
-			w, dataErr := client.Data()
-			if dataErr != nil {
-				log.Printf("security: SMTP DATA command failed: %v", dataErr)
-				return
-			}
-			if _, err = w.Write([]byte(message)); err != nil {
-				log.Printf("security: SMTP write message failed: %v", err)
-				return
-			}
-			if err = w.Close(); err != nil {
-				log.Printf("security: SMTP close data failed: %v", err)
-				return
-			}
-		} else {
-			// Standard STARTTLS connection (e.g. port 587 / 25)
-			err = smtp.SendMail(addr, auth, sender, strings.Split(cfg.Recipient, ","), []byte(message))
+	if err := client.Auth(auth); err != nil {
+		return fmt.Errorf("SMTP auth for %s: %w", cfg.Username, err)
+	}
+	if err := client.Mail(sender); err != nil {
+		return fmt.Errorf("SMTP MAIL FROM: %w", err)
+	}
+	for _, rcpt := range recipients {
+		if err := client.Rcpt(strings.TrimSpace(rcpt)); err != nil {
+			return fmt.Errorf("SMTP RCPT TO: %w", err)
 		}
-
-		if err != nil {
-			log.Printf("security: send alert email to %s failed: %v", cfg.Recipient, err)
-		} else {
-			log.Printf("security: alert email successfully delivered to %s for threat IP %s", cfg.Recipient, attackIP)
-		}
-	}()
-
+	}
+	w, err := client.Data()
+	if err != nil {
+		return fmt.Errorf("SMTP DATA: %w", err)
+	}
+	if _, err := w.Write([]byte(message)); err != nil {
+		return fmt.Errorf("SMTP write message: %w", err)
+	}
+	if err := w.Close(); err != nil {
+		return fmt.Errorf("SMTP close data: %w", err)
+	}
 	return nil
 }

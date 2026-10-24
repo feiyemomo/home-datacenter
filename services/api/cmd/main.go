@@ -142,6 +142,11 @@ func main() {
 	camONVIF := camera.NewONVIFController()
 	camReg := camera.NewRegistry(database.DB, go2, frigate, box, camONVIF, cfg.Camera.WebRTCPublicBase)
 
+	// Initialize the AI alert source manager before MQTT starts so the
+	// singleton binds to the persisted config path, not an empty dir.
+	aiSourceMgr := camera.GetGlobalAIAlertSourceManager(filepath.Dir(cfg.Database.Path))
+	log.Printf("ai_source: current alert source mode: %s", aiSourceMgr.GetSource())
+
 	// MQTT client connects to Mosquitto and routes messages to
 	// the EventBus via the Handler. The camera Registry is passed
 	// as the slug lookup so Frigate events (which use ASCII slugs
@@ -213,7 +218,8 @@ func main() {
 	}
 	guardMgr := security.NewGuardManager(database.DB, bus)
 	mqttHandler.SetGuardProvider(guardMgr)
-	securityHandler := handler.NewSecurityHandler(guardMgr, defenseMgr, alertMgr)
+	hostWatcher := security.NewHostLogWatcher(defenseMgr, cfg.Security.Defense.HostAuthLogPath, cfg.Security.Defense.ExportRulesPath)
+	securityHandler := handler.NewSecurityHandler(guardMgr, defenseMgr, alertMgr, hostWatcher)
 
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 	recMetricsDir := cfg.Maintenance.RecordingsRoot
@@ -244,6 +250,11 @@ func main() {
 		OutputDir: cfg.Camera.RecordingDir,
 	}
 	camHandler := handler.NewCameraHandler(camReg, camONVIF, camRecorder, cfg.Camera.WebRTCPublicBase, cfg.Camera.ICEServers, userService, bus)
+
+	// Start ISAPI alert listener to ingest on-board AI human detection directly from IPCs
+	isapiAlertListener := camera.NewISAPIAlertListener(camReg, bus, guardMgr, visionClient)
+	isapiAlertListener.Start()
+	defer isapiAlertListener.Stop()
 
 	// v1.8.26: start the transcode-cache cleaner. Keeps the
 	// .transcode-cache directory bounded (default: keep 7 days, sweep
@@ -308,7 +319,7 @@ func main() {
 		return out
 	}
 
-	maintenance.StartAll(database.DB, bus, maintenance.Config{
+	bgMonitors := maintenance.StartAll(database.DB, bus, maintenance.Config{
 		DBPath:             cfg.Maintenance.SQLiteDBPath,
 		BackupDir:          cfg.Maintenance.BackupDir,
 		BackupKeep:         cfg.Maintenance.BackupKeep,
@@ -335,7 +346,15 @@ func main() {
 		RecordingStaleAfter:    time.Duration(cfg.Maintenance.RecordingStaleAfterMinutes) * time.Minute,
 		RecordingCheckInterval: time.Duration(cfg.Maintenance.RecordingCheckIntervalMinutes) * time.Minute,
 		RecordingTargets:       recordingTargets,
-		RecordingSizeInterval:  time.Duration(cfg.Maintenance.RecordingSizeIntervalHours) * time.Hour,
+		RecordingSizeInterval: func() time.Duration {
+			if cfg.Maintenance.RecordingSizeIntervalMinutes > 0 {
+				return time.Duration(cfg.Maintenance.RecordingSizeIntervalMinutes) * time.Minute
+			}
+			if cfg.Maintenance.RecordingSizeIntervalHours > 0 {
+				return time.Duration(cfg.Maintenance.RecordingSizeIntervalHours) * time.Hour
+			}
+			return 10 * time.Minute
+		}(),
 		RecordingSizeWarnBytes: cfg.Maintenance.RecordingSizeWarnBytes,
 		RecordingSizeCritBytes: cfg.Maintenance.RecordingSizeCritBytes,
 		// v1.8.32: recording quota → auto-shorten Frigate retention.
@@ -384,6 +403,9 @@ func main() {
 		// consecutive-failure threshold and fire a spurious alert.
 		ServiceStartupDelay: 60 * time.Second,
 	})
+	if bgMonitors != nil && bgMonitors.RecordingSize != nil {
+		systemHandler.SetRecordingSizeMonitor(bgMonitors.RecordingSize)
+	}
 
 	// Purge any soft-deleted camera rows left over from older
 	// deployments where Unregister performed a soft delete. Those
@@ -670,6 +692,8 @@ func main() {
 		}
 
 		// v1.11.0: Security Guard & Intrusion Defense
+		api.GET("/security/check-ip", securityHandler.CheckIP)
+
 		securityGroup := api.Group("/security")
 		securityGroup.Use(middleware.JWTAuth(deviceRepo))
 		{
@@ -679,6 +703,7 @@ func main() {
 			securityGroup.GET("/banned", securityHandler.ListBanned)
 			securityGroup.GET("/events", securityHandler.ListEvents)
 			securityGroup.GET("/whitelist", securityHandler.GetWhitelist)
+			securityGroup.GET("/host-logs", securityHandler.GetHostLogs)
 		}
 
 		// Admin-only security emergency response operations
@@ -692,6 +717,7 @@ func main() {
 			securityAdmin.DELETE("/whitelist/:entry", securityHandler.DeleteWhitelist)
 			securityAdmin.PUT("/config", securityHandler.UpdateConfig)
 			securityAdmin.POST("/test-alert", securityHandler.TestAlertEmail)
+			securityAdmin.DELETE("/events/prune", securityHandler.PruneEvents)
 		}
 
 		// v1.6.11: in-app self-update endpoints. JWT-protected so
@@ -746,6 +772,7 @@ func main() {
 		{
 			// Read endpoints are available to any authenticated user.
 			camGroup.GET("", camHandler.List)
+			camGroup.GET("ai-source", camHandler.GetAISource)
 			camGroup.GET("ice", camHandler.ICE)
 			camGroup.GET("alerts", camHandler.ListAlerts)
 			camGroup.GET("alerts/:id/snapshot", camHandler.AlertSnapshot)
@@ -806,6 +833,7 @@ func main() {
 			adminCam.Use(middleware.RequireAdmin(database.DB))
 			{
 				adminCam.POST("", camHandler.Register)
+				adminCam.PUT("ai-source", camHandler.SetAISource)
 				adminCam.DELETE(":id", camHandler.Delete)
 				adminCam.PUT(":id/presets/:alias", camHandler.SetPreset)
 				adminCam.DELETE(":id/presets/:alias", camHandler.DeletePreset)

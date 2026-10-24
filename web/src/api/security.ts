@@ -7,6 +7,7 @@ import type {
     SecurityMode,
     SecurityEvent,
     SecurityWhitelistItem,
+    HostLogStatusResponse,
 } from "@/types";
 
 /**
@@ -141,4 +142,24 @@ export async function updateSecurityConfig(cfg: {
     const { data } = await client.put<{ status: string }>("/security/config", cfg);
     return data;
 }
+
+/**
+ * Prune historical security events older than specified days.
+ * DELETE /api/v1/security/events/prune?days=30
+ */
+export async function pruneSecurityEvents(days: number = 30): Promise<{ deleted: number; retention_days: number }> {
+    const { data } = await client.delete<{ deleted: number; retention_days: number }>(`/security/events/prune?days=${days}`);
+    return data;
+}
+
+/**
+ * Get host OS authentication logs and firewall sync status.
+ * GET /api/v1/security/host-logs
+ */
+export async function getHostLogs(): Promise<HostLogStatusResponse> {
+    const { data } = await client.get<HostLogStatusResponse>("/security/host-logs");
+    return data;
+}
+
+
 

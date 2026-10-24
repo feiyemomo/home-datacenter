@@ -175,6 +175,8 @@ type DefenseConfig struct {
 	FailureWindowMins int      `mapstructure:"failure_window_mins"` // default 5 mins
 	BanDurationMins   int      `mapstructure:"ban_duration_mins"`   // default 30 mins
 	WhitelistIPs      []string `mapstructure:"whitelist_ips"`       // IPs exempt from ban (LAN/gateway)
+	HostAuthLogPath   string   `mapstructure:"host_auth_log_path"`  // Path to mounted host auth.log (/host/log/auth.log)
+	ExportRulesPath   string   `mapstructure:"export_rules_path"`   // Path to export firewall blocklist (/data/security/blocked_ips.txt)
 }
 
 // CameraConfig holds the camera platform settings.
@@ -285,8 +287,10 @@ type MaintenanceConfig struct {
 	// RecordingCheckIntervalMinutes is how often the recording health
 	// scan runs. Default 5.
 	RecordingCheckIntervalMinutes int `mapstructure:"recording_check_interval_minutes"`
-	// RecordingSizeIntervalHours is how often the recordings tree size
-	// is walked. Default 1. 0 disables.
+	// RecordingSizeIntervalMinutes is how often the recordings tree size
+	// is walked and FIFO pruned. Default 10. 0 disables.
+	RecordingSizeIntervalMinutes int `mapstructure:"recording_size_interval_minutes"`
+	// RecordingSizeIntervalHours is preserved for backward compatibility.
 	RecordingSizeIntervalHours int `mapstructure:"recording_size_interval_hours"`
 	// RecordingSizeWarnBytes / RecordingSizeCritBytes are size
 	// thresholds for the recordings tree. 0 disables that level.
@@ -439,7 +443,8 @@ func Load(path string) error {
 	v.SetDefault("maintenance.recordings_root", "")
 	v.SetDefault("maintenance.recording_stale_after_minutes", 10)
 	v.SetDefault("maintenance.recording_check_interval_minutes", 5)
-	v.SetDefault("maintenance.recording_size_interval_hours", 1)
+	v.SetDefault("maintenance.recording_size_interval_minutes", 10)
+	v.SetDefault("maintenance.recording_size_interval_hours", 0)
 	v.SetDefault("maintenance.recording_size_warn_bytes", 0)
 	v.SetDefault("maintenance.recording_size_crit_bytes", 0)
 	v.SetDefault("maintenance.recording_quota_bytes", 0)

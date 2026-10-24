@@ -483,6 +483,23 @@ export interface SecurityGuardState {
     updated_at: number;
 }
 
+// -------------------- AI Alert Source --------------------
+
+export type AIAlertSource = "camera" | "frigate" | "both";
+
+export interface AIAlertSourceInfo {
+    key: AIAlertSource;
+    name: string;
+    description: string;
+    active: boolean;
+}
+
+export interface AIAlertSourceStatus {
+    current_source: AIAlertSource;
+    available_sources: AIAlertSourceInfo[];
+    updated_at: string;
+}
+
 // -------------------- Intrusion Defense & Firewall Management --------------------
 
 export interface BanEntry {
@@ -534,6 +551,23 @@ export interface SecurityWhitelistItem {
     entry: string;
     note: string;
     created_at: string;
+}
+
+export interface HostAuthLogEntry {
+    timestamp: string;
+    ip: string;
+    user: string;
+    port: string;
+    status: "failed" | "accepted" | "invalid_user";
+    service: string;
+    raw_message: string;
+}
+
+export interface HostLogStatusResponse {
+    enabled: boolean;
+    source_path: string;
+    export_path: string;
+    entries: HostAuthLogEntry[];
 }
 
 export interface DefenseOverview {
