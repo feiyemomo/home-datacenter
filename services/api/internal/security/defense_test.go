@@ -18,7 +18,7 @@ func setupTestDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatalf("failed to open in-memory sqlite: %v", err)
 	}
-	if err := db.AutoMigrate(&model.IPBan{}, &model.SecurityEvent{}, &model.SecurityWhitelist{}); err != nil {
+	if err := db.AutoMigrate(&model.IPBan{}, &model.SecurityEvent{}, &model.SecurityWhitelist{}, &model.SecurityHourlyStat{}); err != nil {
 		t.Fatalf("failed to migrate schema: %v", err)
 	}
 	return db
@@ -262,4 +262,102 @@ func TestDefenseManager_ProgressiveBanAndPrune(t *testing.T) {
 	if pruned != 0 {
 		t.Fatalf("expected 0 events pruned (created just now)")
 	}
+}
+
+// TestDefenseManager_DetectionVsEnforcementSeparated is a regression guard for
+// the dashboard bug where "累计阻断拦截" was computed as
+// auth_fail-events + post-ban hits. Those are two different measurements:
+//
+//	detection  -> a failed authentication was observed (bounded: one per attempt
+//	              until the threshold trips)
+//	enforcement-> a request was rejected because the IP was ALREADY banned
+//	              (unbounded: grows with every further attempt)
+//
+// Folding them together made a single brute-force campaign look like thousands
+// of "blocks" while the real post-ban counter was still zero.
+func TestDefenseManager_DetectionVsEnforcementSeparated(t *testing.T) {
+	db := setupTestDB(t)
+	bus := eventbus.New()
+	alertMgr := NewAlertManager(config.AlertConfig{Enabled: false})
+
+	defenseCfg := config.DefenseConfig{
+		MaxAuthFailures:   3,
+		FailureWindowMins: 5,
+		BanDurationMins:   30,
+	}
+
+	dm := NewDefenseManager(db, defenseCfg, alertMgr, bus)
+	attacker := "198.51.100.201"
+
+	// Three failed authentications trip the threshold and ban the IP.
+	dm.RecordAuthFailure(attacker, "fail 1", "ssh")
+	dm.RecordAuthFailure(attacker, "fail 2", "ssh")
+	dm.RecordAuthFailure(attacker, "fail 3", "ssh")
+
+	if !isBannedIn(activeBanIPs(dm), attacker) {
+		t.Fatalf("expected %s to be banned after 3 failures", attacker)
+	}
+	for i := 0; i < 10; i++ {
+		dm.flushHourly()
+	}
+
+	// Post-ban traffic: every subsequent attempt is an enforcement hit.
+	// RecordAuthFailure must short-circuit into IsBanned, which credits the
+	// "blocked" series rather than the detection series.
+	for i := 0; i < 7; i++ {
+		dm.RecordAuthFailure(attacker, "fail after ban", "ssh")
+	}
+	dm.flushHourly()
+
+	ov := dm.GetOverview()
+
+	// Detection count reflects the 3 recorded auth_fail detections.
+	if ov.TotalAuthFailures != 3 {
+		t.Fatalf("expected total_auth_failures=3, got %d", ov.TotalAuthFailures)
+	}
+
+	// Enforcement count is independent: exactly the 7 post-ban rejections.
+	if ov.TotalBlockedHits != 7 {
+		t.Fatalf("expected total_blocked_hits=7 (post-ban only), got %d", ov.TotalBlockedHits)
+	}
+
+	if ov.TotalBlockedHits == ov.TotalAuthFailures {
+		t.Fatalf("detection and enforcement counters must not be conflated")
+	}
+
+	// The two 24h series must stay separate too.
+	sumAuth, sumBlocked := int64(0), int64(0)
+	for _, v := range ov.AuthFails24h {
+		sumAuth += v
+	}
+	for _, v := range ov.BlockedHits24h {
+		sumBlocked += v
+	}
+	if sumAuth != 3 {
+		t.Fatalf("expected auth_fails_24h to sum to 3, got %d", sumAuth)
+	}
+	if sumBlocked < 7 {
+		t.Fatalf("expected blocked_hits_24h to sum to >=7, got %d", sumBlocked)
+	}
+}
+
+// activeBanIPs snapshots the blocklist WITHOUT going through IsBanned(), which
+// would itself credit a post-ban interception hit and skew the counters under
+// assertion.
+func activeBanIPs(dm *DefenseManager) []string {
+	list := dm.ListBanned()
+	ips := make([]string, 0, len(list))
+	for _, b := range list {
+		ips = append(ips, b.IP)
+	}
+	return ips
+}
+
+func isBannedIn(ips []string, target string) bool {
+	for _, ip := range ips {
+		if ip == target {
+			return true
+		}
+	}
+	return false
 }

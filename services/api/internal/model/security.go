@@ -49,6 +49,24 @@ type SecurityEvent struct {
 
 func (SecurityEvent) TableName() string { return "security_events" }
 
+// SecurityHourlyStat aggregates per-hour counters so the dashboard can plot
+// two genuinely different series:
+//
+//   - AuthFails: detection events (a failed authentication attempt was seen).
+//   - Blocked:   enforcement events (a request was rejected because its source
+//     IP was ALREADY on the blocklist).
+//
+// They must never be summed together: a single offender produces a handful of
+// AuthFails and then potentially thousands of Blocked hits afterwards.
+type SecurityHourlyStat struct {
+	Bucket    string    `gorm:"size:16;primaryKey" json:"bucket"` // "2006-01-02T15" in server local time
+	AuthFails int64     `gorm:"not null;default:0" json:"auth_fails"`
+	Blocked   int64     `gorm:"not null;default:0" json:"blocked"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (SecurityHourlyStat) TableName() string { return "security_hourly_stats" }
+
 // SecurityWhitelist persists dynamically managed IP or CIDR exemptions.
 type SecurityWhitelist struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`

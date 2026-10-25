@@ -261,27 +261,39 @@ export default function Security() {
         return events.filter((e) => e.type === eventFilterType);
     }, [events, eventFilterType]);
 
-    // 24h Trend Chart calculations (Smooth Line & Gradient Area)
-    const raw24hData = useMemo(() => {
+    // 24h trend: two independent series.
+    //   authFails -> detection (a failed authentication was observed)
+    //   blocked   -> enforcement (a request was rejected because the IP was
+    //                already banned)
+    // They are plotted as separate lines and are never summed together.
+    const authFails24h = useMemo(() => {
+        return overview?.auth_fails_24h ?? Array(24).fill(0);
+    }, [overview?.auth_fails_24h]);
+
+    const blocked24h = useMemo(() => {
         return overview?.blocked_hits_24h ?? Array(24).fill(0);
     }, [overview?.blocked_hits_24h]);
 
     const maxHits = useMemo(() => {
-        return Math.max(1, ...raw24hData);
-    }, [raw24hData]);
+        return Math.max(1, ...authFails24h, ...blocked24h);
+    }, [authFails24h, blocked24h]);
 
-    const totalHits24h = useMemo(() => {
-        return raw24hData.reduce((a, b) => a + b, 0);
-    }, [raw24hData]);
+    const totalAuth24h = useMemo(() => {
+        return authFails24h.reduce((a, b) => a + b, 0);
+    }, [authFails24h]);
+
+    const totalBlocked24h = useMemo(() => {
+        return blocked24h.reduce((a, b) => a + b, 0);
+    }, [blocked24h]);
 
     const peakIndex = useMemo(() => {
-        return raw24hData.reduce((maxI, val, i, arr) => (val > arr[maxI] ? i : maxI), 0);
-    }, [raw24hData]);
+        return authFails24h.reduce((maxI, val, i, arr) => (val > arr[maxI] ? i : maxI), 0);
+    }, [authFails24h]);
 
-    const peakHits = raw24hData[peakIndex] || 0;
+    const peakHits = authFails24h[peakIndex] || 0;
     const currentHour = new Date().getHours();
 
-    const chartPoints = useMemo(() => {
+    const buildPoints = (data: number[]) => {
         const svgW = 600;
         const svgH = 120;
         const padX = 20;
@@ -290,26 +302,38 @@ export default function Security() {
         const drawW = svgW - padX * 2;
         const drawH = svgH - padTop - padBottom;
 
-        return raw24hData.map((hits, i) => {
+        return data.map((hits, i) => {
             const x = padX + (i / 23) * drawW;
             const y = padTop + drawH - (hits / maxHits) * drawH;
             const hour = `${(currentHour - 23 + i + 24) % 24}:00`;
             return { x, y, hits, hour, index: i };
         });
-    }, [raw24hData, maxHits, currentHour]);
+    };
 
-    const svgLinePath = useMemo(() => {
-        if (chartPoints.length === 0) return "";
-        return chartPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
-    }, [chartPoints]);
+    const authPoints = useMemo(
+        () => buildPoints(authFails24h),
+        [authFails24h, maxHits, currentHour],
+    );
+    const blockedPoints = useMemo(
+        () => buildPoints(blocked24h),
+        [blocked24h, maxHits, currentHour],
+    );
 
-    const svgAreaPath = useMemo(() => {
-        if (chartPoints.length === 0) return "";
-        const baseline = 100; // 120 - 20 padBottom
-        const first = chartPoints[0];
-        const last = chartPoints[chartPoints.length - 1];
-        return `${svgLinePath} L ${last.x.toFixed(1)} ${baseline} L ${first.x.toFixed(1)} ${baseline} Z`;
-    }, [chartPoints, svgLinePath]);
+    const toPath = (pts: { x: number; y: number }[]) =>
+        pts.length === 0
+            ? ""
+            : pts.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+
+    const authLinePath = useMemo(() => toPath(authPoints), [authPoints]);
+    const blockedLinePath = useMemo(() => toPath(blockedPoints), [blockedPoints]);
+
+    const authAreaPath = useMemo(() => {
+        if (authPoints.length === 0) return "";
+        const baseline = 100;
+        const first = authPoints[0];
+        const last = authPoints[authPoints.length - 1];
+        return `${authLinePath} L ${last.x.toFixed(1)} ${baseline} L ${first.x.toFixed(1)} ${baseline} Z`;
+    }, [authPoints, authLinePath]);
 
     const handleUpgradeToPermanent = async (ip: string) => {
         try {
@@ -683,7 +707,7 @@ export default function Security() {
                 <Card className="glass-subtle hover-glow border-[rgb(var(--border)/0.4)]">
                     <CardHeader className="flex flex-row items-center justify-between pb-2">
                         <span className="text-xs font-medium text-fg-muted">
-                            累计阻断拦截
+                            累计阻断拦截 (封禁后)
                         </span>
                         <div className="rounded-lg p-2 bg-amber-500/10 text-amber-500">
                             <ShieldAlert size={18} />
@@ -693,8 +717,15 @@ export default function Security() {
                         <div className="text-2xl font-bold tracking-tight text-fg">
                             {overview?.total_blocked_hits ?? 0}
                         </div>
-                        <p className="mt-1 text-[11px] text-fg-muted">
-                            重启/重建不丢失，数据库持久化存储
+                        <p className="mt-1 text-[11px] text-fg-muted leading-relaxed">
+                            IP 进入黑名单后再次来访被拒绝的次数
+                        </p>
+                        <p className="mt-1 text-[10px] text-fg-muted/80 border-t border-[rgb(var(--border)/0.2)] pt-1">
+                            另：累计认证失败{" "}
+                            <span className="font-mono text-fg">
+                                {overview?.total_auth_failures ?? 0}
+                            </span>{" "}
+                            次（识别阶段，与拦截分开统计）
                         </p>
                     </CardContent>
                 </Card>
@@ -770,20 +801,23 @@ export default function Security() {
                         <div>
                             <CardTitle className="text-xs font-semibold flex items-center gap-1.5">
                                 <TrendingUp size={15} className="text-primary" />
-                                <span>24 小时阻断走势与攻击峰值 (折线趋势图)</span>
+                                <span>24 小时封禁后阻断走势与攻击峰值</span>
                             </CardTitle>
                             <CardDescription className="text-[11px] mt-0.5">
-                                过去 24 小时阻断与攻击波次走势（小时级采样）
+                                红线 = 黑名单生效后的实际阻断次数；琥珀线 = 认证失败识别次数（两者独立统计，不相加）
                             </CardDescription>
                         </div>
-                        <div className="flex items-center gap-2">
+                        <div className="flex flex-wrap items-center gap-2">
                             {peakHits > 0 && (
-                                <Badge variant="outline" className="text-[10px] border-rose-500/40 text-rose-500 bg-rose-500/10">
-                                    峰值: {peakHits} 次 ({(currentHour - 23 + peakIndex + 24) % 24}:00)
+                                <Badge variant="outline" className="text-[10px] border-amber-500/40 text-amber-600 bg-amber-500/10">
+                                    识别峰值: {peakHits} 次 ({(currentHour - 23 + peakIndex + 24) % 24}:00)
                                 </Badge>
                             )}
+                            <Badge variant="outline" className="text-[10px] border-rose-500/40 text-rose-500 bg-rose-500/10">
+                                24h 阻断 {totalBlocked24h} 次
+                            </Badge>
                             <Badge variant="outline" className="text-[10px] text-fg-muted">
-                                近24h拦截: {totalHits24h} 次
+                                24h 识别 {totalAuth24h} 次
                             </Badge>
                         </div>
                     </CardHeader>
@@ -792,9 +826,9 @@ export default function Security() {
                         <div className="relative h-28 w-full border-b border-[rgb(var(--border)/0.2)]">
                             <svg viewBox="0 0 600 120" preserveAspectRatio="none" className="w-full h-full overflow-visible">
                                 <defs>
-                                    <linearGradient id="trendAreaGradient" x1="0" y1="0" x2="0" y2="1">
-                                        <stop offset="0%" stopColor="#f43f5e" stopOpacity="0.35" />
-                                        <stop offset="100%" stopColor="#f43f5e" stopOpacity="0.0" />
+                                    <linearGradient id="authAreaGradient" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stopColor="#f59e0b" stopOpacity="0.18" />
+                                        <stop offset="100%" stopColor="#f59e0b" stopOpacity="0.0" />
                                     </linearGradient>
                                 </defs>
 
@@ -803,15 +837,25 @@ export default function Security() {
                                 <line x1="20" y1="60" x2="580" y2="60" stroke="rgba(255,255,255,0.08)" strokeDasharray="3 3" />
                                 <line x1="20" y1="100" x2="580" y2="100" stroke="rgba(255,255,255,0.15)" />
 
-                                {/* Area fill under curve */}
-                                {svgAreaPath && (
-                                    <path d={svgAreaPath} fill="url(#trendAreaGradient)" />
+                                {/* Detection series (auth failures) — thin amber reference line */}
+                                {authAreaPath && <path d={authAreaPath} fill="url(#authAreaGradient)" />}
+                                {authLinePath && (
+                                    <path
+                                        d={authLinePath}
+                                        fill="none"
+                                        stroke="#f59e0b"
+                                        strokeWidth="1.5"
+                                        strokeDasharray="4 3"
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                        opacity="0.85"
+                                    />
                                 )}
 
-                                {/* Main trend polyline */}
-                                {svgLinePath && (
+                                {/* Enforcement series (blocked after ban) — primary red line */}
+                                {blockedLinePath && (
                                     <path
-                                        d={svgLinePath}
+                                        d={blockedLinePath}
                                         fill="none"
                                         stroke="#f43f5e"
                                         strokeWidth="2.5"
@@ -820,29 +864,24 @@ export default function Security() {
                                     />
                                 )}
 
-                                {/* Data dots */}
-                                {chartPoints.map((p) => {
+                                {/* Enforcement data dots */}
+                                {blockedPoints.map((p) => {
                                     if (p.hits === 0) return null;
-                                    const isPeak = p.index === peakIndex && peakHits > 0;
                                     return (
-                                        <g key={p.index}>
-                                            {isPeak && (
-                                                <circle cx={p.x} cy={p.y} r="7" fill="#f43f5e" opacity="0.3" className="animate-ping" />
-                                            )}
-                                            <circle
-                                                cx={p.x}
-                                                cy={p.y}
-                                                r={isPeak ? "4" : "3"}
-                                                fill={isPeak ? "#f43f5e" : "#fb7185"}
-                                                stroke="#18181b"
-                                                strokeWidth="1.5"
-                                            />
-                                        </g>
+                                        <circle
+                                            key={`b-${p.index}`}
+                                            cx={p.x}
+                                            cy={p.y}
+                                            r="3"
+                                            fill="#f43f5e"
+                                            stroke="#18181b"
+                                            strokeWidth="1.5"
+                                        />
                                     );
                                 })}
 
                                 {/* Invisible interactive hit columns for hover tooltip */}
-                                {chartPoints.map((p) => (
+                                {blockedPoints.map((p) => (
                                     <rect
                                         key={`hit-${p.index}`}
                                         x={p.x - 12}
@@ -889,10 +928,27 @@ export default function Security() {
                                     }}
                                     className="absolute -translate-x-1/2 -translate-y-full pointer-events-none z-20 rounded-md bg-bg-surface/95 px-2 py-1 text-[11px] font-mono text-fg shadow-lg border border-[rgb(var(--border)/0.5)] whitespace-nowrap"
                                 >
-                                    <div className="font-semibold text-rose-500">{hoveredPoint.hour}</div>
-                                    <div className="text-[10px] text-fg-muted">{hoveredPoint.hits} 次阻断拦截</div>
+                                    <div className="font-semibold text-fg">{hoveredPoint.hour}</div>
+                                    <div className="text-[10px] text-rose-500">
+                                        阻断 {blocked24h[hoveredPoint.index] ?? 0} 次
+                                    </div>
+                                    <div className="text-[10px] text-amber-500">
+                                        识别 {authFails24h[hoveredPoint.index] ?? 0} 次
+                                    </div>
                                 </div>
                             )}
+                        </div>
+
+                        {/* Legend */}
+                        <div className="flex items-center gap-4 mt-2 text-[10px] text-fg-muted">
+                            <span className="flex items-center gap-1.5">
+                                <span className="inline-block h-0.5 w-4 rounded bg-rose-500" />
+                                封禁后实际阻断
+                            </span>
+                            <span className="flex items-center gap-1.5">
+                                <span className="inline-block h-0.5 w-4 rounded bg-amber-500 opacity-80" style={{ borderTop: "1px dashed #f59e0b" }} />
+                                认证失败识别
+                            </span>
                         </div>
 
                         {/* X-Axis Time Ticks */}

@@ -572,13 +572,19 @@ export interface HostLogStatusResponse {
 
 export interface DefenseOverview {
     total_banned_count: number;
+    /** Enforcement: requests rejected because the source IP was already banned. */
     total_blocked_hits: number;
+    /** Detection: failed authentications observed. Tracked independently. */
+    total_auth_failures?: number;
     active_bans: BanEntry[];
     smtp_enabled: boolean;
     recipient: string;
     pending_attempts?: PendingAttempt[];
     bans_today?: number;
     bans_7d?: number;
+    /** Detection series, 24 hourly buckets aligned to the current hour last. */
+    auth_fails_24h?: number[];
+    /** Enforcement series, 24 hourly buckets aligned to the current hour last. */
     blocked_hits_24h?: number[];
     top_attackers?: TopAttacker[];
     by_type?: Record<string, number>;

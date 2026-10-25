@@ -78,20 +78,36 @@ type DefenseConfigSummary struct {
 }
 
 // DefenseOverview provides summary metrics for dashboard visualization.
+//
+// The three counters deliberately measure different things and are NEVER
+// added together:
+//
+//	TotalAuthFailures -> detection: failed authentications that were observed.
+//	TotalBlockedHits  -> enforcement: requests rejected because the source IP
+//	                     was already banned at the time of the request.
+//	TotalBannedCount  -> the size of the active blocklist right now.
 type DefenseOverview struct {
-	TotalBannedCount int                  `json:"total_banned_count"`
-	TotalBlockedHits int64                `json:"total_blocked_hits"`
-	ActiveBans       []BanEntry           `json:"active_bans"`
-	SMTPEnabled      bool                 `json:"smtp_enabled"`
-	Recipient        string               `json:"recipient"`
-	PendingAttempts  []PendingAttempt     `json:"pending_attempts"`
-	BansToday        int64                `json:"bans_today"`
-	Bans7d           int64                `json:"bans_7d"`
-	BlockedHits24h   []int64              `json:"blocked_hits_24h"`
-	TopAttackers     []TopAttacker        `json:"top_attackers"`
-	ByType           map[string]int64     `json:"by_type"`
-	Config           DefenseConfigSummary `json:"config"`
-	LastEventAt      *time.Time           `json:"last_event_at"`
+	TotalBannedCount  int                  `json:"total_banned_count"`
+	TotalBlockedHits  int64                `json:"total_blocked_hits"`
+	TotalAuthFailures int64                `json:"total_auth_failures"`
+	ActiveBans        []BanEntry           `json:"active_bans"`
+	SMTPEnabled       bool                 `json:"smtp_enabled"`
+	Recipient         string               `json:"recipient"`
+	PendingAttempts   []PendingAttempt     `json:"pending_attempts"`
+	BansToday         int64                `json:"bans_today"`
+	Bans7d            int64                `json:"bans_7d"`
+	AuthFails24h      []int64              `json:"auth_fails_24h"`
+	BlockedHits24h    []int64              `json:"blocked_hits_24h"`
+	TopAttackers      []TopAttacker        `json:"top_attackers"`
+	ByType            map[string]int64     `json:"by_type"`
+	Config            DefenseConfigSummary `json:"config"`
+	LastEventAt       *time.Time           `json:"last_event_at"`
+}
+
+// hourlyDelta holds not-yet-flushed per-hour counters.
+type hourlyDelta struct {
+	AuthFails int64
+	Blocked   int64
 }
 
 // DefenseManager coordinates attack detection, IP banning, persistence, and alert dispatch.
@@ -110,9 +126,11 @@ type DefenseManager struct {
 
 	alertCooldown map[string]time.Time
 	blockedHits   int64
-	hourlyHits    [24]int64
-	lastHourIdx   int
-	lastHourTime  time.Time
+
+	// hourlyMu guards hourlyStat, which buffers the current hour's counters
+	// until the janitor flushes them into security_hourly_stats.
+	hourlyMu   sync.Mutex
+	hourlyStat map[string]*hourlyDelta
 }
 
 // NewDefenseManager initializes defense state, loads persisted bans & whitelists, and starts janitor loop.
@@ -125,6 +143,7 @@ func NewDefenseManager(db *gorm.DB, cfg config.DefenseConfig, alertMgr *AlertMan
 		failures:      make(map[string]*FailedAttempt),
 		banned:        make(map[string]BanEntry),
 		alertCooldown: make(map[string]time.Time),
+		hourlyStat:    make(map[string]*hourlyDelta),
 	}
 
 	dm.parseWhitelist(cfg.WhitelistIPs)
@@ -169,10 +188,103 @@ func (dm *DefenseManager) loadPersistedState() {
 		log.Printf("security: loaded %d active bans from database", len(dbBans))
 	}
 
-	// 3. Compute total historical blocked hits
-	var totalHits int64
-	if err := dm.db.Model(&model.IPBan{}).Select("COALESCE(SUM(hit_count), 0)").Scan(&totalHits).Error; err == nil {
-		atomic.StoreInt64(&dm.blockedHits, totalHits)
+	// 3. Restore the cumulative post-ban interception counter.
+	//
+	// This is sourced from security_hourly_stats.blocked rather than
+	// SUM(ip_bans.hit_count): the janitor deletes expired temporary bans, so
+	// their hit counts would silently disappear and the cumulative number would
+	// appear to go backwards.
+	var totalBlocked int64
+	if err := dm.db.Model(&model.SecurityHourlyStat{}).
+		Select("COALESCE(SUM(blocked), 0)").Scan(&totalBlocked).Error; err == nil {
+		atomic.StoreInt64(&dm.blockedHits, totalBlocked)
+	}
+
+	// 4. Seed the hourly table from historical security_events on first boot so
+	// the 24h charts are not empty right after this feature lands.
+	dm.backfillHourlyStats()
+}
+
+// backfillHourlyStats reconstructs the AuthFails series from security_events the
+// first time the hourly table is introduced. Post-ban "blocked" counts cannot be
+// reconstructed from history, so those start from zero.
+func (dm *DefenseManager) backfillHourlyStats() {
+	var existing int64
+	if err := dm.db.Model(&model.SecurityHourlyStat{}).Count(&existing).Error; err != nil || existing > 0 {
+		return
+	}
+
+	type bucketRow struct {
+		Bucket string
+		Count  int64
+	}
+	var rows []bucketRow
+	// created_at is stored as "YYYY-MM-DD HH:MM:SS...+08:00"; substr() avoids
+	// depending on SQLite's date parser accepting the full layout.
+	if err := dm.db.Raw(`
+		SELECT substr(created_at, 1, 10) || 'T' || substr(created_at, 12, 2) AS bucket,
+		       COUNT(*) AS count
+		FROM security_events
+		WHERE type = 'auth_fail' AND created_at >= ?
+		GROUP BY bucket
+	`, time.Now().AddDate(0, 0, -2)).Scan(&rows).Error; err != nil {
+		return
+	}
+
+	now := time.Now()
+	for _, r := range rows {
+		dm.db.Exec(`
+			INSERT INTO security_hourly_stats (bucket, auth_fails, blocked, updated_at)
+			VALUES (?, ?, 0, ?)
+			ON CONFLICT(bucket) DO UPDATE SET auth_fails = excluded.auth_fails, updated_at = excluded.updated_at
+		`, r.Bucket, r.Count, now)
+	}
+	log.Printf("security: backfilled %d hourly bucket(s) from historical security_events", len(rows))
+}
+
+// hourBucketKey renders the canonical hourly bucket identifier.
+func hourBucketKey(t time.Time) string { return t.Format("2006-01-02T15") }
+
+// bumpHourly buffers one counter increment for the given hour.
+func (dm *DefenseManager) bumpHourly(now time.Time, blocked bool) {
+	dm.hourlyMu.Lock()
+	key := hourBucketKey(now)
+	d := dm.hourlyStat[key]
+	if d == nil {
+		d = &hourlyDelta{}
+		dm.hourlyStat[key] = d
+	}
+	if blocked {
+		d.Blocked++
+	} else {
+		d.AuthFails++
+	}
+	dm.hourlyMu.Unlock()
+}
+
+// flushHourly moves buffered counters into SQLite. Called by the janitor.
+func (dm *DefenseManager) flushHourly() {
+	if dm.db == nil {
+		return
+	}
+
+	dm.hourlyMu.Lock()
+	pending := dm.hourlyStat
+	dm.hourlyStat = make(map[string]*hourlyDelta)
+	dm.hourlyMu.Unlock()
+
+	now := time.Now()
+	for key, d := range pending {
+		if err := dm.db.Exec(`
+			INSERT INTO security_hourly_stats (bucket, auth_fails, blocked, updated_at)
+			VALUES (?, ?, ?, ?)
+			ON CONFLICT(bucket) DO UPDATE SET
+				auth_fails = auth_fails + excluded.auth_fails,
+				blocked    = blocked + excluded.blocked,
+				updated_at = excluded.updated_at
+		`, key, d.AuthFails, d.Blocked, now).Error; err != nil {
+			log.Printf("security: failed to flush hourly stats for %s: %v", key, err)
+		}
 	}
 }
 
@@ -266,57 +378,68 @@ func (dm *DefenseManager) IsBanned(ip string) (bool, BanEntry) {
 		e.LastHitAt = utils.NullTime{Time: now, Valid: true}
 		dm.banned[ip] = e
 	}
-	dm.recordHitBucket(now)
 	dm.mu.Unlock()
+
+	// This is a genuine enforcement event: the IP was already banned and its
+	// request has just been rejected. It goes into the "blocked" series, never
+	// into the "auth_fails" (detection) series.
+	dm.bumpHourly(now, true)
 
 	return true, entry
 }
 
-func (dm *DefenseManager) recordHitBucket(now time.Time) {
-	hourIdx := now.Hour()
-	if dm.lastHourTime.IsZero() {
-		dm.lastHourTime = now
-		dm.lastHourIdx = hourIdx
-	} else if hourIdx != dm.lastHourIdx {
-		dm.lastHourIdx = hourIdx
-		dm.hourlyHits[hourIdx] = 0
-		dm.lastHourTime = now
+// get24hSeries returns two independent 24-bucket series aligned so that the
+// last bucket is the current hour:
+//
+//	authFails -> detections (a failed authentication was observed)
+//	blocked   -> enforcements (a request was rejected because the IP was
+//	             already on the blocklist)
+//
+// Historical buckets come from security_hourly_stats; the current hour is
+// topped up with whatever is still buffered in memory.
+func (dm *DefenseManager) get24hSeries(now time.Time) (authFails, blocked []int64) {
+	authFails = make([]int64, 24)
+	blocked = make([]int64, 24)
+
+	// Window start = the beginning of the hour 23 hours ago.
+	base := now.Add(-23 * time.Hour)
+	windowStart := time.Date(base.Year(), base.Month(), base.Day(), base.Hour(), 0, 0, 0, base.Location())
+
+	indexOf := func(t time.Time) int {
+		return int(t.Sub(windowStart) / time.Hour)
 	}
-	dm.hourlyHits[hourIdx]++
-}
 
-func (dm *DefenseManager) get24hHits(now time.Time) []int64 {
-	buckets := make([]int64, 24)
-	if dm.db == nil {
-		return buckets
-	}
-
-	twentyFourHoursAgo := now.Add(-23 * time.Hour)
-	windowStart := time.Date(twentyFourHoursAgo.Year(), twentyFourHoursAgo.Month(), twentyFourHoursAgo.Day(), twentyFourHoursAgo.Hour(), 0, 0, 0, twentyFourHoursAgo.Location())
-
-	type eventTime struct {
-		CreatedAt time.Time
-	}
-	var evs []eventTime
-	_ = dm.db.Model(&model.SecurityEvent{}).
-		Select("created_at").
-		Where("created_at >= ? AND type IN ('auth_fail', 'manual_ban')", windowStart).
-		Find(&evs)
-
-	for _, ev := range evs {
-		diffHours := int(ev.CreatedAt.Sub(windowStart).Hours())
-		if diffHours >= 0 && diffHours < 24 {
-			buckets[diffHours]++
+	if dm.db != nil {
+		var rows []model.SecurityHourlyStat
+		if err := dm.db.Where("bucket >= ?", hourBucketKey(windowStart)).Find(&rows).Error; err == nil {
+			for _, r := range rows {
+				t, err := time.ParseInLocation("2006-01-02T15", r.Bucket, now.Location())
+				if err != nil {
+					continue
+				}
+				if i := indexOf(t); i >= 0 && i < 24 {
+					authFails[i] += r.AuthFails
+					blocked[i] += r.Blocked
+				}
+			}
 		}
 	}
 
-	// Also add in-memory live hits for the current hour
-	dm.mu.RLock()
-	currentHourHits := dm.hourlyHits[now.Hour()]
-	dm.mu.RUnlock()
-	buckets[23] += currentHourHits
+	// Merge counters that have not been flushed yet.
+	dm.hourlyMu.Lock()
+	for key, d := range dm.hourlyStat {
+		t, err := time.ParseInLocation("2006-01-02T15", key, now.Location())
+		if err != nil {
+			continue
+		}
+		if i := indexOf(t); i >= 0 && i < 24 {
+			authFails[i] += d.AuthFails
+			blocked[i] += d.Blocked
+		}
+	}
+	dm.hourlyMu.Unlock()
 
-	return buckets
+	return authFails, blocked
 }
 
 // calculateEscalatedBan calculates the ban duration and escalation level for an IP based on past violations.
@@ -351,13 +474,18 @@ func (dm *DefenseManager) calculateEscalatedBan(ip string) (duration time.Durati
 
 // RecordAuthFailure tallies authentication/API failures per IP, triggering ban & alert if threshold met.
 func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
-	// If the IP is already banned, do not accumulate failures or trigger repeated ban alerts
+	// If the IP is already banned, this is not a new detection — it is an
+	// enforcement hit (the request is being rejected by the blocklist).
+	// IsBanned() credits it to the "blocked" series for us.
 	if banned, _ := dm.IsBanned(ip); banned {
 		return
 	}
 
 	now := time.Now()
 	isWhite := dm.IsWhitelisted(ip)
+
+	// Detection counter: a failed authentication has been observed.
+	dm.bumpHourly(now, false)
 
 	dm.mu.Lock()
 	attempt, ok := dm.failures[ip]
@@ -659,13 +787,12 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 			Reason:        fa.Reason,
 		})
 	}
-	blocked24h := dm.get24hHits(now)
+	authFails24h, blocked24h := dm.get24hSeries(now)
 	dm.mu.RUnlock()
-
-	// 2. Database aggregates (today bans, 7d bans, total threats, top attackers, event breakdown)
+	// 2. Database aggregates (today bans, 7d bans, total detections, top attackers, event breakdown)
 	var bansToday int64
 	var bans7d int64
-	var totalThreats int64
+	var totalAuthFailures int64
 	var lastEventAt *time.Time
 	byType := make(map[string]int64)
 	topAttackers := make([]TopAttacker, 0)
@@ -676,7 +803,15 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 
 		dm.db.Model(&model.SecurityEvent{}).Where("type IN ('auth_fail', 'manual_ban') AND created_at >= ?", startOfDay).Count(&bansToday)
 		dm.db.Model(&model.SecurityEvent{}).Where("type IN ('auth_fail', 'manual_ban') AND created_at >= ?", sevenDaysAgo).Count(&bans7d)
-		dm.db.Model(&model.SecurityEvent{}).Where("type IN ('auth_fail', 'manual_ban')").Count(&totalThreats)
+
+		// Detection total = every observed failed authentication. Sourced from the
+		// per-hour counters (which increment once per failure) rather than from
+		// security_events, because that table only stores ONE row per threshold
+		// trip — it cannot represent the individual attempts.
+		var persistedAuthFails int64
+		dm.db.Model(&model.SecurityHourlyStat{}).
+			Select("COALESCE(SUM(auth_fails), 0)").Scan(&persistedAuthFails)
+		totalAuthFailures = persistedAuthFails
 
 		// Top attackers aggregated from security_events for real attack attempts
 		type topAgg struct {
@@ -749,23 +884,34 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 		}
 	}
 
-	// 3. Combined whitelist strings
+	// 3. Fold in detection counters that the janitor has not flushed yet.
+	dm.hourlyMu.Lock()
+	for _, d := range dm.hourlyStat {
+		totalAuthFailures += d.AuthFails
+	}
+	dm.hourlyMu.Unlock()
+
+	// 4. Combined whitelist strings
 	allWhitelist := make([]string, 0, len(dm.cfg.WhitelistIPs)+len(dm.dynamicWL))
 	allWhitelist = append(allWhitelist, dm.cfg.WhitelistIPs...)
 	allWhitelist = append(allWhitelist, dm.dynamicWL...)
 
 	return DefenseOverview{
 		TotalBannedCount: len(bannedList),
-		TotalBlockedHits: totalThreats + atomic.LoadInt64(&dm.blockedHits),
-		ActiveBans:       bannedList,
-		SMTPEnabled:      smtpCfg.Enabled,
-		Recipient:        smtpCfg.Recipient,
-		PendingAttempts:  pending,
-		BansToday:        bansToday,
-		Bans7d:           bans7d,
-		BlockedHits24h:   blocked24h,
-		TopAttackers:     topAttackers,
-		ByType:           byType,
+		// Enforcement only: requests rejected *because* the source IP was
+		// already blocklisted. Detection counts are reported separately below.
+		TotalBlockedHits:  atomic.LoadInt64(&dm.blockedHits),
+		TotalAuthFailures: totalAuthFailures,
+		ActiveBans:        bannedList,
+		SMTPEnabled:       smtpCfg.Enabled,
+		Recipient:         smtpCfg.Recipient,
+		PendingAttempts:   pending,
+		BansToday:         bansToday,
+		Bans7d:            bans7d,
+		AuthFails24h:      authFails24h,
+		BlockedHits24h:    blocked24h,
+		TopAttackers:      topAttackers,
+		ByType:            byType,
 		Config: DefenseConfigSummary{
 			MaxAuthFailures:   dm.cfg.MaxAuthFailures,
 			FailureWindowMins: dm.cfg.FailureWindowMins,
@@ -965,6 +1111,13 @@ func (dm *DefenseManager) janitorLoop() {
 					})
 				}
 			}
+
+			// 5. Persist buffered per-hour detection / enforcement counters.
+			dm.flushHourly()
+
+			// 6. Drop hourly buckets older than the retention window.
+			dm.db.Where("bucket < ?", hourBucketKey(now.AddDate(0, 0, -90))).
+				Delete(&model.SecurityHourlyStat{})
 		}
 	}
 }
