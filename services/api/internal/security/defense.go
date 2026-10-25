@@ -286,12 +286,36 @@ func (dm *DefenseManager) recordHitBucket(now time.Time) {
 }
 
 func (dm *DefenseManager) get24hHits(now time.Time) []int64 {
-	currentHour := now.Hour()
 	buckets := make([]int64, 24)
-	for i := 0; i < 24; i++ {
-		h := (currentHour - 23 + i + 24) % 24
-		buckets[i] = dm.hourlyHits[h]
+	if dm.db == nil {
+		return buckets
 	}
+
+	twentyFourHoursAgo := now.Add(-23 * time.Hour)
+	windowStart := time.Date(twentyFourHoursAgo.Year(), twentyFourHoursAgo.Month(), twentyFourHoursAgo.Day(), twentyFourHoursAgo.Hour(), 0, 0, 0, twentyFourHoursAgo.Location())
+
+	type eventTime struct {
+		CreatedAt time.Time
+	}
+	var evs []eventTime
+	_ = dm.db.Model(&model.SecurityEvent{}).
+		Select("created_at").
+		Where("created_at >= ? AND type IN ('auth_fail', 'manual_ban')", windowStart).
+		Find(&evs)
+
+	for _, ev := range evs {
+		diffHours := int(ev.CreatedAt.Sub(windowStart).Hours())
+		if diffHours >= 0 && diffHours < 24 {
+			buckets[diffHours]++
+		}
+	}
+
+	// Also add in-memory live hits for the current hour
+	dm.mu.RLock()
+	currentHourHits := dm.hourlyHits[now.Hour()]
+	dm.mu.RUnlock()
+	buckets[23] += currentHourHits
+
 	return buckets
 }
 
@@ -638,9 +662,10 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 	blocked24h := dm.get24hHits(now)
 	dm.mu.RUnlock()
 
-	// 2. Database aggregates (today bans, 7d bans, top attackers, event breakdown)
+	// 2. Database aggregates (today bans, 7d bans, total threats, top attackers, event breakdown)
 	var bansToday int64
 	var bans7d int64
+	var totalThreats int64
 	var lastEventAt *time.Time
 	byType := make(map[string]int64)
 	topAttackers := make([]TopAttacker, 0)
@@ -651,17 +676,55 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 
 		dm.db.Model(&model.SecurityEvent{}).Where("type IN ('auth_fail', 'manual_ban') AND created_at >= ?", startOfDay).Count(&bansToday)
 		dm.db.Model(&model.SecurityEvent{}).Where("type IN ('auth_fail', 'manual_ban') AND created_at >= ?", sevenDaysAgo).Count(&bans7d)
+		dm.db.Model(&model.SecurityEvent{}).Where("type IN ('auth_fail', 'manual_ban')").Count(&totalThreats)
 
-		// Top attackers
-		var topBans []model.IPBan
-		dm.db.Model(&model.IPBan{}).Order("hit_count DESC, banned_at DESC").Limit(5).Find(&topBans)
-		for _, tb := range topBans {
+		// Top attackers aggregated from security_events for real attack attempts
+		type topAgg struct {
+			IP       string
+			Hits     int64
+			LastSeen string
+			Detail   string
+		}
+		var taggs []topAgg
+		dm.db.Model(&model.SecurityEvent{}).
+			Select("ip, count(*) as hits, max(created_at) as last_seen, max(detail) as detail").
+			Where("type = 'auth_fail' AND ip != '' AND ip NOT IN ('127.0.0.1', '::1')").
+			Group("ip").
+			Order("hits DESC").
+			Limit(5).
+			Scan(&taggs)
+
+		for _, ta := range taggs {
+			var t time.Time
+			if ta.LastSeen != "" {
+				t, _ = time.Parse(time.RFC3339Nano, ta.LastSeen)
+				if t.IsZero() {
+					t, _ = time.Parse("2006-01-02 15:04:05.999999999-07:00", ta.LastSeen)
+				}
+				if t.IsZero() {
+					t, _ = time.Parse("2006-01-02 15:04:05", ta.LastSeen)
+				}
+			}
 			topAttackers = append(topAttackers, TopAttacker{
-				IP:        tb.IP,
-				Hits:      tb.HitCount,
-				LastHitAt: tb.LastHitAt,
-				Reason:    tb.Reason,
+				IP:        ta.IP,
+				Hits:      ta.Hits,
+				LastHitAt: utils.NullTime{Time: t, Valid: !t.IsZero()},
+				Reason:    fmt.Sprintf("累计触发 %d 次暴力破解告警", ta.Hits),
 			})
+		}
+
+		// Fallback to ip_bans if security_events has no auth_fail records
+		if len(topAttackers) == 0 {
+			var topBans []model.IPBan
+			dm.db.Model(&model.IPBan{}).Order("hit_count DESC, banned_at DESC").Limit(5).Find(&topBans)
+			for _, tb := range topBans {
+				topAttackers = append(topAttackers, TopAttacker{
+					IP:        tb.IP,
+					Hits:      tb.HitCount,
+					LastHitAt: tb.LastHitAt,
+					Reason:    tb.Reason,
+				})
+			}
 		}
 
 		// By type breakdown (past 7 days)
@@ -693,7 +756,7 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 
 	return DefenseOverview{
 		TotalBannedCount: len(bannedList),
-		TotalBlockedHits: atomic.LoadInt64(&dm.blockedHits),
+		TotalBlockedHits: totalThreats + atomic.LoadInt64(&dm.blockedHits),
 		ActiveBans:       bannedList,
 		SMTPEnabled:      smtpCfg.Enabled,
 		Recipient:        smtpCfg.Recipient,

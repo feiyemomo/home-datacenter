@@ -113,6 +113,9 @@ export default function Security() {
     const [hostLogData, setHostLogData] = useState<HostLogStatusResponse | null>(null);
     const [hostLogLoading, setHostLogLoading] = useState(false);
 
+    // 24h Trend Chart hover point
+    const [hoveredPoint, setHoveredPoint] = useState<{ hour: string; hits: number; x: number; y: number; index: number } | null>(null);
+
     // Config form state
     const [cfgFailures, setCfgFailures] = useState(5);
     const [cfgWindow, setCfgWindow] = useState(5);
@@ -257,6 +260,56 @@ export default function Security() {
         if (eventFilterType === "all") return events;
         return events.filter((e) => e.type === eventFilterType);
     }, [events, eventFilterType]);
+
+    // 24h Trend Chart calculations (Smooth Line & Gradient Area)
+    const raw24hData = useMemo(() => {
+        return overview?.blocked_hits_24h ?? Array(24).fill(0);
+    }, [overview?.blocked_hits_24h]);
+
+    const maxHits = useMemo(() => {
+        return Math.max(1, ...raw24hData);
+    }, [raw24hData]);
+
+    const totalHits24h = useMemo(() => {
+        return raw24hData.reduce((a, b) => a + b, 0);
+    }, [raw24hData]);
+
+    const peakIndex = useMemo(() => {
+        return raw24hData.reduce((maxI, val, i, arr) => (val > arr[maxI] ? i : maxI), 0);
+    }, [raw24hData]);
+
+    const peakHits = raw24hData[peakIndex] || 0;
+    const currentHour = new Date().getHours();
+
+    const chartPoints = useMemo(() => {
+        const svgW = 600;
+        const svgH = 120;
+        const padX = 20;
+        const padTop = 15;
+        const padBottom = 20;
+        const drawW = svgW - padX * 2;
+        const drawH = svgH - padTop - padBottom;
+
+        return raw24hData.map((hits, i) => {
+            const x = padX + (i / 23) * drawW;
+            const y = padTop + drawH - (hits / maxHits) * drawH;
+            const hour = `${(currentHour - 23 + i + 24) % 24}:00`;
+            return { x, y, hits, hour, index: i };
+        });
+    }, [raw24hData, maxHits, currentHour]);
+
+    const svgLinePath = useMemo(() => {
+        if (chartPoints.length === 0) return "";
+        return chartPoints.map((p, i) => `${i === 0 ? "M" : "L"} ${p.x.toFixed(1)} ${p.y.toFixed(1)}`).join(" ");
+    }, [chartPoints]);
+
+    const svgAreaPath = useMemo(() => {
+        if (chartPoints.length === 0) return "";
+        const baseline = 100; // 120 - 20 padBottom
+        const first = chartPoints[0];
+        const last = chartPoints[chartPoints.length - 1];
+        return `${svgLinePath} L ${last.x.toFixed(1)} ${baseline} L ${first.x.toFixed(1)} ${baseline} Z`;
+    }, [chartPoints, svgLinePath]);
 
     const handleUpgradeToPermanent = async (ip: string) => {
         try {
@@ -717,50 +770,137 @@ export default function Security() {
                         <div>
                             <CardTitle className="text-xs font-semibold flex items-center gap-1.5">
                                 <TrendingUp size={15} className="text-primary" />
-                                <span>24 小时阻断走势与攻击峰值</span>
+                                <span>24 小时阻断走势与攻击峰值 (折线趋势图)</span>
                             </CardTitle>
                             <CardDescription className="text-[11px] mt-0.5">
-                                过去 24 小时每个时间段的拦截阻断分布（近 24 小时活跃度）
+                                过去 24 小时阻断与攻击波次走势（小时级采样）
                             </CardDescription>
                         </div>
-                        <Badge variant="outline" className="text-[10px] text-fg-muted">
-                            共计 24 小时数据
-                        </Badge>
+                        <div className="flex items-center gap-2">
+                            {peakHits > 0 && (
+                                <Badge variant="outline" className="text-[10px] border-rose-500/40 text-rose-500 bg-rose-500/10">
+                                    峰值: {peakHits} 次 ({(currentHour - 23 + peakIndex + 24) % 24}:00)
+                                </Badge>
+                            )}
+                            <Badge variant="outline" className="text-[10px] text-fg-muted">
+                                近24h拦截: {totalHits24h} 次
+                            </Badge>
+                        </div>
                     </CardHeader>
                     <CardContent className="pt-2">
-                        {/* 24 bars chart */}
-                        <div className="h-28 flex items-end gap-1.5 pt-4 pb-1 border-b border-[rgb(var(--border)/0.2)]">
-                            {(overview?.blocked_hits_24h ?? Array(24).fill(0)).map((hits, idx) => {
-                                const maxHits = Math.max(1, ...(overview?.blocked_hits_24h ?? [1]));
-                                const heightPercent = Math.max(8, Math.round((hits / maxHits) * 100));
-                                const hourLabel = `${(new Date().getHours() - 23 + idx + 24) % 24}:00`;
-                                return (
-                                    <div
-                                        key={idx}
-                                        className="flex-1 flex flex-col items-center group relative h-full justify-end"
-                                    >
-                                        {/* Tooltip on hover */}
-                                        <div className="absolute -top-7 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity bg-bg-surface/90 text-fg text-[10px] py-0.5 px-1.5 rounded shadow pointer-events-none whitespace-nowrap z-10 border border-[rgb(var(--border)/0.4)] font-mono">
-                                            {hourLabel}: {hits} 次阻断
-                                        </div>
-                                        <div
-                                            style={{ height: `${heightPercent}%` }}
-                                            className={cn(
-                                                "w-full rounded-t transition-all",
-                                                hits === 0
-                                                    ? "bg-[rgb(var(--bg-subtle)/0.5)]"
-                                                    : hits > 10
-                                                    ? "bg-rose-500 shadow-sm shadow-rose-500/30"
-                                                    : "bg-primary/70 hover:bg-primary",
+                        {/* SVG Line & Area Trend Chart */}
+                        <div className="relative h-28 w-full border-b border-[rgb(var(--border)/0.2)]">
+                            <svg viewBox="0 0 600 120" preserveAspectRatio="none" className="w-full h-full overflow-visible">
+                                <defs>
+                                    <linearGradient id="trendAreaGradient" x1="0" y1="0" x2="0" y2="1">
+                                        <stop offset="0%" stopColor="#f43f5e" stopOpacity="0.35" />
+                                        <stop offset="100%" stopColor="#f43f5e" stopOpacity="0.0" />
+                                    </linearGradient>
+                                </defs>
+
+                                {/* Background horizontal guide grid lines */}
+                                <line x1="20" y1="20" x2="580" y2="20" stroke="rgba(255,255,255,0.08)" strokeDasharray="3 3" />
+                                <line x1="20" y1="60" x2="580" y2="60" stroke="rgba(255,255,255,0.08)" strokeDasharray="3 3" />
+                                <line x1="20" y1="100" x2="580" y2="100" stroke="rgba(255,255,255,0.15)" />
+
+                                {/* Area fill under curve */}
+                                {svgAreaPath && (
+                                    <path d={svgAreaPath} fill="url(#trendAreaGradient)" />
+                                )}
+
+                                {/* Main trend polyline */}
+                                {svgLinePath && (
+                                    <path
+                                        d={svgLinePath}
+                                        fill="none"
+                                        stroke="#f43f5e"
+                                        strokeWidth="2.5"
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                    />
+                                )}
+
+                                {/* Data dots */}
+                                {chartPoints.map((p) => {
+                                    if (p.hits === 0) return null;
+                                    const isPeak = p.index === peakIndex && peakHits > 0;
+                                    return (
+                                        <g key={p.index}>
+                                            {isPeak && (
+                                                <circle cx={p.x} cy={p.y} r="7" fill="#f43f5e" opacity="0.3" className="animate-ping" />
                                             )}
+                                            <circle
+                                                cx={p.x}
+                                                cy={p.y}
+                                                r={isPeak ? "4" : "3"}
+                                                fill={isPeak ? "#f43f5e" : "#fb7185"}
+                                                stroke="#18181b"
+                                                strokeWidth="1.5"
+                                            />
+                                        </g>
+                                    );
+                                })}
+
+                                {/* Invisible interactive hit columns for hover tooltip */}
+                                {chartPoints.map((p) => (
+                                    <rect
+                                        key={`hit-${p.index}`}
+                                        x={p.x - 12}
+                                        y="0"
+                                        width="24"
+                                        height="120"
+                                        fill="transparent"
+                                        className="cursor-pointer"
+                                        onMouseEnter={() => setHoveredPoint(p)}
+                                        onMouseLeave={() => setHoveredPoint(null)}
+                                    />
+                                ))}
+
+                                {/* Hover indicator vertical bar & tooltip */}
+                                {hoveredPoint && (
+                                    <g>
+                                        <line
+                                            x1={hoveredPoint.x}
+                                            y1="10"
+                                            x2={hoveredPoint.x}
+                                            y2="100"
+                                            stroke="#f43f5e"
+                                            strokeWidth="1"
+                                            strokeDasharray="2 2"
                                         />
-                                    </div>
-                                );
-                            })}
+                                        <circle
+                                            cx={hoveredPoint.x}
+                                            cy={hoveredPoint.y}
+                                            r="4"
+                                            fill="#ffffff"
+                                            stroke="#f43f5e"
+                                            strokeWidth="2"
+                                        />
+                                    </g>
+                                )}
+                            </svg>
+
+                            {/* Floating hover badge */}
+                            {hoveredPoint && (
+                                <div
+                                    style={{
+                                        left: `${(hoveredPoint.index / 23) * 100}%`,
+                                        top: "-10px",
+                                    }}
+                                    className="absolute -translate-x-1/2 -translate-y-full pointer-events-none z-20 rounded-md bg-bg-surface/95 px-2 py-1 text-[11px] font-mono text-fg shadow-lg border border-[rgb(var(--border)/0.5)] whitespace-nowrap"
+                                >
+                                    <div className="font-semibold text-rose-500">{hoveredPoint.hour}</div>
+                                    <div className="text-[10px] text-fg-muted">{hoveredPoint.hits} 次阻断拦截</div>
+                                </div>
+                            )}
                         </div>
-                        <div className="flex justify-between items-center text-[10px] text-fg-muted mt-1.5 font-mono">
+
+                        {/* X-Axis Time Ticks */}
+                        <div className="flex justify-between items-center text-[10px] text-fg-muted mt-2 font-mono">
                             <span>24 小时前</span>
+                            <span>18 小时前</span>
                             <span>12 小时前</span>
+                            <span>6 小时前</span>
                             <span>当前</span>
                         </div>
                     </CardContent>
