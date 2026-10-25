@@ -22,7 +22,7 @@ logger = logging.getLogger("keepalive")
 
 H3C_USERNAME = os.environ.get("H3C_USERNAME", "momo324")
 H3C_PASSWORD = os.environ.get("H3C_PASSWORD", "")
-H3C_APP_NAMES = [a.strip() for a in os.environ.get("H3C_APP_NAMES", os.environ.get("H3C_APP_NAME", "home,webrtc_test,nas_ssh")).split(",") if a.strip()]
+H3C_APP_NAMES = [a.strip() for a in os.environ.get("H3C_APP_NAMES", os.environ.get("H3C_APP_NAME", "home,webrtc_test")).split(",") if a.strip()]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 MIN_REMAINING_MINUTES = int(os.environ.get("MIN_REMAINING_MINUTES", "25"))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8087"))

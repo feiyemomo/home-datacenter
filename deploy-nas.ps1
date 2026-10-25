@@ -215,14 +215,14 @@ $BuildFlag = if ($NoBuild) { "" } else { "--build" }
 # web/dist/ web/tsconfig.tsbuildinfo — web build cache
 $Excludes = @(
     "./data", "./.git", "./build-host",
-    "./web/node_modules", "./web/dist",
+    "./web/node_modules", "./web/dist", "./web/.npm-cache",
     "./.env", "./.env.local",
     "./.token.txt", "./sdp_offer.txt",
     "./.vscode", "./.idea",
     ".DS_Store", "Thumbs.db",
     "*.log", "log_*.txt",
     "./read_db.py", "__pycache__",
-    "*.exe", "./services/api/server",
+    "*.exe", "./services/api/server", "./services/api/server_linux",
     "./web/tsconfig.tsbuildinfo", "./web/tsconfig.node.tsbuildinfo",
     # Developer local overrides must never overwrite NAS production configs.
     "./services/api/configs/config.local.yaml",

@@ -327,6 +327,11 @@ func (dm *DefenseManager) calculateEscalatedBan(ip string) (duration time.Durati
 
 // RecordAuthFailure tallies authentication/API failures per IP, triggering ban & alert if threshold met.
 func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
+	// If the IP is already banned, do not accumulate failures or trigger repeated ban alerts
+	if banned, _ := dm.IsBanned(ip); banned {
+		return
+	}
+
 	now := time.Now()
 	isWhite := dm.IsWhitelisted(ip)
 
@@ -369,6 +374,11 @@ func (dm *DefenseManager) RecordAuthFailure(ip, reason, userAgent string) {
 			dm.mu.Unlock()
 
 			if parsed := net.ParseIP(strings.TrimSpace(ip)); parsed != nil && parsed.IsLoopback() {
+				return
+			}
+
+			// Throttle gateway warning alerts so we don't spam EventBus or database
+			if !dm.shouldSendAlert(ip) {
 				return
 			}
 

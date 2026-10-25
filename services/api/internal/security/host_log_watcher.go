@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -61,12 +62,18 @@ func NewHostLogWatcher(dm *DefenseManager, logPath, exportPath string) *HostLogW
 		exportPath = "/data/security/blocked_ips.txt"
 	}
 
+	var initialOffset int64
+	if fi, err := os.Stat(logPath); err == nil {
+		initialOffset = fi.Size()
+	}
+
 	hw := &HostLogWatcher{
 		dm:            dm,
 		logPath:       logPath,
 		exportPath:    exportPath,
 		maxEntries:    100,
 		recentEntries: make([]HostAuthLogEntry, 0, 100),
+		lastOffset:    initialOffset,
 		stopChan:      make(chan struct{}),
 	}
 
@@ -225,16 +232,25 @@ func (hw *HostLogWatcher) handleAuthEntry(entry HostAuthLogEntry) {
 		return
 	}
 
+	ipStr := strings.TrimSpace(entry.IP)
+	parsedIP := net.ParseIP(ipStr)
+	if parsedIP == nil || parsedIP.IsLoopback() {
+		return
+	}
+
 	switch entry.Status {
 	case "failed", "invalid_user":
+		// If already banned, don't re-trigger failure accumulation / alert storms
+		if banned, _ := hw.dm.IsBanned(ipStr); banned {
+			return
+		}
 		reason := fmt.Sprintf("NAS 宿主机 SSH 爆破探测 (目标用户: %s)", entry.User)
-		hw.dm.RecordAuthFailure(entry.IP, reason, "OpenSSH-Host")
-		// Update exported rules whenever new failure might cause a ban
+		hw.dm.RecordAuthFailure(ipStr, reason, "OpenSSH-Host")
 		hw.ExportFirewallRules()
 
 	case "accepted":
 		action := fmt.Sprintf("NAS 宿主机 SSH 登录成功 (用户: %s, 端口: %s)", entry.User, entry.Port)
-		hw.dm.RecordOperatorEvent(entry.User, entry.IP, "host_ssh_login", action, "宿主操作系统安全审计")
+		hw.dm.RecordOperatorEvent(entry.User, ipStr, "host_ssh_login", action, "宿主操作系统安全审计")
 	}
 }
 

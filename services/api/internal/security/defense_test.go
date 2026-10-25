@@ -236,9 +236,12 @@ func TestDefenseManager_ProgressiveBanAndPrune(t *testing.T) {
 		t.Fatalf("expected 1st offense to be temporary ban")
 	}
 
-	// 2nd offense simulation -> 6 hours
+	// Simulate ban expired / unbanned, then 2nd offense
+	dm.ManualUnban("admin", testIP)
 	dm.RecordAuthFailure(testIP, "fail 3", "curl/7.0")
 	dm.RecordAuthFailure(testIP, "fail 4", "curl/7.0")
+
+	// Verify 3rd offense calculation
 	dur, perm, count := dm.calculateEscalatedBan(testIP)
 	if count != 3 || dur != 24*time.Hour || perm {
 		t.Fatalf("expected 3rd offense calculation, got count=%d dur=%v perm=%v", count, dur, perm)

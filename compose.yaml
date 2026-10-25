@@ -655,7 +655,7 @@ services:
       - H3C_USERNAME=${H3C_USERNAME}
       - H3C_PASSWORD=${H3C_PASSWORD}
       - H3C_APP_NAME=${H3C_APP_NAME:-home}
-      - H3C_APP_NAMES=${H3C_APP_NAMES:-home,webrtc_test,nas_ssh}
+      - H3C_APP_NAMES=${H3C_APP_NAMES:-home,webrtc_test}
       - FRIGATE_URL=http://home-frigate:5000
       - CHECK_INTERVAL=60
       - MIN_REMAINING_MINUTES=25
