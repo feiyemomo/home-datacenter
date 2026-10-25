@@ -164,9 +164,10 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 // are treated as normal for pruning.
 func (s *Subscriber) pruneSystemLogs() {
 	caps := map[string]int64{
-		model.LevelNormal:  500,
-		model.LevelInfo:    200,
-		model.LevelWarning: 200,
+		model.LevelCritical: 1000,
+		model.LevelNormal:   500,
+		model.LevelInfo:     200,
+		model.LevelWarning:  200,
 	}
 	for level, keep := range caps {
 		var count int64

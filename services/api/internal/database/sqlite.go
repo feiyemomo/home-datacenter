@@ -38,6 +38,16 @@ func InitDB(dbPath string) {
 		log.Fatalf("failed to connect sqlite: %v", err)
 	}
 
+	if sqlDB, err := db.DB(); err == nil {
+		sqlDB.SetMaxOpenConns(1) // Single-writer SQLite architecture prevents database locking
+		_, _ = sqlDB.Exec("PRAGMA journal_mode = WAL;")
+		_, _ = sqlDB.Exec("PRAGMA synchronous = NORMAL;")
+		_, _ = sqlDB.Exec("PRAGMA busy_timeout = 5000;")
+		_, _ = sqlDB.Exec("PRAGMA cache_size = -64000;")   // 64MB RAM page cache
+		_, _ = sqlDB.Exec("PRAGMA mmap_size = 268435456;") // 256MB memory-mapped reads
+		_, _ = sqlDB.Exec("PRAGMA temp_store = MEMORY;")   // in-memory temp tables / sort
+	}
+
 	err = db.AutoMigrate(
 		&model.User{},
 		&model.Device{},
@@ -54,6 +64,8 @@ func InitDB(dbPath string) {
 	if err != nil {
 		log.Fatalf("failed to migrate database: %v", err)
 	}
+
+	optimizeIndexes(db)
 
 	// One-shot backfill: cameras that were registered before the
 	// onvif_profile_token column was added had the value stored
@@ -223,3 +235,16 @@ func backfillSystemLogLevel(db *gorm.DB) error {
 
 	return nil
 }
+
+func optimizeIndexes(db *gorm.DB) {
+	indexes := []string{
+		"CREATE INDEX IF NOT EXISTS idx_security_events_type_created ON security_events(type, created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_security_events_ip_type_created ON security_events(ip, type, created_at);",
+		"CREATE INDEX IF NOT EXISTS idx_system_logs_level_ts ON system_logs(level, ts, id);",
+		"CREATE INDEX IF NOT EXISTS idx_system_logs_type_ts ON system_logs(event_type, ts, id);",
+	}
+	for _, sql := range indexes {
+		_ = db.Exec(sql).Error
+	}
+}
+
