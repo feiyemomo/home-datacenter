@@ -17,7 +17,8 @@ import (
 )
 
 // BoostSpeakerVolume attempts to set the hardware speaker volume of a
-// Hikvision or compatible ISAPI camera to 100% (maximum hardware amplifier gain).
+// Hikvision or compatible ISAPI camera to 80% (optimal acoustic balance
+// preventing distortion and local microphone acoustic feedback loop).
 func BoostSpeakerVolume(ctx context.Context, host string, port int, user, pass string) {
 	if host == "" || user == "" {
 		return
@@ -32,11 +33,11 @@ func BoostSpeakerVolume(ctx context.Context, host string, port int, user, pass s
 	}{
 		{
 			path: "/ISAPI/System/TwoWayAudio/channels/1",
-			body: `<TwoWayAudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><speakerVolume>100</speakerVolume></TwoWayAudioChannel>`,
+			body: `<TwoWayAudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><speakerVolume>80</speakerVolume></TwoWayAudioChannel>`,
 		},
 		{
 			path: "/ISAPI/System/Audio/channels/1",
-			body: `<AudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><audioOutputVolume>100</audioOutputVolume></AudioChannel>`,
+			body: `<AudioChannel xmlns="http://www.hikvision.com/ver20/XMLSchema" version="2.0"><id>1</id><audioOutputVolume>80</audioOutputVolume></AudioChannel>`,
 		},
 	}
 

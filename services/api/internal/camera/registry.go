@@ -818,6 +818,9 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
 			detectEnabled = false
 		}
+		if mgr := GetGlobalAIAlertSourceManager(""); mgr != nil && mgr.GetSource() == AISourceCamera {
+			detectEnabled = false
+		}
 		recordOutputArgs := RecordOutputArgsFor(cameraHasAudio(&c))
 		frigateCams = append(frigateCams, FrigateCameraConfig{
 			Name:    slug,
@@ -1544,6 +1547,9 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 		detectEnabled := camEnabled
 		var sec model.SecurityState
 		if r.DB != nil && r.DB.First(&sec).Error == nil && sec.Mode == model.GuardModeDisarmed {
+			detectEnabled = false
+		}
+		if mgr := GetGlobalAIAlertSourceManager(""); mgr != nil && mgr.GetSource() == AISourceCamera {
 			detectEnabled = false
 		}
 		recordOutputArgs := RecordOutputArgsFor(cameraHasAudio(&c))

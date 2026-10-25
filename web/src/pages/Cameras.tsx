@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, LayoutGrid, List, Maximize2, Sparkles } from "lucide-react";
+import { Camera as CameraIcon, Plus, Trash2, RefreshCcw, Loader2, LayoutGrid, List, Maximize2, Sparkles, Sliders, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Select } from "@/components/ui/input";
-import { listCameras, deleteCamera, updateCodec, updateCameraDetectFPS } from "@/api/camera";
-import type { Camera, WsMessage } from "@/types";
+import { listCameras, deleteCamera, updateCodec, updateCameraDetectFPS, getAIAlertSource, setAIAlertSource, setMotionFallback } from "@/api/camera";
+import type { Camera, WsMessage, AIAlertSource, AIAlertSourceStatus } from "@/types";
 import { useAuth } from "@/hooks/useAuth";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
@@ -46,6 +46,63 @@ export default function Cameras() {
         listCameras,
         { refetchMs: 30000 }
     );
+
+    // AI alert source menu state (admin only)
+    const [aiSource, setAiSource] = useState<AIAlertSourceStatus | null>(null);
+    const [aiSourceOpen, setAiSourceOpen] = useState(false);
+    const [switchingSource, setSwitchingSource] = useState<AIAlertSource | null>(null);
+    const aiSourceRef = useRef<HTMLDivElement>(null);
+
+    useEffect(() => {
+        if (!isAdmin) return;
+        getAIAlertSource().then(setAiSource).catch(() => {});
+    }, [isAdmin]);
+
+    useEffect(() => {
+        if (!aiSourceOpen) return;
+        const onClick = (e: MouseEvent) => {
+            if (aiSourceRef.current && !aiSourceRef.current.contains(e.target as Node)) {
+                setAiSourceOpen(false);
+            }
+        };
+        const onKey = (e: KeyboardEvent) => {
+            if (e.key === "Escape") setAiSourceOpen(false);
+        };
+        window.addEventListener("mousedown", onClick);
+        window.addEventListener("keydown", onKey);
+        return () => {
+            window.removeEventListener("mousedown", onClick);
+            window.removeEventListener("keydown", onKey);
+        };
+    }, [aiSourceOpen]);
+
+    const handleSwitchAISource = async (source: AIAlertSource) => {
+        if (aiSource?.current_source === source) {
+            setAiSourceOpen(false);
+            return;
+        }
+        setSwitchingSource(source);
+        try {
+            const res = await setAIAlertSource(source);
+            setAiSource(res);
+        } catch (e) {
+            setError(e instanceof Error ? e.message : String(e));
+        } finally {
+            setSwitchingSource(null);
+            setAiSourceOpen(false);
+        }
+    };
+
+    const handleToggleMotionFallback = async (e: React.MouseEvent) => {
+        e.stopPropagation();
+        const next = !aiSource?.motion_fallback;
+        try {
+            const res = await setMotionFallback(next);
+            setAiSource(res);
+        } catch (err) {
+            setError(err instanceof Error ? err.message : String(err));
+        }
+    };
 
     async function remove(id: number) {
         if (!isAdmin) return;
@@ -130,6 +187,106 @@ export default function Cameras() {
                         <RefreshCcw size={14} className={loading ? "animate-spin mr-1.5" : "mr-1.5"} />
                         刷新
                     </Button>
+
+                    {/* AI Alert Source Selector (Admin only) */}
+                    {isAdmin && (
+                        <div ref={aiSourceRef} className="relative z-30">
+                            <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => setAiSourceOpen((v) => !v)}
+                                disabled={switchingSource !== null}
+                                className="text-xs gap-1.5 border-[rgb(var(--border)/0.4)]"
+                                title="切换人员检测 AI 告警来源（摄像头硬件 AI / Frigate / 双路互备）"
+                            >
+                                <Sliders size={13} className={switchingSource !== null ? "animate-spin" : ""} />
+                                <span>
+                                    AI来源: {
+                                        aiSource?.current_source === "camera"
+                                            ? "机载AI"
+                                            : aiSource?.current_source === "frigate"
+                                            ? "Frigate"
+                                            : aiSource?.current_source === "both"
+                                            ? "双路互备"
+                                            : "机载AI"
+                                    }
+                                </span>
+                            </Button>
+                            {aiSourceOpen && (
+                                <div className="absolute right-0 top-full mt-2 w-72 overflow-hidden rounded-xl glass p-2 shadow-2xl animate-scale-in ring-1 ring-[rgb(var(--border)/0.3)] space-y-1">
+                                    <div className="px-2 py-1 text-[11px] font-semibold text-fg-subtle border-b border-border/40 mb-1">
+                                        选择人员 AI 告警来源
+                                    </div>
+                                    {!aiSource ? (
+                                        <div className="p-3 text-xs text-fg-muted flex items-center gap-2">
+                                            <Loader2 size={13} className="animate-spin" />
+                                            <span>加载中…</span>
+                                        </div>
+                                    ) : (
+                                        aiSource.available_sources.map((s) => {
+                                            const active = s.key === aiSource.current_source;
+                                            return (
+                                                <button
+                                                    key={s.key}
+                                                    type="button"
+                                                    onClick={() => handleSwitchAISource(s.key)}
+                                                    className={cn(
+                                                        "w-full flex items-start gap-2.5 p-2 rounded-lg text-left transition-all text-xs",
+                                                        active
+                                                            ? "bg-[rgb(var(--accent-primary)/0.12)] text-[rgb(var(--accent-primary))]"
+                                                            : "hover:bg-[rgb(var(--bg-subtle)/0.5)] text-fg"
+                                                    )}
+                                                >
+                                                    <div className="min-w-0 flex-1">
+                                                        <div className="font-medium flex items-center justify-between">
+                                                            <span>{s.name}</span>
+                                                            {active && <Check size={13} />}
+                                                        </div>
+                                                        <div className="text-[10px] text-fg-muted mt-0.5 leading-tight">
+                                                            {s.description}
+                                                        </div>
+                                                    </div>
+                                                </button>
+                                            );
+                                        })
+                                    )}
+                                    {aiSource && (
+                                        <div className="pt-2 mt-1 border-t border-border/40">
+                                            <button
+                                                type="button"
+                                                onClick={handleToggleMotionFallback}
+                                                className={cn(
+                                                    "w-full flex items-center justify-between p-2 rounded-lg text-left transition-all text-xs",
+                                                    aiSource.motion_fallback
+                                                        ? "bg-amber-500/10 text-amber-500 border border-amber-500/30"
+                                                        : "hover:bg-[rgb(var(--bg-subtle)/0.5)] text-fg"
+                                                )}
+                                            >
+                                                <div className="min-w-0 flex-1 pr-2">
+                                                    <div className="font-medium flex items-center gap-1.5">
+                                                        <span>移动侦测兼容模式 (防漏报)</span>
+                                                    </div>
+                                                    <div className="text-[10px] text-fg-muted mt-0.5 leading-tight">
+                                                        {aiSource.motion_fallback ? "已开启 (兼容VMD移动侦测报警)" : "已关闭 (严格仅认人体标签)"}
+                                                    </div>
+                                                </div>
+                                                <div className={cn(
+                                                    "w-8 h-4 rounded-full transition-colors relative flex items-center px-0.5 shrink-0",
+                                                    aiSource.motion_fallback ? "bg-amber-500" : "bg-fg-muted/30"
+                                                )}>
+                                                    <div className={cn(
+                                                        "w-3 h-3 rounded-full bg-white transition-transform",
+                                                        aiSource.motion_fallback ? "translate-x-4" : "translate-x-0"
+                                                    )} />
+                                                </div>
+                                            </button>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
                     {isAdmin && (
                         <Button
                             size="sm"

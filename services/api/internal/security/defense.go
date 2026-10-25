@@ -92,7 +92,10 @@ type DefenseOverview struct {
 	TotalAuthFailures int64                `json:"total_auth_failures"`
 	ActiveBans        []BanEntry           `json:"active_bans"`
 	SMTPEnabled       bool                 `json:"smtp_enabled"`
+	SenderEmail       string               `json:"sender_email"`
+	SMTPHost          string               `json:"smtp_host"`
 	Recipient         string               `json:"recipient"`
+	Recipients        []string             `json:"recipients"`
 	PendingAttempts   []PendingAttempt     `json:"pending_attempts"`
 	BansToday         int64                `json:"bans_today"`
 	Bans7d            int64                `json:"bans_7d"`
@@ -904,7 +907,10 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 		TotalAuthFailures: totalAuthFailures,
 		ActiveBans:        bannedList,
 		SMTPEnabled:       smtpCfg.Enabled,
+		SenderEmail:       smtpCfg.Username,
+		SMTPHost:          smtpCfg.Host,
 		Recipient:         smtpCfg.Recipient,
+		Recipients:        dm.alertMgr.GetRecipients(),
 		PendingAttempts:   pending,
 		BansToday:         bansToday,
 		Bans7d:            bans7d,
@@ -922,16 +928,30 @@ func (dm *DefenseManager) GetOverview() DefenseOverview {
 	}
 }
 
-// ListEvents queries the security events timeline.
-func (dm *DefenseManager) ListEvents(limit int) ([]model.SecurityEvent, error) {
+// ListEvents queries the security events timeline with optional filtering by type, ip, and keyword.
+func (dm *DefenseManager) ListEvents(limit int, eventType, ip, keyword string) ([]model.SecurityEvent, error) {
 	if dm.db == nil {
 		return []model.SecurityEvent{}, nil
 	}
 	if limit <= 0 || limit > 200 {
 		limit = 50
 	}
+	q := dm.db.Model(&model.SecurityEvent{})
+	if eventType != "" && eventType != "all" {
+		q = q.Where("type = ?", eventType)
+	}
+	if ip != "" {
+		q = q.Where("ip = ?", ip)
+	}
+	if keyword != "" {
+		k := "%" + keyword + "%"
+		q = q.Where("detail LIKE ? OR action LIKE ? OR ip LIKE ?", k, k, k)
+	}
 	var events []model.SecurityEvent
-	err := dm.db.Order("created_at DESC").Limit(limit).Find(&events).Error
+	err := q.Order("created_at DESC").Limit(limit).Find(&events).Error
+	if events == nil {
+		events = []model.SecurityEvent{}
+	}
 	return events, err
 }
 
@@ -953,14 +973,28 @@ func (dm *DefenseManager) RecordOperatorEvent(operatorUser, ip, eventType, detai
 	dm.dispatchAlert(fmt.Sprintf("管理员 %s: %s", operatorUser, eventType), ip, eventType, detail, action)
 }
 
-// ListWhitelist returns all dynamic whitelist records.
+// ListWhitelist returns all whitelist records, including system-configured and dynamically added.
 func (dm *DefenseManager) ListWhitelist() ([]model.SecurityWhitelist, error) {
-	if dm.db == nil {
-		return []model.SecurityWhitelist{}, nil
-	}
 	var list []model.SecurityWhitelist
-	err := dm.db.Order("created_at DESC").Find(&list).Error
-	return list, err
+	if dm.db != nil {
+		_ = dm.db.Order("created_at DESC").Find(&list).Error
+	}
+	existing := make(map[string]bool)
+	for _, item := range list {
+		existing[item.Entry] = true
+	}
+	// Fold in system configured whitelist IPs
+	for _, sysIP := range dm.cfg.WhitelistIPs {
+		sysIP = strings.TrimSpace(sysIP)
+		if sysIP != "" && !existing[sysIP] {
+			list = append(list, model.SecurityWhitelist{
+				Entry: sysIP,
+				Note:  "系统配置内置豁免",
+			})
+			existing[sysIP] = true
+		}
+	}
+	return list, nil
 }
 
 // AddWhitelist registers a dynamic whitelist exemption.

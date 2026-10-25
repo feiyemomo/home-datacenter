@@ -38,15 +38,19 @@ func NewSystemLogHandler(db *gorm.DB) *SystemLogHandler {
 //	                  "user.login"); matched by exact equality on
 //	                  the indexed event_type column.
 //	level       str   optional filter (v1.6.36): "critical" |
-//	                  "normal" | "info". Matched by exact equality
+//	                  "normal" | "info" | "warning". Matched by exact equality
 //	                  on the indexed level column.
+//	source      str   optional filter: "mqtt" | "ws" | "system" | "camera" | "automation"
+//	keyword     str   optional substring search on message, context, or source
+//	start_ts    int64 optional unix timestamp lower bound (inclusive)
+//	end_ts      int64 optional unix timestamp upper bound (inclusive)
 //
 // Response envelope (utils.Success):
 //
 //	{ "logs": [...], "total": N }
 //
-// where `total` is the count after applying the event_type / level
-// filters (but ignoring limit/offset) so the dashboard can render
+// where `total` is the count after applying all filters
+// (but ignoring limit/offset) so the dashboard can render
 // a pager.
 func (h *SystemLogHandler) List(c *gin.Context) {
 	limit, err := strconv.Atoi(c.DefaultQuery("limit", "50"))
@@ -64,13 +68,32 @@ func (h *SystemLogHandler) List(c *gin.Context) {
 
 	eventType := c.Query("event_type")
 	level := c.Query("level")
+	source := c.Query("source")
+	keyword := c.Query("keyword")
 
 	q := h.db.Model(&model.SystemLog{})
-	if eventType != "" {
+	if eventType != "" && eventType != "all" {
 		q = q.Where("event_type = ?", eventType)
 	}
-	if level != "" {
+	if level != "" && level != "all" {
 		q = q.Where("level = ?", level)
+	}
+	if source != "" && source != "all" {
+		q = q.Where("source = ?", source)
+	}
+	if keyword != "" {
+		k := "%" + keyword + "%"
+		q = q.Where("message LIKE ? OR context LIKE ? OR source LIKE ? OR event_type LIKE ? OR payload LIKE ?", k, k, k, k, k)
+	}
+	if startTsStr := c.Query("start_ts"); startTsStr != "" {
+		if startTs, err := strconv.ParseInt(startTsStr, 10, 64); err == nil && startTs > 0 {
+			q = q.Where("ts >= ?", startTs)
+		}
+	}
+	if endTsStr := c.Query("end_ts"); endTsStr != "" {
+		if endTs, err := strconv.ParseInt(endTsStr, 10, 64); err == nil && endTs > 0 {
+			q = q.Where("ts <= ?", endTs)
+		}
 	}
 
 	var total int64

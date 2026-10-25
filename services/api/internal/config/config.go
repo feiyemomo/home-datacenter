@@ -29,6 +29,7 @@ type Config struct {
 	Go2RTC      Go2RTCConfig      `mapstructure:"go2rtc"`
 	Frigate     FrigateConfig     `mapstructure:"frigate"`
 	Camera      CameraConfig      `mapstructure:"camera"`
+	Notify      NotifyConfig      `mapstructure:"notify"`
 	Network     NetworkConfig     `mapstructure:"network"`
 	Releases    ReleasesConfig    `mapstructure:"releases"`
 	Maintenance MaintenanceConfig `mapstructure:"maintenance"`
@@ -213,6 +214,32 @@ type CameraConfig struct {
 	// browser RTCIceServer shape: [{"urls":"stun:..."},
 	// {"urls":["turn:...","turns:..."],"username":"...","credential":"..."}]
 	ICEServers string `mapstructure:"ice_servers"`
+}
+
+// NotifyConfig holds the person-alert coalescing (de-bounce) tunables.
+// When a camera keeps seeing the same person, the first detection fires a
+// normal alert and subsequent detections within the session window are
+// merged into a single periodic "update" event instead of a new alert.
+type NotifyConfig struct {
+	// SessionWindowSeconds is how long an activity session stays open after
+	// the last detection before it is closed (the next detection then
+	// counts as a fresh first-report). Default 90.
+	SessionWindowSeconds int `mapstructure:"session_window_seconds"`
+
+	// HeartbeatSeconds is the minimum gap between update events emitted
+	// within an open session. Detections arriving faster than this are
+	// merged silently (count incremented, no event published). Default 30.
+	HeartbeatSeconds int `mapstructure:"heartbeat_seconds"`
+
+	// DedupSeconds is the minimum gap between two detections on the same
+	// camera that are considered distinct (replaces the hard-coded 5s
+	// per-camera window). Default 5.
+	DedupSeconds int `mapstructure:"dedup_seconds"`
+
+	// CrossSourceDedupSeconds is the "both" mode window for merging a
+	// hardware-AI and a Frigate event for the same camera (replaces the
+	// hard-coded 6s). Default 6.
+	CrossSourceDedupSeconds int `mapstructure:"cross_source_dedup_seconds"`
 }
 
 // NetworkConfig holds the network capability detection settings
@@ -409,6 +436,14 @@ func Load(path string) error {
 	v.SetDefault("camera.recording_dir", "/data/recordings")
 	v.SetDefault("camera.webrtc_public_base", "")
 	v.SetDefault("camera.ice_servers", `[{"urls":"stun:stun.qq.com:3478"},{"urls":"stun:stun.miwifi.com:3478"},{"urls":"stun:stun.cloudflare.com:3478"}]`)
+
+	// Person-alert coalescing (de-bounce) defaults: one first-report per
+	// activity session, a 30s heartbeat for in-session updates, and a 90s
+	// silence window before a session is considered closed.
+	v.SetDefault("notify.session_window_seconds", 90)
+	v.SetDefault("notify.heartbeat_seconds", 30)
+	v.SetDefault("notify.dedup_seconds", 5)
+	v.SetDefault("notify.cross_source_dedup_seconds", 6)
 
 	// Phase 10 defaults — network capability detection
 	v.SetDefault("network.check_interval_seconds", 60)

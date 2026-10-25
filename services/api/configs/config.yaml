@@ -102,6 +102,25 @@ camera:
   #                    "username":"x","credential":"y"}]'
   ice_servers: '[{"urls":"stun:stun.qq.com:3478"},{"urls":"stun:stun.miwifi.com:3478"},{"urls":"stun:stun.cloudflare.com:3478"}]'
 
+# Person-alert coalescing (de-bounce). When a camera keeps seeing the same
+# person, the first detection fires a normal alert; subsequent detections
+# within the session are merged into a single periodic "update" event
+# (is_update=true) carrying the running count instead of a new alert. This
+# keeps the phone from buzzing on every frame of continuous activity.
+notify:
+  # How long an activity session stays open after the last detection before
+  # it is closed (the next detection then counts as a fresh first-report).
+  session_window_seconds: 90
+  # Minimum gap between update events emitted within an open session.
+  # Detections faster than this are merged silently (count++, no event).
+  heartbeat_seconds: 30
+  # Minimum gap between two detections on the same camera considered
+  # distinct (replaces the former hard-coded 5s per-camera window).
+  dedup_seconds: 5
+  # "both" mode window for merging a hardware-AI and a Frigate event for
+  # the same camera (replaces the former hard-coded 6s).
+  cross_source_dedup_seconds: 6
+
 # Phase 10: Network capability detection
 # The server detects IPv6 availability, NAT type, and P2P feasibility
 # by querying public STUN servers. Results are cached for

@@ -496,6 +496,7 @@ export interface AIAlertSourceInfo {
 
 export interface AIAlertSourceStatus {
     current_source: AIAlertSource;
+    motion_fallback?: boolean;
     available_sources: AIAlertSourceInfo[];
     updated_at: string;
 }

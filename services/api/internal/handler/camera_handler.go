@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -243,6 +244,50 @@ func (h *CameraHandler) Register(c *gin.Context) {
 		})
 	}
 	utils.Success(c, cameraView(cam, h.Reg.StreamConfig(cam), true, true))
+}
+
+// CreatePreset — POST /api/v1/cameras/:id/presets
+// Saves the camera's current PTZ position on the camera hardware as a new preset.
+// Request body: { "name": "客厅", "token": "optional_token" }
+type presetCreateReq struct {
+	Name  string `json:"name" binding:"required"`
+	Token string `json:"token"`
+}
+
+func (h *CameraHandler) CreatePreset(c *gin.Context) {
+	id, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid id")
+		return
+	}
+	var req presetCreateReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("[handler] create preset invalid request body: %v", err)
+		utils.Fail(c, http.StatusBadRequest, "invalid request body: name is required")
+		return
+	}
+	cam, actualToken, err := h.Reg.CreatePreset(c.Request.Context(), uint(id), req.Name, req.Token)
+	if err != nil {
+		log.Printf("[handler] failed to create preset on camera %d: %v", id, err)
+		utils.Fail(c, http.StatusBadGateway, fmt.Sprintf("failed to create preset: %v", err))
+		return
+	}
+	if h.bus != nil {
+		payload, _ := json.Marshal(eventbus.CameraManagePayload{
+			AdminID:    c.GetUint("user_id"),
+			CameraID:   uint(id),
+			CameraName: cam.Name,
+			Action:     "update",
+			Detail:     fmt.Sprintf("创建预置位【%s】(token: %s)", req.Name, actualToken),
+			Ts:         time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:   eventbus.TopicCameraUpdate,
+			Payload: payload,
+			Source:  eventbus.SourceSystem,
+		})
+	}
+	utils.Success(c, gin.H{"id": id, "name": req.Name, "token": actualToken, "presets": cam.Presets})
 }
 
 // SetPreset — PUT /api/v1/cameras/:id/presets/:alias
@@ -795,18 +840,6 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 
 	// Include thumbnails so the dashboard can render preview images
 	// without a second round-trip per event.
-	if h.Reg == nil || h.Reg.Frigate == nil {
-		utils.Success(c, gin.H{"alerts": []any{}, "total": 0})
-		return
-	}
-	events, err := h.Reg.Frigate.ListEventsFiltered(c.Request.Context(), filter)
-	if err != nil {
-		log.Printf("[handler] frigate events unavailable: %v", err)
-		utils.Success(c, gin.H{"alerts": []any{}, "total": 0})
-		return
-	}
-
-	// Map Frigate camera slugs to home-api camera IDs.
 	type alertEntry struct {
 		ID          string   `json:"id"`
 		CameraSlug  string   `json:"camera_slug"`
@@ -820,36 +853,93 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 		HasClip     bool     `json:"has_clip"`
 		HasSnapshot bool     `json:"has_snapshot"`
 		Thumbnail   string   `json:"thumbnail,omitempty"`
+		Source      string   `json:"source,omitempty"`
 	}
 
-	alerts := make([]alertEntry, 0, len(events))
-	for _, ev := range events {
-		if !isAdmin && !allowedSlugs[ev.Camera] {
-			continue
+	alerts := make([]alertEntry, 0, limit)
+
+	// 1. Fetch persisted camera hardware AI alerts from SQLite
+	if h.Reg != nil && h.Reg.DB != nil {
+		q := h.Reg.DB.Model(&model.CameraAlert{})
+		if cid, err := strconv.ParseUint(c.Query("camera_id"), 10, 64); err == nil && cid > 0 {
+			q = q.Where("camera_id = ?", uint(cid))
 		}
-		entry := alertEntry{
-			ID:          ev.ID,
-			CameraSlug:  ev.Camera,
-			Label:       ev.Label,
-			Confidence:  ev.EffectiveTopScore(),
-			StartTime:   ev.StartTime,
-			EndTime:     ev.EndTime,
-			Zones:       ev.Zones,
-			HasClip:     ev.HasClip,
-			HasSnapshot: ev.HasSnapshot,
-			Thumbnail:   ev.Thumbnail,
+		if lbl := strings.TrimSpace(c.Query("label")); lbl != "" {
+			q = q.Where("label = ?", lbl)
 		}
-		// Resolve slug to camera ID.
-		if camID, ok := h.Reg.LookupByFrigateSlug(ev.Camera); ok {
-			entry.CameraID = camID
-			if cam, err := h.Reg.Get(camID); err == nil {
-				entry.CameraName = cam.StreamName
+		if filter.Before > 0 {
+			q = q.Where("start_time < ?", float64(filter.Before))
+		}
+		if filter.After > 0 {
+			q = q.Where("start_time > ?", float64(filter.After))
+		}
+		var localAlerts []model.CameraAlert
+		if err := q.Order("start_time DESC").Limit(limit).Find(&localAlerts).Error; err == nil {
+			for _, la := range localAlerts {
+				cam, err := h.Reg.Get(la.CameraID)
+				if !isAdmin && (err != nil || !h.Reg.CanRead(cam, uid, isAdmin)) {
+					continue
+				}
+				alerts = append(alerts, alertEntry{
+					ID:          la.ID,
+					CameraSlug:  la.CameraSlug,
+					CameraID:    la.CameraID,
+					CameraName:  la.CameraName,
+					Label:       la.Label,
+					Confidence:  la.Confidence,
+					StartTime:   la.StartTime,
+					EndTime:     la.EndTime,
+					HasClip:     true,
+					HasSnapshot: la.HasSnapshot,
+					Thumbnail:   la.Thumbnail,
+					Source:      la.Source,
+				})
 			}
 		}
-		alerts = append(alerts, entry)
+	}
+
+	// 2. Fetch Frigate events if configured
+	if h.Reg != nil && h.Reg.Frigate != nil {
+		events, err := h.Reg.Frigate.ListEventsFiltered(c.Request.Context(), filter)
+		if err == nil {
+			for _, ev := range events {
+				if !isAdmin && !allowedSlugs[ev.Camera] {
+					continue
+				}
+				entry := alertEntry{
+					ID:          ev.ID,
+					CameraSlug:  ev.Camera,
+					Label:       ev.Label,
+					Confidence:  ev.EffectiveTopScore(),
+					StartTime:   ev.StartTime,
+					EndTime:     ev.EndTime,
+					Zones:       ev.Zones,
+					HasClip:     ev.HasClip,
+					HasSnapshot: ev.HasSnapshot,
+					Thumbnail:   ev.Thumbnail,
+					Source:      "frigate",
+				}
+				if camID, ok := h.Reg.LookupByFrigateSlug(ev.Camera); ok {
+					entry.CameraID = camID
+					if cam, err := h.Reg.Get(camID); err == nil {
+						entry.CameraName = cam.StreamName
+					}
+				}
+				alerts = append(alerts, entry)
+			}
+		}
+	}
+
+	// 3. Sort merged alerts descending by StartTime and enforce limit
+	sort.Slice(alerts, func(i, j int) bool {
+		return alerts[i].StartTime > alerts[j].StartTime
+	})
+	if len(alerts) > limit {
+		alerts = alerts[:limit]
 	}
 
 	utils.Success(c, gin.H{"alerts": alerts, "total": len(alerts)})
+	return
 }
 
 // MotionRanges — GET /api/v1/cameras/:id/motion-ranges?after=UNIX&before=UNIX
@@ -919,8 +1009,9 @@ func (h *CameraHandler) MotionRanges(c *gin.Context) {
 	utils.Success(c, gin.H{"ranges": ranges, "total": len(ranges)})
 }
 
-// canReadEvent verifies that the caller has permission to view the Frigate
-// detection event identified by eventID. Admins are permitted unconditionally;
+// canReadEvent verifies that the caller has permission to view the
+// detection event identified by eventID. Supports both Frigate events
+// and persisted ISAPI camera alerts. Admins are permitted unconditionally;
 // non-admins are checked against the camera owning the event.
 func (h *CameraHandler) canReadEvent(c *gin.Context, eventID string) bool {
 	uid, isAdmin, ok := h.callerIsAdmin(c)
@@ -931,6 +1022,21 @@ func (h *CameraHandler) canReadEvent(c *gin.Context, eventID string) bool {
 	if isAdmin {
 		return true
 	}
+
+	// 1. Check if it is a local persisted camera alert
+	if h.Reg != nil && h.Reg.DB != nil {
+		var alert model.CameraAlert
+		if err := h.Reg.DB.First(&alert, "id = ?", eventID).Error; err == nil {
+			cam, err := h.Reg.Get(alert.CameraID)
+			if err != nil || !h.Reg.CanRead(cam, uid, isAdmin) {
+				utils.Fail(c, http.StatusForbidden, "not your camera")
+				return false
+			}
+			return true
+		}
+	}
+
+	// 2. Fall back to Frigate event check
 	if h.Reg == nil || h.Reg.Frigate == nil {
 		utils.Fail(c, http.StatusBadGateway, "frigate not available")
 		return false
@@ -972,6 +1078,28 @@ func (h *CameraHandler) AlertSnapshot(c *gin.Context) {
 	}
 	if !h.canReadEvent(c, eventID) {
 		return
+	}
+
+	// 1. Check if event is an ISAPI camera alert with a local snapshot file
+	if h.Reg != nil && h.Reg.DB != nil {
+		var localAlert model.CameraAlert
+		if err := h.Reg.DB.First(&localAlert, "id = ?", eventID).Error; err == nil {
+			if localAlert.SnapshotPath != "" {
+				if fileBytes, err := os.ReadFile(localAlert.SnapshotPath); err == nil && len(fileBytes) > 0 {
+					c.Header("Cache-Control", "public, max-age=3600")
+					c.Data(http.StatusOK, "image/jpeg", fileBytes)
+					return
+				}
+			}
+			// If snapshot path is empty but base64 thumbnail exists
+			if localAlert.Thumbnail != "" {
+				if b, err := base64.StdEncoding.DecodeString(localAlert.Thumbnail); err == nil && len(b) > 0 {
+					c.Header("Cache-Control", "public, max-age=3600")
+					c.Data(http.StatusOK, "image/jpeg", b)
+					return
+				}
+			}
+		}
 	}
 
 	quality, _ := strconv.Atoi(c.DefaultQuery("quality", "100"))
@@ -1016,6 +1144,27 @@ func (h *CameraHandler) AlertThumbnail(c *gin.Context) {
 	}
 	if !h.canReadEvent(c, eventID) {
 		return
+	}
+
+	// 1. Check if event is an ISAPI camera alert with a local thumbnail or snapshot
+	if h.Reg != nil && h.Reg.DB != nil {
+		var localAlert model.CameraAlert
+		if err := h.Reg.DB.First(&localAlert, "id = ?", eventID).Error; err == nil {
+			if localAlert.Thumbnail != "" {
+				if b, err := base64.StdEncoding.DecodeString(localAlert.Thumbnail); err == nil && len(b) > 0 {
+					c.Header("Cache-Control", "public, max-age=3600")
+					c.Data(http.StatusOK, "image/jpeg", b)
+					return
+				}
+			}
+			if localAlert.SnapshotPath != "" {
+				if fileBytes, err := os.ReadFile(localAlert.SnapshotPath); err == nil && len(fileBytes) > 0 {
+					c.Header("Cache-Control", "public, max-age=3600")
+					c.Data(http.StatusOK, "image/jpeg", fileBytes)
+					return
+				}
+			}
+		}
 	}
 
 	body, contentType, err := h.Reg.Frigate.EventThumbnail(c.Request.Context(), eventID)
@@ -2518,3 +2667,92 @@ func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool
 		"updated_at":   cam.UpdatedAt,
 	}
 }
+
+// GetAISource — GET /api/v1/cameras/ai-source
+// Returns the currently active AI alert source configuration (camera, frigate, both).
+func (h *CameraHandler) GetAISource(c *gin.Context) {
+	mgr := camera.GetGlobalAIAlertSourceManager("")
+	if mgr == nil {
+		utils.Fail(c, http.StatusInternalServerError, "AI source manager uninitialized")
+		return
+	}
+	utils.Success(c, mgr.GetStatus())
+}
+
+// setAISourceReq is the JSON request body for PUT /api/v1/cameras/ai-source.
+type setAISourceReq struct {
+	Source         string `json:"source"`
+	MotionFallback *bool  `json:"motion_fallback"`
+}
+
+// SetAISource — PUT /api/v1/cameras/ai-source
+// Sets the global AI alert source mode ("camera" | "frigate" | "both") and/or motion fallback.
+func (h *CameraHandler) SetAISource(c *gin.Context) {
+	var req setAISourceReq
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	mgr := camera.GetGlobalAIAlertSourceManager("")
+	if mgr == nil {
+		utils.Fail(c, http.StatusInternalServerError, "AI source manager uninitialized")
+		return
+	}
+	if req.Source != "" {
+		if err := mgr.SetSource(req.Source); err != nil {
+			utils.Fail(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if req.MotionFallback != nil {
+		mgr.SetMotionFallback(*req.MotionFallback)
+	}
+
+	if h.bus != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"source":          mgr.GetSource(),
+			"motion_fallback": mgr.GetMotionFallback(),
+			"updated_by":      c.GetString("user_name"),
+			"updated_at":      time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    "camera.ai_source_changed",
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityInfo,
+			Payload:  payload,
+		})
+	}
+	utils.Success(c, mgr.GetStatus())
+}
+
+// SetMotionFallback — PUT /api/v1/cameras/motion-fallback
+func (h *CameraHandler) SetMotionFallback(c *gin.Context) {
+	var req struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body: 'enabled' (boolean) is required")
+		return
+	}
+	mgr := camera.GetGlobalAIAlertSourceManager("")
+	if mgr == nil {
+		utils.Fail(c, http.StatusInternalServerError, "AI source manager uninitialized")
+		return
+	}
+	mgr.SetMotionFallback(req.Enabled)
+	if h.bus != nil {
+		payload, _ := json.Marshal(map[string]any{
+			"motion_fallback": req.Enabled,
+			"updated_by":      c.GetString("user_name"),
+			"updated_at":      time.Now().Unix(),
+		})
+		h.bus.Publish(eventbus.Event{
+			Topic:    "camera.ai_source_changed",
+			Source:   eventbus.SourceSystem,
+			Severity: eventbus.SeverityInfo,
+			Payload:  payload,
+		})
+	}
+	utils.Success(c, mgr.GetStatus())
+}
+

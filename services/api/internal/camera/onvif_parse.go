@@ -17,7 +17,16 @@ import "regexp"
 var (
 	profileRe = regexp.MustCompile(`<(?:trt:Profiles|Profiles|MediaProfile)\b[^>]*token="([^"]+)"[^>]*>\s*<(?:tt:Name|Name)>([^<]+)</`)
 	presetRe  = regexp.MustCompile(`<(?:tptz:Preset|Preset)\b[^>]*token="([^"]+)"[^>]*>\s*<(?:tt:Name|Name)>([^<]+)</`)
+	presetTokenRe = regexp.MustCompile(`<(?:tptz:PresetToken|PresetToken)>([^<]+)</`)
 )
+
+func parsePresetToken(xml string) string {
+	m := presetTokenRe.FindStringSubmatch(xml)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
 
 func parseProfiles(xml string) []Profile {
 	matches := profileRe.FindAllStringSubmatch(xml, -1)

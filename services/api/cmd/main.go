@@ -190,7 +190,7 @@ func main() {
 	logSub.Start()
 
 	// ---- Services & Handlers ----
-	alertMgr := security.NewAlertManager(cfg.Security.Alert)
+	alertMgr := security.NewAlertManager(cfg.Security.Alert, database.DB)
 	defenseMgr := security.NewDefenseManager(database.DB, cfg.Security.Defense, alertMgr, bus)
 
 	authService := service.NewAuthService(userRepo, deviceRepo)
@@ -716,6 +716,9 @@ func main() {
 			securityAdmin.POST("/whitelist", securityHandler.AddWhitelist)
 			securityAdmin.DELETE("/whitelist/:entry", securityHandler.DeleteWhitelist)
 			securityAdmin.PUT("/config", securityHandler.UpdateConfig)
+			securityAdmin.PUT("/alert-email", securityHandler.UpdateAlertEmail)
+			securityAdmin.POST("/alert-recipients", securityHandler.AddAlertRecipient)
+			securityAdmin.DELETE("/alert-recipients/:email", securityHandler.DeleteAlertRecipient)
 			securityAdmin.POST("/test-alert", securityHandler.TestAlertEmail)
 			securityAdmin.DELETE("/events/prune", securityHandler.PruneEvents)
 		}
@@ -834,7 +837,9 @@ func main() {
 			{
 				adminCam.POST("", camHandler.Register)
 				adminCam.PUT("ai-source", camHandler.SetAISource)
+				adminCam.PUT("motion-fallback", camHandler.SetMotionFallback)
 				adminCam.DELETE(":id", camHandler.Delete)
+				adminCam.POST(":id/presets", camHandler.CreatePreset)
 				adminCam.PUT(":id/presets/:alias", camHandler.SetPreset)
 				adminCam.DELETE(":id/presets/:alias", camHandler.DeletePreset)
 				adminCam.POST(":id/preset/:alias", camHandler.GotoPreset)

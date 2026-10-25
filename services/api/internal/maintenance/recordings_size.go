@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -58,6 +60,8 @@ type RecordingSizeMonitor struct {
 	onRecover   func() error
 	quotaActive bool
 
+	mu        sync.Mutex
+	sampling  atomic.Bool
 	lastLevel string
 }
 
@@ -83,6 +87,18 @@ func (m *RecordingSizeMonitor) SetFrigateDBPath(p string) *RecordingSizeMonitor 
 	return m
 }
 
+// SetQuotaBytes updates the quota threshold at runtime.
+func (m *RecordingSizeMonitor) SetQuotaBytes(quotaBytes uint64) {
+	m.mu.Lock()
+	m.quotaBytes = quotaBytes
+	m.mu.Unlock()
+}
+
+// TriggerSample triggers a size sample and FIFO pruning check immediately in background.
+func (m *RecordingSizeMonitor) TriggerSample() {
+	go m.sample()
+}
+
 // Run samples once immediately, then on every tick forever.
 func (m *RecordingSizeMonitor) Run() {
 	m.sample()
@@ -96,6 +112,14 @@ func (m *RecordingSizeMonitor) Run() {
 // sample computes the total size of the recordings tree and emits an
 // alert on a level transition.
 func (m *RecordingSizeMonitor) sample() {
+	if !m.sampling.CompareAndSwap(false, true) {
+		return
+	}
+	defer m.sampling.Store(false)
+
+	m.mu.Lock()
+	quotaBytes := m.quotaBytes
+	m.mu.Unlock()
 	size, fileCount, err := dirSize(m.root)
 	if err != nil {
 		// Root missing (fresh box, no recordings yet) is not an
@@ -116,19 +140,19 @@ func (m *RecordingSizeMonitor) sample() {
 	// synchronously — the interval is long (1h) so a brief HTTP push
 	// (bounded by the caller's context timeout) won't stall anything.
 	// The callback closure is responsible for its own cancellation.
-	if m.quotaBytes > 0 {
-		over := size >= m.quotaBytes
+	if quotaBytes > 0 {
+		over := size >= quotaBytes
 		if over {
 			// Incremental FIFO pruning: instead of abruptly dropping 24h
 			// full days or waiting for coarse daily retention cleanup, prune
 			// oldest hour segments in moderate chunks down to 95% of quota ceiling.
-			targetSize := uint64(float64(m.quotaBytes) * 0.95)
-			if targetSize > m.quotaBytes {
-				targetSize = m.quotaBytes
+			targetSize := uint64(float64(quotaBytes) * 0.95)
+			if targetSize > quotaBytes {
+				targetSize = quotaBytes
 			}
 			excess := size - targetSize
 			log.Printf("maintenance: recordings size %s over quota %s (excess %s) — FIFO pruning oldest hour segments",
-				humanBytes(size), humanBytes(m.quotaBytes), humanBytes(excess))
+				humanBytes(size), humanBytes(quotaBytes), humanBytes(excess))
 
 			res, pruneErr := PruneOldestRecordings(m.root, m.frigateDBPath, excess, 12)
 			if pruneErr != nil {
@@ -141,14 +165,14 @@ func (m *RecordingSizeMonitor) sample() {
 				} else {
 					size = 0
 				}
-				over = size >= m.quotaBytes
+				over = size >= quotaBytes
 			}
 		}
 
 		if over && !m.quotaActive {
 			if m.onExceed != nil {
 				log.Printf("maintenance: recordings size %s still over quota %s after prune — triggering retention reduction",
-					humanBytes(size), humanBytes(m.quotaBytes))
+					humanBytes(size), humanBytes(quotaBytes))
 				// v1.8.34: only commit the crossed state once the
 				// action succeeds. A transient failure (first sample
 				// racing the Frigate restart from BootReplay) keeps
@@ -170,7 +194,7 @@ func (m *RecordingSizeMonitor) sample() {
 		} else if !over && m.quotaActive {
 			if m.onRecover != nil {
 				log.Printf("maintenance: recordings size back under quota %s — restoring normal retention",
-					humanBytes(m.quotaBytes))
+					humanBytes(quotaBytes))
 				if err := m.onRecover(); err != nil {
 					log.Printf("maintenance: quota recovered action failed, will retry next sample: %v", err)
 				} else {
@@ -274,9 +298,12 @@ func (m *RecordingSizeMonitor) sample() {
 // given level/severity and publishes it on the event bus so connected
 // dashboards (and the Android admin quota banner) react to it.
 func (m *RecordingSizeMonitor) emitQuotaEvent(level, busSev string, msg string) {
+	m.mu.Lock()
+	qb := m.quotaBytes
+	m.mu.Unlock()
 	payload, _ := json.Marshal(map[string]any{
 		"path":        m.root,
-		"quota_bytes": m.quotaBytes,
+		"quota_bytes": qb,
 		"level":       level,
 	})
 	entry := &model.SystemLog{

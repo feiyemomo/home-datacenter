@@ -60,6 +60,7 @@ func InitDB(dbPath string) {
 		&model.IPBan{},
 		&model.SecurityEvent{},
 		&model.SecurityWhitelist{},
+		&model.SecurityRecipient{},
 		&model.SecurityHourlyStat{},
 		&model.CameraAlert{},
 	)
@@ -244,6 +245,8 @@ func optimizeIndexes(db *gorm.DB) {
 		"CREATE INDEX IF NOT EXISTS idx_security_events_ip_type_created ON security_events(ip, type, created_at);",
 		"CREATE INDEX IF NOT EXISTS idx_system_logs_level_ts ON system_logs(level, ts, id);",
 		"CREATE INDEX IF NOT EXISTS idx_system_logs_type_ts ON system_logs(event_type, ts, id);",
+		"CREATE INDEX IF NOT EXISTS idx_system_logs_source_ts ON system_logs(source, ts);",
+		"CREATE INDEX IF NOT EXISTS idx_system_logs_ts_desc ON system_logs(ts DESC, id DESC);",
 	}
 	for _, sql := range indexes {
 		_ = db.Exec(sql).Error

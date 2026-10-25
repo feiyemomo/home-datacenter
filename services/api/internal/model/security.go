@@ -77,3 +77,13 @@ type SecurityWhitelist struct {
 
 func (SecurityWhitelist) TableName() string { return "security_whitelist" }
 
+// SecurityRecipient persists dynamically managed alert recipient emails.
+type SecurityRecipient struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Email     string    `gorm:"size:128;uniqueIndex;not null" json:"email"`
+	CreatedAt time.Time `gorm:"not null" json:"created_at"`
+}
+
+func (SecurityRecipient) TableName() string { return "security_recipients" }
+
+

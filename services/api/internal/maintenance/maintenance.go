@@ -142,10 +142,17 @@ type Config struct {
 	ServiceStartupDelay time.Duration
 }
 
+// BackgroundMonitors holds references to active background monitors that
+// support runtime configuration updates.
+type BackgroundMonitors struct {
+	RecordingSize *RecordingSizeMonitor
+}
+
 // StartAll launches every background maintenance loop in its own
 // goroutine. It never returns; each loop logs and continues on error.
 // Call once at process boot after the DB and EventBus are ready.
-func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
+func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) *BackgroundMonitors {
+	monitors := &BackgroundMonitors{}
 	if cfg.DiskInterval > 0 && cfg.DiskPath != "" {
 		go NewDiskMonitor(db, bus, cfg.DiskPath, cfg.DiskWarnPct, cfg.DiskCritPct, cfg.DiskInterval).Run()
 	}
@@ -167,6 +174,7 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 		if cfg.FrigateDBPath != "" {
 			rsm.SetFrigateDBPath(cfg.FrigateDBPath)
 		}
+		monitors.RecordingSize = rsm
 		go rsm.Run()
 	}
 	if cfg.SysResourceInterval > 0 {
@@ -176,4 +184,5 @@ func StartAll(db *gorm.DB, bus *eventbus.Bus, cfg Config) {
 		go NewServiceMonitor(db, bus, cfg.ServiceProbes, cfg.ServiceInterval, cfg.ServiceFails, cfg.ServiceStartupDelay).Run()
 	}
 	log.Println("maintenance: background loops started")
+	return monitors
 }

@@ -1,17 +1,24 @@
 package security
 
 import (
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
+	"mime"
 	"net"
 	"net/smtp"
 	"strings"
 	"sync"
 	"time"
 
+	"gorm.io/gorm"
+
 	"home-datacenter-api/internal/config"
+	"home-datacenter-api/internal/model"
 )
 
 // ErrAlertNotConfigured is returned when SMTP alerting is disabled or
@@ -21,13 +28,46 @@ var ErrAlertNotConfigured = errors.New("SMTP alert not configured or disabled")
 // AlertManager handles sending security alerts via Email and other channels.
 type AlertManager struct {
 	cfg config.AlertConfig
+	db  *gorm.DB
 	mu  sync.RWMutex
 }
 
-func NewAlertManager(cfg config.AlertConfig) *AlertManager {
-	return &AlertManager{
+func NewAlertManager(cfg config.AlertConfig, db ...*gorm.DB) *AlertManager {
+	am := &AlertManager{
 		cfg: cfg,
 	}
+	if len(db) > 0 && db[0] != nil {
+		am.db = db[0]
+		// Load persisted recipients from DB
+		var rows []model.SecurityRecipient
+		if err := am.db.Order("id ASC").Find(&rows).Error; err == nil && len(rows) > 0 {
+			var list []string
+			for _, r := range rows {
+				cleanEmail := strings.TrimSpace(r.Email)
+				if cleanEmail != "" {
+					list = append(list, cleanEmail)
+				}
+			}
+			if len(list) > 0 {
+				am.cfg.Recipient = strings.Join(list, ",")
+				if am.cfg.Host != "" && am.cfg.Username != "" && am.cfg.Password != "" {
+					am.cfg.Enabled = true
+				}
+			}
+		} else if am.cfg.Recipient != "" {
+			// Seed existing cfg.Recipient to database
+			for _, r := range strings.Split(am.cfg.Recipient, ",") {
+				r = strings.TrimSpace(r)
+				if r != "" {
+					_ = am.db.Where(model.SecurityRecipient{Email: r}).FirstOrCreate(&model.SecurityRecipient{
+						Email:     r,
+						CreatedAt: time.Now(),
+					}).Error
+				}
+			}
+		}
+	}
+	return am
 }
 
 // UpdateConfig dynamically updates SMTP configurations.
@@ -35,6 +75,114 @@ func (am *AlertManager) UpdateConfig(cfg config.AlertConfig) {
 	am.mu.Lock()
 	defer am.mu.Unlock()
 	am.cfg = cfg
+}
+
+// UpdateRecipient updates the alert recipient email and enables alerts if host/user/pass are configured.
+func (am *AlertManager) UpdateRecipient(recipient string) {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	am.cfg.Recipient = strings.TrimSpace(recipient)
+	if am.cfg.Recipient != "" && am.cfg.Host != "" && am.cfg.Username != "" && am.cfg.Password != "" {
+		am.cfg.Enabled = true
+	}
+}
+
+// GetRecipients parses and returns all trimmed recipient emails.
+func (am *AlertManager) GetRecipients() []string {
+	am.mu.RLock()
+	defer am.mu.RUnlock()
+	var list []string
+	if am.cfg.Recipient != "" {
+		for _, r := range strings.Split(am.cfg.Recipient, ",") {
+			r = strings.TrimSpace(r)
+			if r != "" {
+				list = append(list, r)
+			}
+		}
+	}
+	return list
+}
+
+// SetRecipients updates the full list of recipient emails.
+func (am *AlertManager) SetRecipients(recipients []string) []string {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	var clean []string
+	seen := make(map[string]bool)
+	for _, r := range recipients {
+		r = strings.TrimSpace(r)
+		if r != "" && !seen[r] {
+			clean = append(clean, r)
+			seen[r] = true
+		}
+	}
+	am.cfg.Recipient = strings.Join(clean, ",")
+	if len(clean) > 0 && am.cfg.Host != "" && am.cfg.Username != "" && am.cfg.Password != "" {
+		am.cfg.Enabled = true
+	}
+	if am.db != nil {
+		_ = am.db.Session(&gorm.Session{AllowGlobalUpdate: true}).Delete(&model.SecurityRecipient{}).Error
+		for _, r := range clean {
+			_ = am.db.Create(&model.SecurityRecipient{
+				Email:     r,
+				CreatedAt: time.Now(),
+			}).Error
+		}
+	}
+	return clean
+}
+
+// AddRecipient adds a new recipient email if not already present.
+func (am *AlertManager) AddRecipient(email string) []string {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	email = strings.TrimSpace(email)
+	var clean []string
+	seen := make(map[string]bool)
+	if am.cfg.Recipient != "" {
+		for _, r := range strings.Split(am.cfg.Recipient, ",") {
+			r = strings.TrimSpace(r)
+			if r != "" && !seen[r] {
+				clean = append(clean, r)
+				seen[r] = true
+			}
+		}
+	}
+	if email != "" && !seen[email] {
+		clean = append(clean, email)
+	}
+	am.cfg.Recipient = strings.Join(clean, ",")
+	if len(clean) > 0 && am.cfg.Host != "" && am.cfg.Username != "" && am.cfg.Password != "" {
+		am.cfg.Enabled = true
+	}
+	if am.db != nil && email != "" {
+		_ = am.db.Where(model.SecurityRecipient{Email: email}).FirstOrCreate(&model.SecurityRecipient{
+			Email:     email,
+			CreatedAt: time.Now(),
+		}).Error
+	}
+	return clean
+}
+
+// RemoveRecipient removes a recipient email.
+func (am *AlertManager) RemoveRecipient(email string) []string {
+	am.mu.Lock()
+	defer am.mu.Unlock()
+	email = strings.TrimSpace(email)
+	var clean []string
+	if am.cfg.Recipient != "" {
+		for _, r := range strings.Split(am.cfg.Recipient, ",") {
+			r = strings.TrimSpace(r)
+			if r != "" && !strings.EqualFold(r, email) {
+				clean = append(clean, r)
+			}
+		}
+	}
+	am.cfg.Recipient = strings.Join(clean, ",")
+	if am.db != nil && email != "" {
+		_ = am.db.Where("email = ? COLLATE NOCASE", email).Delete(&model.SecurityRecipient{}).Error
+	}
+	return clean
 }
 
 // GetConfig returns current SMTP configuration snapshot.
@@ -142,33 +290,83 @@ func buildSecurityMessage(cfg config.AlertConfig, subject, attackIP, alertType, 
 </body>
 </html>`, alertType, attackIP, time.Now().Format("2006-01-02 15:04:05 MST"), action, detail)
 
-	header := make(map[string]string)
+	var cleanRecipients []string
+	for _, r := range strings.Split(cfg.Recipient, ",") {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			cleanRecipients = append(cleanRecipients, r)
+		}
+	}
+
 	sender := cfg.Sender
 	if sender == "" {
 		sender = cfg.Username
 	}
-	header["From"] = fmt.Sprintf("Home Datacenter Security <%s>", sender)
-	header["To"] = cfg.Recipient
-	header["Subject"] = fmt.Sprintf("[安全警报] %s: %s", subject, attackIP)
-	header["MIME-Version"] = "1.0"
-	header["Content-Type"] = "text/html; charset=UTF-8"
 
-	message := ""
-	for k, v := range header {
-		message += fmt.Sprintf("%s: %s\r\n", k, v)
+	var randVal uint64
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		randVal = binary.BigEndian.Uint64(b[:])
+	} else {
+		randVal = uint64(time.Now().UnixNano())
 	}
-	message += "\r\n" + body
-	return sender, message
+
+	encodedSubject := mime.BEncoding.Encode("UTF-8", fmt.Sprintf("[安全警报] %s: %s", subject, attackIP))
+
+	// Base64 encode HTML body and wrap at 76 characters per RFC 2045
+	rawB64 := base64.StdEncoding.EncodeToString([]byte(body))
+	var bodyBuf strings.Builder
+	for i := 0; i < len(rawB64); i += 76 {
+		end := i + 76
+		if end > len(rawB64) {
+			end = len(rawB64)
+		}
+		bodyBuf.WriteString(rawB64[i:end])
+		bodyBuf.WriteString("\r\n")
+	}
+
+	headers := []struct {
+		k, v string
+	}{
+		{"From", fmt.Sprintf("Home Datacenter Security <%s>", sender)},
+		{"To", strings.Join(cleanRecipients, ", ")},
+		{"Subject", encodedSubject},
+		{"Date", time.Now().Format(time.RFC1123Z)},
+		{"Message-ID", fmt.Sprintf("<%d.%d@homedatacenter.local>", time.Now().UnixNano(), randVal)},
+		{"MIME-Version", "1.0"},
+		{"Content-Type", "text/html; charset=UTF-8"},
+		{"Content-Transfer-Encoding", "base64"},
+		{"X-Priority", "1"},
+		{"Importance", "High"},
+	}
+
+	var msgBuf strings.Builder
+	for _, h := range headers {
+		msgBuf.WriteString(fmt.Sprintf("%s: %s\r\n", h.k, h.v))
+	}
+	msgBuf.WriteString("\r\n")
+	msgBuf.WriteString(bodyBuf.String())
+	return sender, msgBuf.String()
 }
 
 func deliverMail(cfg config.AlertConfig, sender, message string) error {
+	var cleanRecipients []string
+	for _, r := range strings.Split(cfg.Recipient, ",") {
+		r = strings.TrimSpace(r)
+		if r != "" {
+			cleanRecipients = append(cleanRecipients, r)
+		}
+	}
+	if len(cleanRecipients) == 0 {
+		return errors.New("no alert recipients specified")
+	}
+
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	auth := smtp.PlainAuth("", cfg.Username, cfg.Password, cfg.Host)
-	recipients := strings.Split(cfg.Recipient, ",")
 
 	if cfg.Port != 465 {
 		// Standard STARTTLS connection (e.g. port 587 / 25)
-		return smtp.SendMail(addr, auth, sender, recipients, []byte(message))
+		return smtp.SendMail(addr, auth, sender, cleanRecipients, []byte(message))
 	}
 
 	// SSL/TLS direct connection (Standard for QQ Mail port 465)
@@ -191,10 +389,18 @@ func deliverMail(cfg config.AlertConfig, sender, message string) error {
 	if err := client.Mail(sender); err != nil {
 		return fmt.Errorf("SMTP MAIL FROM: %w", err)
 	}
-	for _, rcpt := range recipients {
-		if err := client.Rcpt(strings.TrimSpace(rcpt)); err != nil {
-			return fmt.Errorf("SMTP RCPT TO: %w", err)
+	var lastRcptErr error
+	accepted := 0
+	for _, rcpt := range cleanRecipients {
+		if err := client.Rcpt(rcpt); err != nil {
+			log.Printf("security: SMTP RCPT TO (%s) rejected: %v", rcpt, err)
+			lastRcptErr = err
+		} else {
+			accepted++
 		}
+	}
+	if accepted == 0 {
+		return fmt.Errorf("all recipients rejected: %w", lastRcptErr)
 	}
 	w, err := client.Data()
 	if err != nil {

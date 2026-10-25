@@ -201,9 +201,87 @@ func (o *ONVIFController) DiscoverPresets(
 	return parsePresets(string(raw)), nil
 }
 
-// GotoPreset issues an ONVIF GotoPreset request. The preset token
-// must be known to the camera (i.e. set up in the camera's own UI
-// first; ONVIF has no API to *create* a preset on most firmware).
+// CreatePreset sends an ONVIF SetPreset request to persist the camera's
+// current PTZ position under presetName. If presetToken is provided, it updates
+// an existing preset; if empty, the camera creates a new preset and assigns a token.
+// Returns the assigned or confirmed preset token.
+func (o *ONVIFController) CreatePreset(
+	ctx context.Context,
+	id uint,
+	host string, port int, user, pass, profileToken, presetName, presetToken string,
+) (string, error) {
+	deviceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", host, port)
+	var tokenTag string
+	if presetToken != "" {
+		tokenTag = fmt.Sprintf("\n      <tptz:PresetToken>%s</tptz:PresetToken>", xmlEscape(presetToken))
+	}
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <soap:Body>
+    <tptz:SetPreset>
+      <tptz:ProfileToken>%s</tptz:ProfileToken>
+      <tptz:PresetName>%s</tptz:PresetName>%s
+    </tptz:SetPreset>
+  </soap:Body>
+</soap:Envelope>`, xmlEscape(profileToken), xmlEscape(presetName), tokenTag)
+	body = strings.Replace(body, "<soap:Body>", wsseHeader(user, pass)+"<soap:Body>", 1)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, deviceURL, strings.NewReader(body))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/soap+xml; charset=utf-8")
+	resp, err := o.hc.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		buf, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("onvif setpreset http %d: %s", resp.StatusCode, string(buf))
+	}
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if bytes.Contains(raw, []byte("<Fault")) {
+		return "", fmt.Errorf("onvif setpreset fault: %s", truncate(string(raw), 256))
+	}
+	tok := parsePresetToken(string(raw))
+	if tok == "" && presetToken != "" {
+		tok = presetToken
+	}
+	if tok == "" {
+		tok = presetName
+	}
+
+	o.mu.Lock()
+	s, ok := o.cached[id]
+	if ok {
+		s.profileToken = profileToken
+	}
+	o.mu.Unlock()
+	return tok, nil
+}
+
+// RemovePreset removes a preset from the camera via ONVIF RemovePreset.
+func (o *ONVIFController) RemovePreset(
+	ctx context.Context,
+	host string, port int, user, pass, profileToken, presetToken string,
+) error {
+	deviceURL := fmt.Sprintf("http://%s:%d/onvif/device_service", host, port)
+	body := fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
+<soap:Envelope xmlns:soap="http://www.w3.org/2003/05/soap-envelope"
+               xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">
+  <soap:Body>
+    <tptz:RemovePreset>
+      <tptz:ProfileToken>%s</tptz:ProfileToken>
+      <tptz:PresetToken>%s</tptz:PresetToken>
+    </tptz:RemovePreset>
+  </soap:Body>
+</soap:Envelope>`, xmlEscape(profileToken), xmlEscape(presetToken))
+	return o.sendSoap(ctx, deviceURL, user, pass, body)
+}
+
+// GotoPreset issues an ONVIF GotoPreset request.
 func (o *ONVIFController) GotoPreset(
 	ctx context.Context,
 	id uint,

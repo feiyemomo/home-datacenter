@@ -28,6 +28,8 @@ type SystemHandler struct {
 	recordingsDir string
 	quotaBytes    uint64
 	bus           *eventbus.Bus
+
+	recordingSizeMonitor *maintenance.RecordingSizeMonitor
 }
 
 // NewSystemHandler creates a handler for system status and MQTT debug.
@@ -42,6 +44,12 @@ func NewSystemHandler(
 		deviceMgr:  deviceMgr,
 		startTime:  time.Now(),
 	}
+}
+
+// SetRecordingSizeMonitor connects the runtime recording size monitor to allow
+// immediate quota re-enforcement when storage settings change.
+func (h *SystemHandler) SetRecordingSizeMonitor(m *maintenance.RecordingSizeMonitor) {
+	h.recordingSizeMonitor = m
 }
 
 // ConfigureMetrics sets up the filesystem and recording paths for telemetry.
@@ -270,6 +278,10 @@ func (h *SystemHandler) UpdateStorageConfig(c *gin.Context) {
 
 	// Update in-memory metrics quota
 	h.quotaBytes = uint64(req.QuotaGB) * 1024 * 1024 * 1024
+	if h.recordingSizeMonitor != nil {
+		h.recordingSizeMonitor.SetQuotaBytes(h.quotaBytes)
+		h.recordingSizeMonitor.TriggerSample()
+	}
 
 	cfg := StorageConfig{
 		QuotaGB:              req.QuotaGB,

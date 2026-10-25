@@ -190,10 +190,10 @@ func TestDefenseManager_AlertCooldownAndWhitelist(t *testing.T) {
 		t.Fatalf("expected 10.1.2.3 to be whitelisted under 10.0.0.0/8")
 	}
 
-	// List dynamic whitelist
+	// List dynamic whitelist (includes 1 system + 1 dynamic)
 	wls, err := dm.ListWhitelist()
-	if err != nil || len(wls) != 1 {
-		t.Fatalf("expected 1 dynamic whitelist entry, got %d, err: %v", len(wls), err)
+	if err != nil || len(wls) != 2 {
+		t.Fatalf("expected 2 whitelist entries (1 system + 1 dynamic), got %d, err: %v", len(wls), err)
 	}
 
 	// Remove whitelist
@@ -202,6 +202,10 @@ func TestDefenseManager_AlertCooldownAndWhitelist(t *testing.T) {
 	}
 	if dm.IsWhitelisted("10.1.2.3") {
 		t.Fatalf("expected 10.1.2.3 not to be whitelisted after removal")
+	}
+	wlsAfter, _ := dm.ListWhitelist()
+	if len(wlsAfter) != 1 {
+		t.Fatalf("expected 1 system whitelist entry after removal, got %d", len(wlsAfter))
 	}
 
 	// Dynamic config update

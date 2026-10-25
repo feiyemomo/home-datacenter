@@ -229,7 +229,7 @@ func (h *SecurityHandler) CheckIP(c *gin.Context) {
 	c.Status(http.StatusNoContent)
 }
 
-// ListEvents queries the security events timeline.
+// ListEvents queries the security events timeline with optional filters.
 func (h *SecurityHandler) ListEvents(c *gin.Context) {
 	if h.defenseMgr == nil {
 		utils.Fail(c, http.StatusServiceUnavailable, "defense manager not configured")
@@ -241,7 +241,11 @@ func (h *SecurityHandler) ListEvents(c *gin.Context) {
 			limit = v
 		}
 	}
-	events, err := h.defenseMgr.ListEvents(limit)
+	eventType := c.Query("type")
+	ip := c.Query("ip")
+	keyword := c.Query("keyword")
+
+	events, err := h.defenseMgr.ListEvents(limit, eventType, ip, keyword)
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
 		return
@@ -384,6 +388,157 @@ func (h *SecurityHandler) UpdateConfig(c *gin.Context) {
 		return
 	}
 	utils.Success(c, gin.H{"status": "updated"})
+}
+
+type updateAlertEmailRequest struct {
+	Recipient  string   `json:"recipient"`
+	Recipients []string `json:"recipients"`
+}
+
+// UpdateAlertEmail updates the administrator recipient emails for security alerts.
+//
+//	Route: PUT /api/v1/security/alert-email
+func (h *SecurityHandler) UpdateAlertEmail(c *gin.Context) {
+	if h.alertMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "alert manager not configured")
+		return
+	}
+	var req updateAlertEmailRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+
+	var recList []string
+	if len(req.Recipients) > 0 {
+		recList = req.Recipients
+	} else if req.Recipient != "" {
+		for _, r := range strings.Split(req.Recipient, ",") {
+			r = strings.TrimSpace(r)
+			if r != "" {
+				recList = append(recList, r)
+			}
+		}
+	}
+
+	for _, email := range recList {
+		if !strings.Contains(email, "@") {
+			utils.Fail(c, http.StatusBadRequest, fmt.Sprintf("invalid email address: %s", email))
+			return
+		}
+	}
+
+	clean := h.alertMgr.SetRecipients(recList)
+
+	operatorIP := c.GetString("real_client_ip")
+	if operatorIP == "" {
+		operatorIP = c.ClientIP()
+	}
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+	if h.defenseMgr != nil {
+		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
+			fmt.Sprintf("管理员 %s 更新安全告警接收邮箱为: %s", operatorUser, strings.Join(clean, ", ")),
+			"配置更新成功")
+	}
+
+	cfg := h.alertMgr.GetConfig()
+	utils.Success(c, gin.H{
+		"recipient":    cfg.Recipient,
+		"recipients":   clean,
+		"sender_email": cfg.Username,
+		"smtp_host":    cfg.Host,
+		"smtp_enabled": cfg.Enabled,
+	})
+}
+
+// AddAlertRecipient adds a new recipient email.
+//
+//	Route: POST /api/v1/security/alert-recipients
+func (h *SecurityHandler) AddAlertRecipient(c *gin.Context) {
+	if h.alertMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "alert manager not configured")
+		return
+	}
+	var req struct {
+		Recipient string `json:"recipient" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "recipient is required")
+		return
+	}
+	email := strings.TrimSpace(req.Recipient)
+	if email == "" || !strings.Contains(email, "@") {
+		utils.Fail(c, http.StatusBadRequest, "invalid email address")
+		return
+	}
+
+	clean := h.alertMgr.AddRecipient(email)
+
+	operatorIP := c.GetString("real_client_ip")
+	if operatorIP == "" {
+		operatorIP = c.ClientIP()
+	}
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+	if h.defenseMgr != nil {
+		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
+			fmt.Sprintf("管理员 %s 新增安全告警接收邮箱: %s", operatorUser, email),
+			"添加接收人成功")
+	}
+
+	cfg := h.alertMgr.GetConfig()
+	utils.Success(c, gin.H{
+		"recipient":    cfg.Recipient,
+		"recipients":   clean,
+		"sender_email": cfg.Username,
+		"smtp_host":    cfg.Host,
+		"smtp_enabled": cfg.Enabled,
+	})
+}
+
+// DeleteAlertRecipient removes an alert recipient email.
+//
+//	Route: DELETE /api/v1/security/alert-recipients/:email
+func (h *SecurityHandler) DeleteAlertRecipient(c *gin.Context) {
+	if h.alertMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "alert manager not configured")
+		return
+	}
+	email := c.Param("email")
+	if email == "" {
+		utils.Fail(c, http.StatusBadRequest, "email is required")
+		return
+	}
+
+	clean := h.alertMgr.RemoveRecipient(email)
+
+	operatorIP := c.GetString("real_client_ip")
+	if operatorIP == "" {
+		operatorIP = c.ClientIP()
+	}
+	operatorUser := c.GetString("user_name")
+	if operatorUser == "" {
+		operatorUser = "admin"
+	}
+	if h.defenseMgr != nil {
+		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
+			fmt.Sprintf("管理员 %s 移除安全告警接收邮箱: %s", operatorUser, email),
+			"移除接收人成功")
+	}
+
+	cfg := h.alertMgr.GetConfig()
+	utils.Success(c, gin.H{
+		"recipient":    cfg.Recipient,
+		"recipients":   clean,
+		"sender_email": cfg.Username,
+		"smtp_host":    cfg.Host,
+		"smtp_enabled": cfg.Enabled,
+	})
 }
 
 // TestAlertEmail dispatches a test alert via QQ Mail SMTP to confirm delivery.

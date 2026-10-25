@@ -125,9 +125,9 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 	}
 
 	// v1.6.37: prune per-level backlog so routine events don't
-	// drown out urgent ones in SQLite. Critical events are kept
-	// indefinitely (audit trail); normal/info are capped. See
-	// pruneSystemLogs for the retention table.
+	// drown out urgent ones in SQLite. Every level is capped, with
+	// critical kept the longest (audit trail). See pruneSystemLogs
+	// for the retention table.
 	s.pruneSystemLogs()
 
 	// Re-publish the freshly persisted row (now with its ID) on
@@ -148,10 +148,11 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 // (device online, camera status_changed) don't grow system_logs
 // unbounded and crowd out critical events in queries.
 //
-// Retention table (v1.6.37):
-//   - critical: unlimited (audit trail — camera/device offline)
-//   - normal:   keep newest 500 rows (device online)
-//   - info:     keep newest 200 rows (camera status_changed)
+// Retention table (v1.6.37; caps raised in v1.11.x):
+//   - critical: keep newest 5000 rows (audit trail — camera/device offline)
+//   - normal:   keep newest 2000 rows (device online)
+//   - info:     keep newest 1000 rows (camera status_changed)
+//   - warning:  keep newest 1000 rows (quota / disk / backup thresholds)
 //
 // Runs on every insert. Cheap because:
 //   1. Count is on the indexed `level` column.
@@ -164,10 +165,10 @@ func (s *Subscriber) handle(topic string, e eventbus.Event) {
 // are treated as normal for pruning.
 func (s *Subscriber) pruneSystemLogs() {
 	caps := map[string]int64{
-		model.LevelCritical: 1000,
-		model.LevelNormal:   500,
-		model.LevelInfo:     200,
-		model.LevelWarning:  200,
+		model.LevelCritical: 5000,
+		model.LevelNormal:   2000,
+		model.LevelInfo:     1000,
+		model.LevelWarning:  1000,
 	}
 	for level, keep := range caps {
 		var count int64

@@ -115,6 +115,13 @@ func NewHandler(bus *eventbus.Bus, manager *device.Manager, slugLookup SlugLooku
 				h.SyncFrigateDetection(p.Mode)
 			}
 		})
+		bus.Subscribe("camera.ai_source_changed", func(e eventbus.Event) {
+			mode := model.GuardModeArmedAway
+			if h.guardProvider != nil {
+				mode = h.guardProvider.GetMode()
+			}
+			h.SyncFrigateDetection(mode)
+		})
 	}
 	return h
 }
@@ -344,6 +351,15 @@ func (h *Handler) handleFrigateEvent(payload []byte) {
 		log.Printf("mqtt: frigate detection below confidence threshold: camera=%s label=%s confidence=%.2f",
 			slug, frigEv.After.Label, confidence)
 		return
+	}
+
+	// Check AI alert source policy (e.g. if set to "camera", suppress Frigate alert broadcast & vision analysis)
+	if mgr := camera.GetGlobalAIAlertSourceManager(""); mgr != nil {
+		if !mgr.ShouldProcessFrigateAlert(cameraID) {
+			log.Printf("mqtt: frigate alert suppressed by AI alert source policy (camera=%s id=%d mode=%s)",
+				slug, cameraID, mgr.GetSource())
+			return
+		}
 	}
 
 	ts := int64(frigEv.After.StartTime)
@@ -1026,8 +1042,9 @@ func (h *Handler) OnConnect(client pahomqtt.Client) {
 }
 
 // SyncFrigateDetection synchronizes Frigate's object detection toggle
-// with the system security mode. Disarmed shuts down detection to save
-// 100% CPU and eliminate nuisance events. Armed modes turn it ON.
+// with the system security mode and AI alert source mode.
+// If security mode is Disarmed OR AI alert source is set to "camera" (hardware-only),
+// Frigate's detection pipeline is turned OFF to completely eliminate CPU overhead.
 func (h *Handler) SyncFrigateDetection(guardMode string) {
 	if h.slugLookup == nil {
 		return
@@ -1037,6 +1054,14 @@ func (h *Handler) SyncFrigateDetection(guardMode string) {
 	case "disarm", "off", model.GuardModeDisarmed:
 		payload = "OFF"
 	}
+
+	// If the user selected camera-hardware-only AI, Frigate detection is never needed
+	if mgr := camera.GetGlobalAIAlertSourceManager(""); mgr != nil {
+		if mgr.GetSource() == camera.AISourceCamera {
+			payload = "OFF"
+		}
+	}
+
 	slugs := h.slugLookup.AllFrigateSlugs()
 	for _, slug := range slugs {
 		detectTopic := fmt.Sprintf("frigate/%s/detect/set", slug)

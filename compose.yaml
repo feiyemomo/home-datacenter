@@ -572,7 +572,8 @@ services:
   alist:
     image: xhofe/alist:latest
     container_name: home-alist
-    restart: unless-stopped
+    restart: "no"
+    profiles: [ "archive" ]
     logging: *default-logging
     volumes:
       - ./data/alist:/opt/alist/data
@@ -595,7 +596,8 @@ services:
   recordings-archive:
     image: rclone/rclone:1.68
     container_name: home-recordings-archive
-    restart: unless-stopped
+    restart: "no"
+    profiles: [ "archive" ]
     logging: *default-logging
     security_opt:
       - no-new-privileges:true

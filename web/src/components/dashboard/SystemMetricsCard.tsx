@@ -58,7 +58,7 @@ export default function SystemMetricsCard({ metrics, onCleaned }: SystemMetricsC
     const [cleanResult, setCleanResult] = useState<string | null>(null);
     const [cleanError, setCleanError] = useState<string | null>(null);
     const [showModal, setShowModal] = useState(false);
-    const [cfgQuota, setCfgQuota] = useState(400);
+    const [cfgQuota, setCfgQuota] = useState(380);
     const [cfgHour, setCfgHour] = useState(3);
     const [cfgMinAge, setCfgMinAge] = useState(7);
     const [savingCfg, setSavingCfg] = useState(false);
@@ -68,7 +68,7 @@ export default function SystemMetricsCard({ metrics, onCleaned }: SystemMetricsC
         setShowModal(true);
         try {
             const cfg = await getStorageConfig();
-            setCfgQuota(cfg.quota_gb || 400);
+            setCfgQuota(cfg.quota_gb || 380);
             setCfgHour(cfg.archive_schedule_hour ?? 3);
             setCfgMinAge(cfg.archive_min_age_days ?? 7);
         } catch (e) {
@@ -355,13 +355,13 @@ export default function SystemMetricsCard({ metrics, onCleaned }: SystemMetricsC
                                         type="number"
                                         min="50"
                                         max="5000"
-                                        step="50"
+                                        step="1"
                                         value={cfgQuota}
-                                        onChange={(e) => setCfgQuota(Math.max(50, parseInt(e.target.value) || 400))}
+                                        onChange={(e) => setCfgQuota(Math.max(50, parseInt(e.target.value) || 380))}
                                         className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                                     />
                                     <div className="flex gap-1">
-                                        {[200, 400, 800, 1000].map((q) => (
+                                        {[200, 380, 400, 800, 1000].map((q) => (
                                             <Button
                                                 key={q}
                                                 type="button"

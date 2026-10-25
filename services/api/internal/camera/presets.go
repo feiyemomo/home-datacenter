@@ -7,6 +7,41 @@ import (
 	"home-datacenter-api/internal/model"
 )
 
+// CreatePreset saves the current PTZ position on the camera hardware as a new preset
+// via ONVIF SetPreset and records the friendly alias -> preset token mapping.
+func (r *Registry) CreatePreset(
+	ctx context.Context, camID uint, name, token string,
+) (*model.Camera, string, error) {
+	cam, err := r.Get(camID)
+	if err != nil {
+		return nil, "", err
+	}
+	profile := cam.OnvifProfileToken
+	if profile == "" {
+		return nil, "", fmt.Errorf("camera %d: no onvif profile token", camID)
+	}
+	user, pass, err := r.DecryptCredentials(cam)
+	if err != nil {
+		return nil, "", err
+	}
+	actualToken, err := r.ONVIF.CreatePreset(ctx, camID, cam.Host, cam.ONVIFPort, user, pass, profile, name, token)
+	if err != nil {
+		return nil, "", fmt.Errorf("onvif setpreset failed: %w", err)
+	}
+	if cam.Presets == nil {
+		cam.Presets = model.JSON{}
+	}
+	cam.Presets[name] = actualToken
+	if err := r.DB.Model(&model.Camera{}).Where("id = ?", camID).Updates(map[string]any{
+		"presets":    model.JSON(cam.Presets),
+		"updated_at": nowFn(),
+	}).Error; err != nil {
+		return nil, "", err
+	}
+	updated, err := r.Get(camID)
+	return updated, actualToken, err
+}
+
 // SetPreset stores (or updates) a single friendly-name → ONVIF
 // preset-token mapping. Existing aliases are preserved.
 func (r *Registry) SetPreset(camID uint, alias, token string) (*model.Camera, error) {

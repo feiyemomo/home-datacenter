@@ -1,5 +1,13 @@
 import client from "./client";
-import type { Camera, CameraRecording, IceConfig, PTZCommand, PresetEntry } from "@/types";
+import type {
+    AIAlertSource,
+    AIAlertSourceStatus,
+    Camera,
+    CameraRecording,
+    IceConfig,
+    PTZCommand,
+    PresetEntry,
+} from "@/types";
 
 /**
  * Camera platform API surface.
@@ -350,5 +358,35 @@ export function cameraFrameUrl(cameraId: number): string {
  */
 export async function updateCameraDetectFPS(id: number, fps: number): Promise<{ id: number; detect_fps: number }> {
     const { data } = await client.put<{ id: number; detect_fps: number }>(`/cameras/${id}/detect-fps`, { fps });
+    return data;
+}
+
+/**
+ * Get the active AI alert source (camera hardware AI / Frigate / both).
+ *
+ * GET /api/v1/cameras/ai-source
+ */
+export async function getAIAlertSource(): Promise<AIAlertSourceStatus> {
+    const { data } = await client.get<AIAlertSourceStatus>("/cameras/ai-source");
+    return data;
+}
+
+/**
+ * Switch the AI alert source. Admin only.
+ *
+ * PUT /api/v1/cameras/ai-source
+ */
+export async function setAIAlertSource(source: AIAlertSource): Promise<AIAlertSourceStatus> {
+    const { data } = await client.put<AIAlertSourceStatus>("/cameras/ai-source", { source });
+    return data;
+}
+
+/**
+ * Toggle the motion fallback compatibility mode. Admin only.
+ *
+ * PUT /api/v1/cameras/motion-fallback
+ */
+export async function setMotionFallback(enabled: boolean): Promise<AIAlertSourceStatus> {
+    const { data } = await client.put<AIAlertSourceStatus>("/cameras/motion-fallback", { enabled });
     return data;
 }
