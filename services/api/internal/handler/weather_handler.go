@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,7 +56,7 @@ type WeatherHandler struct {
 // NewWeatherHandler creates a weather proxy handler.
 func NewWeatherHandler() *WeatherHandler {
 	return &WeatherHandler{
-		defaultLocation: "Baoji",
+		defaultLocation: "Chencang",
 		httpClient: &http.Client{
 			Timeout: 15 * time.Second,
 		},
@@ -72,34 +72,31 @@ func NewWeatherHandler() *WeatherHandler {
 //	@Success	200	{object}	utils.ApiResponse
 //	@Router		/api/v1/weather [get]
 func (h *WeatherHandler) Weather(c *gin.Context) {
-	// Serve from cache if fresh — avoids hitting wttr.in on every
-	// app open.
-	h.mu.RLock()
-	cached := h.cache
-	cachedAt := h.cachedAt
-	h.mu.RUnlock()
-	if cached != "" && time.Since(cachedAt) < h.cacheTTL {
-		var data interface{}
-		if err := json.Unmarshal([]byte(cached), &data); err == nil {
-			utils.Success(c, data)
-			return
+	// Weather target location: prefer fixed Chencang (陈仓区) to avoid
+	// ISP carrier IP geolocation drifting to nearby township tags (e.g. Mayingchen).
+	target := h.defaultLocation
+	loc := strings.TrimSpace(c.Query("location"))
+	if loc != "" {
+		target = loc
+	}
+	isDefault := loc == "" || strings.EqualFold(loc, h.defaultLocation)
+
+	// Serve from cache if fresh — only for default location to avoid
+	// location cross-contamination between different queries.
+	if isDefault {
+		h.mu.RLock()
+		cached := h.cache
+		cachedAt := h.cachedAt
+		h.mu.RUnlock()
+		if cached != "" && time.Since(cachedAt) < h.cacheTTL {
+			var data interface{}
+			if err := json.Unmarshal([]byte(cached), &data); err == nil {
+				utils.Success(c, data)
+				return
+			}
 		}
 	}
 
-	// Use the client's public IP for geolocation. wttr.in reads
-	// the X-Forwarded-For header (or the TCP remote addr) and
-	// geolocates automatically — we just need to forward the
-	// caller's IP so that LAN clients (which share the server's
-	// public IP via NAT) are located correctly.
-	clientIP := c.ClientIP()
-
-	// Build the wttr.in URL. We use url.URL + url.PathEscape so a
-	// spoofed X-Forwarded-For value (which c.ClientIP() trusts) can't
-	// inject path components or query strings into the request.
-	target := h.defaultLocation
-	if isPublicIP(clientIP) {
-		target = clientIP
-	}
 	u := &url.URL{
 		Scheme:   "https",
 		Host:     "wttr.in",
@@ -122,14 +119,16 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		log.Printf("[handler] weather service unavailable: %v", err)
-		h.mu.RLock()
-		cached := h.cache
-		h.mu.RUnlock()
-		if cached != "" {
-			var data interface{}
-			if err := json.Unmarshal([]byte(cached), &data); err == nil {
-				utils.Success(c, data)
-				return
+		if isDefault {
+			h.mu.RLock()
+			cached := h.cache
+			h.mu.RUnlock()
+			if cached != "" {
+				var data interface{}
+				if err := json.Unmarshal([]byte(cached), &data); err == nil {
+					utils.Success(c, data)
+					return
+				}
 			}
 		}
 		utils.Fail(c, http.StatusBadGateway, "weather service unavailable")
@@ -140,14 +139,16 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024))
 		log.Printf("[handler] weather service returned status %d: %s", resp.StatusCode, string(body))
-		h.mu.RLock()
-		cached := h.cache
-		h.mu.RUnlock()
-		if cached != "" {
-			var data interface{}
-			if err := json.Unmarshal([]byte(cached), &data); err == nil {
-				utils.Success(c, data)
-				return
+		if isDefault {
+			h.mu.RLock()
+			cached := h.cache
+			h.mu.RUnlock()
+			if cached != "" {
+				var data interface{}
+				if err := json.Unmarshal([]byte(cached), &data); err == nil {
+					utils.Success(c, data)
+					return
+				}
 			}
 		}
 		utils.Fail(c, http.StatusBadGateway,
@@ -161,11 +162,13 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 		return
 	}
 
-	// Cache the raw JSON body.
-	h.mu.Lock()
-	h.cache = string(body)
-	h.cachedAt = time.Now()
-	h.mu.Unlock()
+	// Cache only default location results.
+	if isDefault {
+		h.mu.Lock()
+		h.cache = string(body)
+		h.cachedAt = time.Now()
+		h.mu.Unlock()
+	}
 
 	// Parse and re-wrap in our envelope.
 	var data interface{}
@@ -175,25 +178,4 @@ func (h *WeatherHandler) Weather(c *gin.Context) {
 	}
 
 	utils.Success(c, data)
-}
-
-// isPublicIP reports whether ipStr is a public (non-RFC1918/non-loopback/
-// non-link-local/non-unspecified) IPv4 or IPv6 address. We only forward
-// public IPs to wttr.in for geolocation — private LAN IPs would confuse
-// wttr.in (it would try to locate 192.168.x.y and fall back to its own
-// server location).
-//
-// Unlike naive string-prefix matching, net.ParseIP fully validates the
-// address and rejects anything that isn't a well-formed IP literal, so
-// a spoofed X-Forwarded-For value like "192.168.1.1/../../etc" can't
-// sneak past the check.
-func isPublicIP(ipStr string) bool {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return false
-	}
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
-		return false
-	}
-	return true
 }

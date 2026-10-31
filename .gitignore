@@ -97,6 +97,8 @@ android/app-release-*.apk
 android/release-notes-v*.txt
 
 # ---- Build artifacts, logs & archives ----
+*.tar.gz
+*.b64
 go2rtc-extract/
 go2rtc-new/
 go2rtc-v2/

@@ -434,6 +434,22 @@ generic messages like `"operation failed"`, `"internal server error"`,
 or `"invalid credentials"`. This prevents information leakage through
 API error responses. 46+ locations were updated.
 
+### 15. Intrusion Defense Center (Phase 2 & 3 — 2026-10-31)
+
+To protect the internet-exposed API against brute-force credential stuffing and unauthorized scanning, the Intrusion Defense Center was upgraded to Phase 2 & 3:
+
+1. **Database Persistence**:
+   - `ip_bans`: Stores active and historical IP bans (`ip`, `reason`, `source`, `banned_at`, `expires_at`, `permanent`, `hit_count`, `last_hit_at`). Banned IPs persist across container restarts.
+   - `security_events`: Append-only audit trail for all security activities (`auth_fail`, `manual_ban`, `unban`, `rate_limit`, `config_change`, `test_alert`).
+   - `security_whitelists`: User-defined CIDRs/IPs with notes that bypass intrusion blocking.
+2. **Self-Protection & Lockout Prevention**:
+   - `ManualBan` validates IP candidates against loopback (`127.0.0.1`, `::1`), RFC1918 gateway networks, static config whitelists, and dynamic database whitelists.
+   - Specifically protects the currently authenticated caller's IP (`ErrSelfIP`), preventing administrator self-lockout.
+3. **Alert Deduplication**:
+   - Outbound alert emails (via SMTP) implement a 10-minute cooldown window per attacking IP address, mitigating alert flooding during distributed attacks.
+4. **Dynamic Whitelist & Runtime Policy Configuration**:
+   - REST endpoints (`/api/v1/security/whitelist`, `/api/v1/security/config`) permit authorized administrators to tune thresholds (`max_failures`, `window_mins`, `ban_duration_mins`) and manage exemptions dynamically without restarting the backend.
+
 ---
 
 ## Residual Risks (accepted, not yet fixed)

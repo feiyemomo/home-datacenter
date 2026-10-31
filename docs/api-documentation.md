@@ -1740,12 +1740,21 @@ Publish `{"status":"offline",...}` to flip it back.
 | `/api/v1/vision/persons` | POST | JWT | Enroll new person face (image base64/URL) |
 | `/api/v1/vision/persons/:name` | DELETE | JWT | Remove person from face database |
 | `/api/v1/vision/analyze` | POST | JWT | On-demand image analysis (face detection/matching + pose/fall estimation) |
+| `/api/v1/security/overview` | GET | JWT+admin | Defense status, counts, pending attempts, 24h hits, top attackers |
+| `/api/v1/security/ban` | POST | JWT+admin | Manual ban IP `{ip, duration_minutes, reason, permanent}` with self-protection |
+| `/api/v1/security/ban/:ip` | DELETE | JWT+admin | Unban IP |
+| `/api/v1/security/events` | GET | JWT+admin | Query security audit events timeline (`limit`) |
+| `/api/v1/security/whitelist` | GET | JWT+admin | List dynamic whitelisted IP/CIDR entries |
+| `/api/v1/security/whitelist` | POST | JWT+admin | Add dynamic whitelist entry `{cidr, note}` |
+| `/api/v1/security/whitelist/:entry` | DELETE | JWT+admin | Remove dynamic whitelist entry |
+| `/api/v1/security/config` | PUT | JWT+admin | Update defense policy `{max_failures, window_mins, ban_duration_mins}` |
+| `/api/v1/security/test-alert` | POST | JWT+admin | Send test alert email via SMTP |
 
-> Camera + Automation + Vision endpoints are described in detail in
+> Camera + Automation + Vision + Security endpoints are described in detail in
 > [`docs/platformization.md`](platformization.md) and
-> [`docs/security.md`](security.md) §11–12. The rows above are the
-> authoritative route surface as of Phase 11 (Vision AI).
+> [`docs/security.md`](security.md) §11–15. The rows above are the
+> authoritative route surface as of Security Defense Center Phase 2 & 3.
 
 ---
 
-**Document Version:** 2026-09-23 (sync: added Phase 11 Vision AI endpoints `/api/v1/vision/*` and EventBus topics `camera.person_recognized` & `camera.fall_detected`)
+**Document Version:** 2026-10-31 (sync: added Security Defense Center Phase 2 & 3 endpoints `/api/v1/security/*` and dynamic policy/whitelist management)

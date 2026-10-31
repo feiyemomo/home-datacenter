@@ -803,6 +803,7 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 		}
 	}
 
+	var targetCamID uint
 	if camIDStr := c.Query("camera_id"); camIDStr != "" {
 		if cid, err := strconv.ParseUint(camIDStr, 10, 64); err == nil && cid > 0 {
 			cam, err := h.Reg.Get(uint(cid))
@@ -814,6 +815,7 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 				utils.Fail(c, http.StatusForbidden, "not your camera")
 				return
 			}
+			targetCamID = uint(cid)
 			if slug, ok := h.Reg.LookupFrigateSlugByCameraID(uint(cid)); ok {
 				filter.Cameras = slug
 			}
@@ -829,6 +831,7 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 			utils.Fail(c, http.StatusForbidden, "not your camera")
 			return
 		}
+		targetCamID = camID
 		filter.Cameras = slug
 	} else if !isAdmin {
 		var slugs []string
@@ -861,8 +864,8 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 	// 1. Fetch persisted camera hardware AI alerts from SQLite
 	if h.Reg != nil && h.Reg.DB != nil {
 		q := h.Reg.DB.Model(&model.CameraAlert{})
-		if cid, err := strconv.ParseUint(c.Query("camera_id"), 10, 64); err == nil && cid > 0 {
-			q = q.Where("camera_id = ?", uint(cid))
+		if targetCamID > 0 {
+			q = q.Where("camera_id = ?", targetCamID)
 		}
 		if lbl := strings.TrimSpace(c.Query("label")); lbl != "" {
 			q = q.Where("label = ?", lbl)
@@ -876,6 +879,9 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 		var localAlerts []model.CameraAlert
 		if err := q.Order("start_time DESC").Limit(limit).Find(&localAlerts).Error; err == nil {
 			for _, la := range localAlerts {
+				if targetCamID > 0 && la.CameraID != targetCamID {
+					continue
+				}
 				cam, err := h.Reg.Get(la.CameraID)
 				if !isAdmin && (err != nil || !h.Reg.CanRead(cam, uid, isAdmin)) {
 					continue
@@ -924,6 +930,10 @@ func (h *CameraHandler) ListAlerts(c *gin.Context) {
 					if cam, err := h.Reg.Get(camID); err == nil {
 						entry.CameraName = cam.StreamName
 					}
+				}
+				// If a specific camera_id was queried, strictly reject events from other cameras
+				if targetCamID > 0 && entry.CameraID != targetCamID {
+					continue
 				}
 				alerts = append(alerts, entry)
 			}

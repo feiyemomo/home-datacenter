@@ -467,7 +467,8 @@ services:
   # on the same network as the other services so it can resolve
   # "web", "api" etc.
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    # 2026-10 eMudhra weak key vulnerability fix: must be >= 2026.10.2
+    image: cloudflare/cloudflared:2026.10.3
     container_name: home-cloudflared
     restart: unless-stopped
     logging: *default-logging

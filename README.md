@@ -37,8 +37,8 @@
 - **边缘 AI 视觉与姿态跌倒检测 (`home-vision`)**：专为低功耗 Intel J4125 优化的轻量级 OpenCV DNN（YuNet 人脸匹配 + YOLOv8n-pose 17 点骨骼跌倒判定），配备前置动态 CPU 熔断门控。
 - **事件驱动与自动化引擎 (EventBus)**：统一硬件与监控状态变更，支持触发器、时间/正则条件、防抖降噪（Throttle）与 Notify/MQTT/Webhook 动作。
 - **双端自适应互联 (Web SPA + Android App)**：支持局域网直接直连、公网 IPv6 动态直连（50ms 极低延迟）与 Cloudflare Tunnel 安全穿透三通道平滑自适应。
-- **多重安全防护体系**：AES-256-GCM 摄像头凭据静态加密、Nginx Auth-Request 反向代理门禁、WebSocket CSWSH 防御、令牌桶防爆破限流。
-- **数据持久化与异地冷备**：SQLite 数据库每日自动打快照并同步至 S3 兼容对象存储（Bitiful 亿安云），具备磁盘配额自动压缩与生命周期淘汰策略。
+- **多重安全防护体系**：AES-256-GCM 摄像头凭据静态加密、Nginx Auth-Request 反向代理门禁、WebSocket CSWSH 防御、令牌桶防爆破限流、SQLite 持久化安全防御中心（自动防爆破熔断、防自锁校验、10分钟告警降噪、在线白名单与策略配置）。
+- **数据持久化与智能淘汰**：SQLite 数据库每日自动打快照并同步至 S3 兼容对象存储（Bitiful 亿安云），录像配备基于小时级增量 FIFO 淘汰机制，超额自动平滑释放最早历史录像，最大化保留监控天数。
 
 
 ---
@@ -489,7 +489,7 @@ curl -sS -X POST http://localhost:8080/api/v1/automation/rules \
 | 磁盘监控 | 数据盘使用率告警，写 `system.disk` 并实时推送 dashboard | 每 10 分钟；80% 告警 / 90% 严重 |
 | 录像活性监控 | 检测"在线但录像片段停滞"的摄像头，写 `system.recording` 告警 | 默认停滞 10 分钟判定 |
 | 服务存活监控 | 探测 web/MQTT 从属服务，连续失败写 `system.service` 告警 | 每 30s；连续 3 次判定宕机 |
-| 录像容量监控 | 统计录像目录总大小，超阈值告警（先于通用磁盘告警） | 每小时；warn/crit 字节阈值 |
+| 录像容量监控与增量淘汰 | 统计录像目录总大小，超阈值告警；超出 400 GiB 配额时按整小时由远及近自动 FIFO 淘汰最早录像，平滑降回安全水位 | 每小时巡检；超配额自动小步长平滑释放 |
 | CPU/内存监控 | 采样主机 CPU/内存，超阈值告警 | 每 5 分钟；warn/crit 百分比 |
 | 旧包清理 | `data/releases` 只留最新 5 个 APK，含启动 + 每日清理 | 保留 5 个 |
 

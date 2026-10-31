@@ -395,7 +395,7 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 - **Live Viewing**: Dual engine support in frontend: WebRTC (sub-second latency via `/go2rtc/api/webrtc`) and HLS (reliable playback via `/go2rtc/api/stream.m3u8`).
 - **ONVIF Control**: WS-Security `UsernameToken` with `PasswordDigest` over SOAP (nonce + created timestamp), preventing plaintext credential transmission over LAN.
 - **Recording & Playback**: Frigate writes ~10s MP4 segments under `/media/frigate/recordings/YYYY-MM-DD/HH/<cam>/MM.SS.mp4`. `home-api` serves segments directly via `http.ServeFile` with range support and hardware acceleration (`h264_vaapi` via `/dev/dri/renderD128` Intel J4125 iGPU).
-- **Recording Quota**: Automated quota manager enforces storage limits (default 400 GiB), automatically shortening Frigate retention policy when storage exceeds threshold.
+- **Recording Quota & Incremental FIFO Pruning**: Automated quota manager enforces storage limits (default 400 GiB). If recordings exceed quota, `recordings_prune.go` executes incremental hour-by-hour FIFO deletions (`YYYY-MM-DD/HH`), deleting earliest hours first until usage safely drops below the threshold. Frigate retention is set to 90 days, handing lifecycle management completely to the backend FIFO pruner.
 
 ### 2. Edge Vision AI Subsystem (`home-vision`)
 - **Microservice Architecture**: Lightweight Python 3.11 container using OpenCV DNN with pure SSE4.2 / oneDNN (no AVX2 / no PyTorch, tailored for Intel Celeron J4125).
@@ -435,6 +435,12 @@ or shorter than 32 chars. Generate with `openssl rand -hex 32`.
 - **Revocation**: Per-request check on `device.RevokedAt` and `device.TokenVersion`. Admin token rotation invalidates prior tokens immediately.
 - **Object-Level Authorization (BOLA)**: Camera read permissions (`CanRead`) scoped to owner or shared users. Alert events, snapshots, and thumbnails strictly enforce camera access control.
 - **Nginx Reverse Proxy Security**: `/go2rtc/` and `/frigate/` gated by `/api/v1/auth/verify`. Native Frigate dashboard strictly restricted to admin users (`/internal/auth/verify-admin`). CORS headers dynamically restricted to allowed origins (`$cors_origin`).
+- **Intrusion Defense Center (Phase 2 & 3)**:
+  - SQLite persistence for IP bans (`ip_bans`), security events (`security_events`), and whitelists (`security_whitelists`).
+  - Self-protection engine preventing accidental lockouts of loopback (`127.0.0.1`, `::1`), RFC1918 gateway networks, and active admin caller IP.
+  - Alert deduplication with a 10-minute cooldown window per source IP.
+  - Granular observability: pending suspicious attempts, today/7d ban counts, 24-hour hourly block trends, top attackers, and event breakdown by type.
+  - Runtime dynamic whitelist and policy config update without container restarts.
 
 ---
 

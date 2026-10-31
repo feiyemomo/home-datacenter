@@ -2,6 +2,42 @@
 
 ## 更新日志
 
+### 录像配额增量 FIFO 淘汰 + Frigate 90 天留存联动 (2026-10-31)
+
+> **背景**：NAS 录像存储设定了 400 GiB 配额。在云端归档暂停（蓝奏云接口变动）的情况下，旧机制直接将 Frigate 的全局留存天数从 4 天强制压减至 3 天甚至更短，导致第 4 天的录像被全量淘汰，策略过于激进，无法精细化平衡磁盘空间与监控回放需求。
+
+**增量 FIFO 小时级淘汰算法**（`services/api/internal/maintenance/recordings_prune.go`）：
+- 新增 `CheckAndPruneRecordings` 与 `PruneEarliestHourDirectory` 机制。
+- 每小时例行巡检；若录像总物理容量超过 400 GiB 配额，自动按物理时间升序索引 `/media/frigate/recordings/YYYY-MM-DD/HH` 目录。
+- 每次仅淘汰最早的单个整小时录像目录（如 `2026-10-27/02`），并即时复测磁盘容量。
+- 一旦录像容量安全回落至配额以下，立即退出淘汰循环，最大程度保护最新及相邻历史录像。
+- 部署实测：单次淘汰 6 小时过期目录，平滑释放 22.6 GiB 存储空间，录像占用从 402.6 GiB 安全降至 380 GiB（总磁盘占用降至 89%），告警自愈。
+
+**Frigate 留存配置联动**（`deploy/frigate/config.yml`、`services/api/configs/config.yaml`）：
+- 将 Frigate 的 `record.retain.days` 和 `motion.retain.days` 统一延长至 90 天。
+- 录像生命周期的淘汰权完全收归 Go 后端配额管理器，实现"物理容量允许范围内最大化保留"的滑动保留体验。
+
+### 安全防御中心二期与三期全面落地（持久化、防误伤自锁、告警降噪、细粒度可观测与动态配置） (2026-10-31)
+
+> **背景**：安全防御中心 v1.15.0 仅具备内存级封禁，存在服务重启黑名单丢失、缺少白名单自锁保护、同一 IP 频繁触发导致告警邮件风暴、无历史审计与可观测趋势、阈值无法在线配置等 P0/P1 问题。
+
+**持久化与防自锁保护（阶段二）**（`services/api/internal/security/defense.go`、`model/security.go`、`database/sqlite.go`）：
+- **全量 SQLite 持久化**：新增 `ip_bans`（封禁表）、`security_events`（安全审计事件表）与 `security_whitelists`（动态白名单表），系统启动时自动加载有效黑名单并拉起过期清理协程（janitor）。
+- **防误伤与防自锁引擎**：手动封禁增加 `checkSelfProtection` 校验，强制拦截回环地址（`127.0.0.1`、`::1`）、已配置静态/动态白名单、局域网网关及当前发起封禁请求的管理员 IP，返回 409 冲突及明确错误提示。
+- **告警去重降噪**：为每个恶意 IP 增加 10 分钟邮件告警冷却窗口；命中白名单后清零认证失败计数器，杜绝日志与邮件风暴。
+- **审计追踪**：手动封禁、解封、测试邮件、白名单增删、策略配置修改统一生成 `security_events` 记录并发布至内部 `security.alert` 事件流。
+
+**细粒度可观测性与动态配置（阶段三）**（`internal/handler/security_handler.go`、`web/src/pages/Security.tsx`）：
+- **丰富观测指标**：`GET /api/v1/security/overview` 新增 `pending_attempts`（当前观察中 IP 及剩余窗口）、`bans_today` / `bans_7d`（周期封禁数）、`blocked_hits_24h`（24 小时阻断分布桶）、`top_attackers`（高危攻击来源 Top 5）及 `by_type`（威胁类型统计）。
+- **动态白名单与策略管理**：提供 `GET/POST/DELETE /api/v1/security/whitelist` 及 `PUT /api/v1/security/config` 接口，支持在线调整最大失败尝试次数（`max_failures`）、观察窗口（`window_mins`）及封禁时长（`ban_duration_mins`），5 秒内热生效无需重启容器。
+- **Web 前端管理选项卡**：控制台重构为 4 大 Tab：生效黑名单、观察中可疑 IP、安全事件时间线、白名单与防御策略配置。
+
+### 基础服务与安全性加固 (2026-10-31)
+
+- **Cloudflared 弱密钥防护**：升级并固定 `cloudflare/cloudflared:2026.10.3`，防御 2026-10 eMudhra 弱密钥潜在安全缺陷。
+- **天气代理定位收敛**：`WeatherHandler` 默认查询城市调整为宝鸡市陈仓区（`Chencang`），并优先使用前端传递的 `location` 参数，避免因宽带运营商出口 IP 漂移导致气象定位频繁变动。
+- **摄像头告警精准过滤**：`ListAlerts` 在指定 `camera_id` 查询时增加严格校验，过滤掉 Frigate 按标签匹配时可能夹带的异源事件。
+
 ### 登录失效错误码 (2026-10-07)
 
 > **背景**：App 端按 401 的 `message` 文本判断是否需要重新登录，后端改动提示文字就会让失效处理悄悄失效。
