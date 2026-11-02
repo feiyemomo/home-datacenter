@@ -611,11 +611,11 @@ func main() {
 			// frontend must call this endpoint to expire it properly.
 			auth.POST("/logout", authHandler.Logout)
 			// POST /auth/refresh re-issues a fresh JWT for an authenticated client with updated iat
-			auth.POST("/refresh", middleware.JWTAuth(deviceRepo), authHandler.Refresh)
+			auth.POST("/refresh", middleware.JWTAuth(deviceRepo, userRepo), authHandler.Refresh)
 		}
 
 		user := api.Group("/user")
-		user.Use(middleware.JWTAuth(deviceRepo))
+		user.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			// /me is available to any authenticated user.
 			user.GET("/me", userHandler.Me)
@@ -635,7 +635,7 @@ func main() {
 		}
 
 		device := api.Group("/device")
-		device.Use(middleware.JWTAuth(deviceRepo))
+		device.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			device.GET("/list", deviceHandler.List)
 			device.POST("", deviceHandler.Create)
@@ -653,7 +653,7 @@ func main() {
 		}
 
 		system := api.Group("/system")
-		system.Use(middleware.JWTAuth(deviceRepo))
+		system.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			system.GET("/status", systemHandler.Status)
 			// Persisted audit log: device / camera / user events
@@ -673,7 +673,7 @@ func main() {
 		// so a non-admin authenticated user can read audit logs but
 		// cannot purge them.
 		systemAdmin := api.Group("/system")
-		systemAdmin.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		systemAdmin.Use(middleware.JWTAuth(deviceRepo, userRepo), middleware.RequireAdmin(database.DB))
 		{
 			// v1.8.14: delete a single log entry after manual
 			// verification. Used by the "核查并删除" workflow
@@ -695,10 +695,10 @@ func main() {
 		api.GET("/security/check-ip", securityHandler.CheckIP)
 
 		securityGroup := api.Group("/security")
-		securityGroup.Use(middleware.JWTAuth(deviceRepo))
+		securityGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			securityGroup.GET("/guard", securityHandler.GetGuard)
-			securityGroup.PUT("/guard", middleware.RequireAdmin(database.DB), securityHandler.SetGuard)
+			securityGroup.PUT("/guard", securityHandler.SetGuard)
 			securityGroup.GET("/overview", securityHandler.GetOverview)
 			securityGroup.GET("/banned", securityHandler.ListBanned)
 			securityGroup.GET("/events", securityHandler.ListEvents)
@@ -708,7 +708,7 @@ func main() {
 
 		// Admin-only security emergency response operations
 		securityAdmin := api.Group("/security")
-		securityAdmin.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		securityAdmin.Use(middleware.JWTAuth(deviceRepo, userRepo), middleware.RequireAdmin(database.DB))
 		{
 			securityAdmin.POST("/ban", securityHandler.ManualBan)
 			securityAdmin.PUT("/ban/:ip", securityHandler.UpdateBan)
@@ -734,7 +734,7 @@ func main() {
 		// APK into the directory — no DB row, no restart.
 		releaseHandler := handler.NewReleaseHandler(config.AppConfig.Releases.Dir, database.DB)
 		releaseGroup := api.Group("/release")
-		releaseGroup.Use(middleware.JWTAuth(deviceRepo))
+		releaseGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			releaseGroup.GET("/latest", releaseHandler.Latest)
 			releaseGroup.GET("/latest/apk", releaseHandler.Download)
@@ -757,21 +757,21 @@ func main() {
 		// app can show current weather on the dashboard. JWT-protected
 		// (auth users only — no anonymous weather queries).
 		weatherHandler := handler.NewWeatherHandler()
-		api.GET("/weather", middleware.JWTAuth(deviceRepo), weatherHandler.Weather)
+		api.GET("/weather", middleware.JWTAuth(deviceRepo, userRepo), weatherHandler.Weather)
 
 		// Alert snapshot & thumbnail aliases (allows /api/v1/alerts/:id/snapshot as well as /cameras/alerts/:id/snapshot)
-		api.GET("/alerts/:id/snapshot", middleware.JWTAuth(deviceRepo), camHandler.AlertSnapshot)
-		api.GET("/alerts/:id/thumbnail", middleware.JWTAuth(deviceRepo), camHandler.AlertThumbnail)
+		api.GET("/alerts/:id/snapshot", middleware.JWTAuth(deviceRepo, userRepo), camHandler.AlertSnapshot)
+		api.GET("/alerts/:id/thumbnail", middleware.JWTAuth(deviceRepo, userRepo), camHandler.AlertThumbnail)
 
 		mqttGroup := api.Group("/mqtt")
-		mqttGroup.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		mqttGroup.Use(middleware.JWTAuth(deviceRepo, userRepo), middleware.RequireAdmin(database.DB))
 		{
 			mqttGroup.POST("/publish", systemHandler.Publish)
 		}
 
 		// Phase 4: camera platformization endpoints
 		camGroup := api.Group("/cameras")
-		camGroup.Use(middleware.JWTAuth(deviceRepo))
+		camGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			// Read endpoints are available to any authenticated user.
 			camGroup.GET("", camHandler.List)
@@ -858,7 +858,7 @@ func main() {
 		// Rules are CRUD-managed here; the engine itself runs in the
 		// background and reacts to EventBus events.
 		automationGroup := api.Group("/automation")
-		automationGroup.Use(middleware.JWTAuth(deviceRepo), middleware.RequireAdmin(database.DB))
+		automationGroup.Use(middleware.JWTAuth(deviceRepo, userRepo), middleware.RequireAdmin(database.DB))
 		{
 			automationGroup.GET("/rules", automationHandler.List)
 			automationGroup.POST("/rules", automationHandler.Create)
@@ -881,7 +881,7 @@ func main() {
 		// app needs it to decide the connection strategy). P2P peer
 		// registration is also per-user. The peer list is admin-only.
 		netGroup := api.Group("/network")
-		netGroup.Use(middleware.JWTAuth(deviceRepo))
+		netGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			netGroup.GET("/status", netHandler.Status)
 			// P2P signaling endpoints.
@@ -899,7 +899,7 @@ func main() {
 
 		// Vision AI service (face recognition & pose/fall estimation)
 		visionGroup := api.Group("/vision")
-		visionGroup.Use(middleware.JWTAuth(deviceRepo))
+		visionGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			visionHandler := vision.NewHandler(visionClient, bus)
 			visionHandler.RegisterRoutes(visionGroup)
