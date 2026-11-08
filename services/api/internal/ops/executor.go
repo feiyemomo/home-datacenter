@@ -328,10 +328,12 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	// 4. Dispatch the structured action
 	out, err := e.dispatchAction(ctx, spec, canonical)
 	if err != nil {
-		// Execution mutation failed -> attempt atomic rollback if specified
+		// Execution mutation failed -> attempt atomic rollback if specified with decoupled context
 		var rbErr error
 		if spec.RollbackSpec != nil {
-			rbErr = e.ExecuteRollback(ctx, *spec.RollbackSpec)
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer rbCancel()
+			rbErr = e.ExecuteRollback(rbCtx, *spec.RollbackSpec)
 		}
 		duration := time.Since(startTime).Milliseconds()
 		e.recordExecutionHistory(canonical, spec.Action, "rolled_back", out, fmt.Sprintf("execution failed: %v; rollback err: %v", err, rbErr))
@@ -354,10 +356,12 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	duration := time.Since(startTime).Milliseconds()
 
 	if probeErr != nil {
-		// Health probe failed! Trigger atomic rollback
+		// Health probe failed! Trigger atomic rollback with decoupled timeout context (Blocker 1 fix)
 		var rbErr error
 		if spec.RollbackSpec != nil {
-			rbErr = e.ExecuteRollback(ctx, *spec.RollbackSpec)
+			rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer rbCancel()
+			rbErr = e.ExecuteRollback(rbCtx, *spec.RollbackSpec)
 		}
 		e.recordExecutionHistory(canonical, spec.Action, "rolled_back", out, fmt.Sprintf("health probe failed: %v; rollback err: %v", probeErr, rbErr))
 
@@ -899,10 +903,12 @@ func executeDockerSocketRestart(ctx context.Context, sockPath, containerName str
 	}
 
 	tr := &http.Transport{
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
 		},
 	}
+	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
 	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", containerName)
@@ -937,10 +943,12 @@ func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName 
 	}
 
 	tr := &http.Transport{
+		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
 		},
 	}
+	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
 	// 1. Create exec instance

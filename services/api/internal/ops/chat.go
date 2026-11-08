@@ -122,8 +122,8 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 	var session model.OpsChatSession
 	err := h.db.Where("session_id = ?", sessionID).First(&session).Error
 	if err == nil {
-		// Session exists: enforce IDOR boundary
-		if !isAdmin && session.UserID != currentUserID && session.Scope != model.ChatScopeHousehold && session.UserID != 0 {
+		// Session exists: enforce IDOR boundary strictly
+		if !isAdmin && session.Scope != model.ChatScopeHousehold && (session.UserID == 0 || session.UserID != currentUserID) {
 			c.JSON(http.StatusForbidden, gin.H{
 				"error":      "无权访问此会话 (Forbidden: session isolation violation)",
 				"session_id": sessionID,

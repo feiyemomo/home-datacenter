@@ -223,6 +223,14 @@ func (h *OpsHandler) GetRecoveryFSM() *ContainerRecoveryFSM {
 		return fsm
 	}
 
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// Double-check after acquiring lock
+	if fsm = GetGlobalRecoveryFSM(); fsm != nil {
+		return fsm
+	}
+
 	// Lazy initialization with handler resources
 	newFSM := NewContainerRecoveryFSM(h.db, h.bus, h.executor)
 	SetGlobalRecoveryFSM(newFSM)
