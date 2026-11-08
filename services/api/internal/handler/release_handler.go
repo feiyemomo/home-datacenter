@@ -196,7 +196,10 @@ func (h *ReleaseHandler) findLatest(targetFlavor string) (*apkFile, error) {
 	// Compute or read sha256 checksum for APK integrity verification.
 	shaPath := filepath.Join(h.releasesDir, latest.FileName+".sha256")
 	if b, err := os.ReadFile(shaPath); err == nil && len(b) > 0 {
-		latest.SHA256 = strings.TrimSpace(string(b))
+		fields := strings.Fields(string(b))
+		if len(fields) > 0 {
+			latest.SHA256 = strings.ToLower(strings.TrimSpace(fields[0]))
+		}
 	} else if f, err := os.Open(latest.Path); err == nil {
 		defer f.Close()
 		hasher := sha256.New()
