@@ -10,14 +10,20 @@ import (
 
 // Proposal status constants.
 const (
-	ProposalStatusAwaitingApproval = "AWAITING_APPROVAL"
+	ProposalStatusPending          = "PENDING"
+	ProposalStatusAwaitingApproval = "AWAITING_APPROVAL" // Canonical / backward compatible
+	ProposalStatusApprovalRequired = "APPROVAL_REQUIRED"
 	ProposalStatusApproved         = "APPROVED"
 	ProposalStatusScheduled        = "SCHEDULED"
 	ProposalStatusExecuting        = "EXECUTING"
 	ProposalStatusExecuted         = "EXECUTED"
 	ProposalStatusRejected         = "REJECTED"
+	ProposalStatusCancelled        = "CANCELLED"
 	ProposalStatusFailed           = "FAILED"
-	ProposalStatusFailedRolledback = "FAILED_ROLLEDBACK"
+	ProposalStatusRollingBack      = "ROLLING_BACK"
+	ProposalStatusRolledBack       = "ROLLED_BACK"
+	ProposalStatusFailedRolledback = "FAILED_ROLLEDBACK" // Backward compatible alias for ROLLED_BACK
+	ProposalStatusRollbackFailed   = "ROLLBACK_FAILED"
 )
 
 // Risk level constants.

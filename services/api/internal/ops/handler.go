@@ -37,16 +37,31 @@ var AllowedCoreContainers = map[string]bool{
 
 // OpsHandler manages BFF endpoints for 1Panel and datacenter ops.
 type OpsHandler struct {
-	client     *OnePanelClient
-	fallback   *HostFallbackProvider
-	db         *gorm.DB
-	bus        *eventbus.Bus
-	defenseMgr *security.DefenseManager
-	executor   OperationExecutor
+	client      *OnePanelClient
+	fallback    *HostFallbackProvider
+	db          *gorm.DB
+	bus         *eventbus.Bus
+	defenseMgr  *security.DefenseManager
+	executor    OperationExecutor
+	vulnScanner *VulnScanner
 
 	mu                  sync.RWMutex
 	newAPIFailCount     int
 	newAPICooldownUntil time.Time
+}
+
+// SetVulnScanner configures the VulnScanner for OpsHandler.
+func (h *OpsHandler) SetVulnScanner(s *VulnScanner) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.vulnScanner = s
+}
+
+// GetVulnScanner returns the current VulnScanner instance.
+func (h *OpsHandler) GetVulnScanner() *VulnScanner {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.vulnScanner
 }
 
 // NewOpsHandler creates a new OpsHandler.

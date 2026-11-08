@@ -64,8 +64,6 @@ def is_production() -> bool:
         return False
     if env in ("production", "prod"):
         return True
-    if os.path.exists("/.dockerenv"):
-        return True
     return False
 
 
@@ -73,6 +71,7 @@ def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
     """
     Enforces security boot guard in production mode.
     Fails fast if critical secrets or tokens are missing, placeholders, or weak.
+    Permits basic Tier-1 Rule Engine execution when optional LLM token is absent.
     """
     if not is_production():
         return
@@ -80,13 +79,17 @@ def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
     cfg = config or OpsAgentConfig.load()
     errors = []
 
-    # 1. NEW_API_TOKEN check (if NEW_API_URL configured for remote access)
+    # 1. NEW_API_TOKEN check (if present, must be strong; if absent, log warning and degrade to Tier-1)
     if cfg.new_api_url and "localhost" not in cfg.new_api_url and "127.0.0.1" not in cfg.new_api_url:
         token = cfg.new_api_token.strip()
-        if not token:
-            errors.append("NEW_API_TOKEN must not be empty in production")
-        elif token.lower() in WEAK_SECRETS_BLACKLIST or len(token) < 8:
-            errors.append(f"NEW_API_TOKEN is weak or placeholder ({token[:4]}...)")
+        if token:
+            if token.lower() in WEAK_SECRETS_BLACKLIST or len(token) < 8:
+                errors.append(f"NEW_API_TOKEN is weak or placeholder ({token[:4]}...)")
+        else:
+            logger.warning(
+                "NEW_API_TOKEN is not configured in production: "
+                "Tier-2 LLM diagnostic reasoning disabled, auto-degrading to Tier-1 Rule Engine autonomous recovery."
+            )
 
     # 2. ONEPANEL_PASSWORD check (if present in environment or configured)
     onepanel_pass = os.environ.get("ONEPANEL_PASSWORD", "").strip()
@@ -126,6 +129,8 @@ class HomeOpsAgent:
         self._tasks: list[asyncio.Task] = []
         self._mqtt_client: Optional[Any] = None
         self._mqtt_queue: asyncio.Queue = asyncio.Queue()
+        self._docker_event_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
+        self._last_docker_event_time: int = int(time.time())
         self._mqtt_connected: bool = False
 
     def _create_paho_client(self, loop: asyncio.AbstractEventLoop) -> Optional[Any]:
@@ -207,6 +212,7 @@ class HomeOpsAgent:
         # Register asyncio tasks
         self._tasks = [
             asyncio.create_task(self._docker_event_listener(), name="docker_events"),
+            asyncio.create_task(self._docker_event_processor(), name="docker_processor"),
             asyncio.create_task(self._mqtt_listener(), name="mqtt_security"),
             asyncio.create_task(self._disk_monitor_loop(), name="disk_monitor"),
             asyncio.create_task(self._scheduled_proposals_loop(), name="scheduled_proposals"),
@@ -242,7 +248,8 @@ class HomeOpsAgent:
     async def _docker_event_listener(self) -> None:
         """
         Connects to /var/run/docker.sock and streams container lifecycle events.
-        Triggers Tier 1 backoff restart or Tier 2 LLM escalation upon crashes.
+        Decoupled: only ingests and enqueues events without blocking I/O or inline sleep.
+        Correctly decodes HTTP Chunked transfer encoding and line-delimited JSON.
         """
         sock_path = self.config.docker_socket
         while self.running:
@@ -253,62 +260,183 @@ class HomeOpsAgent:
 
             try:
                 reader, writer = await asyncio.open_unix_connection(sock_path)
+                since_time = self._last_docker_event_time
                 req = (
-                    b"GET /events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D HTTP/1.1\r\n"
-                    b"Host: docker\r\n"
-                    b"User-Agent: home-ops-agent\r\n"
-                    b"Connection: close\r\n\r\n"
-                )
+                    f"GET /events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since_time} HTTP/1.1\r\n"
+                    f"Host: docker\r\n"
+                    f"User-Agent: home-ops-agent\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("utf-8")
                 writer.write(req)
                 await writer.drain()
 
-                logger.info(f"Connected to Docker events stream via {sock_path}")
+                logger.info(f"Connected to Docker events stream via {sock_path} (since={since_time})")
 
+                # 1. Consume HTTP response headers until CRLF CRLF
+                while self.running:
+                    header_line = await reader.readline()
+                    if not header_line or header_line in (b"\r\n", b"\n"):
+                        break
+
+                # 2. Ingest stream of events (HTTP Chunked or line-delimited JSON)
                 while self.running:
                     line = await reader.readline()
                     if not line:
                         break
-                    line_str = line.decode("utf-8", errors="ignore").strip()
-                    if not line_str or line_str.startswith("HTTP/") or ":" in line_str:
+                    raw_line = line.strip()
+                    if not raw_line:
                         continue
 
+                    chunk_len = -1
                     try:
-                        event = json.loads(line_str)
-                        action = event.get("Action", "")
-                        status = event.get("status", "")
-                        actor = event.get("Actor", {})
-                        attributes = actor.get("Attributes", {})
-                        container_name = attributes.get("name", actor.get("ID", "")[:12])
+                        chunk_header = raw_line.split(b';')[0].strip()
+                        chunk_len = int(chunk_header, 16)
+                    except ValueError:
+                        chunk_len = -1
 
-                        if action in ("die", "kill", "oom") or status in ("die", "kill"):
-                            exit_code = int(attributes.get("exitCode", 1))
-                            if exit_code != 0:
-                                logger.warning(f"Detected container crash: {container_name} (exit {exit_code})")
-                                # Read container logs if needed
-                                stderr_snippet = f"Container {container_name} exited with status {exit_code}"
-                                result = self.rule_engine.handle_container_crash(container_name, exit_code, stderr_snippet)
+                    event_bytes = None
+                    if chunk_len > 0:
+                        event_bytes = await reader.readexactly(chunk_len)
+                        # Consume trailing CRLF
+                        await reader.readline()
+                    elif chunk_len == 0:
+                        # End of chunks
+                        break
+                    else:
+                        event_bytes = raw_line
 
-                                if result.get("action") == "restart_container":
-                                    backoff = result.get("backoff_sec", 1)
-                                    await asyncio.sleep(backoff)
-                                    await self._restart_docker_container(container_name, sock_path)
-
-                                elif result.get("action") == "request_diagnostic":
-                                    # Create high-risk pending proposal for human review
-                                    self.proposal_manager.create_proposal(
-                                        prop_id=f"prop-crash-{container_name}-{int(time.time())}",
-                                        title=f"【高危告警】{container_name} 连续崩溃自愈推演方案",
-                                        risk_level="HIGH",
-                                        action=f"docker restart {container_name}",
-                                        rollback_cmd=f"docker logs {container_name}",
-                                        target_component=container_name,
-                                        estimated_seconds=30
-                                    )
-                    except json.JSONDecodeError:
-                        continue
+                    if event_bytes:
+                        try:
+                            event = json.loads(event_bytes.decode("utf-8", errors="ignore"))
+                            if isinstance(event, dict):
+                                self._last_docker_event_time = int(time.time())
+                                try:
+                                    self._docker_event_queue.put_nowait(event)
+                                except asyncio.QueueFull:
+                                    logger.warning("Docker event queue full (500), dropping oldest event")
+                                    try:
+                                        self._docker_event_queue.get_nowait()
+                                    except Exception:
+                                        pass
+                                    self._docker_event_queue.put_nowait(event)
+                        except json.JSONDecodeError:
+                            continue
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.debug(f"Docker socket connection error: {e}. Reconnecting in 5s...")
+                logger.debug(f"Docker socket connection notice: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
+
+    async def _docker_event_processor(self) -> None:
+        """
+        Consumes events from queue, executes local two-tier rule filtering,
+        and coordinates authoritative self-healing through Go Core API.
+        """
+        sock_path = self.config.docker_socket
+        while self.running:
+            try:
+                event = await self._docker_event_queue.get()
+                action = event.get("Action", "")
+                status = event.get("status", "")
+                actor = event.get("Actor", {})
+                attributes = actor.get("Attributes", {})
+                container_name = attributes.get("name", actor.get("ID", "")[:12])
+
+                if action in ("die", "kill", "oom") or status in ("die", "kill"):
+                    exit_code = int(attributes.get("exitCode", 1))
+                    if exit_code != 0:
+                        logger.warning(f"Detected container crash: {container_name} (exit {exit_code})")
+                        stderr_snippet = f"Container {container_name} exited with status {exit_code}"
+                        result = self.rule_engine.handle_container_crash(container_name, exit_code, stderr_snippet)
+
+                        if result.get("action") == "restart_container":
+                            backoff = result.get("backoff_sec", 1)
+                            await asyncio.sleep(backoff)
+
+                            # 1. First attempt authoritative recovery via Go Core FSM
+                            recovered = await self._report_event_to_go_core(container_name, exit_code, action, stderr_snippet)
+                            if not recovered:
+                                # 2. Fallback to emergency local socket restart if Go Core is unreachable
+                                logger.info(f"[Emergency Autonomy] Go Core unreachable or offline. Executing direct socket restart for {container_name}")
+                                await self._restart_docker_container(container_name, sock_path)
+
+                        elif result.get("action") == "request_diagnostic":
+                            prop_id = f"prop-crash-{container_name}-{int(time.time())}"
+                            await self._submit_proposal_to_go_core(
+                                prop_id=prop_id,
+                                title=f"【高危告警】{container_name} 连续崩溃自愈推演方案",
+                                risk_level="HIGH",
+                                action=f"docker restart {container_name}",
+                                rollback_cmd=f"docker logs {container_name}",
+                                target_component=container_name,
+                                estimated_seconds=30
+                            )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug(f"Docker event processing error: {e}")
+
+    async def _report_event_to_go_core(self, container_name: str, exit_code: int, action: str, error_msg: str) -> bool:
+        """Reports crash event to Go Active Core API for authoritative policy verification and execution."""
+        api_url = f"{self.config.api_base_url.rstrip('/')}/api/v1/ops/fsm/event"
+        payload = {
+            "component": container_name,
+            "container_name": container_name,
+            "action": action,
+            "exit_code": exit_code,
+            "oom_killed": (action == "oom" or exit_code == 137),
+            "error_message": error_msg,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        }
+        try:
+            req_data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(api_url, data=req_data, headers={"Content-Type": "application/json"})
+            loop = asyncio.get_running_loop()
+            def do_req():
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    return resp.status in (200, 201)
+            return await loop.run_in_executor(None, do_req)
+        except Exception as e:
+            logger.debug(f"Report event to Go Core failed ({api_url}): {e}")
+            return False
+
+    async def _submit_proposal_to_go_core(self, prop_id: str, title: str, risk_level: str, action: str, rollback_cmd: str, target_component: str, estimated_seconds: int) -> bool:
+        """Submits high-risk diagnostic proposal to Go Core for human review."""
+        api_url = f"{self.config.api_base_url.rstrip('/')}/api/v1/ops/proposals"
+        payload = {
+            "proposal_id": prop_id,
+            "title": title,
+            "risk_level": risk_level,
+            "action": action,
+            "rollback_plan": rollback_cmd,
+            "target_component": target_component,
+            "estimated_seconds": estimated_seconds
+        }
+        try:
+            req_data = json.dumps(payload).encode("utf-8")
+            req = urllib.request.Request(api_url, data=req_data, headers={"Content-Type": "application/json"})
+            loop = asyncio.get_running_loop()
+            def do_req():
+                with urllib.request.urlopen(req, timeout=3) as resp:
+                    return resp.status in (200, 201)
+            res = await loop.run_in_executor(None, do_req)
+            if res:
+                logger.info(f"Submitted proposal {prop_id} to Go Core successfully")
+                return True
+        except Exception as e:
+            logger.debug(f"Submit proposal to Go Core failed ({api_url}): {e}")
+
+        # Local tracking fallback
+        self.proposal_manager.create_proposal(
+            prop_id=prop_id,
+            title=title,
+            risk_level=risk_level,
+            action=action,
+            rollback_cmd=rollback_cmd,
+            target_component=target_component,
+            estimated_seconds=estimated_seconds
+        )
+        return False
 
     async def _restart_docker_container(self, container_name: str, sock_path: str) -> bool:
         """Sends POST /containers/{name}/restart to Docker socket."""

@@ -644,7 +644,24 @@ func (h *OpsHandler) generateCVEReport() (string, []string) {
 	sb.WriteString("【Google OSV / CVE 漏洞威胁情报与加固报告】\n\n")
 	sb.WriteString("• 漏洞情报源: Google OSV (Open Source Vulnerabilities) 实时 API & 1Panel WAF 哨兵\n")
 	sb.WriteString("• 依赖基线状态: 项目 go.mod 与 requirements.txt 依赖组件纳入持续动态解析与自动扫描\n")
-	sb.WriteString("• 防御机制: 纯 Go SQLite (glebarez/sqlite) 内存免疫，SQL 参数化预编译，WAF 规则实时阻断\n\n")
+	sb.WriteString("• 防御机制: 纯 Go SQLite (glebarez/sqlite) 内存免疫，SQL 参数化预编译，WAF 规则实时阻断\n")
+
+	scanner := h.GetVulnScanner()
+	scanStatus := ""
+	var lastAt time.Time
+	if scanner != nil {
+		scanStatus = scanner.LastScanStatus()
+		lastAt = scanner.LastScanAt()
+		if scanStatus == "" || lastAt.IsZero() {
+			sb.WriteString("• 扫描状态: 尚未执行动态依赖漏洞扫描 (初始化阶段)\n\n")
+		} else if scanStatus == "failed" {
+			sb.WriteString(fmt.Sprintf("• 扫描状态: 最近一次扫描异常 (%s)，本地情报可能滞后\n\n", scanner.LastScanError()))
+		} else {
+			sb.WriteString(fmt.Sprintf("• 扫描状态: 正常 (最新扫描完成于 %s)\n\n", lastAt.Format("2006-01-02 15:04:05")))
+		}
+	} else {
+		sb.WriteString("• 扫描状态: 依赖漏洞情报模块就绪\n\n")
+	}
 
 	if len(vulnProps) > 0 {
 		sb.WriteString(fmt.Sprintf("• 已记录的 CVE/安全加固提案 (%d 项):\n", len(vulnProps)))
@@ -655,7 +672,13 @@ func (h *OpsHandler) generateCVEReport() (string, []string) {
 		}
 		sb.WriteString("\n处置建议: 您可在【待审提案】面板中点击【预约 03:00 执行】或【立即执行】对上述组件进行沙箱热修加固。")
 	} else {
-		sb.WriteString("• 结论: 当前数据中心所有动态解析的核心依赖组件均处于安全基准线内，未收到未处置的高危 CVE 漏洞告警。")
+		if scanner != nil && (scanStatus == "" || lastAt.IsZero()) {
+			sb.WriteString("• 结论: 尚未执行依赖漏洞全量扫描。建议在运维中心或调用 /ops/scan-vulns 触发扫描以更新最新 CVE 情报。")
+		} else if scanner != nil && scanStatus == "failed" {
+			sb.WriteString("• 结论: 因上游网络或接口超时，最近一次漏洞扫描未成功完成；当前本地无未处置的高危 CVE 记录。")
+		} else {
+			sb.WriteString("• 结论: 当前数据中心所有动态解析的核心依赖组件经 Google OSV 扫描均处于安全基准线内，未收到未处置的高危 CVE 漏洞告警。")
+		}
 	}
 
 	return sb.String(), referenced

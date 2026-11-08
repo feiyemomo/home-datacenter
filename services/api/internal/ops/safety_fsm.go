@@ -23,15 +23,16 @@ import (
 type UpdateFSMState string
 
 const (
-	StateIdle         UpdateFSMState = "IDLE"
-	StateDetecting    UpdateFSMState = "DETECTING"
-	StateSnapshotting UpdateFSMState = "SNAPSHOTTING"
-	StateApplying     UpdateFSMState = "APPLYING"
-	StateProbing      UpdateFSMState = "PROBING"
-	StateCommitted    UpdateFSMState = "COMMITTED"
-	StateRollingBack  UpdateFSMState = "ROLLING_BACK"
-	StateRolledBack   UpdateFSMState = "ROLLED_BACK"
-	StateFailed       UpdateFSMState = "FAILED"
+	StateIdle           UpdateFSMState = "IDLE"
+	StateDetecting      UpdateFSMState = "DETECTING"
+	StateSnapshotting   UpdateFSMState = "SNAPSHOTTING"
+	StateApplying       UpdateFSMState = "APPLYING"
+	StateProbing        UpdateFSMState = "PROBING"
+	StateCommitted      UpdateFSMState = "COMMITTED"
+	StateRollingBack    UpdateFSMState = "ROLLING_BACK"
+	StateRolledBack     UpdateFSMState = "ROLLED_BACK"
+	StateRollbackFailed UpdateFSMState = "ROLLBACK_FAILED"
+	StateFailed         UpdateFSMState = "FAILED"
 )
 
 // SafetyFSM coordinates low-peak automated update detection, database snapshotting,
@@ -44,9 +45,10 @@ type SafetyFSM struct {
 	healthProbe string
 	httpClient  *http.Client
 
-	mu           sync.Mutex
-	currentState UpdateFSMState
-	lastRunAt    time.Time
+	mu                sync.Mutex
+	currentState      UpdateFSMState
+	lastTerminalState UpdateFSMState
+	lastRunAt         time.Time
 }
 
 // NewSafetyFSM creates a configured SafetyFSM instance.
@@ -60,13 +62,14 @@ func NewSafetyFSM(db *gorm.DB, client *OnePanelClient, alertMgr *security.AlertM
 	_ = os.MkdirAll(backupDir, 0755)
 
 	return &SafetyFSM{
-		db:           db,
-		client:       client,
-		alertMgr:     alertMgr,
-		backupDir:    backupDir,
-		healthProbe:  healthURL,
-		httpClient:   &http.Client{Timeout: 5 * time.Second},
-		currentState: StateIdle,
+		db:                db,
+		client:            client,
+		alertMgr:          alertMgr,
+		backupDir:         backupDir,
+		healthProbe:       healthURL,
+		httpClient:        &http.Client{Timeout: 5 * time.Second},
+		currentState:      StateIdle,
+		lastTerminalState: StateIdle,
 	}
 }
 
@@ -75,6 +78,13 @@ func (f *SafetyFSM) CurrentState() UpdateFSMState {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.currentState
+}
+
+// LastTerminalState returns the outcome state of the most recent execution (COMMITTED, ROLLED_BACK, ROLLBACK_FAILED, FAILED).
+func (f *SafetyFSM) LastTerminalState() UpdateFSMState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastTerminalState
 }
 
 // ExecuteSafeUpdate carries out the full lifecycle:
@@ -100,6 +110,10 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 	// Step 1: Physical snapshot of database
 	snapshotPath, err := f.createPhysicalSnapshot(component, now)
 	if err != nil {
+		f.mu.Lock()
+		f.currentState = StateFailed
+		f.lastTerminalState = StateFailed
+		f.mu.Unlock()
 		f.recordHistory(component, "快照创建失败中止更新", oldVer, newVer, "failed", "", err.Error(), "VACUUM INTO failed")
 		return fmt.Errorf("pre-update database snapshot failed: %w", err)
 	}
@@ -111,6 +125,10 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 	log.Printf("[safety-fsm] Step 2: Applying update for %s (%s -> %s)", component, oldVer, newVer)
 	if applyFn != nil {
 		if err := applyFn(); err != nil {
+			f.mu.Lock()
+			f.currentState = StateFailed
+			f.lastTerminalState = StateFailed
+			f.mu.Unlock()
 			log.Printf("[safety-fsm] apply failed: %v", err)
 			f.recordHistory(component, "组件更新执行失败", oldVer, newVer, "failed", snapshotPath, err.Error(), "")
 			return err
@@ -175,7 +193,18 @@ ProbeLoop:
 			rbErr = rollbackFn()
 		}
 
-		f.recordHistory(component, "健康检查失败触发自动回滚", oldVer, newVer, "rolled_back", snapshotPath,
+		f.mu.Lock()
+		if rbErr != nil {
+			f.currentState = StateRollbackFailed
+			f.lastTerminalState = StateRollbackFailed
+		} else {
+			f.currentState = StateRolledBack
+			f.lastTerminalState = StateRolledBack
+		}
+		f.mu.Unlock()
+
+		status := "rolled_back"
+		f.recordHistory(component, "健康检查失败触发自动回滚", oldVer, newVer, status, snapshotPath,
 			fmt.Sprintf("Probe failed: %v", lastProbeErr), fmt.Sprintf("Rollback result: %v", rbErr))
 
 		// Send emergency alert email if enabled
@@ -192,9 +221,6 @@ ProbeLoop:
 			}
 		}
 
-		f.mu.Lock()
-		f.currentState = StateRolledBack
-		f.mu.Unlock()
 		if rbErr != nil {
 			return fmt.Errorf("component health probe failed (%v) and rollback failed: %w", lastProbeErr, rbErr)
 		}
@@ -204,6 +230,7 @@ ProbeLoop:
 	// Step 4b: Commit Success
 	f.mu.Lock()
 	f.currentState = StateCommitted
+	f.lastTerminalState = StateCommitted
 	f.mu.Unlock()
 	log.Printf("[safety-fsm] SUCCESS: Health probe passed for %s %s", component, newVer)
 

@@ -262,6 +262,11 @@ func main() {
 	)
 	vulnScanner := ops.NewVulnScanner(database.DB, alertMgr)
 
+	// Startup orphan proposal sweeper to fail orphaned transient proposals
+	if err := ops.SweepOrphanProposals(database.DB); err != nil {
+		log.Printf("[ops] warning: failed to sweep orphan proposals: %v", err)
+	}
+
 	// Phase 11 / WO 5.4: 1Panel WAF log collector & bi-directional ipBlack.json firewall sync
 	wafCollector := ops.NewWAFCollector(
 		database.DB,
@@ -987,6 +992,7 @@ func main() {
 		opsGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
+			opsHandler.SetVulnScanner(vulnScanner)
 			opsHandler.RegisterRoutes(opsGroup)
 			opsHandler.RegisterProposalRoutes(opsGroup)
 			opsHandler.RegisterChatRoutes(opsGroup)
@@ -996,7 +1002,7 @@ func main() {
 				go func() {
 					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 					defer cancel()
-					_ = vulnScanner.ScanDefaultPackages(scanCtx)
+					_, _ = vulnScanner.ScanWorkspaceDependencies(scanCtx, ".")
 				}()
 				utils.Success(c, gin.H{
 					"message": "已触发 Google OSV 依赖漏洞情报全量扫描",
@@ -1031,13 +1037,41 @@ func main() {
 				go func() {
 					checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 					defer cancel()
+					executor := opsHandler.GetExecutor()
+					applyFn := func() error {
+						if executor == nil {
+							return fmt.Errorf("operation executor not configured")
+						}
+						spec := ops.OperationSpec{
+							Action: ops.ActionDockerRestart,
+							Target: req.Component,
+						}
+						res, err := executor.Execute(checkCtx, spec)
+						if err != nil {
+							return err
+						}
+						if res != nil && !res.Success {
+							return fmt.Errorf("apply failed: %s", res.Error)
+						}
+						return nil
+					}
+					rollbackFn := func() error {
+						if executor == nil {
+							return fmt.Errorf("operation executor not configured")
+						}
+						spec := ops.OperationSpec{
+							Action: ops.ActionDockerRestart,
+							Target: req.Component,
+						}
+						return executor.ExecuteRollback(context.Background(), spec)
+					}
 					_, _ = safetyFSM.CheckAndPerformOffPeakUpdate(
 						checkCtx,
 						req.Component,
 						req.OldVer,
 						req.NewVer,
-						func() error { return nil },
-						func() error { return nil },
+						applyFn,
+						rollbackFn,
 					)
 				}()
 				utils.Success(c, gin.H{
@@ -1056,7 +1090,7 @@ func main() {
 				if ops.IsOffPeak(now) {
 					log.Println("[ops] Off-peak maintenance window active (02:00-05:00), executing dependency vulnerability checks")
 					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-					_ = vulnScanner.ScanDefaultPackages(scanCtx)
+					_, _ = vulnScanner.ScanWorkspaceDependencies(scanCtx, ".")
 					cancel()
 				}
 			}

@@ -151,10 +151,12 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		return
 	}
 
-	// Only proposals in AWAITING_APPROVAL can be approved
-	if proposal.Status != model.ProposalStatusAwaitingApproval {
+	// Only proposals in pending approval states can be approved
+	if proposal.Status != model.ProposalStatusAwaitingApproval &&
+		proposal.Status != model.ProposalStatusApprovalRequired &&
+		proposal.Status != model.ProposalStatusPending {
 		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("Invalid state transition from %s: must be AWAITING_APPROVAL first", proposal.Status),
+			"error": fmt.Sprintf("Invalid state transition from %s: must be AWAITING_APPROVAL/APPROVAL_REQUIRED first", proposal.Status),
 		})
 		return
 	}

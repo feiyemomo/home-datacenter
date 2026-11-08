@@ -9,6 +9,8 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -68,12 +70,14 @@ var DefaultScanTargets = []PackageTarget{
 // VulnScanner integrates with Google OSV (Open Source Vulnerabilities) API
 // to fetch zero-auth, real-time vulnerability intelligence for project dependencies.
 type VulnScanner struct {
-	db         *gorm.DB
-	alertMgr   *security.AlertManager
-	httpClient *http.Client
-	apiURL     string
-	mu         sync.Mutex
-	lastScanAt time.Time
+	db             *gorm.DB
+	alertMgr       *security.AlertManager
+	httpClient     *http.Client
+	apiURL         string
+	mu             sync.Mutex
+	lastScanAt     time.Time
+	lastScanStatus string // "success", "failed", ""
+	lastScanError  string
 }
 
 // NewVulnScanner creates a VulnScanner instance.
@@ -105,6 +109,20 @@ func (s *VulnScanner) LastScanAt() time.Time {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.lastScanAt
+}
+
+// LastScanStatus returns "success", "failed", or "" depending on recent scan outcome.
+func (s *VulnScanner) LastScanStatus() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastScanStatus
+}
+
+// LastScanError returns the error string from the last failed scan.
+func (s *VulnScanner) LastScanError() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastScanError
 }
 
 // CVSS31Metrics models the Base Metrics of FIRST CVSS v3.1 specification.
@@ -426,20 +444,106 @@ func (s *VulnScanner) ScanPackage(ctx context.Context, ecosystem, pkgName, versi
 
 // ScanDefaultPackages scans all baseline datacenter dependencies against Google OSV.
 func (s *VulnScanner) ScanDefaultPackages(ctx context.Context) error {
+	successCount := 0
+	var lastErr error
+
 	for _, target := range DefaultScanTargets {
 		vulns, err := s.ScanPackage(ctx, target.Ecosystem, target.Package, target.Version)
 		if err != nil {
+			lastErr = err
 			log.Printf("[vuln-scanner] scan %s (%s) failed: %v", target.Component, target.Package, err)
 			continue
 		}
+		successCount++
 		if len(vulns) > 0 {
 			s.ProcessVulnerabilities(vulns, target.Component, target.Version)
 		}
 	}
+
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if successCount == 0 && lastErr != nil {
+		s.lastScanStatus = "failed"
+		s.lastScanError = lastErr.Error()
+		return lastErr
+	}
+
+	s.lastScanStatus = "success"
+	s.lastScanError = ""
 	s.lastScanAt = time.Now()
-	s.mu.Unlock()
 	return nil
+}
+
+// ScanWorkspaceDependencies extracts dependencies dynamically from workspace go.mod and requirements.txt,
+// scanning them against Google OSV and updating scanner status.
+func (s *VulnScanner) ScanWorkspaceDependencies(ctx context.Context, workspaceRoot string) ([]OSVVuln, error) {
+	var targets []PackageTarget
+
+	// 1. Try parsing go.mod
+	goModPaths := []string{
+		filepath.Join(workspaceRoot, "services", "api", "go.mod"),
+		filepath.Join(workspaceRoot, "go.mod"),
+	}
+	for _, p := range goModPaths {
+		if content, err := os.ReadFile(p); err == nil {
+			if parsed, err := ParseGoMod(string(content)); err == nil && len(parsed) > 0 {
+				targets = append(targets, parsed...)
+				break
+			}
+		}
+	}
+
+	// 2. Try parsing requirements.txt
+	reqPaths := []string{
+		filepath.Join(workspaceRoot, "deploy", "ops-agent", "requirements.txt"),
+		filepath.Join(workspaceRoot, "requirements.txt"),
+	}
+	for _, p := range reqPaths {
+		if content, err := os.ReadFile(p); err == nil {
+			if parsed, err := ParseRequirementsTxt(string(content)); err == nil && len(parsed) > 0 {
+				targets = append(targets, parsed...)
+				break
+			}
+		}
+	}
+
+	if len(targets) == 0 {
+		targets = DefaultScanTargets
+	}
+
+	var allVulns []OSVVuln
+	successCount := 0
+	var lastErr error
+
+	for _, target := range targets {
+		if target.Version == "" {
+			continue
+		}
+		vulns, err := s.ScanPackage(ctx, target.Ecosystem, target.Package, target.Version)
+		if err != nil {
+			lastErr = err
+			log.Printf("[vuln-scanner] scan %s (%s) failed: %v", target.Component, target.Package, err)
+			continue
+		}
+		successCount++
+		if len(vulns) > 0 {
+			allVulns = append(allVulns, vulns...)
+			s.ProcessVulnerabilities(vulns, target.Component, target.Version)
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if successCount == 0 && lastErr != nil {
+		s.lastScanStatus = "failed"
+		s.lastScanError = lastErr.Error()
+		return nil, fmt.Errorf("all dependency scans failed: %w", lastErr)
+	}
+
+	s.lastScanStatus = "success"
+	s.lastScanError = ""
+	s.lastScanAt = time.Now()
+	return allVulns, nil
 }
 
 // ProcessVulnerabilities evaluates scan results, escalates high/critical CVEs to proposals and email alerts.
