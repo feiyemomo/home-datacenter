@@ -95,21 +95,25 @@ def check_addr_reachable(addr, default_port=80):
     if not addr:
         return False
     try:
-        is_https = addr.lower().startswith("https://")
-        clean = addr if "://" in addr else "http://" + addr
-        parsed = urllib.parse.urlparse(clean)
-        host = parsed.hostname
-        if not host:
-            return False
-        port = parsed.port or (443 if is_https else default_port)
-        if "http://" in clean or "https://" in clean:
-            req = urllib.request.Request(clean, headers={"User-Agent": "H3C-Probe/1.0"})
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
-                return resp.status < 500
+        lower = addr.strip().lower()
+        if lower.startswith("http://") or lower.startswith("https://"):
+            req = urllib.request.Request(addr.strip(), headers={"User-Agent": "H3C-Probe/1.0"})
+            try:
+                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                    return resp.status < 500
+            except urllib.error.HTTPError as e:
+                # 4xx client errors (401/403/404) mean the server and tunnel are alive; only 5xx is failure
+                return e.code < 500
         else:
-            s = socket.create_connection((host, port), timeout=3.0)
-            s.close()
-            return True
+            clean = addr.strip().strip("/")
+            if ":" in clean:
+                host, port_str = clean.rsplit(":", 1)
+                port = int(port_str)
+            else:
+                host = clean
+                port = default_port
+            with socket.create_connection((host, port), timeout=3.0):
+                return True
     except Exception as e:
         logger.warning(f"Reachability check for {addr} failed: {e}")
         return False

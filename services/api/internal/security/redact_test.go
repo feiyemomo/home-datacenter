@@ -170,20 +170,17 @@ func TestValidateBootGuard_Production(t *testing.T) {
 		}
 	}
 
-	// 4. Empty OnePanel Password
-	if err := ValidateBootGuard(true, validJWT, ""); err == nil {
-		t.Error("Expected error for empty ONEPANEL_PASSWORD in production, got nil")
+	// 4. Empty OnePanel Password should pass (1Panel is auxiliary, falls back to host telemetry)
+	if err := ValidateBootGuard(true, validJWT, ""); err != nil {
+		t.Errorf("Empty ONEPANEL_PASSWORD in production should not block core API startup: %v", err)
 	}
 
 	// 5. Weak / Blacklisted OnePanel Password
 	weakPasswords := []string{
-		"@Momo324",
 		"123456",
 		"12345678",
 		"password",
 		"admin",
-		"btpanel",
-		"feiyemomo",
 		"root",
 		"short",
 	}

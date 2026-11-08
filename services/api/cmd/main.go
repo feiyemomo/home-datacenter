@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -58,6 +59,9 @@ func main() {
 	onePanelPassword := os.Getenv("ONEPANEL_PASSWORD")
 	if err := security.ValidateBootGuard(security.IsProductionEnvironment(), cfg.JWT.Secret, onePanelPassword); err != nil {
 		log.Fatalf("FAIL-FAST BOOT GUARD: %v. Refusing to boot in production.", err)
+	}
+	if strings.TrimSpace(onePanelPassword) == "" && security.IsProductionEnvironment() {
+		log.Println("[BootGuard] ONEPANEL_PASSWORD not set; 1Panel ops integration will fallback to host metrics")
 	}
 
 	// Apply JWT config to utils

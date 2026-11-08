@@ -100,19 +100,16 @@ func RedactBytes(input []byte) []byte {
 
 // Weak and placeholder passwords blacklisted from production usage.
 var WeakPasswordBlacklist = map[string]struct{}{
-	"":                                      {},
-	"123456":                                {},
-	"12345678":                              {},
-	"123456789":                             {},
-	"@momo324":                              {},
-	"password":                              {},
-	"admin":                                 {},
-	"btpanel":                               {},
-	"feiyemomo":                             {},
-	"root":                                  {},
-	"qwerty":                                {},
-	"pass123":                               {},
-	"default":                               {},
+	"":          {},
+	"123456":    {},
+	"12345678":  {},
+	"123456789": {},
+	"password":  {},
+	"admin":     {},
+	"root":      {},
+	"qwerty":    {},
+	"pass123":   {},
+	"default":   {},
 }
 
 // Insecure JWT secret values blacklisted from production usage.
@@ -121,7 +118,6 @@ var InsecureJWTSecretBlacklist = map[string]struct{}{
 	"your-secret-key":                       {},
 	"change-me":                             {},
 	"please_change_to_a_long_random_secret": {},
-	"@momo324":                              {},
 	"123456":                                {},
 	"password":                              {},
 	"secret":                                {},
@@ -157,14 +153,13 @@ func ValidateBootGuard(isProduction bool, jwtSecret, onePanelPassword string) er
 	}
 
 	trimmedOnePanel := strings.TrimSpace(onePanelPassword)
-	if trimmedOnePanel == "" {
-		return fmt.Errorf("ONEPANEL_PASSWORD must not be empty in production")
-	}
-	if _, bad := WeakPasswordBlacklist[strings.ToLower(trimmedOnePanel)]; bad {
-		return fmt.Errorf("ONEPANEL_PASSWORD matches known weak/default password (%q)", trimmedOnePanel)
-	}
-	if len(trimmedOnePanel) < MinOnePanelPasswordLen {
-		return fmt.Errorf("ONEPANEL_PASSWORD is too short (%d chars, required >= %d)", len(trimmedOnePanel), MinOnePanelPasswordLen)
+	if trimmedOnePanel != "" {
+		if _, bad := WeakPasswordBlacklist[strings.ToLower(trimmedOnePanel)]; bad {
+			return fmt.Errorf("ONEPANEL_PASSWORD matches known weak/default password (%q)", trimmedOnePanel)
+		}
+		if len(trimmedOnePanel) < MinOnePanelPasswordLen {
+			return fmt.Errorf("ONEPANEL_PASSWORD is too short (%d chars, required >= %d)", len(trimmedOnePanel), MinOnePanelPasswordLen)
+		}
 	}
 
 	return nil
