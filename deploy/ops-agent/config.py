@@ -19,6 +19,12 @@ class OpsAgentConfig:
     mqtt_broker: str = os.getenv("MQTT_BROKER", "home-mosquitto")
     mqtt_port: int = int(os.getenv("MQTT_PORT", "1883"))
     mqtt_topic: str = os.getenv("MQTT_TOPIC", "security/#")
+    mqtt_user: str = os.getenv("MQTT_USER", "")
+    mqtt_password: str = os.getenv("MQTT_PASSWORD", "")
+    mqtt_tls: bool = os.getenv("MQTT_TLS", "false").lower() in ("true", "1", "yes")
+    mqtt_lwt_topic: str = os.getenv("MQTT_LWT_TOPIC", "home-datacenter/ops-agent/status")
+    mqtt_client_id: str = os.getenv("MQTT_CLIENT_ID", "")
+    mqtt_qos: int = int(os.getenv("MQTT_QOS", "1"))
     api_base_url: str = os.getenv("API_BASE_URL", "http://home-api:8080")
     new_api_url: str = os.getenv("NEW_API_URL", "http://home-new-api:3000/v1")
     new_api_token: str = os.getenv("NEW_API_TOKEN", "")
@@ -31,6 +37,7 @@ class OpsAgentConfig:
     crash_escalation_threshold: int = 3
     crash_window_sec: float = 900.0      # 15 minutes
     disk_threshold_percent: float = 85.0
+    disk_cleanup_cooldown_sec: float = float(os.getenv("DISK_CLEANUP_COOLDOWN_SEC", "3600.0"))  # 1 hour cooldown
 
     # Low peak scheduling window (03:00 to 05:00 AM)
     low_peak_start_hour: int = 3

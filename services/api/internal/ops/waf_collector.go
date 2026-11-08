@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -47,11 +46,19 @@ type WAFCollector struct {
 	bus        *eventbus.Bus
 	defenseMgr *security.DefenseManager
 	cfg        WAFCollectorConfig
+	executor   OperationExecutor
 
 	mu           sync.Mutex
 	lastSyncedID int64
 	running      bool
 	cancel       context.CancelFunc
+}
+
+// SetExecutor configures the OperationExecutor for safe WAF operations.
+func (c *WAFCollector) SetExecutor(exec OperationExecutor) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.executor = exec
 }
 
 // NewWAFCollector creates a new 1Panel WAF log collector and firewall syncer.
@@ -403,14 +410,28 @@ func (c *WAFCollector) SyncBannedIPs(bannedEntries []security.BanEntry) error {
 }
 
 func (c *WAFCollector) reloadOpenResty() error {
+	c.mu.Lock()
+	exec := c.executor
+	c.mu.Unlock()
+
+	if exec != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, err := exec.Execute(ctx, OperationSpec{
+			Action: ActionWAFReload,
+			Target: ComponentOpenResty,
+		})
+		return err
+	}
+
+	// Route through Docker socket without bare shell exec if socket is available
+	sockPath := "/var/run/docker.sock"
+	if _, err := os.Stat(sockPath); err != nil {
+		return nil
+	}
 	containerName := os.Getenv("OPENRESTY_CONTAINER_NAME")
 	if containerName == "" {
 		containerName = "1Panel-openresty-WuDU"
 	}
-	// Attempt via docker exec if docker socket mounted
-	cmd := exec.Command("docker", "exec", containerName, "nginx", "-s", "reload")
-	if err := cmd.Run(); err == nil {
-		return nil
-	}
-	return nil
+	return executeDockerSocketExec(context.Background(), sockPath, containerName, []string{"nginx", "-s", "reload"})
 }

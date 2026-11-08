@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -25,10 +26,11 @@ func Recovery(sink PanicSink) gin.HandlerFunc {
 		defer func() {
 			if r := recover(); r != nil {
 				stack := debug.Stack()
+				redactedStack := security.RedactSensitiveBytes(stack)
 				log.Printf("[recovery] panic serving %s %s: %v\n%s",
-					c.Request.Method, c.Request.URL.Path, r, stack)
+					c.Request.Method, c.Request.URL.Path, r, redactedStack)
 				if sink != nil {
-					sink(c, r, stack)
+					sink(c, r, redactedStack)
 				}
 				c.AbortWithStatusJSON(http.StatusInternalServerError, utils.Response{
 					Code:    http.StatusInternalServerError,

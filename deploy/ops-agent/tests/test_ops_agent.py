@@ -5,6 +5,7 @@ Unit test suite for home-ops-agent daemon, two-tier cost funnel, and proposal li
 import os
 import sys
 import tempfile
+import time
 import unittest
 
 # Ensure deploy/ops-agent is on path
@@ -28,6 +29,18 @@ class TestOpsAgentConfig(unittest.TestCase):
         self.assertEqual(cfg.name, "home-ops-agent")
         self.assertEqual(cfg.runtime, "python:3.11-slim")
         self.assertEqual(cfg.async_loop, "asyncio")
+
+    def test_mqtt_config_attributes(self):
+        """M4: Verify MQTT auth, TLS, LWT, QoS 1, and disk cleanup cooldown configuration."""
+        cfg = OpsAgentConfig.load()
+        self.assertTrue(hasattr(cfg, "mqtt_user"))
+        self.assertTrue(hasattr(cfg, "mqtt_password"))
+        self.assertTrue(hasattr(cfg, "mqtt_tls"))
+        self.assertTrue(hasattr(cfg, "mqtt_lwt_topic"))
+        self.assertTrue(hasattr(cfg, "mqtt_qos"))
+        self.assertTrue(hasattr(cfg, "disk_cleanup_cooldown_sec"))
+        self.assertEqual(cfg.mqtt_qos, 1)
+        self.assertEqual(cfg.disk_cleanup_cooldown_sec, 3600.0)
 
 
 class TestRuleEngineSanitization(unittest.TestCase):
@@ -214,6 +227,50 @@ class TestHomeOpsAgentDaemon(unittest.TestCase):
         self.assertFalse(agent.running)
         self.assertIsNotNone(agent.rule_engine)
         self.assertIsNotNone(agent.proposal_manager)
+
+
+class TestSafeDiskCleanup(unittest.TestCase):
+    """Tests Safe Disk Cleanup: 1-hour cooldown, volume whitelist protection, and delta measurement."""
+
+    def setUp(self):
+        self.engine = TwoTierRuleEngine()
+
+    def test_protected_volume_whitelist(self):
+        """Persistent volumes (/data, /vol1, /media, etc.) must NEVER be pruned."""
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("/data"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("/data/sqlite/app.db"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("/vol1/docker/home-datacenter"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("/media/frigate"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("/var/lib/docker/volumes"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("/etc/nginx"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("data-sqlite"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("data-recordings"))
+        self.assertTrue(TwoTierRuleEngine.is_protected_volume("backup-state"))
+
+        # Temporary caches must NOT be blocked
+        self.assertFalse(TwoTierRuleEngine.is_protected_volume("/tmp/buildcache"))
+        self.assertFalse(TwoTierRuleEngine.is_protected_volume("/var/tmp/buildcache"))
+
+    def test_cleanup_cooldown_and_delta(self):
+        """First cleanup succeeds; immediate second cleanup is rejected by 1h cooldown."""
+        # 1. First cleanup succeeds and records delta
+        r1 = self.engine.handle_disk_usage(90.0)
+        self.assertEqual(r1["action"], "purge_temp_cache")
+        self.assertIn("freed_bytes", r1)
+        self.assertIn("free_before_bytes", r1)
+        self.assertIn("free_after_bytes", r1)
+        self.assertGreaterEqual(r1["freed_bytes"], 0)
+
+        # 2. Immediate second call triggers 1-hour cooldown skip
+        r2 = self.engine.handle_disk_usage(91.0)
+        self.assertEqual(r2["action"], "cooldown_active")
+        self.assertIn("cooldown_remaining_sec", r2)
+        self.assertGreater(r2["cooldown_remaining_sec"], 3500)
+
+        # 3. Simulate cooldown expiration (3601s elapsed)
+        self.engine.last_disk_cleanup_time = time.time() - 3605
+        r3 = self.engine.handle_disk_usage(91.0)
+        self.assertEqual(r3["action"], "purge_temp_cache")
 
 
 if __name__ == "__main__":

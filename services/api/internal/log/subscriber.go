@@ -17,6 +17,7 @@ import (
 
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/security"
 )
 
 // Subscriber bridges EventBus events into the SystemLog table.
@@ -587,8 +588,8 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 		EventType: topic,
 		Level:     level,
 		Source:    e.Source,
-		Message:   message,
-		Payload:   string(e.Payload),
+		Message:   security.RedactSensitiveInfo(message),
+		Payload:   security.RedactSensitiveInfo(string(e.Payload)),
 	}
 }
 

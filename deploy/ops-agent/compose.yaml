@@ -13,6 +13,9 @@ services:
       - DOCKER_SOCKET=/var/run/docker.sock
       - MQTT_BROKER=home-mosquitto
       - MQTT_PORT=1883
+      - MQTT_USER=home-datacenter
+      - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      - MQTT_TLS=false
       - NEW_API_URL=http://home-new-api:3000/v1
       - NEW_API_MODEL=agent-fast
       - API_BASE_URL=http://home-api:8080

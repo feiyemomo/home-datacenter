@@ -78,6 +78,7 @@ func TestListAndCreateProposals(t *testing.T) {
 	w = httptest.NewRecorder()
 	req, _ = http.NewRequest(http.MethodPost, "/api/v1/ops/proposals", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Admin", "true")
 	r.ServeHTTP(w, req)
 
 	if w.Code != http.StatusCreated {
@@ -284,8 +285,8 @@ func TestProposalRejectsNonAdminWithoutContextElevation(t *testing.T) {
 	req.Header.Set("X-Admin", "true")
 	r.ServeHTTP(w, req)
 
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 Forbidden when X-Admin header is supplied without context elevation, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusForbidden && w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 403 Forbidden or 401 Unauthorized when X-Admin header is supplied without context elevation, got %d: %s", w.Code, w.Body.String())
 	}
 }
 

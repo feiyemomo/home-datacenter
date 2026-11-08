@@ -52,12 +52,7 @@ func NewOnePanelClient(baseURL, entrance, username, password string) *OnePanelCl
 	if entrance == "" {
 		entrance = "btpanel"
 	}
-	if username == "" {
-		username = "feiyemomo"
-	}
-	if password == "" {
-		password = "@Momo324"
-	}
+	// Fallback credentials purged for security: username and password must be explicitly provided.
 
 	return &OnePanelClient{
 		baseURL:  baseURL,

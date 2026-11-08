@@ -42,6 +42,7 @@ type OpsHandler struct {
 	db         *gorm.DB
 	bus        *eventbus.Bus
 	defenseMgr *security.DefenseManager
+	executor   OperationExecutor
 
 	mu                  sync.RWMutex
 	newAPIFailCount     int
@@ -62,13 +63,29 @@ func NewOpsHandler(
 	if fallback == nil {
 		fallback = NewHostFallbackProvider("", "")
 	}
-	return &OpsHandler{
+	h := &OpsHandler{
 		client:     client,
 		fallback:   fallback,
 		db:         db,
 		bus:        bus,
 		defenseMgr: defenseMgr,
 	}
+	h.executor = NewOperationExecutor(db, bus, client, fallback, WithBaselineExtractor(h.ComputeFingerprint))
+	return h
+}
+
+// SetExecutor sets the OperationExecutor for OpsHandler.
+func (h *OpsHandler) SetExecutor(exec OperationExecutor) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.executor = exec
+}
+
+// GetExecutor returns the current OperationExecutor.
+func (h *OpsHandler) GetExecutor() OperationExecutor {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.executor
 }
 
 // RegisterRoutes registers ops endpoints under the given router group.

@@ -54,6 +54,12 @@ func main() {
 
 	cfg := config.AppConfig
 
+	// Fail-Fast Boot Guard: verify required production credentials
+	onePanelPassword := os.Getenv("ONEPANEL_PASSWORD")
+	if err := security.ValidateBootGuard(security.IsProductionEnvironment(), cfg.JWT.Secret, onePanelPassword); err != nil {
+		log.Fatalf("FAIL-FAST BOOT GUARD: %v. Refusing to boot in production.", err)
+	}
+
 	// Apply JWT config to utils
 	utils.JWTSecret = cfg.JWT.Secret
 	utils.TokenExpireDays = cfg.JWT.ExpireDays
@@ -533,8 +539,8 @@ func main() {
 			EventType: "server.panic",
 			Level:     model.LevelCritical,
 			Source:    "server",
-			Message:   fmt.Sprintf("服务器内部错误: %v", panicVal),
-			Payload:   string(stack),
+			Message:   security.RedactSensitiveInfo(fmt.Sprintf("服务器内部错误: %v", panicVal)),
+			Payload:   security.RedactSensitiveInfo(string(stack)),
 		}
 		if err := database.DB.Create(entry).Error; err != nil {
 			log.Printf("recovery: persist panic log failed: %v", err)

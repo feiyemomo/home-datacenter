@@ -6,7 +6,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
-# The daemon is designed with zero external heavy dependencies for minimal memory footprint (RAM <= 50MB)
+# Install lightweight dependencies (paho-mqtt for secure MQTT transport)
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
 COPY config.py proposal.py rule_engine.py main.py ./
 
 CMD ["python", "main.py"]

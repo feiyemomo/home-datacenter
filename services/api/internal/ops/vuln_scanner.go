@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"strings"
 	"sync"
@@ -106,22 +107,167 @@ func (s *VulnScanner) LastScanAt() time.Time {
 	return s.lastScanAt
 }
 
+// CVSS31Metrics models the Base Metrics of FIRST CVSS v3.1 specification.
+type CVSS31Metrics struct {
+	AV float64 // Attack Vector
+	AC float64 // Attack Complexity
+	PR float64 // Privileges Required
+	UI float64 // User Interaction
+	S  string  // Scope: "U" (Unchanged) or "C" (Changed)
+	C  float64 // Confidentiality
+	I  float64 // Integrity
+	A  float64 // Availability
+}
+
+func roundUpCVSS(val float64) float64 {
+	return math.Ceil(val*10.0) / 10.0
+}
+
+// ParseCVSS31Vector computes the exact FIRST CVSS v3.1 Base Score and severity risk level.
+func ParseCVSS31Vector(vector string) (float64, string, error) {
+	parts := strings.Split(vector, "/")
+	if len(parts) == 0 || (!strings.HasPrefix(parts[0], "CVSS:3.1") && !strings.HasPrefix(parts[0], "CVSS:3.0")) {
+		return 0, "", fmt.Errorf("invalid CVSS 3.x vector: %s", vector)
+	}
+
+	m := CVSS31Metrics{S: "U"}
+	scopeChanged := false
+
+	for _, p := range parts[1:] {
+		kv := strings.SplitN(p, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		k, v := kv[0], kv[1]
+		switch k {
+		case "AV":
+			switch v {
+			case "N": m.AV = 0.85
+			case "A": m.AV = 0.62
+			case "L": m.AV = 0.55
+			case "P": m.AV = 0.20
+			}
+		case "AC":
+			switch v {
+			case "L": m.AC = 0.77
+			case "H": m.AC = 0.44
+			}
+		case "UI":
+			switch v {
+			case "N": m.UI = 0.85
+			case "R": m.UI = 0.62
+			}
+		case "S":
+			m.S = v
+			if v == "C" {
+				scopeChanged = true
+			}
+		case "C":
+			switch v {
+			case "H": m.C = 0.56
+			case "L": m.C = 0.22
+			case "N": m.C = 0.00
+			}
+		case "I":
+			switch v {
+			case "H": m.I = 0.56
+			case "L": m.I = 0.22
+			case "N": m.I = 0.00
+			}
+		case "A":
+			switch v {
+			case "H": m.A = 0.56
+			case "L": m.A = 0.22
+			case "N": m.A = 0.00
+			}
+		}
+	}
+
+	// PR depends on Scope
+	for _, p := range parts[1:] {
+		if strings.HasPrefix(p, "PR:") {
+			v := strings.TrimPrefix(p, "PR:")
+			if scopeChanged {
+				switch v {
+				case "N": m.PR = 0.85
+				case "L": m.PR = 0.68
+				case "H": m.PR = 0.50
+				}
+			} else {
+				switch v {
+				case "N": m.PR = 0.85
+				case "L": m.PR = 0.62
+				case "H": m.PR = 0.27
+				}
+			}
+		}
+	}
+
+	// FIRST CVSS v3.1 Base Score Equations
+	iss := 1.0 - ((1.0 - m.C) * (1.0 - m.I) * (1.0 - m.A))
+	var impact float64
+	if scopeChanged {
+		impact = 7.52*(iss-0.029) - 3.25*math.Pow(iss-0.02, 15.0)
+	} else {
+		impact = 6.42 * iss
+	}
+
+	exploitability := 8.22 * m.AV * m.AC * m.PR * m.UI
+
+	var baseScore float64
+	if impact <= 0 {
+		baseScore = 0.0
+	} else if !scopeChanged {
+		baseScore = roundUpCVSS(math.Min(impact+exploitability, 10.0))
+	} else {
+		baseScore = roundUpCVSS(math.Min(1.08*(impact+exploitability), 10.0))
+	}
+
+	var riskLevel string
+	switch {
+	case baseScore >= 9.0:
+		riskLevel = "CRITICAL"
+	case baseScore >= 7.0:
+		riskLevel = "HIGH"
+	case baseScore >= 4.0:
+		riskLevel = "MEDIUM"
+	default:
+		riskLevel = "LOW"
+	}
+
+	return baseScore, riskLevel, nil
+}
+
 // EvaluateCVSS determines the risk level ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 // and whether it constitutes an emergency critical vulnerability requiring immediate alert.
 func EvaluateCVSS(v OSVVuln) (riskLevel string, isCritical bool) {
 	// 1. Check explicit CVSS severity records from OSV
 	for _, sev := range v.Severity {
-		scoreStr := strings.ToUpper(sev.Score)
-		// Check for CVSS v3/v4 vector
-		if strings.Contains(scoreStr, "AV:N") { // Network accessible
-			if strings.Contains(scoreStr, "C:H") && strings.Contains(scoreStr, "I:H") && strings.Contains(scoreStr, "A:H") {
-				return "CRITICAL", true
+		if strings.HasPrefix(sev.Score, "CVSS:3.1") {
+			_, risk, err := ParseCVSS31Vector(sev.Score)
+			if err == nil {
+				return risk, (risk == "CRITICAL" || risk == "HIGH")
 			}
-			if strings.Contains(scoreStr, "C:H") || strings.Contains(scoreStr, "PR:N") {
-				return "HIGH", true
+		} else if strings.HasPrefix(sev.Score, "CVSS:3.0") {
+			scoreStr := strings.ToUpper(sev.Score)
+			if strings.Contains(scoreStr, "AV:N") {
+				if strings.Contains(scoreStr, "C:H") && strings.Contains(scoreStr, "I:H") && strings.Contains(scoreStr, "A:H") {
+					return "CRITICAL", true
+				}
+				if strings.Contains(scoreStr, "C:H") || strings.Contains(scoreStr, "PR:N") {
+					return "HIGH", true
+				}
+			}
+			_, risk, err := ParseCVSS31Vector(sev.Score)
+			if err == nil {
+				return risk, (risk == "CRITICAL" || risk == "HIGH")
+			}
+		} else if strings.Contains(sev.Score, "CVSS:3") {
+			_, risk, err := ParseCVSS31Vector(sev.Score)
+			if err == nil {
+				return risk, (risk == "CRITICAL" || risk == "HIGH")
 			}
 		}
-		// Try parsing numeric score if present
 		var score float64
 		if _, err := fmt.Sscanf(sev.Score, "%f", &score); err == nil {
 			if score >= 9.0 {
@@ -137,7 +283,7 @@ func EvaluateCVSS(v OSVVuln) (riskLevel string, isCritical bool) {
 		}
 	}
 
-	// 2. Keyword heuristic on Summary and Details
+	// 2. Keyword heuristic fallback if OSV returns no structured CVSS metrics
 	text := strings.ToLower(v.Summary + " " + v.Details)
 	if strings.Contains(text, "remote code execution") ||
 		strings.Contains(text, "rce") ||
@@ -158,6 +304,85 @@ func EvaluateCVSS(v OSVVuln) (riskLevel string, isCritical bool) {
 	}
 
 	return "MEDIUM", false
+}
+
+// ParseGoMod parses go.mod content to dynamically extract dependency packages.
+func ParseGoMod(content string) ([]PackageTarget, error) {
+	var targets []PackageTarget
+	inRequireBlock := false
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "//") || trimmed == "" {
+			continue
+		}
+		if trimmed == "require (" {
+			inRequireBlock = true
+			continue
+		}
+		if inRequireBlock && trimmed == ")" {
+			inRequireBlock = false
+			continue
+		}
+
+		if inRequireBlock || strings.HasPrefix(trimmed, "require ") {
+			if strings.HasPrefix(trimmed, "require ") {
+				trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "require "))
+			}
+			if idx := strings.Index(trimmed, "//"); idx != -1 {
+				trimmed = strings.TrimSpace(trimmed[:idx])
+			}
+			fields := strings.Fields(trimmed)
+			if len(fields) >= 2 {
+				pkg := fields[0]
+				ver := fields[1]
+				parts := strings.Split(pkg, "/")
+				comp := parts[len(parts)-1]
+				targets = append(targets, PackageTarget{
+					Component: comp,
+					Ecosystem: "Go",
+					Package:   pkg,
+					Version:   ver,
+				})
+			}
+		}
+	}
+	return targets, nil
+}
+
+// ParseRequirementsTxt parses Python requirements.txt to dynamically extract package dependencies.
+func ParseRequirementsTxt(content string) ([]PackageTarget, error) {
+	var targets []PackageTarget
+	lines := strings.Split(content, "\n")
+	separators := []string{"==", ">=", "<=", "~=", ">", "<"}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "-") {
+			continue
+		}
+
+		pkg := trimmed
+		ver := ""
+		for _, sep := range separators {
+			if idx := strings.Index(trimmed, sep); idx != -1 {
+				pkg = strings.TrimSpace(trimmed[:idx])
+				ver = strings.TrimSpace(trimmed[idx+len(sep):])
+				break
+			}
+		}
+
+		if pkg != "" {
+			targets = append(targets, PackageTarget{
+				Component: pkg,
+				Ecosystem: "PyPI",
+				Package:   pkg,
+				Version:   ver,
+			})
+		}
+	}
+	return targets, nil
 }
 
 // ScanPackage queries Google OSV for vulnerabilities in a specific ecosystem package.

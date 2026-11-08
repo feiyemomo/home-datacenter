@@ -17,6 +17,7 @@ const (
 	ProposalStatusExecuted         = "EXECUTED"
 	ProposalStatusRejected         = "REJECTED"
 	ProposalStatusFailed           = "FAILED"
+	ProposalStatusFailedRolledback = "FAILED_ROLLEDBACK"
 )
 
 // Risk level constants.
@@ -46,6 +47,8 @@ type OpsProposal struct {
 	ApprovedBy       string         `gorm:"size:64" json:"approved_by"`
 	ExecutedAt       utils.NullTime `json:"executed_at"`
 	ExecutionLog     string         `gorm:"type:text" json:"execution_log"`
+	BaselineHash     string         `gorm:"size:128" json:"baseline_hash"`
+	ActionSpec       string         `gorm:"type:text" json:"action_spec"`
 	CreatedAt        time.Time      `gorm:"not null" json:"created_at"`
 	UpdatedAt        time.Time      `json:"updated_at"`
 }
@@ -120,10 +123,17 @@ func (p *OpsProposal) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+const (
+	ChatScopePersonal  = "personal"
+	ChatScopeHousehold = "household"
+)
+
 // OpsChatSession models a multi-turn chat session with Ops Copilot.
 type OpsChatSession struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	SessionID string    `gorm:"size:64;uniqueIndex" json:"session_id"`
+	UserID    uint      `gorm:"index;not null;default:0" json:"user_id"`
+	Scope     string    `gorm:"size:32;not null;default:'personal'" json:"scope"` // "personal" | "household"
 	Title     string    `gorm:"size:255" json:"title"`
 	CreatedAt time.Time `gorm:"not null" json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -136,7 +146,9 @@ type OpsChatMessage struct {
 	ID        uint      `gorm:"primaryKey" json:"id"`
 	MessageID string    `gorm:"size:64;index" json:"message_id"`
 	SessionID string    `gorm:"size:64;index" json:"session_id"`
-	Role      string    `gorm:"size:32;not null" json:"role"` // "user", "assistant", "system"
+	UserID    uint      `gorm:"index;not null;default:0" json:"user_id"`
+	Scope     string    `gorm:"size:32;not null;default:'personal'" json:"scope"` // "personal" | "household"
+	Role      string    `gorm:"size:32;not null" json:"role"`                     // "user", "assistant", "system"
 	Content   string    `gorm:"type:text;not null" json:"content"`
 	Model     string    `gorm:"size:64" json:"model"`
 	Timestamp int64     `json:"timestamp"`

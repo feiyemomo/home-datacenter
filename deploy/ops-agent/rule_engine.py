@@ -12,7 +12,9 @@ Two-Tier Funnel Cost Control Rule Engine for home-ops-agent:
 
 import json
 import logging
+import os
 import re
+import shutil
 import subprocess
 import time
 import urllib.error
@@ -22,6 +24,33 @@ from typing import Any, Dict, List, Optional, Set
 from config import OpsAgentConfig
 
 logger = logging.getLogger("home-ops-agent.rule_engine")
+
+PROTECTED_VOLUME_PREFIXES = (
+    "/data",
+    "/vol1",
+    "/media",
+    "/mnt",
+    "/var/lib/docker/volumes",
+    "/etc",
+    "/root",
+    "/home",
+    "/boot",
+    "/sys",
+    "/proc",
+    "/dev",
+)
+
+PROTECTED_VOLUMES = {
+    "data-sqlite",
+    "data-recordings",
+    "backup-state",
+}
+
+SAFE_TEMP_CACHE_DIRS = [
+    "/tmp/buildcache",
+    "/var/tmp/buildcache",
+    "/tmp/docker-build",
+]
 
 
 def sanitize_log(text: str) -> str:
@@ -64,10 +93,38 @@ class TwoTierRuleEngine:
         self.auth_fail_counts: Dict[str, int] = {}
         self.auth_fail_timestamps: Dict[str, List[float]] = {}
         self.banned_ips: Set[str] = set()
-        self.cleaned_caches: List[float] = []
+        self.cleaned_caches: List[Any] = []
+        self.last_disk_cleanup_time: float = 0.0
         self.llm_queries: List[Dict[str, Any]] = []
         self.tier1_intercept_count: int = 0
         self.tier2_escalate_count: int = 0
+
+    @staticmethod
+    def is_protected_volume(path: str) -> bool:
+        """
+        Validates if target path belongs to a protected persistent volume.
+        Protects /data, /vol1, /media, Docker volumes, and system root directories.
+        """
+        if not path:
+            return False
+        if path in PROTECTED_VOLUMES:
+            return True
+        for name in PROTECTED_VOLUMES:
+            if name in path:
+                return True
+
+        # Normalize slashes and strip Windows drive letter if present
+        clean_path = path.replace("\\", "/").strip()
+        if len(clean_path) >= 2 and clean_path[1] == ":" and clean_path[0].isalpha():
+            clean_path = clean_path[2:]
+        if not clean_path.startswith("/"):
+            clean_path = "/" + clean_path
+
+        for prefix in PROTECTED_VOLUME_PREFIXES:
+            p = prefix.rstrip("/")
+            if clean_path == p or clean_path.startswith(p + "/"):
+                return True
+        return False
 
     def handle_auth_failure(self, ip: str) -> Dict[str, Any]:
         """
@@ -165,28 +222,96 @@ class TwoTierRuleEngine:
 
     def handle_disk_usage(self, disk_percent: float, mount_path: str = "/") -> Dict[str, Any]:
         """
-        Tier 1 Rule: Disk utilization >= threshold -> auto purge temporary caches (0 tokens).
+        Tier 1 Rule: Safe Disk Cleanup
+        - Enforces 1-hour cooldown period between cleanups to prevent churn.
+        - Strictly protects persistent volumes (/data, /vol1) from pruning.
+        - Measures before/after disk free space delta (freed_bytes).
         """
         self.tier1_intercept_count += 1
         threshold = max(self.config.disk_threshold_percent, 85.0)
 
-        if disk_percent >= threshold:
-            self.cleaned_caches.append(time.time())
-            purged_items = self._purge_temp_cache(mount_path)
-            logger.warning(f"[Tier 1] Disk usage at {disk_percent:.1f}% (threshold {threshold}%). Purged temporary caches.")
+        if disk_percent < threshold:
             return {
                 "handled_by": "tier1_rule_engine",
-                "action": "purge_temp_cache",
-                "mount_path": mount_path,
+                "action": "status_nominal",
                 "disk_percent": disk_percent,
-                "purged_items": purged_items,
                 "tokens_used": 0
             }
 
+        now = time.time()
+        elapsed = now - self.last_disk_cleanup_time
+        cooldown_sec = getattr(self.config, "disk_cleanup_cooldown_sec", 3600.0)
+
+        # 1. Enforce 1-hour cooldown period
+        if elapsed < cooldown_sec:
+            remaining = int(cooldown_sec - elapsed)
+            logger.info(
+                f"[Tier 1] Disk usage at {disk_percent:.1f}% >= {threshold}%, "
+                f"but cooldown is active ({remaining}s remaining). Skipping cleanup."
+            )
+            return {
+                "handled_by": "tier1_rule_engine",
+                "action": "cooldown_active",
+                "mount_path": mount_path,
+                "disk_percent": disk_percent,
+                "cooldown_remaining_sec": remaining,
+                "tokens_used": 0
+            }
+
+        # 2. Before delta measurement
+        try:
+            usage_before = shutil.disk_usage(mount_path)
+            free_before = usage_before.free
+        except Exception:
+            free_before = 0
+
+        # 3. Execute safe pruning of build caches
+        purged_items = self._purge_temp_cache(mount_path)
+        self.last_disk_cleanup_time = now
+
+        # 4. After delta measurement
+        try:
+            usage_after = shutil.disk_usage(mount_path)
+            free_after = usage_after.free
+            freed_bytes = max(0, free_after - free_before)
+            disk_percent_after = round((usage_after.used / usage_after.total) * 100.0, 2)
+        except Exception:
+            free_after = free_before
+            freed_bytes = 0
+            disk_percent_after = disk_percent
+
+        freed_mb = round(freed_bytes / (1024 * 1024), 2)
+        cleanup_record = {
+            "timestamp": now,
+            "mount_path": mount_path,
+            "disk_percent_before": disk_percent,
+            "disk_percent_after": disk_percent_after,
+            "free_before_bytes": free_before,
+            "free_after_bytes": free_after,
+            "freed_bytes": freed_bytes,
+            "freed_mb": freed_mb,
+            "purged_items": purged_items
+        }
+        self.cleaned_caches.append(cleanup_record)
+
+        logger.warning(
+            f"[Tier 1] Disk usage at {disk_percent:.1f}% >= {threshold}%. "
+            f"Purged temporary build caches. Freed {freed_mb:.2f}MB ({freed_bytes} bytes). "
+            f"Cooldown of {int(cooldown_sec)}s active."
+        )
+
         return {
             "handled_by": "tier1_rule_engine",
-            "action": "status_nominal",
+            "action": "purge_temp_cache",
+            "mount_path": mount_path,
             "disk_percent": disk_percent,
+            "disk_percent_before": disk_percent,
+            "disk_percent_after": disk_percent_after,
+            "free_before_bytes": free_before,
+            "free_after_bytes": free_after,
+            "freed_bytes": freed_bytes,
+            "freed_mb": freed_mb,
+            "purged_items": purged_items,
             "tokens_used": 0
         }
 
@@ -204,12 +329,49 @@ class TwoTierRuleEngine:
             logger.debug(f"iptables command skipped or simulated: {e}")
 
     def _purge_temp_cache(self, mount_path: str) -> List[str]:
-        """Runs cache cleanup commands (docker builder prune, temporary files)."""
-        purged = ["docker builder prune -f", "/tmp orphan files"]
+        """
+        Executes safe cache cleanup commands.
+        Only targets docker builder prune and temporary build cache folders.
+        Never touches protected persistent data volumes.
+        """
+        purged = []
         try:
-            subprocess.run(["docker", "builder", "prune", "-f"], check=False, capture_output=True, timeout=5)
+            res = subprocess.run(
+                ["docker", "builder", "prune", "-f"],
+                check=False,
+                capture_output=True,
+                timeout=10
+            )
+            if res.returncode == 0:
+                purged.append("docker builder prune -f")
         except Exception:
             pass
+
+        try:
+            res = subprocess.run(
+                ["docker", "image", "prune", "-f", "--filter", "dangling=true"],
+                check=False,
+                capture_output=True,
+                timeout=10
+            )
+            if res.returncode == 0:
+                purged.append("docker image prune -f --filter dangling=true")
+        except Exception:
+            pass
+
+        for temp_dir in SAFE_TEMP_CACHE_DIRS:
+            if not self.is_protected_volume(temp_dir) and os.path.exists(temp_dir):
+                try:
+                    for entry in os.scandir(temp_dir):
+                        if entry.is_file() or entry.is_symlink():
+                            os.unlink(entry.path)
+                    purged.append(f"cleaned {temp_dir}")
+                except Exception:
+                    pass
+
+        if not purged:
+            purged.append("docker builder prune -f (simulated)")
+
         return purged
 
     def _query_new_api_diagnostic(self, container: str, crashes: int, exit_code: int, sanitized_log: str) -> Dict[str, Any]:

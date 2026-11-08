@@ -3,10 +3,12 @@ package ops
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -267,18 +269,143 @@ func (f *SafetyFSM) recordHistory(component, action, oldVer, newVer, status, sna
 	_ = f.db.Create(&history).Error
 }
 
+var componentNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_\-]{1,32}$`)
+
+const SQLiteMagicHeader = "SQLite format 3\x00"
+
+// CleanSnapshotComponentName sanitizes a component name, enforcing whitelist characters and max 32 bytes length.
+func CleanSnapshotComponentName(raw string) (string, error) {
+	base := filepath.Base(strings.TrimSpace(raw))
+	if base == "." || base == "/" || base == "\\" || base == "" {
+		return "", fmt.Errorf("invalid component name %q: empty or directory root", raw)
+	}
+
+	// Truncate to max 32 characters
+	if len(base) > 32 {
+		base = base[:32]
+	}
+
+	// Validate against strict whitelist
+	if !componentNameRegex.MatchString(base) {
+		// Sanitize non-matching characters to '_' for compatibility while preventing injection
+		var sb strings.Builder
+		for _, r := range base {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+				sb.WriteRune(r)
+			} else {
+				sb.WriteRune('_')
+			}
+		}
+		base = sb.String()
+	}
+
+	if !componentNameRegex.MatchString(base) {
+		return "", fmt.Errorf("component name %q failed whitelist regex validation ^[a-zA-Z0-9_\\-]{1,32}$", raw)
+	}
+	return base, nil
+}
+
+// ValidateSQLiteSnapshot verifies that the file exists, is non-empty, and matches the 16-byte SQLite format magic header.
+func ValidateSQLiteSnapshot(filePath string) error {
+	cleanPath := filepath.Clean(filePath)
+	info, err := os.Stat(cleanPath)
+	if err != nil {
+		return fmt.Errorf("snapshot file unreadable: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("snapshot path is a directory: %s", cleanPath)
+	}
+	if info.Size() < 16 {
+		return fmt.Errorf("snapshot file too small (%d bytes), not a valid SQLite database", info.Size())
+	}
+
+	f, err := os.Open(cleanPath)
+	if err != nil {
+		return fmt.Errorf("failed to open snapshot file: %w", err)
+	}
+	defer f.Close()
+
+	header := make([]byte, 16)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return fmt.Errorf("failed to read SQLite magic header: %w", err)
+	}
+
+	if string(header) != SQLiteMagicHeader {
+		return fmt.Errorf("invalid SQLite snapshot: header magic mismatch (got %q, expected %q)", string(header), SQLiteMagicHeader)
+	}
+	return nil
+}
+
 func (f *SafetyFSM) createPhysicalSnapshot(component string, now time.Time) (string, error) {
-	snapshotName := fmt.Sprintf("snapshot_%s_%d.db", component, now.Unix())
+	cleanComp, err := CleanSnapshotComponentName(component)
+	if err != nil {
+		return "", fmt.Errorf("snapshot component validation rejected: %w", err)
+	}
+
+	_ = os.MkdirAll(f.backupDir, 0755)
+
+	snapshotName := fmt.Sprintf("snapshot_%s_%d.db", cleanComp, now.Unix())
 	snapshotPath := filepath.Join(f.backupDir, snapshotName)
+
+	// Ensure path containment within backupDir
+	rel, err := filepath.Rel(f.backupDir, snapshotPath)
+	if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return "", fmt.Errorf("snapshot path traversal detected: %s", snapshotPath)
+	}
+
 	snapshotPathForSQL := filepath.ToSlash(snapshotPath)
-	log.Printf("[safety-fsm] Step 1: Taking SQLite snapshot for %s -> %s", component, snapshotPathForSQL)
+	log.Printf("[safety-fsm] Step 1: Taking SQLite snapshot for %s -> %s", cleanComp, snapshotPathForSQL)
 	if f.db != nil {
 		safePath := strings.ReplaceAll(snapshotPathForSQL, "'", "''")
 		if err := f.db.Exec(fmt.Sprintf("VACUUM INTO '%s'", safePath)).Error; err != nil {
 			log.Printf("[safety-fsm] CRITICAL: VACUUM INTO failed (%v), aborting update to protect data integrity", err)
 			return "", fmt.Errorf("VACUUM INTO failed: %w", err)
 		}
+		// Verify written snapshot magic header
+		if err := ValidateSQLiteSnapshot(snapshotPath); err != nil {
+			return "", fmt.Errorf("created snapshot failed validation: %w", err)
+		}
 	}
 	return snapshotPath, nil
+}
+
+// RestorePhysicalSnapshot validates magic bytes and atomically restores a verified database snapshot.
+func (f *SafetyFSM) RestorePhysicalSnapshot(snapshotPath, targetDBPath string) error {
+	cleanSnapshot := filepath.Clean(snapshotPath)
+	cleanTarget := filepath.Clean(targetDBPath)
+	if cleanTarget == "" || cleanTarget == "." {
+		return fmt.Errorf("invalid target database path")
+	}
+
+	if err := ValidateSQLiteSnapshot(cleanSnapshot); err != nil {
+		return fmt.Errorf("snapshot validation failed before restore: %w", err)
+	}
+
+	srcFile, err := os.Open(cleanSnapshot)
+	if err != nil {
+		return fmt.Errorf("failed to open source snapshot: %w", err)
+	}
+	defer srcFile.Close()
+
+	tmpTarget := cleanTarget + ".restore.tmp"
+	dstFile, err := os.OpenFile(tmpTarget, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to create temporary restore file: %w", err)
+	}
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		dstFile.Close()
+		_ = os.Remove(tmpTarget)
+		return fmt.Errorf("failed to copy snapshot content: %w", err)
+	}
+	dstFile.Close()
+
+	if err := os.Rename(tmpTarget, cleanTarget); err != nil {
+		_ = os.Remove(tmpTarget)
+		return fmt.Errorf("failed to atomically replace target database: %w", err)
+	}
+
+	log.Printf("[safety-fsm] Restored verified snapshot %s -> %s", cleanSnapshot, cleanTarget)
+	return nil
 }
 

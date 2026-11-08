@@ -24,6 +24,7 @@ type PostChatMessageRequest struct {
 	Content   string `json:"content"`
 	Message   string `json:"message"` // Fallback property for legacy / E2E compatibility
 	Model     string `json:"model"`   // e.g. "agent-deep", "agent-fast"
+	Scope     string `json:"scope"`   // "personal" (default) or "household"
 }
 
 // ChatMessageResponse represents the unified Copilot response payload.
@@ -51,8 +52,15 @@ func (h *OpsHandler) RegisterChatRoutes(rg *gin.RouterGroup) {
 //
 //	Route: GET /api/v1/ops/chat/sessions
 func (h *OpsHandler) ListChatSessions(c *gin.Context) {
+	currentUserID := c.GetUint("user_id")
+	isAdmin := c.GetBool("is_admin")
+
 	var sessions []model.OpsChatSession
-	if err := h.db.Order("id DESC").Find(&sessions).Error; err != nil {
+	query := h.db.Order("id DESC")
+	if !isAdmin {
+		query = query.Where("user_id = ? OR scope = ?", currentUserID, model.ChatScopeHousehold)
+	}
+	if err := query.Find(&sessions).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -60,6 +68,8 @@ func (h *OpsHandler) ListChatSessions(c *gin.Context) {
 	if len(sessions) == 0 {
 		defaultSession := model.OpsChatSession{
 			SessionID: "session-ops-001",
+			UserID:    currentUserID,
+			Scope:     model.ChatScopeHousehold,
 			Title:     "系统日常运维与主动安全 Copilot",
 			CreatedAt: time.Now(),
 			UpdatedAt: time.Now(),
@@ -80,6 +90,9 @@ func (h *OpsHandler) ListChatSessions(c *gin.Context) {
 //
 //	Route: POST /api/v1/ops/chat/messages
 func (h *OpsHandler) PostChatMessage(c *gin.Context) {
+	currentUserID := c.GetUint("user_id")
+	isAdmin := c.GetBool("is_admin")
+
 	var req PostChatMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body: " + err.Error()})
@@ -105,16 +118,36 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 		modelAlias = "agent-deep"
 	}
 
-	// Ensure session exists
+	// Session ownership & Anti-IDOR check
 	var session model.OpsChatSession
-	if err := h.db.Where("session_id = ?", sessionID).First(&session).Error; err != nil {
+	err := h.db.Where("session_id = ?", sessionID).First(&session).Error
+	if err == nil {
+		// Session exists: enforce IDOR boundary
+		if !isAdmin && session.UserID != currentUserID && session.Scope != model.ChatScopeHousehold && session.UserID != 0 {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":      "无权访问此会话 (Forbidden: session isolation violation)",
+				"session_id": sessionID,
+			})
+			return
+		}
+	} else {
+		// Create session with caller ownership
+		scope := strings.TrimSpace(req.Scope)
+		if scope != model.ChatScopeHousehold {
+			scope = model.ChatScopePersonal
+		}
 		session = model.OpsChatSession{
 			SessionID: sessionID,
+			UserID:    currentUserID,
+			Scope:     scope,
 			Title:     truncateTitle(prompt, 30),
 			CreatedAt: time.Now(),
 			UpdatedAt: time.Now(),
 		}
-		_ = h.db.Create(&session).Error
+		if err := h.db.Create(&session).Error; err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create chat session: " + err.Error()})
+			return
+		}
 	}
 
 	// 1. Assemble system telemetry context
@@ -126,10 +159,12 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 	now := time.Now()
 	msgID := fmt.Sprintf("msg-%d", now.UnixNano()/1e6)
 
-	// Persist user and assistant messages
+	// Persist user and assistant messages with user_id and scope
 	userEntry := model.OpsChatMessage{
 		MessageID: fmt.Sprintf("user-%d", now.UnixNano()/1e6),
 		SessionID: sessionID,
+		UserID:    currentUserID,
+		Scope:     session.Scope,
 		Role:      "user",
 		Content:   prompt,
 		Timestamp: now.UnixMilli(),
@@ -140,6 +175,8 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 	assistantEntry := model.OpsChatMessage{
 		MessageID: msgID,
 		SessionID: sessionID,
+		UserID:    currentUserID,
+		Scope:     session.Scope,
 		Role:      "assistant",
 		Content:   replyText,
 		Model:     usedModel,
@@ -379,37 +416,61 @@ func (h *OpsHandler) domainReasoningFallback(prompt string) (string, []string) {
 		return reply, referenced
 	}
 
+	// 1. SSH / Brute-force De-faking
 	if strings.Contains(p, "ssh") || strings.Contains(p, "攻击") || strings.Contains(p, "暴力破解") || strings.Contains(p, "attack") || strings.Contains(p, "ban") {
-		var bansToday int64 = 142
-		var activeBanned int = 2
-		bannedIPList := "194.26.29.112 (德国), 45.142.214.50 (俄罗斯)"
-
-		if h.defenseMgr != nil {
-			ov := h.defenseMgr.GetOverview()
-			if ov.BansToday > 0 {
-				bansToday = ov.BansToday
-			}
-			if ov.TotalBannedCount > 0 {
-				activeBanned = ov.TotalBannedCount
-			}
+		if h.defenseMgr == nil {
+			return "【SSH 安全威胁与暴力破解分析报告】\n\n• 安全防御模块状态: 未配置/状态未知 (DefenseManager 未就绪)\n• 提示: 宿主机未启用安全防御管理器，无法获取实时拦截与封禁统计。", referenced
 		}
 
-		reply := fmt.Sprintf("【SSH 安全威胁与暴力破解分析报告 — 过去 24 小时】\n\n"+
-			"• 攻击总次数: %d 次 (已由 1Panel WAF 与 fail2ban 实时拦截阻断)\n"+
-			"• 当前活动封禁 IP: %d 个\n"+
-			"• 主要攻击源 IP: %s, 192.168.1.199 (内网探测已隔离)\n"+
-			"• 命中防御策略: iptables -I INPUT ... DROP 规则与 Mosquitto security.ban 联动\n"+
-			"• 处理结论: 检测到针对 SSH 端口的密码爆破行为。单 IP 失败达 5 次已触发【第一层本地规则引擎】直接封禁，0 Token 消耗，系统安全无虞。",
-			bansToday, activeBanned, bannedIPList)
-		return reply, referenced
+		ov := h.defenseMgr.GetOverview()
+		var sb strings.Builder
+		sb.WriteString("【SSH 安全威胁与暴力破解分析报告 — 过去 24 小时】\n\n")
+		sb.WriteString(fmt.Sprintf("• 今日拦截攻击次数: %d 次 (已由 1Panel WAF 与 fail2ban 实时拦截阻断)\n", ov.BansToday))
+		sb.WriteString(fmt.Sprintf("• 当前活动封禁 IP: %d 个\n", ov.TotalBannedCount))
+
+		if len(ov.ActiveBans) > 0 {
+			var ipStrs []string
+			for i, b := range ov.ActiveBans {
+				if i >= 5 {
+					ipStrs = append(ipStrs, fmt.Sprintf("... 等共 %d 个", len(ov.ActiveBans)))
+					break
+				}
+				ipStrs = append(ipStrs, b.IP)
+			}
+			sb.WriteString(fmt.Sprintf("• 当前封禁列表: %s\n", strings.Join(ipStrs, ", ")))
+		} else {
+			sb.WriteString("• 当前封禁列表: 暂无活动封禁 IP (当前系统安全环境良好)\n")
+		}
+
+		if len(ov.TopAttackers) > 0 {
+			var attStrs []string
+			for i, ta := range ov.TopAttackers {
+				if i >= 3 {
+					break
+				}
+				attStrs = append(attStrs, fmt.Sprintf("%s (%d次)", ta.IP, ta.Hits))
+			}
+			sb.WriteString(fmt.Sprintf("• 主要攻击源 IP: %s\n", strings.Join(attStrs, ", ")))
+		} else {
+			sb.WriteString("• 主要攻击源 IP: 过去 24 小时内未记录到高频恶意攻击源\n")
+		}
+
+		sb.WriteString("• 命中防御策略: iptables -I INPUT ... DROP 规则与 Mosquitto security.ban 联动\n")
+		if ov.BansToday > 0 || ov.TotalBannedCount > 0 {
+			sb.WriteString("• 处理结论: 检测到密码爆破行为。单 IP 连续失败触发【第一层本地规则引擎】直接封禁，0 Token 消耗，系统安全无虞。")
+		} else {
+			sb.WriteString("• 处理结论: 未检测到异常暴力破解或攻击行为，系统安全无虞。")
+		}
+		return sb.String(), referenced
 	}
 
+	// 2. Proposals
 	if strings.Contains(p, "提案") || strings.Contains(p, "待批") || strings.Contains(p, "高危") || strings.Contains(p, "proposal") || strings.Contains(p, "upgrade") {
 		var pending []model.OpsProposal
 		_ = h.db.Where("status = ?", model.ProposalStatusAwaitingApproval).Find(&pending).Error
 
 		if len(pending) == 0 {
-			return "当前系统无待审批的高危变更提案，全部 7 个核心服务容器均处于稳定版本运行中。", referenced
+			return "当前系统无待审批的高危变更提案，核心服务容器均处于稳定版本运行中。", referenced
 		}
 
 		var sb strings.Builder
@@ -423,55 +484,102 @@ func (h *OpsHandler) domainReasoningFallback(prompt string) (string, []string) {
 		return sb.String(), referenced
 	}
 
+	// 3. S3 Backup De-faking
 	if strings.Contains(p, "备份") || strings.Contains(p, "s3") || strings.Contains(p, "backup") {
-		s3 := h.fallback.GetS3BackupStatus()
-		s3StatusStr := "HEALTHY"
-		if !s3.OK {
-			s3StatusStr = "WARNING"
+		if h.fallback == nil {
+			return "【S3 异地增量冷备健康度检查】\n\n• 运行状态: 状态未知/未配置 (FallbackProvider 未就绪)", referenced
 		}
-		lastSyncStr := "今日 04:00"
+		s3 := h.fallback.GetS3BackupStatus()
+		if !s3.Configured || s3.Source == "none" {
+			return "【S3 异地增量冷备健康度检查】\n\n" +
+				"• 运行状态: 状态未知/未配置\n" +
+				"• 提示: 未检测到异地冷备状态记录（状态文件 /data/backup-state/last.json 不存在或未生成）。\n" +
+				"• 建议: 请检查离线备份脚本或定时冷备任务配置。", referenced
+		}
+
+		s3StatusStr := "正常 (HEALTHY)"
+		if !s3.OK {
+			s3StatusStr = fmt.Sprintf("告警 (WARNING: %s)", s3.ErrorMessage)
+		}
+		lastSyncStr := "从未同步/时间未知"
 		if s3.LastSyncAt != nil {
-			lastSyncStr = s3.LastSyncAt.Format("2006-01-02 15:04")
+			lastSyncStr = s3.LastSyncAt.Format("2006-01-02 15:04:05")
 		}
 		sizeGB := float64(s3.RemoteBytes) / (1024 * 1024 * 1024)
-		if sizeGB == 0 {
-			sizeGB = 102.4
-		}
+
 		reply := fmt.Sprintf("【S3 异地增量冷备健康度检查】\n\n"+
-			"• 运行状态: 正常 (%s)\n"+
+			"• 运行状态: %s\n"+
 			"• 最近同步时间: %s\n"+
-			"• 快照占用空间: %.1f GB\n"+
-			"• 加密与传输: AES-256-GCM 客户端本地加密后通过 TLS 1.3 专线上传\n"+
-			"• 容灾策略: NAS 本地存储池快照 + Cloudflare R2 / AWS S3 异地冷备双副本保障。",
-			s3StatusStr, lastSyncStr, sizeGB)
+			"• 快照占用空间: %.2f GB (共 %d 个文件, 耗时 %.1f 秒)\n"+
+			"• 存储桶目标: %s\n"+
+			"• 容灾策略: NAS 本地存储池快照 + 异地冷备双副本保障。",
+			s3StatusStr, lastSyncStr, sizeGB, s3.RemoteFiles, s3.DurationSec, s3.Bucket)
 		return reply, referenced
 	}
 
+	// 4. Vision AI De-faking
 	if strings.Contains(p, "vision") || strings.Contains(p, "重启") || strings.Contains(p, "face") {
-		return "【Vision AI 智能视觉分析诊断】\n\n" +
-			"• 容器运行状态: 正常 (PID 容器 active running)\n" +
-			"• 重启历史诊断: 凌晨 03:15 系统瞬时 CPU 负载超过 80%，触发了【3 级动态 CPU 门控硬件保护熔断】；Vision 进程主动休眠让出硬件算力以保障视频流，15 秒后负载回落自动健康自愈拉起。\n" +
-			"• 人脸特征特征库: 已通过 AES-256-GCM 密文落盘验证，注册与删除接口强制校验 JWT 管理员权限，未检测到任何特征篡改。", referenced
+		var containers []ContainerSummary
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if h.client != nil {
+			if cList, err := h.client.ListContainers(ctx); err == nil && len(cList) > 0 {
+				containers = cList
+			}
+		}
+		if len(containers) == 0 && h.fallback != nil {
+			containers = h.fallback.GetHostContainers(ctx)
+		}
+
+		var visionCt *ContainerSummary
+		for _, ct := range containers {
+			if strings.Contains(ct.Name, "vision") {
+				visionCt = &ct
+				break
+			}
+		}
+
+		if visionCt == nil {
+			return "【Vision AI 智能视觉分析诊断】\n\n" +
+				"• 容器运行状态: 状态未知/未检测到运行实例 (home-vision 容器未发现)\n" +
+				"• 诊断说明: 无法从 Docker 守护进程或 1Panel 中检索到 home-vision 容器实例。\n" +
+				"• 人脸特征库: 特征数据由系统数据库统一管理，请确认 Vision AI 服务部署状态。", referenced
+		}
+
+		restartDiag := "近期稳定运行，无异常重启记录。"
+		if visionCt.RestartCount > 0 {
+			restartDiag = fmt.Sprintf("记录到 %d 次重启，可能受宿主机瞬时负载或 OOM 影响，请关注资源配额。", visionCt.RestartCount)
+		}
+
+		reply := fmt.Sprintf("【Vision AI 智能视觉分析诊断】\n\n"+
+			"• 容器运行状态: %s (%s)\n"+
+			"• 资源消耗情况: CPU %.1f%%, 内存 %.1f MB\n"+
+			"• 重启历史诊断: %s\n"+
+			"• 人脸特征库: 注册与比对接口受 JWT 鉴权保护，运行正常。",
+			visionCt.State, visionCt.Status, visionCt.CPUPercent, visionCt.MemoryUsageMB, restartDiag)
+		return reply, referenced
 	}
 
+	// 5. CVE Vulnerability Report
 	if strings.Contains(p, "cve") || strings.Contains(p, "漏洞") || strings.Contains(p, "vulnerability") || strings.Contains(p, "安全报告") {
 		reply, props := h.generateCVEReport()
 		return reply, props
 	}
 
+	// 6. Container Resource Ranking
 	if strings.Contains(p, "容器") || strings.Contains(p, "资源") || strings.Contains(p, "排行") || strings.Contains(p, "container") {
 		var containers []ContainerSummary
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
 		if h.client != nil {
-			cList, err := h.client.ListContainers(context.Background())
-			if err == nil && len(cList) > 0 {
+			if cList, err := h.client.ListContainers(ctx); err == nil && len(cList) > 0 {
 				containers = cList
 			}
 		}
-		if len(containers) == 0 {
-			containers = h.fallback.GetHostContainers(context.Background())
+		if len(containers) == 0 && h.fallback != nil {
+			containers = h.fallback.GetHostContainers(ctx)
 		}
 
-		// Sort containers by CPUPercent descending, then MemoryUsageMB descending
 		sort.Slice(containers, func(i, j int) bool {
 			if containers[i].CPUPercent != containers[j].CPUPercent {
 				return containers[i].CPUPercent > containers[j].CPUPercent
@@ -487,16 +595,42 @@ func (h *OpsHandler) domainReasoningFallback(prompt string) (string, []string) {
 		return sb.String(), referenced
 	}
 
+	// 7. General Default System Fallback
+	var containers []ContainerSummary
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if h.client != nil {
+		if cList, err := h.client.ListContainers(ctx); err == nil && len(cList) > 0 {
+			containers = cList
+		}
+	}
+	if len(containers) == 0 && h.fallback != nil {
+		containers = h.fallback.GetHostContainers(ctx)
+	}
+
+	runningCount := 0
+	for _, ct := range containers {
+		if strings.ToLower(ct.State) == "running" || strings.HasPrefix(strings.ToLower(ct.Status), "up") {
+			runningCount++
+		}
+	}
+
+	containerStatusStr := "容器状态未知 (Docker 守护进程不可达)"
+	if len(containers) > 0 {
+		containerStatusStr = fmt.Sprintf("共检测到 %d 个容器 (%d 个正常运行)", len(containers), runningCount)
+	}
+
 	status := h.fallback.GetHostStatus()
 	return fmt.Sprintf("主动协作 Ops Copilot 已分析您的指令：「%s」。\n\n"+
-		"当前系统状态平稳：\n"+
+		"当前系统状态：\n"+
 		"• 宿主机 CPU: %.1f%% (负载: %.2f/%.2f/%.2f), 内存: %dMB/%dMB (%.1f%%)\n"+
 		"• 存储池健康: %s 水位 (已用 %.1fGB/%.1fGB)\n"+
-		"• 7 个微服务网格正常连通，H3C 简优云乒乓热备通道运行良好。\n\n"+
-		"如需执行任何高危运维操作（如镜像版本升级、表结构重构），请随时吩咐我协助在沙箱中推演提案。",
+		"• 微服务网格: %s。\n\n"+
+		"如需执行任何高危运维操作（如镜像版本升级、表结构重构），请随时吩咐我协助推演提案。",
 		prompt, status.CPU.Percent, status.CPU.LoadAverage[0], status.CPU.LoadAverage[1], status.CPU.LoadAverage[2],
 		status.Memory.UsedMB, status.Memory.TotalMB, status.Memory.UsedPercent,
-		status.DiskPool.Watermark, status.DiskPool.UsedGB, status.DiskPool.TotalGB), referenced
+		status.DiskPool.Watermark, status.DiskPool.UsedGB, status.DiskPool.TotalGB,
+		containerStatusStr), referenced
 }
 
 func (h *OpsHandler) generateCVEReport() (string, []string) {
@@ -509,11 +643,8 @@ func (h *OpsHandler) generateCVEReport() (string, []string) {
 	var sb strings.Builder
 	sb.WriteString("【Google OSV / CVE 漏洞威胁情报与加固报告】\n\n")
 	sb.WriteString("• 漏洞情报源: Google OSV (Open Source Vulnerabilities) 实时 API & 1Panel WAF 哨兵\n")
-	sb.WriteString("• 依赖基线状态: 核心组件已纳入持续自动扫描\n")
-	sb.WriteString("  - github.com/gin-gonic/gin (v1.9.1): 正常，未发现直接 RCE 风险\n")
-	sb.WriteString("  - github.com/glebarez/sqlite (v1.11.0): 纯 Go 驱动，完全免疫 CGO 内存越界攻击\n")
-	sb.WriteString("  - gorm.io/gorm (v1.25.7): 正常，SQL 参数预编译闭环\n")
-	sb.WriteString("  - OpenResty & 1pwaf: 正常，WAF 规则库处于实时防御状态\n\n")
+	sb.WriteString("• 依赖基线状态: 项目 go.mod 与 requirements.txt 依赖组件纳入持续动态解析与自动扫描\n")
+	sb.WriteString("• 防御机制: 纯 Go SQLite (glebarez/sqlite) 内存免疫，SQL 参数化预编译，WAF 规则实时阻断\n\n")
 
 	if len(vulnProps) > 0 {
 		sb.WriteString(fmt.Sprintf("• 已记录的 CVE/安全加固提案 (%d 项):\n", len(vulnProps)))
@@ -524,7 +655,7 @@ func (h *OpsHandler) generateCVEReport() (string, []string) {
 		}
 		sb.WriteString("\n处置建议: 您可在【待审提案】面板中点击【预约 03:00 执行】或【立即执行】对上述组件进行沙箱热修加固。")
 	} else {
-		sb.WriteString("• 结论: 当前数据中心所有核心容器均处于安全基准线内，未收到未处置的高危 CVE 漏洞告警。")
+		sb.WriteString("• 结论: 当前数据中心所有动态解析的核心依赖组件均处于安全基准线内，未收到未处置的高危 CVE 漏洞告警。")
 	}
 
 	return sb.String(), referenced

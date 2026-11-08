@@ -11,11 +11,18 @@ import shutil
 import signal
 import sys
 import time
-from typing import Optional
+from typing import Any, Optional
+
+try:
+    import paho.mqtt.client as paho_mqtt
+    PAHO_AVAILABLE = True
+except ImportError:
+    paho_mqtt = None
+    PAHO_AVAILABLE = False
 
 from config import OpsAgentConfig
 from proposal import ProposalLifecycleManager
-from rule_engine import TwoTierRuleEngine
+from rule_engine import TwoTierRuleEngine, sanitize_log
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,6 +30,85 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("home-ops-agent")
+
+
+class SensitiveInfoFilter(logging.Filter):
+    """Logging filter ensuring passwords, tokens, and keys are scrubbed before output."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = sanitize_log(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {k: sanitize_log(str(v)) if isinstance(v, str) else v for k, v in record.args.items()}
+            elif isinstance(record.args, tuple):
+                record.args = tuple(sanitize_log(str(a)) if isinstance(a, str) else a for a in record.args)
+        return True
+
+
+sensitive_filter = SensitiveInfoFilter()
+logging.getLogger().addFilter(sensitive_filter)
+logger.addFilter(sensitive_filter)
+
+WEAK_SECRETS_BLACKLIST = {
+    "", "123456", "12345678", "123456789", "@momo324", "password", "admin",
+    "btpanel", "feiyemomo", "root", "qwerty", "pass123", "default", "your-secret-key",
+    "change-me", "please_change_to_a_long_random_secret", "homedatacenter", "token", "secret"
+}
+
+
+def is_production() -> bool:
+    """Returns True if running in production mode."""
+    env = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", os.environ.get("ENV", ""))).lower().strip()
+    if env in ("development", "dev", "test", "testing"):
+        return False
+    if env in ("production", "prod"):
+        return True
+    if os.path.exists("/.dockerenv"):
+        return True
+    return False
+
+
+def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
+    """
+    Enforces security boot guard in production mode.
+    Fails fast if critical secrets or tokens are missing, placeholders, or weak.
+    """
+    if not is_production():
+        return
+
+    cfg = config or OpsAgentConfig.load()
+    errors = []
+
+    # 1. NEW_API_TOKEN check (if NEW_API_URL configured for remote access)
+    if cfg.new_api_url and "localhost" not in cfg.new_api_url and "127.0.0.1" not in cfg.new_api_url:
+        token = cfg.new_api_token.strip()
+        if not token:
+            errors.append("NEW_API_TOKEN must not be empty in production")
+        elif token.lower() in WEAK_SECRETS_BLACKLIST or len(token) < 8:
+            errors.append(f"NEW_API_TOKEN is weak or placeholder ({token[:4]}...)")
+
+    # 2. ONEPANEL_PASSWORD check (if present in environment or configured)
+    onepanel_pass = os.environ.get("ONEPANEL_PASSWORD", "").strip()
+    if onepanel_pass:
+        if onepanel_pass.lower() in WEAK_SECRETS_BLACKLIST or len(onepanel_pass) < 8:
+            errors.append("ONEPANEL_PASSWORD is weak or placeholder")
+
+    # 3. JWT_SECRET check (if present in environment or configured)
+    jwt_secret = os.environ.get("JWT_SECRET", "").strip()
+    if jwt_secret:
+        if jwt_secret.lower() in WEAK_SECRETS_BLACKLIST or len(jwt_secret) < 32:
+            errors.append("JWT_SECRET is weak or less than 32 characters")
+
+    # 4. MQTT_PASSWORD check (if remote broker and password required)
+    mqtt_pass = os.environ.get("MQTT_PASSWORD", "").strip()
+    if mqtt_pass and (mqtt_pass.lower() in WEAK_SECRETS_BLACKLIST or len(mqtt_pass) < 6):
+        errors.append("MQTT_PASSWORD is weak or placeholder")
+
+    if errors:
+        msg = f"FAIL-FAST BOOT GUARD: {'; '.join(errors)}. Refusing to boot in production."
+        logger.critical(msg)
+        raise RuntimeError(msg)
 
 
 class HomeOpsAgent:
@@ -33,10 +119,85 @@ class HomeOpsAgent:
 
     def __init__(self, config: Optional[OpsAgentConfig] = None):
         self.config = config or OpsAgentConfig.load()
+        validate_boot_guard(self.config)
         self.rule_engine = TwoTierRuleEngine(self.config)
         self.proposal_manager = ProposalLifecycleManager(self.config.db_path)
         self.running = False
         self._tasks: list[asyncio.Task] = []
+        self._mqtt_client: Optional[Any] = None
+        self._mqtt_queue: asyncio.Queue = asyncio.Queue()
+        self._mqtt_connected: bool = False
+
+    def _create_paho_client(self, loop: asyncio.AbstractEventLoop) -> Optional[Any]:
+        """Creates and configures standard paho-mqtt client with auth, TLS, LWT, and QoS 1."""
+        if not PAHO_AVAILABLE or paho_mqtt is None:
+            logger.warning("paho-mqtt library is not installed; MQTT listener will run in fallback mode")
+            return None
+
+        client_id = self.config.mqtt_client_id or f"home-ops-agent-{os.getpid()}"
+        if hasattr(paho_mqtt, "CallbackAPIVersion"):
+            client = paho_mqtt.Client(paho_mqtt.CallbackAPIVersion.VERSION2, client_id=client_id)
+        else:
+            client = paho_mqtt.Client(client_id=client_id)
+
+        # 1. Credentials Authentication
+        if self.config.mqtt_user or self.config.mqtt_password:
+            client.username_pw_set(self.config.mqtt_user, self.config.mqtt_password)
+
+        # 2. TLS Encryption Support
+        if self.config.mqtt_tls:
+            import ssl
+            client.tls_set(cert_reqs=ssl.CERT_REQUIRED, tls_version=ssl.PROTOCOL_TLS_CLIENT)
+
+        # 3. Last Will and Testament (LWT)
+        lwt_payload = json.dumps({
+            "status": "offline",
+            "agent": self.config.name,
+            "reason": "unexpected_disconnect",
+            "timestamp": time.time()
+        })
+        client.will_set(self.config.mqtt_lwt_topic, payload=lwt_payload, qos=self.config.mqtt_qos, retain=True)
+
+        # 4. Lifecycle Callbacks
+        def on_connect(cl, userdata, flags, rc, properties=None):
+            code = rc.value if hasattr(rc, "value") else rc
+            if code == 0:
+                self._mqtt_connected = True
+                logger.info(f"Connected to Mosquitto MQTT broker at {self.config.mqtt_broker}:{self.config.mqtt_port}")
+                cl.subscribe(self.config.mqtt_topic, qos=self.config.mqtt_qos)
+                logger.info(f"Subscribed to topic '{self.config.mqtt_topic}' with QoS {self.config.mqtt_qos}")
+                online_payload = json.dumps({
+                    "status": "online",
+                    "agent": self.config.name,
+                    "timestamp": time.time()
+                })
+                cl.publish(self.config.mqtt_lwt_topic, payload=online_payload, qos=self.config.mqtt_qos, retain=True)
+            else:
+                self._mqtt_connected = False
+                logger.error(f"Mosquitto connection rejected with return code {code}")
+
+        def on_disconnect(cl, userdata, rc, properties=None):
+            self._mqtt_connected = False
+            code = rc.value if hasattr(rc, "value") else rc
+            if code != 0:
+                logger.warning(f"Unexpected MQTT disconnect (rc={code}). Automatic reconnect scheduled.")
+
+        def on_message(cl, userdata, msg):
+            try:
+                topic = msg.topic
+                payload_str = msg.payload.decode("utf-8", errors="ignore")
+                if loop and loop.is_running():
+                    loop.call_soon_threadsafe(self._mqtt_queue.put_nowait, (topic, payload_str))
+            except Exception as e:
+                logger.debug(f"Error buffering incoming MQTT message: {e}")
+
+        client.on_connect = on_connect
+        client.on_disconnect = on_disconnect
+        client.on_message = on_message
+
+        # Exponential backoff reconnection configuration
+        client.reconnect_delay_set(min_delay=1, max_delay=60)
+        return client
 
     async def start(self) -> None:
         """Starts all daemon background event loops."""
@@ -58,8 +219,22 @@ class HomeOpsAgent:
             logger.info("Daemon tasks cancelled, initiating graceful shutdown")
 
     async def stop(self) -> None:
-        """Stops the daemon cleanly."""
+        """Stops the daemon cleanly, publishing clean offline LWT message."""
         self.running = False
+        if self._mqtt_client:
+            try:
+                offline_payload = json.dumps({
+                    "status": "offline",
+                    "agent": self.config.name,
+                    "reason": "clean_shutdown",
+                    "timestamp": time.time()
+                })
+                self._mqtt_client.publish(self.config.mqtt_lwt_topic, payload=offline_payload, qos=1, retain=True)
+                self._mqtt_client.loop_stop()
+                self._mqtt_client.disconnect()
+            except Exception as e:
+                logger.debug(f"Error shutting down MQTT client: {e}")
+
         for task in self._tasks:
             task.cancel()
         logger.info(f"{self.config.name} stopped successfully")
@@ -159,16 +334,51 @@ class HomeOpsAgent:
 
     async def _mqtt_listener(self) -> None:
         """
-        Subscribes to Mosquitto security.* topics.
+        Subscribes to Mosquitto security topics via paho-mqtt client with QoS 1.
         Processes auth failures and brute-force events with Tier 1 auto-ban.
         """
+        loop = asyncio.get_running_loop()
+        self._mqtt_client = self._create_paho_client(loop)
+
+        if self._mqtt_client:
+            try:
+                self._mqtt_client.connect_async(
+                    self.config.mqtt_broker,
+                    self.config.mqtt_port,
+                    keepalive=60
+                )
+                self._mqtt_client.loop_start()
+            except Exception as e:
+                logger.warning(f"Initial async connect to MQTT broker failed: {e}. paho-mqtt will retry.")
+
+            while self.running:
+                try:
+                    # Wait for messages dispatched from paho thread
+                    topic, payload_str = await self._mqtt_queue.get()
+                    if "auth_fail" in topic or "security" in topic:
+                        try:
+                            data = json.loads(payload_str)
+                            ip = data.get("ip") or data.get("client_ip")
+                            if ip:
+                                res = self.rule_engine.handle_auth_failure(ip)
+                                logger.info(f"MQTT security event from {ip}: action={res.get('action')}")
+                        except Exception:
+                            pass
+                    self._mqtt_queue.task_done()
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    logger.debug(f"MQTT worker loop error: {e}")
+            return
+
+        # Fallback raw socket listener when paho-mqtt is unavailable
         while self.running:
             try:
                 reader, writer = await asyncio.open_connection(
                     self.config.mqtt_broker,
                     self.config.mqtt_port
                 )
-                logger.info(f"Connected to MQTT broker at {self.config.mqtt_broker}:{self.config.mqtt_port}")
+                logger.info(f"Connected to MQTT broker (fallback) at {self.config.mqtt_broker}:{self.config.mqtt_port}")
 
                 # Minimal MQTT v3.1.1 CONNECT packet
                 client_id = f"ops-agent-{os.getpid()}".encode("utf-8")
@@ -183,7 +393,6 @@ class HomeOpsAgent:
 
                 connack = await reader.read(4)
                 if len(connack) >= 4 and connack[3] == 0:
-                    # SUBSCRIBE to security/#
                     topic = b"security/#"
                     sub_pkt = bytearray([
                         0x82, len(topic) + 5,
@@ -192,7 +401,7 @@ class HomeOpsAgent:
                     ]) + topic + bytearray([0x00])
                     writer.write(sub_pkt)
                     await writer.drain()
-                    logger.info("Subscribed to MQTT topic security/#")
+                    logger.info("Subscribed to MQTT topic security/# (fallback)")
 
                 while self.running:
                     header = await reader.read(2)
@@ -217,6 +426,8 @@ class HomeOpsAgent:
                                     logger.info(f"MQTT security event from {ip}: action={res.get('action')}")
                             except Exception:
                                 pass
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 logger.debug(f"MQTT connection notice: {e}. Retrying in 10s...")
                 await asyncio.sleep(10)
@@ -264,6 +475,12 @@ class HomeOpsAgent:
 
 
 async def main() -> None:
+    try:
+        validate_boot_guard()
+    except RuntimeError as e:
+        logger.critical(str(e))
+        sys.exit(1)
+
     agent = HomeOpsAgent()
 
     loop = asyncio.get_running_loop()
