@@ -100,6 +100,10 @@ services:
       - /var/log/auth.log:/host/log/auth.log:ro
       # Export directory for host-level firewall (iptables/ipset) blocklist synchronization
       - ./data/security:/data/security
+      # 1Panel OpenResty 1pwaf SQLite logs & rule synchronization
+      - /opt/1panel/apps/openresty/openresty/1pwaf/data:/1pwaf:rw
+      # Docker daemon socket (read-only) for container health & resource metrics fallback
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     depends_on:
       mosquitto:
         condition: service_started
@@ -128,6 +132,11 @@ services:
       - JWT_SECRET=${JWT_SECRET:-}
       - MQTT_USERNAME=${MQTT_USERNAME:-home-datacenter}
       - MQTT_PASSWORD=${MQTT_PASSWORD:-}
+      # 1Panel Enterprise / Community OpenAPI connection
+      - ONEPANEL_URL=${ONEPANEL_URL:-http://172.18.0.1:10000}
+      - ONEPANEL_ENTRANCE=${ONEPANEL_ENTRANCE:-btpanel}
+      - ONEPANEL_USERNAME=${ONEPANEL_USERNAME:-feiyemomo}
+      - ONEPANEL_PASSWORD=${ONEPANEL_PASSWORD:-@Momo324}
       - GO2RTC_BASE_URL=${GO2RTC_BASE_URL:-http://home-frigate:1984}
       - FRIGATE_BASE_URL=${FRIGATE_BASE_URL:-http://home-frigate:5000}
       - VISION_BASE_URL=${VISION_BASE_URL:-http://home-vision:8090}
@@ -269,8 +278,7 @@ services:
     # so the IPv4 binding is unchanged on Docker setups where the
     # default bind address differs.
     ports:
-      - "0.0.0.0:8088:80"
-      # - "[::]:8088:80" # IPv6 unavailable in current server environment
+      - "127.0.0.1:8086:80"
     depends_on:
       api:
         condition: service_started
@@ -316,6 +324,7 @@ services:
       start_period: 5s
     environment:
       - TZ=Asia/Shanghai
+      - JWT_SECRET=${JWT_SECRET:-}
     networks:
       - home-net
 
@@ -371,6 +380,25 @@ services:
         if [ -n "$$NAS_LAN_IP" ]; then
           sed -i "s|<YOUR_NAS_LAN_IP>|$$NAS_LAN_IP|g" /config/config.yml 2>/dev/null || true
         fi
+        python3 - << 'PYEOF'
+        import os
+        f = '/opt/frigate/frigate/config/camera/updater.py'
+        try:
+            if os.path.exists(f):
+                with open(f, 'r') as fp:
+                    c = fp.read()
+                old = '            _, _, camera, raw_type = update_topic.split("/")'
+                new = ('            parts = update_topic.split("/")\n'
+                       '            if len(parts) != 4: continue\n'
+                       '            _, _, camera, raw_type = parts\n'
+                       '            if raw_type not in CameraConfigUpdateEnum.__members__: continue')
+                if old in c:
+                    with open(f, 'w') as fp:
+                        fp.write(c.replace(old, new))
+                    print('[PREFLIGHT] Patched Frigate updater.py successfully.')
+        except Exception as e:
+            print(f'[PREFLIGHT] Warning: failed to patch updater.py: {e}')
+        PYEOF
         exec /init
     environment:
       - SET_CONFIG_BY_API=true
@@ -497,7 +525,8 @@ services:
       - api
       - web
     networks:
-      - home-net
+      home-net:
+        ipv4_address: 172.18.0.19
 
   # coturn — optional STUN/TURN for WebRTC across the public
   # internet. Without this, browsers can only reach go2rtc via
@@ -659,6 +688,10 @@ services:
       - H3C_PASSWORD=${H3C_PASSWORD}
       - H3C_APP_NAME=${H3C_APP_NAME:-home}
       - H3C_APP_NAMES=${H3C_APP_NAMES:-home,webrtc_test}
+      - PING_PONG_APP_A=home
+      - PING_PONG_PORT_A=8088
+      - PING_PONG_APP_B=home_b
+      - PING_PONG_PORT_B=8089
       - FRIGATE_URL=http://home-frigate:5000
       - CHECK_INTERVAL=60
       - MIN_REMAINING_MINUTES=25

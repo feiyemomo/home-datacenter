@@ -5,16 +5,103 @@ import base64
 import logging
 import urllib.request
 import urllib.parse
+import hmac
+import hashlib
+import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import numpy as np
 import cv2
+import psutil
 
 from face_engine import FaceEngine
 from pose_engine import PoseEngine
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("vision_service")
+
+# Prime psutil CPU calculation on startup
+try:
+    psutil.cpu_percent(interval=None)
+except Exception as e:
+    logger.warning(f"Failed to initialize psutil: {e}")
+
+def get_cpu_usage() -> float:
+    try:
+        return float(psutil.cpu_percent(interval=None))
+    except Exception as e:
+        logger.warning(f"Error sampling CPU usage: {e}")
+        return 0.0
+
+def verify_vision_auth(headers) -> tuple[bool, int, str]:
+    """
+    Verifies request authentication for sensitive face operations.
+    Supports:
+      1. VISION_PSK via 'X-Vision-PSK' or 'Authorization: Bearer <psk>'
+      2. JWT Admin via 'Authorization: Bearer <jwt>' with is_admin=True
+    Returns (is_authorized, http_status_code, error_message).
+    """
+    auth_header = headers.get("Authorization", "")
+    psk_header = headers.get("X-Vision-PSK", "")
+
+    token = ""
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:].strip()
+    elif psk_header:
+        token = psk_header.strip()
+    elif auth_header:
+        token = auth_header.strip()
+
+    if not token:
+        return False, 401, "Authentication required: missing Authorization or X-Vision-PSK header"
+
+    psk = os.environ.get("VISION_PSK", "").strip()
+    jwt_secret = os.environ.get("JWT_SECRET", os.environ.get("VISION_JWT_SECRET", "")).strip()
+
+    # 1. PSK match
+    if psk and token == psk:
+        return True, 200, ""
+
+    # 2. JWT verification
+    parts = token.split(".")
+    if len(parts) == 3:
+        try:
+            if not jwt_secret:
+                return False, 401, "JWT authentication unavailable: secret not configured"
+
+            signing_input = f"{parts[0]}.{parts[1]}".encode("ascii")
+            rem = len(parts[2]) % 4
+            sig_b64 = parts[2] + ("=" * (4 - rem) if rem else "")
+            sig = base64.urlsafe_b64decode(sig_b64)
+            expected_sig = hmac.new(jwt_secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+            if not hmac.compare_digest(sig, expected_sig):
+                return False, 401, "Invalid JWT signature"
+
+            rem = len(parts[1]) % 4
+            payload_b64 = parts[1] + ("=" * (4 - rem) if rem else "")
+            payload_bytes = base64.urlsafe_b64decode(payload_b64)
+            payload = json.loads(payload_bytes.decode("utf-8"))
+
+            if "exp" in payload and payload["exp"] < time.time():
+                return False, 401, "JWT token has expired"
+
+            is_admin = bool(payload.get("is_admin") or payload.get("role") == "admin")
+            if is_admin:
+                return True, 200, ""
+            else:
+                return False, 403, "Forbidden: administrator privileges required"
+        except Exception as ex:
+            logger.warning(f"JWT verification failed: {ex}")
+            return False, 401, f"Invalid JWT token: {ex}"
+
+    # Fallback if neither VISION_PSK nor JWT_SECRET is configured in environment
+    if not psk and not jwt_secret:
+        fallback_psk = "homedatacenter-vision-psk"
+        if token == fallback_psk:
+            return True, 200, ""
+        return False, 401, "Invalid credentials (neither VISION_PSK nor JWT_SECRET matched)"
+
+    return False, 401, "Invalid PSK or JWT credentials"
 
 MODEL_DIR = os.environ.get("MODEL_DIR", os.path.join(os.path.dirname(__file__), "models"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data/vision" if os.path.exists("/data") else os.path.join(os.path.dirname(__file__), "data"))
@@ -100,21 +187,24 @@ class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 class VisionHandler(BaseHTTPRequestHandler):
-    def send_json(self, status_code, data):
+    def send_json(self, status_code, data, extra_headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status_code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Vision-PSK")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, str(v))
         self.end_headers()
         self.wfile.write(body)
 
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Vision-PSK")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         self.end_headers()
 
@@ -153,6 +243,11 @@ class VisionHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/v1/face/register" or path == "/api/v1/vision/persons":
+            authorized, status_code, err_msg = verify_vision_auth(self.headers)
+            if not authorized:
+                self.send_json(status_code, {"code": status_code, "message": err_msg})
+                return
+
             name = payload.get("name", "").strip()
             if not name:
                 self.send_json(400, {"code": 400, "message": "name is required"})
@@ -174,6 +269,21 @@ class VisionHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/v1/analyze" or path == "/api/v1/vision/analyze":
+            cpu_usage = get_cpu_usage()
+
+            # Tier 3: CPU > 80% -> Hardware protection circuit breaker
+            if cpu_usage > 80.0:
+                logger.warning(
+                    f"CPU usage {cpu_usage:.1f}% exceeds 80% threshold: hardware protection circuit breaker triggered on {path}"
+                )
+                self.send_json(503, {
+                    "code": 503,
+                    "message": "Hardware protection circuit breaker: CPU usage exceeds 80%",
+                    "cpu_usage": round(cpu_usage, 1),
+                    "gating_mode": "throttled"
+                }, extra_headers={"Retry-After": "5"})
+                return
+
             img = decode_image(payload)
             if img is None:
                 self.send_json(400, {"code": 400, "message": "Valid image or image_url is required"})
@@ -181,6 +291,17 @@ class VisionHandler(BaseHTTPRequestHandler):
 
             detect_face = payload.get("detect_face", True)
             detect_pose = payload.get("detect_pose", True)
+
+            # Tier 2: 60% <= CPU <= 80% -> Lightweight fallback (face only, skip pose)
+            if cpu_usage >= 60.0:
+                gating_mode = "lightweight"
+                detect_pose = False
+                logger.info(
+                    f"CPU usage {cpu_usage:.1f}% between 60%-80%: lightweight fallback mode activated (pose detection skipped)"
+                )
+            else:
+                # Tier 1: CPU < 60% -> Full analysis
+                gating_mode = "full"
 
             faces = []
             poses = []
@@ -206,7 +327,9 @@ class VisionHandler(BaseHTTPRequestHandler):
                     "faces": faces,
                     "poses": poses,
                     "has_fall": has_fall,
-                    "matched_persons": matched_persons
+                    "matched_persons": matched_persons,
+                    "cpu_usage": round(cpu_usage, 1),
+                    "gating_mode": gating_mode
                 }
             })
             return
@@ -218,6 +341,11 @@ class VisionHandler(BaseHTTPRequestHandler):
         path = parsed.path
 
         if path.startswith("/api/v1/face/") or path.startswith("/api/v1/vision/persons/"):
+            authorized, status_code, err_msg = verify_vision_auth(self.headers)
+            if not authorized:
+                self.send_json(status_code, {"code": status_code, "message": err_msg})
+                return
+
             parts = path.strip("/").split("/")
             name = urllib.parse.unquote(parts[-1])
             deleted = face_engine.delete_person(name)

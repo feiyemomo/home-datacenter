@@ -86,4 +86,17 @@ type SecurityRecipient struct {
 
 func (SecurityRecipient) TableName() string { return "security_recipients" }
 
+// SecurityAlertFilter stores alert notification filters and severity thresholds.
+type SecurityAlertFilter struct {
+	ID             uint      `gorm:"primaryKey" json:"id"`
+	CriticalVuln   bool      `gorm:"default:true" json:"critical_vuln"`
+	AutoRollback   bool      `gorm:"default:true" json:"auto_rollback"`
+	BruteForceBan  bool      `gorm:"default:true" json:"brute_force_ban"`
+	ContainerCrash bool      `gorm:"default:true" json:"container_crash"`
+	MinSeverity    string    `gorm:"size:32;default:'warning'" json:"min_severity"` // "info", "warning", "critical"
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+func (SecurityAlertFilter) TableName() string { return "security_alert_filters" }
+
 

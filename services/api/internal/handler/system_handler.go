@@ -1,11 +1,14 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -14,9 +17,19 @@ import (
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/maintenance"
 	"home-datacenter-api/internal/mqtt"
+	"home-datacenter-api/internal/ops"
 	"home-datacenter-api/internal/utils"
 	"home-datacenter-api/internal/ws"
 )
+
+type cachedTelemetryMetrics struct {
+	cpuPercent float64
+	cpuCores   int
+	memTotal   uint64
+	memUsed    uint64
+	memAvail   uint64
+	memUsedPct float64
+}
 
 // SystemHandler exposes system-level status and debug endpoints.
 type SystemHandler struct {
@@ -30,6 +43,13 @@ type SystemHandler struct {
 	bus           *eventbus.Bus
 
 	recordingSizeMonitor *maintenance.RecordingSizeMonitor
+
+	onePanelClient   *ops.OnePanelClient
+	fallbackProvider *ops.HostFallbackProvider
+
+	cachedNodeMu      sync.RWMutex
+	cachedNodeTime    time.Time
+	cachedNodeMetrics *cachedTelemetryMetrics
 }
 
 // NewSystemHandler creates a handler for system status and MQTT debug.
@@ -44,6 +64,12 @@ func NewSystemHandler(
 		deviceMgr:  deviceMgr,
 		startTime:  time.Now(),
 	}
+}
+
+// SetOpsTelemetry injects 1Panel OpenAPI client and host fallback telemetry providers.
+func (h *SystemHandler) SetOpsTelemetry(client *ops.OnePanelClient, fallback *ops.HostFallbackProvider) {
+	h.onePanelClient = client
+	h.fallbackProvider = fallback
 }
 
 // SetRecordingSizeMonitor connects the runtime recording size monitor to allow
@@ -66,6 +92,75 @@ func (h *SystemHandler) ConfigureMetrics(diskPath, recordingsDir string, quotaBy
 func (h *SystemHandler) Status(c *gin.Context) {
 	onlineDevices := h.deviceMgr.GetOnlineDevices()
 	metrics := maintenance.CollectMetrics(h.diskPath, h.recordingsDir, h.quotaBytes)
+
+	// Fetch 1Panel OpenAPI node metrics with short 3-5s in-memory cache,
+	// smoothly falling back to pure Go SQLite / host fallback metrics if 1Panel is unavailable.
+	if h.onePanelClient != nil {
+		h.cachedNodeMu.RLock()
+		cacheValid := h.cachedNodeMetrics != nil && time.Since(h.cachedNodeTime) < 4*time.Second
+		cached := h.cachedNodeMetrics
+		h.cachedNodeMu.RUnlock()
+
+		if !cacheValid {
+			fetchCtx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+			nodeMetrics, err := h.onePanelClient.GetNodeMetrics(fetchCtx)
+			cancel()
+
+			if err == nil && nodeMetrics != nil {
+				cached = &cachedTelemetryMetrics{
+					cpuPercent: math.Round(nodeMetrics.CPUUsedPercent*10) / 10,
+					cpuCores:   nodeMetrics.CPUTotal,
+					memTotal:   nodeMetrics.MemoryTotal,
+					memUsed:    nodeMetrics.MemoryUsed,
+					memAvail:   nodeMetrics.MemoryAvailable,
+					memUsedPct: math.Round(nodeMetrics.MemoryUsedPercent*10) / 10,
+				}
+				h.cachedNodeMu.Lock()
+				h.cachedNodeTime = time.Now()
+				h.cachedNodeMetrics = cached
+				h.cachedNodeMu.Unlock()
+			} else {
+				// Fallback when 1Panel is unreachable or returns error:
+				// If we have previous cache, keep it; otherwise attempt host fallback provider.
+				// Cache fallback metrics with current timestamp under mutex lock
+				// so subsequent calls within cache TTL do not block for 2 seconds.
+				h.cachedNodeMu.Lock()
+				if h.cachedNodeMetrics != nil {
+					cached = h.cachedNodeMetrics
+				} else if h.fallbackProvider != nil {
+					hostStatus := h.fallbackProvider.GetHostStatus()
+					cached = &cachedTelemetryMetrics{
+						cpuPercent: hostStatus.CPU.Percent,
+						cpuCores:   hostStatus.CPU.Cores,
+						memTotal:   hostStatus.Memory.TotalMB * 1024 * 1024,
+						memUsed:    hostStatus.Memory.UsedMB * 1024 * 1024,
+						memAvail:   hostStatus.Memory.FreeMB * 1024 * 1024,
+						memUsedPct: hostStatus.Memory.UsedPercent,
+					}
+					h.cachedNodeMetrics = cached
+				}
+				h.cachedNodeTime = time.Now()
+				h.cachedNodeMu.Unlock()
+			}
+		}
+
+		if cached != nil {
+			metrics.CPU = maintenance.CPUMetrics{
+				Percent: cached.cpuPercent,
+				Cores:   cached.cpuCores,
+			}
+			metrics.Memory = maintenance.MemoryMetrics{
+				TotalBytes:     cached.memTotal,
+				AvailableBytes: cached.memAvail,
+				UsedBytes:      cached.memUsed,
+				UsedPercent:    cached.memUsedPct,
+			}
+			metrics.CPUPercent = cached.cpuPercent
+			metrics.MemoryUsedMB = cached.memUsed / (1024 * 1024)
+			metrics.MemoryTotalMB = cached.memTotal / (1024 * 1024)
+			metrics.MemoryPercent = cached.memUsedPct
+		}
+	}
 
 	utils.Success(c, gin.H{
 		"mqtt_connected":      h.mqttClient.IsConnected(),

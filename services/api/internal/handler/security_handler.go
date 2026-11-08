@@ -46,6 +46,16 @@ type setGuardRequest struct {
 	Mode string `json:"mode" binding:"required"`
 }
 
+func getOperatorName(c *gin.Context, fallback string) string {
+	if name := c.GetString("user_name"); name != "" {
+		return name
+	}
+	if uid := c.GetUint("user_id"); uid > 0 {
+		return fmt.Sprintf("用户#%d", uid)
+	}
+	return fallback
+}
+
 // SetGuard updates the global arming mode.
 //
 //	Route: PUT /api/v1/security/guard
@@ -56,10 +66,7 @@ func (h *SecurityHandler) SetGuard(c *gin.Context) {
 		return
 	}
 
-	userName := c.GetString("user_name")
-	if userName == "" {
-		userName = "user"
-	}
+	userName := getOperatorName(c, "系统")
 
 	state, err := h.guardMgr.SetMode(req.Mode, userName)
 	if err != nil {
@@ -121,10 +128,7 @@ func (h *SecurityHandler) ManualBan(c *gin.Context) {
 	if operatorIP == "" {
 		operatorIP = c.ClientIP()
 	}
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 
 	duration := time.Duration(req.DurationMinutes) * time.Minute
 	reason := req.Reason
@@ -164,10 +168,7 @@ func (h *SecurityHandler) ManualUnban(c *gin.Context) {
 		return
 	}
 
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 
 	if err := h.defenseMgr.ManualUnban(operatorUser, ip); err != nil {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
@@ -272,10 +273,7 @@ func (h *SecurityHandler) PruneEvents(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, err.Error())
 		return
 	}
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 	h.defenseMgr.RecordOperatorEvent(operatorUser, c.ClientIP(), "audit_prune",
 		fmt.Sprintf("清理 %d 天前的历史安全事件日志，共删除 %d 条记录", days, deleted), "审计日志维护完成")
 	utils.Success(c, gin.H{"deleted": deleted, "retention_days": days})
@@ -434,10 +432,7 @@ func (h *SecurityHandler) UpdateAlertEmail(c *gin.Context) {
 	if operatorIP == "" {
 		operatorIP = c.ClientIP()
 	}
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 	if h.defenseMgr != nil {
 		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
 			fmt.Sprintf("管理员 %s 更新安全告警接收邮箱为: %s", operatorUser, strings.Join(clean, ", ")),
@@ -481,10 +476,7 @@ func (h *SecurityHandler) AddAlertRecipient(c *gin.Context) {
 	if operatorIP == "" {
 		operatorIP = c.ClientIP()
 	}
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 	if h.defenseMgr != nil {
 		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
 			fmt.Sprintf("管理员 %s 新增安全告警接收邮箱: %s", operatorUser, email),
@@ -521,10 +513,7 @@ func (h *SecurityHandler) DeleteAlertRecipient(c *gin.Context) {
 	if operatorIP == "" {
 		operatorIP = c.ClientIP()
 	}
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 	if h.defenseMgr != nil {
 		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
 			fmt.Sprintf("管理员 %s 移除安全告警接收邮箱: %s", operatorUser, email),
@@ -574,10 +563,7 @@ func (h *SecurityHandler) TestAlertEmail(c *gin.Context) {
 	}
 
 	cfg := h.alertMgr.GetConfig()
-	operatorUser := c.GetString("user_name")
-	if operatorUser == "" {
-		operatorUser = "admin"
-	}
+	operatorUser := getOperatorName(c, "管理员")
 	if h.defenseMgr != nil {
 		h.defenseMgr.RecordOperatorEvent(operatorUser, clientIP, "test_alert",
 			fmt.Sprintf("管理员 %s 触发 QQ Mail SMTP 测试邮件，接收邮箱: %s", operatorUser, cfg.Recipient),
@@ -591,3 +577,59 @@ func (h *SecurityHandler) TestAlertEmail(c *gin.Context) {
 		"enabled":   cfg.Enabled,
 	})
 }
+
+// GetAlertFilters returns the configured alert push filtering options.
+//
+//	Route: GET /api/v1/security/alert-filters
+func (h *SecurityHandler) GetAlertFilters(c *gin.Context) {
+	if h.alertMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "alert manager not configured")
+		return
+	}
+	filters := h.alertMgr.GetAlertFilters()
+	utils.Success(c, filters)
+}
+
+// UpdateAlertFilters updates the alert push filtering options.
+//
+//	Route: PUT /api/v1/security/alert-filters
+func (h *SecurityHandler) UpdateAlertFilters(c *gin.Context) {
+	if h.alertMgr == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "alert manager not configured")
+		return
+	}
+	var req struct {
+		CriticalVuln   bool   `json:"critical_vuln"`
+		AutoRollback   bool   `json:"auto_rollback"`
+		BruteForceBan  bool   `json:"brute_force_ban"`
+		ContainerCrash bool   `json:"container_crash"`
+		MinSeverity    string `json:"min_severity"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	filterModel := h.alertMgr.GetAlertFilters()
+	filterModel.CriticalVuln = req.CriticalVuln
+	filterModel.AutoRollback = req.AutoRollback
+	filterModel.BruteForceBan = req.BruteForceBan
+	filterModel.ContainerCrash = req.ContainerCrash
+	if req.MinSeverity != "" {
+		filterModel.MinSeverity = req.MinSeverity
+	}
+	updated := h.alertMgr.UpdateAlertFilters(filterModel)
+
+	operatorIP := c.GetString("real_client_ip")
+	if operatorIP == "" {
+		operatorIP = c.ClientIP()
+	}
+	operatorUser := getOperatorName(c, "管理员")
+	if h.defenseMgr != nil {
+		h.defenseMgr.RecordOperatorEvent(operatorUser, operatorIP, "config_change",
+			fmt.Sprintf("管理员 %s 更新安全告警内容过滤配置 (MinSeverity=%s)", operatorUser, updated.MinSeverity),
+			"更新成功")
+	}
+
+	utils.Success(c, updated)
+}
+

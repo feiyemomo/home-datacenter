@@ -20,8 +20,12 @@ func TestRewriteH3CCandidates(t *testing.T) {
 	if strings.Contains(got, "154.8.195.220 32596") {
 		t.Fatalf("stale relay port still present:\n%s", got)
 	}
-	if n := strings.Count(got, "154.8.195.220 52992"); n != 2 {
-		t.Fatalf("expected both relay candidates rewritten (udp+tcp), got %d:\n%s", n, got)
+	// UDP candidate for relay host must be completely discarded
+	if strings.Contains(got, "udp 2130706423 154.8.195.220") {
+		t.Fatalf("udp candidate for relay host was not discarded:\n%s", got)
+	}
+	if n := strings.Count(got, "154.8.195.220 52992"); n != 1 {
+		t.Fatalf("expected only one relay candidate rewritten (tcp only), got %d:\n%s", n, got)
 	}
 	// The TCP one keeps its tcptype suffix.
 	if !strings.Contains(got, "a=candidate:371706427 1 tcp 1671430136 154.8.195.220 52992 typ host tcptype passive\r\n") {

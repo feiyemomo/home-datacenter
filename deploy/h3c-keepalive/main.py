@@ -11,7 +11,7 @@ import urllib.parse
 import urllib.request
 import html
 from datetime import datetime
-from h3c_client import H3CClient
+from h3c_client import H3CClient, PingPongRelay
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,21 +25,38 @@ H3C_PASSWORD = os.environ.get("H3C_PASSWORD", "")
 H3C_APP_NAMES = [a.strip() for a in os.environ.get("H3C_APP_NAMES", os.environ.get("H3C_APP_NAME", "home,webrtc_test")).split(",") if a.strip()]
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "60"))
 MIN_REMAINING_MINUTES = int(os.environ.get("MIN_REMAINING_MINUTES", "25"))
+OVERLAP_SECONDS = int(os.environ.get("OVERLAP_SECONDS", "60"))
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8087"))
 DATA_DIR = os.environ.get("DATA_DIR", "/data/h3c")
 FRIGATE_URL = os.environ.get("FRIGATE_URL", "http://home-frigate:5000")
 GO2RTC_URL = os.environ.get("GO2RTC_URL", "http://home-frigate:1984")
 
+PING_PONG_APP_A = os.environ.get("PING_PONG_APP_A", "home")
+PING_PONG_PORT_A = int(os.environ.get("PING_PONG_PORT_A", "8088"))
+PING_PONG_APP_B = os.environ.get("PING_PONG_APP_B", "home_b")
+PING_PONG_PORT_B = int(os.environ.get("PING_PONG_PORT_B", "8089"))
+
 client = H3CClient(H3C_USERNAME, H3C_PASSWORD)
+ping_pong_relay = PingPongRelay(
+    client=client,
+    app_a=PING_PONG_APP_A,
+    port_a=PING_PONG_PORT_A,
+    app_b=PING_PONG_APP_B,
+    port_b=PING_PONG_PORT_B,
+    min_remaining_minutes=MIN_REMAINING_MINUTES,
+    overlap_seconds=OVERLAP_SECONDS
+)
 
 # Global thread-safe tunnel state
 state_lock = threading.Lock()
 tunnel_state = {
     "status": "initializing",
+    "activeApp": "",
     "externalAddr": "",
     "tunnelId": "",
     "closeTime": "",
     "remainingMinutes": 0,
+    "pendingRetire": None,
     "lastChecked": "",
     "error": None,
     "tunnels": {}
@@ -85,9 +102,14 @@ def check_addr_reachable(addr, default_port=80):
         if not host:
             return False
         port = parsed.port or (443 if is_https else default_port)
-        s = socket.create_connection((host, port), timeout=3.0)
-        s.close()
-        return True
+        if "http://" in clean or "https://" in clean:
+            req = urllib.request.Request(clean, headers={"User-Agent": "H3C-Probe/1.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                return resp.status < 500
+        else:
+            s = socket.create_connection((host, port), timeout=3.0)
+            s.close()
+            return True
     except Exception as e:
         logger.warning(f"Reachability check for {addr} failed: {e}")
         return False
@@ -96,9 +118,7 @@ last_synced_webrtc_addr = None
 
 def sync_webrtc_to_frigate(external_addr):
     global last_synced_webrtc_addr
-    # Only sync when the tunnel address actually changed. Every sync restarts
-    # go2rtc (live streams drop), so syncing on each 60s check would break
-    # live view continuously.
+    # Only sync when the tunnel address actually changed.
     if not external_addr or external_addr == last_synced_webrtc_addr:
         return
     try:
@@ -118,9 +138,7 @@ def sync_webrtc_to_frigate(external_addr):
         if external_addr and external_addr not in new_candidates:
             new_candidates.append(external_addr)
         
-        # LAN / Tailscale candidates are owned by home-api
-        # (BuildWebRTCCandidates); keep whatever is already configured and
-        # only swap the H3C tunnel address.
+        # LAN / Tailscale candidates are owned by home-api (BuildWebRTCCandidates)
         if "127.0.0.1:8555" not in new_candidates:
             new_candidates.insert(0, "127.0.0.1:8555")
         if "stun:8555" not in new_candidates:
@@ -137,7 +155,7 @@ def sync_webrtc_to_frigate(external_addr):
                 }
             }
         }
-        # 1. Update Frigate persistent config on disk
+        # 1. Update Frigate persistent config on disk (zero restart)
         try:
             put_req = urllib.request.Request(
                 f"{FRIGATE_URL}/api/config/set",
@@ -150,18 +168,7 @@ def sync_webrtc_to_frigate(external_addr):
         except Exception as fe:
             logger.warning(f"Could not sync WebRTC candidate to Frigate REST API: {fe}")
 
-        # 2. Update go2rtc's in-memory config.
-        #
-        # NOTE: deliberately NO /api/restart here. go2rtc re-reads
-        # /dev/shm/go2rtc.yaml on restart, and Frigate only regenerates
-        # that file when its own container starts (create_config.py runs
-        # from the s6 boot sequence). Restarting go2rtc therefore threw
-        # the fresh candidate away and reloaded the previous H3C port —
-        # exactly what left every remote client stuck in ICE "checking"
-        # after a tunnel rotation. The candidate is picked up per
-        # session, so the POST alone is enough. The API also rewrites the
-        # relay candidate in the SDP answer it returns, which covers the
-        # window before Frigate's next restart.
+        # 2. Update go2rtc's in-memory config via POST /api/config (zero restart)
         try:
             go2_payload = json.dumps({"webrtc": {"candidates": new_candidates}}).encode("utf-8")
             go2_req = urllib.request.Request(
@@ -175,38 +182,42 @@ def sync_webrtc_to_frigate(external_addr):
         except Exception as ge:
             logger.warning(f"Could not reload go2rtc active config: {ge}")
 
-        # 3. Synchronize /dev/shm/go2rtc.yaml and reload via Docker exec (if socket mounted)
+        # 3. Synchronize /dev/shm/go2rtc.yaml via Docker exec (if socket mounted) WITHOUT restarting go2rtc!
+        # Deliberately NO /api/restart here to preserve live WebRTC sessions and prevent blackouts.
         exec_out = docker_exec_frigate(["python3", "/usr/local/go2rtc/create_config.py"])
         if exec_out is not None:
-            logger.info("Successfully regenerated /dev/shm/go2rtc.yaml via create_config.py")
-            docker_exec_frigate(["curl", "-s", "-X", "POST", "http://127.0.0.1:1984/api/restart"])
+            logger.info("Successfully regenerated /dev/shm/go2rtc.yaml via create_config.py (zero restart)")
 
         last_synced_webrtc_addr = external_addr
     except Exception as e:
         logger.warning(f"Could not sync WebRTC candidate: {e}")
 
-def update_state(primary_data, all_tunnels=None, error=None):
+def update_state(primary_data, all_tunnels=None, pending_retire=None, active_app=None, error=None):
     with state_lock:
         if all_tunnels:
             tunnel_state["tunnels"] = all_tunnels
         if not primary_data:
             tunnel_state["status"] = "error"
-            tunnel_state["error"] = str(error) if error else "Primary 'home' tunnel is not established"
+            tunnel_state["error"] = str(error) if error else "Primary tunnel is not established"
+            tunnel_state["activeApp"] = active_app or ""
             tunnel_state["externalAddr"] = ""
             tunnel_state["tunnelId"] = ""
             tunnel_state["closeTime"] = ""
             tunnel_state["remainingMinutes"] = 0
+            tunnel_state["pendingRetire"] = None
             tunnel_state["lastChecked"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         else:
             tunnel_state["status"] = "online"
+            tunnel_state["activeApp"] = active_app or primary_data.get("appName", "")
             tunnel_state["externalAddr"] = primary_data.get("externalAddr", "")
             tunnel_state["tunnelId"] = primary_data.get("tunnelId", "")
             tunnel_state["closeTime"] = primary_data.get("closeTime", "")
             tunnel_state["remainingMinutes"] = round(primary_data.get("remainingMinutes", 0), 1)
+            tunnel_state["pendingRetire"] = pending_retire
             tunnel_state["lastChecked"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             tunnel_state["error"] = None
             
-            # Write to files if DATA_DIR exists
+            # Write state files if DATA_DIR exists
             try:
                 os.makedirs(DATA_DIR, exist_ok=True)
                 url_path = os.path.join(DATA_DIR, "current_url.txt")
@@ -237,23 +248,58 @@ def update_state(primary_data, all_tunnels=None, error=None):
                 logger.warning(f"Failed to write state files to {DATA_DIR}: {e}")
 
 def run_check(force_renew=False):
-    min_min = 180 if force_renew else MIN_REMAINING_MINUTES
-    results = {}
+    """
+    Executes a comprehensive health check:
+      1. Ping-pong relay step for primary web traffic (home_a 8088 / home_b 8089).
+      2. Ensures secondary tunnels (webrtc_test, nas_ssh).
+      3. Synchronizes WebRTC candidates to Frigate dynamically without restart.
+    """
+    logger.info(f"Running tunnel health check (force_renew={force_renew})...")
+    all_tunnels = {}
+
+    # 1. Primary HTTP Ping-Pong Relay Step
     primary_res = None
+    pending_retire_info = None
+    try:
+        primary_res, pending_retire_info = ping_pong_relay.step(force_renew=force_renew)
+        if primary_res and primary_res.get("externalAddr") and not force_renew:
+            if not check_addr_reachable(primary_res.get("externalAddr")):
+                logger.warning(f"Active tunnel '{ping_pong_relay.active_app}' ({primary_res.get('externalAddr')}) unreachable via TCP! Forcing failover...")
+                primary_res, pending_retire_info = ping_pong_relay.step(force_renew=True)
+        
+        if primary_res:
+            active_app = ping_pong_relay.active_app
+            all_tunnels[active_app] = primary_res
+            all_tunnels["home"] = primary_res  # Compatibility alias
+            logger.info(f"Active primary tunnel '{active_app}': {primary_res.get('externalAddr')} (expires {primary_res.get('closeTime')}, remaining {primary_res.get('remainingMinutes', 0):.1f}m)")
+
+        if pending_retire_info:
+            all_tunnels[pending_retire_info["appName"]] = {
+                "tunnelId": pending_retire_info["tunnelId"],
+                "appName": pending_retire_info["appName"],
+                "externalAddr": pending_retire_info.get("externalAddr"),
+                "status": "ESTABLISHED",
+                "retiring": True
+            }
+            logger.info(f"Overlapping retiring tunnel '{pending_retire_info['appName']}': {pending_retire_info.get('externalAddr')} (retires in <= {OVERLAP_SECONDS}s)")
+    except Exception as e:
+        logger.error(f"Error evaluating ping-pong relay: {e}", exc_info=True)
+
+    # 2. Check other auxiliary tunnels (e.g. webrtc_test, nas_ssh)
+    min_min = 180 if force_renew else MIN_REMAINING_MINUTES
     for app in H3C_APP_NAMES:
+        if app in ("home", PING_PONG_APP_A, PING_PONG_APP_B):
+            continue
         try:
-            logger.info(f"Checking H3C tunnel status for '{app}' (force_renew={force_renew})...")
+            logger.info(f"Checking auxiliary H3C tunnel status for '{app}' (force_renew={force_renew})...")
             res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=min_min)
             if res.get("externalAddr") and not force_renew:
                 if not check_addr_reachable(res.get("externalAddr")):
-                    logger.warning(f"Tunnel '{app}' ({res.get('externalAddr')}) is unreachable via TCP! Forcing recreation...")
+                    logger.warning(f"Tunnel '{app}' ({res.get('externalAddr')}) unreachable! Forcing recreation...")
                     res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=180)
-            results[app] = res
-            logger.info(f"Active tunnel URL for '{app}': {res.get('externalAddr')} (expires {res.get('closeTime')}, remaining {res.get('remainingMinutes', 0):.1f}m)")
-            # primary_res is ONLY assigned from the "home" tunnel if it's ESTABLISHED.
-            # NEVER fallback to "webrtc_test" (8555) or "nas_ssh" (22).
-            if app == "home" and res.get("status") == "ESTABLISHED" and res.get("externalAddr"):
-                primary_res = res
+            all_tunnels[app] = res
+            logger.info(f"Auxiliary tunnel '{app}': {res.get('externalAddr')} (remaining {res.get('remainingMinutes', 0):.1f}m)")
+
             if app == "webrtc_test" and res.get("externalAddr"):
                 try:
                     os.makedirs(DATA_DIR, exist_ok=True)
@@ -262,6 +308,7 @@ def run_check(force_renew=False):
                 except Exception as ex:
                     logger.warning(f"Failed to write webrtc_url.txt: {ex}")
                 sync_webrtc_to_frigate(res.get("externalAddr"))
+
             if app == "nas_ssh" and res.get("externalAddr"):
                 try:
                     os.makedirs(DATA_DIR, exist_ok=True)
@@ -270,41 +317,71 @@ def run_check(force_renew=False):
                 except Exception as ex:
                     logger.warning(f"Failed to write ssh_url.txt: {ex}")
         except Exception as e:
-            logger.error(f"Error during tunnel check for '{app}': {e}", exc_info=True)
-            results[app] = {"status": "error", "error": str(e)}
+            logger.error(f"Error checking auxiliary tunnel '{app}': {e}", exc_info=True)
+            all_tunnels[app] = {"status": "error", "error": str(e)}
 
-    home_err = None
-    if not primary_res:
-        home_entry = results.get("home")
-        if isinstance(home_entry, dict) and home_entry.get("error"):
-            home_err = home_entry.get("error")
-        else:
-            home_err = "Primary 'home' tunnel is not established"
+    # Format pending_retire for status dict
+    formatted_retire = None
+    if pending_retire_info:
+        now = time.time()
+        rem_sec = max(0.0, pending_retire_info["retireAt"] - now)
+        formatted_retire = {
+            "app": pending_retire_info["appName"],
+            "tunnelId": pending_retire_info["tunnelId"],
+            "retireAt": pending_retire_info["retireAt"],
+            "externalAddr": pending_retire_info.get("externalAddr"),
+            "remainingSeconds": round(rem_sec, 1)
+        }
 
-    update_state(primary_res, all_tunnels=results, error=home_err)
+    update_state(
+        primary_data=primary_res,
+        all_tunnels=all_tunnels,
+        pending_retire=formatted_retire,
+        active_app=ping_pong_relay.active_app,
+        error=None if primary_res else "Primary ping-pong relay is not established"
+    )
     return primary_res
 
 def get_sanitized_state():
     with state_lock:
         state_copy = dict(tunnel_state)
         if "tunnels" in state_copy and isinstance(state_copy["tunnels"], dict):
-            # Sanitize external view: omit "nas_ssh" (Finding #60 fix), keep "home" and "webrtc_test"
+            # Sanitize external view: omit "nas_ssh", keep "home_a", "home_b", "home", and "webrtc_test"
             state_copy["tunnels"] = {
                 k: v for k, v in state_copy["tunnels"].items() if k != "nas_ssh"
             }
+        if state_copy.get("pendingRetire"):
+            now = time.time()
+            rem = max(0.0, state_copy["pendingRetire"]["retireAt"] - now)
+            state_copy["pendingRetire"]["remainingSeconds"] = round(rem, 1)
         return state_copy
 
 def keepalive_worker():
     logger.info("Keepalive worker thread started.")
-    # Initial check
     run_check()
+    last_full_check = time.time()
+
     while True:
         try:
-            time.sleep(CHECK_INTERVAL)
-            run_check()
+            time.sleep(5)
+            # 1. Frequently inspect overlap timer to silently delete expired tunnel after 60s
+            if ping_pong_relay.pending_retire:
+                retired = ping_pong_relay.check_and_retire()
+                if retired:
+                    logger.info(f"[PingPong] Overlap finished; retired tunnel {retired['tunnelId']} ({retired['appName']})")
+                    with state_lock:
+                        tunnel_state["pendingRetire"] = None
+                        if retired["appName"] in tunnel_state.get("tunnels", {}):
+                            del tunnel_state["tunnels"][retired["appName"]]
+
+            # 2. Check full interval for renewal triggers
+            now = time.time()
+            if now - last_full_check >= CHECK_INTERVAL:
+                run_check()
+                last_full_check = time.time()
         except Exception as e:
-            logger.error(f"Worker iteration error: {e}")
-            time.sleep(15)
+            logger.error(f"Worker iteration error: {e}", exc_info=True)
+            time.sleep(10)
 
 class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
@@ -385,7 +462,7 @@ class KeepaliveHTTPHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
 
 def main():
-    logger.info(f"Starting H3C NAT Keepalive daemon on port {HTTP_PORT} (apps: {H3C_APP_NAMES})...")
+    logger.info(f"Starting H3C NAT Keepalive daemon on port {HTTP_PORT} (ping-pong: {PING_PONG_APP_A}:{PING_PONG_PORT_A} <-> {PING_PONG_APP_B}:{PING_PONG_PORT_B}, aux: {H3C_APP_NAMES})...")
     worker = threading.Thread(target=keepalive_worker, daemon=True)
     worker.start()
 

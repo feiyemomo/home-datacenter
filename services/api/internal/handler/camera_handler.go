@@ -2718,11 +2718,19 @@ func (h *CameraHandler) SetAISource(c *gin.Context) {
 		mgr.SetMotionFallback(*req.MotionFallback)
 	}
 
+	updatedBy := c.GetString("user_name")
+	if updatedBy == "" {
+		if uid := c.GetUint("user_id"); uid > 0 {
+			updatedBy = fmt.Sprintf("管理员#%d", uid)
+		} else {
+			updatedBy = "管理员"
+		}
+	}
 	if h.bus != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"source":          mgr.GetSource(),
 			"motion_fallback": mgr.GetMotionFallback(),
-			"updated_by":      c.GetString("user_name"),
+			"updated_by":      updatedBy,
 			"updated_at":      time.Now().Unix(),
 		})
 		h.bus.Publish(eventbus.Event{
@@ -2750,10 +2758,18 @@ func (h *CameraHandler) SetMotionFallback(c *gin.Context) {
 		return
 	}
 	mgr.SetMotionFallback(req.Enabled)
+	updatedBy := c.GetString("user_name")
+	if updatedBy == "" {
+		if uid := c.GetUint("user_id"); uid > 0 {
+			updatedBy = fmt.Sprintf("管理员#%d", uid)
+		} else {
+			updatedBy = "管理员"
+		}
+	}
 	if h.bus != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"motion_fallback": req.Enabled,
-			"updated_by":      c.GetString("user_name"),
+			"updated_by":      updatedBy,
 			"updated_at":      time.Now().Unix(),
 		})
 		h.bus.Publish(eventbus.Event{

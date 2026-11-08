@@ -847,10 +847,9 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 			go2rtcStreams[hevcStreamName(c.StreamName)] = r.hevcPassthroughURL(&c, u, p)
 		}
 	}
-	// requires_restart=true when enabling recording so Frigate
-	// starts the recording ffmpeg pipeline. Without a restart the
-	// config push returns 200 but no recordings are produced.
-	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, enabled)
+	// requires_restart=true when toggling recording so Frigate cleanly
+	// restarts and spins up or tears down the recording ffmpeg pipeline.
+	return r.Frigate.PushConfig(ctx, frigateCams, go2rtcStreams, true)
 }
 
 // FrigateSlug returns the ASCII slug Frigate uses for this camera.

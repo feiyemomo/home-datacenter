@@ -120,25 +120,13 @@ Register-EngineEvent PowerShell.Exiting -Action { Remove-Askpass } | Out-Null
 # (avoids "Permission denied (publickey)" when no key is installed).
 function Invoke-NasSSH {
     param([Parameter(Mandatory)][string]$RemoteCmd)
-    $sshOpts = @("-p", "$NAS_PORT",
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "UserKnownHostsFile=NUL",
+    $sshOpts = @("-o", "BatchMode=yes",
                  "-o", "ConnectTimeout=10",
-                 "-o", "ServerAliveInterval=15",
-                 "-o", "ServerAliveCountMax=3")
-    if ($Password) {
-        $sshOpts += @("-o", "PreferredAuthentications=password",
-                      "-o", "PubkeyAuthentication=no",
-                      "-o", "NumberOfPasswordPrompts=1")
-    }
-    # Temporarily relax ErrorActionPreference: ssh's stderr (e.g.
-    # "Warning: Permanently added ... to known hosts") is treated as a
-    # terminating error under "Stop" mode, which prevents $LASTEXITCODE
-    # from being checked. We rely on explicit exit-code checks instead.
+                 "-o", "StrictHostKeyChecking=accept-new")
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & ssh @sshOpts "$NAS_USER@$NAS_HOST" $RemoteCmd 2>&1 | Out-Host
+        & ssh @sshOpts "nas" $RemoteCmd 2>&1 | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -149,21 +137,14 @@ function Invoke-NasSSH {
 function Invoke-NasSCP {
     param([Parameter(Mandatory)][string]$LocalPath,
           [Parameter(Mandatory)][string]$RemoteDest)
-    $scpOpts = @("-P", "$NAS_PORT",
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "UserKnownHostsFile=NUL",
+    $scpOpts = @("-q",
+                 "-o", "BatchMode=yes",
                  "-o", "ConnectTimeout=10",
-                 "-o", "ServerAliveInterval=15",
-                 "-o", "ServerAliveCountMax=3")
-    if ($Password) {
-        $scpOpts += @("-o", "PreferredAuthentications=password",
-                      "-o", "PubkeyAuthentication=no",
-                      "-o", "NumberOfPasswordPrompts=1")
-    }
+                 "-o", "StrictHostKeyChecking=accept-new")
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & scp @scpOpts $LocalPath $RemoteDest 2>&1 | Out-Host
+        & scp @scpOpts $LocalPath "nas:$RemoteDest" 2>&1 | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -223,6 +204,7 @@ $Excludes = @(
     "*.log", "log_*.txt",
     "./read_db.py", "__pycache__",
     "*.exe", "./services/api/server", "./services/api/server_linux",
+    "*.onnx", "*.png",
     "./web/tsconfig.tsbuildinfo", "./web/tsconfig.node.tsbuildinfo",
     # Developer local overrides must never overwrite NAS production configs.
     "./services/api/configs/config.local.yaml",
@@ -297,7 +279,7 @@ Write-Host "==> [3/5] Transferring to NAS and extracting" -ForegroundColor Cyan
 # scp the tarball INTO $REMOTE_PATH (not as a sibling). The remote
 # extract step does `cd $REMOTE_PATH && tar -xzf deploy.tar.gz`, so
 # the file must land inside the directory.
-$exitCode = Invoke-NasSCP -LocalPath $tmpTar -RemoteDest "${NAS_USER}@${NAS_HOST}:$REMOTE_PATH/deploy.tar.gz"
+$exitCode = Invoke-NasSCP -LocalPath $tmpTar -RemoteDest "$REMOTE_PATH/deploy.tar.gz"
 if ($exitCode -ne 0) {
     Write-Error "ERROR: scp failed."
     Remove-Item $tmpTar -ErrorAction SilentlyContinue

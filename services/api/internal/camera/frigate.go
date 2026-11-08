@@ -363,7 +363,6 @@ type HLSConfig struct {
 //
 //	{
 //	  "requires_restart": 0|1,
-//	  "update_topic": "config/cameras",
 //	  "config_data": {
 //	    "cameras": { "front_door": {...}, ... },
 //	    "record": { "enabled": true, "motion": { "days": 7 } },
@@ -472,7 +471,6 @@ func (c *FrigateClient) PushConfig(ctx context.Context, cameras []FrigateCameraC
 	}
 	body, err := json.Marshal(map[string]any{
 		"requires_restart": restartVal,
-		"update_topic":     "config/cameras",
 		"config_data":      partial,
 	})
 	if err != nil {
@@ -737,7 +735,6 @@ func (c *FrigateClient) SetWebRTCCandidates(ctx context.Context, ipv6Addr string
 	// config blocks are preserved.
 	body, err := json.Marshal(map[string]any{
 		"requires_restart": 0,
-		"update_topic":     "config/webrtc-candidates",
 		"config_data":      partial,
 	})
 	if err != nil {
@@ -827,7 +824,6 @@ func (c *FrigateClient) PushRecordRetention(ctx context.Context, days int) error
 	}
 	body, err := json.Marshal(map[string]any{
 		"requires_restart": 0,
-		"update_topic":     "config/record-retention",
 		"config_data":      partial,
 	})
 	if err != nil {

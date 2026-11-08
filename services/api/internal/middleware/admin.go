@@ -12,14 +12,25 @@ import (
 
 // RequireAdmin returns a Gin middleware that rejects requests from
 // non-admin users. It must be installed AFTER JWTAuth (which sets
-// "user_id" into the gin context).
+// "user_id" and "is_admin" into the gin context).
 //
-// We look up the user on every call rather than encoding
-// is_admin in the JWT so an admin can be demoted and the change
-// takes effect on the next request — matching the same
-// "immediate revocation" posture as devices.
+// If "is_admin" is already set in the context by JWTAuth, it uses it
+// directly to save a redundant DB query. Otherwise, it queries the DB
+// to check the latest admin status.
 func RequireAdmin(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if rawAdmin, exists := c.Get("is_admin"); exists {
+			if isAdmin, ok := rawAdmin.(bool); ok {
+				if !isAdmin {
+					utils.Fail(c, http.StatusForbidden, "admin only")
+					c.Abort()
+					return
+				}
+				c.Next()
+				return
+			}
+		}
+
 		raw, ok := c.Get("user_id")
 		if !ok {
 			utils.Fail(c, http.StatusUnauthorized, "unauthenticated")

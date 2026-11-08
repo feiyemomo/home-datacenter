@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import hashlib
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 import numpy as np
 import cv2
 
@@ -47,19 +49,56 @@ class FaceEngine:
         except Exception as e:
             logger.error(f"Failed to initialize face detector/recognizer: {e}")
 
+    def _get_aes_key(self) -> bytes:
+        key_source = os.environ.get("VISION_AES_KEY", "homedatacenter-vision-aes256-default-key")
+        return hashlib.sha256(key_source.encode("utf-8")).digest()
+
     def _load_db(self):
         self.persons = []
         if not os.path.exists(self.db_path):
             return
         try:
-            with open(self.db_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            with open(self.db_path, "rb") as f:
+                raw_bytes = f.read()
+
+            if not raw_bytes:
+                return
+
+            magic = b"AESGCM\x01"
+            data = None
+            migrated_from_plaintext = False
+
+            if raw_bytes.startswith(magic):
+                # Encrypted database format: magic (7 bytes) + nonce (12 bytes) + ciphertext+tag
+                nonce = raw_bytes[len(magic):len(magic) + 12]
+                ciphertext = raw_bytes[len(magic) + 12:]
+                key = self._get_aes_key()
+                aesgcm = AESGCM(key)
+                plaintext = aesgcm.decrypt(nonce, ciphertext, None)
+                data = json.loads(plaintext.decode("utf-8"))
+            else:
+                # Fallback / migration for legacy plaintext JSON
+                try:
+                    text = raw_bytes.decode("utf-8")
+                    data = json.loads(text)
+                    migrated_from_plaintext = True
+                    logger.info("Detected legacy plaintext faces.json; migrating to AES-256-GCM encryption...")
+                except Exception as ex:
+                    logger.error(f"Failed to parse faces database (unrecognized format or decryption error): {ex}")
+                    return
+
+            if data and "persons" in data:
                 for item in data.get("persons", []):
                     self.persons.append({
                         "name": item["name"],
                         "feature": np.array(item["feature"], dtype=np.float32)
                     })
             logger.info(f"Loaded {len(self.persons)} registered persons.")
+
+            if migrated_from_plaintext:
+                self._save_db()
+                logger.info("Successfully migrated faces.json to AES-256-GCM encrypted format.")
+
         except Exception as e:
             logger.error(f"Failed to load faces database: {e}")
 
@@ -74,8 +113,20 @@ class FaceEngine:
                     for p in self.persons
                 ]
             }
-            with open(self.db_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            plaintext = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+            key = self._get_aes_key()
+            aesgcm = AESGCM(key)
+            nonce = os.urandom(12)
+            ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+
+            magic = b"AESGCM\x01"
+            payload = magic + nonce + ciphertext
+
+            tmp_path = self.db_path + ".tmp"
+            with open(tmp_path, "wb") as f:
+                f.write(payload)
+            os.replace(tmp_path, self.db_path)
+            logger.info(f"Saved encrypted faces database ({len(self.persons)} persons).")
         except Exception as e:
             logger.error(f"Failed to save faces database: {e}")
 

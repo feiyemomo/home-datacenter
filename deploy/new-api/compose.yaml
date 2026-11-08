@@ -1,0 +1,19 @@
+services:
+  new-api:
+    image: channels-tool/new-api:latest
+    container_name: home-new-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data:/data
+    environment:
+      - TZ=Asia/Shanghai
+      - SQL_DSN=/data/api.db
+      - HTTP_PROXY=http://172.17.0.1:7890
+      - HTTPS_PROXY=http://172.17.0.1:7890
+      - NO_PROXY=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8
+    deploy:
+      resources:
+        limits:
+          memory: 128M

@@ -192,6 +192,55 @@ func (am *AlertManager) GetConfig() config.AlertConfig {
 	return am.cfg
 }
 
+// GetAlertFilters returns the persisted alert notification filters, or safe defaults.
+func (am *AlertManager) GetAlertFilters() model.SecurityAlertFilter {
+	if am.db == nil {
+		return model.SecurityAlertFilter{
+			CriticalVuln:   true,
+			AutoRollback:   true,
+			BruteForceBan:  true,
+			ContainerCrash: true,
+			MinSeverity:    "warning",
+		}
+	}
+	var filter model.SecurityAlertFilter
+	if err := am.db.First(&filter).Error; err != nil {
+		filter = model.SecurityAlertFilter{
+			CriticalVuln:   true,
+			AutoRollback:   true,
+			BruteForceBan:  true,
+			ContainerCrash: true,
+			MinSeverity:    "warning",
+			UpdatedAt:      time.Now(),
+		}
+		_ = am.db.Create(&filter).Error
+	}
+	return filter
+}
+
+// UpdateAlertFilters saves the updated alert filter preferences to SQLite.
+func (am *AlertManager) UpdateAlertFilters(filter model.SecurityAlertFilter) model.SecurityAlertFilter {
+	if am.db == nil {
+		return filter
+	}
+	var existing model.SecurityAlertFilter
+	if err := am.db.First(&existing).Error; err != nil {
+		filter.UpdatedAt = time.Now()
+		_ = am.db.Create(&filter).Error
+		return filter
+	}
+	existing.CriticalVuln = filter.CriticalVuln
+	existing.AutoRollback = filter.AutoRollback
+	existing.BruteForceBan = filter.BruteForceBan
+	existing.ContainerCrash = filter.ContainerCrash
+	if filter.MinSeverity != "" {
+		existing.MinSeverity = filter.MinSeverity
+	}
+	existing.UpdatedAt = time.Now()
+	_ = am.db.Save(&existing).Error
+	return existing
+}
+
 // MissingFields lists the SMTP settings that prevent alert delivery.
 func (am *AlertManager) MissingFields() []string {
 	cfg := am.GetConfig()
@@ -214,9 +263,59 @@ func (am *AlertManager) MissingFields() []string {
 	return missing
 }
 
+// SeverityRank maps severity levels to comparable ranks: info (1) < warning (2) < critical (3).
+func SeverityRank(sev string) int {
+	switch strings.ToLower(strings.TrimSpace(sev)) {
+	case "info":
+		return 1
+	case "warning", "warn":
+		return 2
+	case "critical", "crit", "error":
+		return 3
+	default:
+		return 2
+	}
+}
+
+// InferAlertSeverity deduces the severity level ("info", "warning", "critical") from alert content.
+func InferAlertSeverity(subject, alertType, detail, action string) string {
+	lowerType := strings.ToLower(alertType)
+	if lowerType == "critical" || lowerType == "warning" || lowerType == "info" {
+		return lowerType
+	}
+	combined := strings.ToLower(subject + " " + alertType + " " + detail + " " + action)
+	if strings.Contains(combined, "critical") ||
+		strings.Contains(combined, "高危") ||
+		strings.Contains(combined, "紧急") ||
+		strings.Contains(combined, "永久封禁") ||
+		strings.Contains(combined, "崩溃") ||
+		strings.Contains(combined, "crash") ||
+		strings.Contains(combined, "rollback") ||
+		strings.Contains(combined, "回滚") ||
+		strings.Contains(combined, "cve") {
+		return "critical"
+	}
+	if strings.Contains(combined, "info") ||
+		strings.Contains(combined, "测试") ||
+		strings.Contains(combined, "test") ||
+		strings.Contains(combined, "正常") ||
+		strings.Contains(combined, "notice") {
+		return "info"
+	}
+	return "warning"
+}
+
 // SendSecurityEmail sends an HTML-formatted security alert to the administrator
-// in the background. Returns ErrAlertNotConfigured when SMTP is not usable.
+// in the background. It enforces the MinSeverity threshold configured in SecurityAlertFilter.
+// Returns ErrAlertNotConfigured when SMTP is not usable.
 func (am *AlertManager) SendSecurityEmail(subject, attackIP, alertType, detail, action string) error {
+	filters := am.GetAlertFilters()
+	eventSev := InferAlertSeverity(subject, alertType, detail, action)
+	if SeverityRank(eventSev) < SeverityRank(filters.MinSeverity) {
+		log.Printf("security: alert email suppressed (event severity %s below min_severity threshold %s)", eventSev, filters.MinSeverity)
+		return nil
+	}
+
 	cfg := am.GetConfig()
 	if len(am.MissingFields()) > 0 {
 		log.Printf("security: alert email skipped (SMTP not configured or disabled)")
@@ -238,6 +337,17 @@ func (am *AlertManager) SendSecurityEmail(subject, attackIP, alertType, detail, 
 // SendSecurityEmailSync delivers the alert synchronously and returns the
 // SMTP error, so callers such as the test endpoint can report failures.
 func (am *AlertManager) SendSecurityEmailSync(subject, attackIP, alertType, detail, action string) error {
+	// For manual connectivity tests, bypass MinSeverity threshold so admins can always test SMTP.
+	isTest := strings.Contains(strings.ToLower(subject+alertType), "test") || strings.Contains(subject+alertType, "测试")
+	if !isTest {
+		filters := am.GetAlertFilters()
+		eventSev := InferAlertSeverity(subject, alertType, detail, action)
+		if SeverityRank(eventSev) < SeverityRank(filters.MinSeverity) {
+			log.Printf("security: sync alert email suppressed (event severity %s below min_severity threshold %s)", eventSev, filters.MinSeverity)
+			return nil
+		}
+	}
+
 	cfg := am.GetConfig()
 	if len(am.MissingFields()) > 0 {
 		return ErrAlertNotConfigured
@@ -249,6 +359,22 @@ func (am *AlertManager) SendSecurityEmailSync(subject, attackIP, alertType, deta
 	}
 	log.Printf("security: alert email successfully delivered to %s for threat IP %s", cfg.Recipient, attackIP)
 	return nil
+}
+
+// HandleContainerCrash triggers an emergency email alert if container_crash filter is enabled.
+func (am *AlertManager) HandleContainerCrash(containerName, detail string) error {
+	filters := am.GetAlertFilters()
+	if !filters.ContainerCrash {
+		log.Printf("security: container crash alert suppressed by filter (container_crash = false)")
+		return nil
+	}
+	return am.SendSecurityEmail(
+		fmt.Sprintf("【核心容器异常】容器 %s 重启或运行失败", containerName),
+		"127.0.0.1",
+		"容器崩溃告警",
+		fmt.Sprintf("核心容器 %s 发生故障或重启失败: %s", containerName, detail),
+		"请登录运维控制台检查 Docker 容器状态并重新启动",
+	)
 }
 
 func buildSecurityMessage(cfg config.AlertConfig, subject, attackIP, alertType, detail, action string) (string, string) {

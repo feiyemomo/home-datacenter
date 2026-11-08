@@ -27,6 +27,7 @@ import (
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
+	"home-datacenter-api/internal/ops"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/service"
@@ -70,6 +71,17 @@ func main() {
 
 	log.Println("sqlite initialized successfully")
 	log.Println("system bootstrap completed")
+
+	// Phase 11 / WO 5.2: Auto-migrate ops chat, proposal, execution history, and alert models
+	if err := database.DB.AutoMigrate(
+		&model.OpsChatSession{},
+		&model.OpsChatMessage{},
+		&model.OpsProposal{},
+		&model.OpsExecutionHistory{},
+		&model.SecurityAlertFilter{},
+	); err != nil {
+		log.Fatalf("failed to auto-migrate ops models: %v", err)
+	}
 
 	deviceRepo := repository.NewDeviceRepository(database.DB)
 
@@ -221,7 +233,64 @@ func main() {
 	hostWatcher := security.NewHostLogWatcher(defenseMgr, cfg.Security.Defense.HostAuthLogPath, cfg.Security.Defense.ExportRulesPath)
 	securityHandler := handler.NewSecurityHandler(guardMgr, defenseMgr, alertMgr, hostWatcher)
 
+	onePanelClient := ops.NewOnePanelClient(
+		os.Getenv("ONEPANEL_URL"),
+		os.Getenv("ONEPANEL_ENTRANCE"),
+		os.Getenv("ONEPANEL_USERNAME"),
+		os.Getenv("ONEPANEL_PASSWORD"),
+	)
+	fallbackProvider := ops.NewHostFallbackProvider(
+		cfg.Maintenance.DiskPath,
+		cfg.Maintenance.BackupStatePath,
+	)
+
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
+	systemHandler.SetOpsTelemetry(onePanelClient, fallbackProvider)
+
+	safetyFSM := ops.NewSafetyFSM(
+		database.DB,
+		onePanelClient,
+		alertMgr,
+		filepath.Join(cfg.Maintenance.DiskPath, "backup"),
+		fmt.Sprintf("http://127.0.0.1:%d/health", cfg.Server.Port),
+	)
+	vulnScanner := ops.NewVulnScanner(database.DB, alertMgr)
+
+	// Phase 11 / WO 5.4: 1Panel WAF log collector & bi-directional ipBlack.json firewall sync
+	wafCollector := ops.NewWAFCollector(
+		database.DB,
+		bus,
+		defenseMgr,
+		ops.WAFCollectorConfig{
+			WAFDataDir:    os.Getenv("WAF_DATA_DIR"),
+			PollInterval:  10 * time.Second,
+			AutoSyncBlack: true,
+		},
+	)
+	wafCollector.Start(context.Background())
+	_ = wafCollector.SyncBannedIPs(defenseMgr.ListBanned())
+
+	// Dynamic IP blocklist synchronization on security alerts
+	bus.Subscribe(eventbus.TopicSecurityAlert, func(event eventbus.Event) {
+		_ = wafCollector.SyncBannedIPs(defenseMgr.ListBanned())
+	})
+
+	// Subscribe to container restart failures and dispatch emergency alert when container_crash filter enabled
+	bus.Subscribe(eventbus.TopicSystemLog, func(event eventbus.Event) {
+		if event.Severity == eventbus.SeverityCritical {
+			var payload struct {
+				Action        string `json:"action"`
+				ContainerName string `json:"container_name"`
+				Success       bool   `json:"success"`
+				Detail        string `json:"detail"`
+			}
+			if err := json.Unmarshal(event.Payload, &payload); err == nil {
+				if payload.Action == "container.restart" && !payload.Success {
+					_ = alertMgr.HandleContainerCrash(payload.ContainerName, payload.Detail)
+				}
+			}
+		}
+	})
 	recMetricsDir := cfg.Maintenance.RecordingsRoot
 	if recMetricsDir == "" {
 		recMetricsDir = cfg.Camera.RecordingDir
@@ -698,18 +767,19 @@ func main() {
 		securityGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
 		{
 			securityGroup.GET("/guard", securityHandler.GetGuard)
-			securityGroup.PUT("/guard", securityHandler.SetGuard)
 			securityGroup.GET("/overview", securityHandler.GetOverview)
 			securityGroup.GET("/banned", securityHandler.ListBanned)
 			securityGroup.GET("/events", securityHandler.ListEvents)
 			securityGroup.GET("/whitelist", securityHandler.GetWhitelist)
 			securityGroup.GET("/host-logs", securityHandler.GetHostLogs)
+			securityGroup.GET("/alert-filters", securityHandler.GetAlertFilters)
 		}
 
-		// Admin-only security emergency response operations
+		// Admin-only security emergency response operations (v1.17.7: PUT /guard is strictly Admin-only)
 		securityAdmin := api.Group("/security")
 		securityAdmin.Use(middleware.JWTAuth(deviceRepo, userRepo), middleware.RequireAdmin(database.DB))
 		{
+			securityAdmin.PUT("/guard", securityHandler.SetGuard)
 			securityAdmin.POST("/ban", securityHandler.ManualBan)
 			securityAdmin.PUT("/ban/:ip", securityHandler.UpdateBan)
 			securityAdmin.DELETE("/ban/:ip", securityHandler.ManualUnban)
@@ -717,6 +787,7 @@ func main() {
 			securityAdmin.DELETE("/whitelist/:entry", securityHandler.DeleteWhitelist)
 			securityAdmin.PUT("/config", securityHandler.UpdateConfig)
 			securityAdmin.PUT("/alert-email", securityHandler.UpdateAlertEmail)
+			securityAdmin.PUT("/alert-filters", securityHandler.UpdateAlertFilters)
 			securityAdmin.POST("/alert-recipients", securityHandler.AddAlertRecipient)
 			securityAdmin.DELETE("/alert-recipients/:email", securityHandler.DeleteAlertRecipient)
 			securityAdmin.POST("/test-alert", securityHandler.TestAlertEmail)
@@ -904,6 +975,86 @@ func main() {
 			visionHandler := vision.NewHandler(visionClient, bus)
 			visionHandler.RegisterRoutes(visionGroup)
 		}
+
+		// Phase 11: 1Panel OpenAPI BFF & Datacenter Operations
+		opsGroup := api.Group("/ops")
+		opsGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
+		{
+			opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
+			opsHandler.RegisterRoutes(opsGroup)
+			opsHandler.RegisterProposalRoutes(opsGroup)
+			opsHandler.RegisterChatRoutes(opsGroup)
+
+			// Autonomous FSM & Vuln Scanner Triggers
+			opsGroup.POST("/scan-vulns", func(c *gin.Context) {
+				go func() {
+					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					defer cancel()
+					_ = vulnScanner.ScanDefaultPackages(scanCtx)
+				}()
+				utils.Success(c, gin.H{
+					"message": "已触发 Google OSV 依赖漏洞情报全量扫描",
+					"ts":      time.Now().Unix(),
+				})
+			})
+
+			opsGroup.GET("/safety-fsm/status", func(c *gin.Context) {
+				utils.Success(c, gin.H{
+					"state":       safetyFSM.CurrentState(),
+					"last_run_at": safetyFSM.LastRunAt(),
+				})
+			})
+
+			opsGroup.POST("/update-check", func(c *gin.Context) {
+				var req struct {
+					Component string `json:"component"`
+					OldVer    string `json:"old_ver"`
+					NewVer    string `json:"new_ver"`
+				}
+				_ = c.ShouldBindJSON(&req)
+				if req.Component == "" {
+					req.Component = "home-api"
+				}
+				if req.OldVer == "" {
+					req.OldVer = "v1.17.0"
+				}
+				if req.NewVer == "" {
+					req.NewVer = "v1.18.0"
+				}
+
+				go func() {
+					checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					_, _ = safetyFSM.CheckAndPerformOffPeakUpdate(
+						checkCtx,
+						req.Component,
+						req.OldVer,
+						req.NewVer,
+						func() error { return nil },
+						func() error { return nil },
+					)
+				}()
+				utils.Success(c, gin.H{
+					"message": fmt.Sprintf("已发起 %s 非繁忙期更新安全检测 (基线状态: %s)", req.Component, safetyFSM.CurrentState()),
+					"state":   safetyFSM.CurrentState(),
+				})
+			})
+		}
+
+		// Periodic off-peak background ticker for autonomous security maintenance & Google OSV scans
+		go func() {
+			ticker := time.NewTicker(1 * time.Hour)
+			defer ticker.Stop()
+			for range ticker.C {
+				now := time.Now()
+				if ops.IsOffPeak(now) {
+					log.Println("[ops] Off-peak maintenance window active (02:00-05:00), executing dependency vulnerability checks")
+					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+					_ = vulnScanner.ScanDefaultPackages(scanCtx)
+					cancel()
+				}
+			}
+		}()
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
@@ -948,6 +1099,7 @@ func main() {
 		if err := s.Shutdown(shutCtx); err != nil {
 			log.Printf("main: shutdown drain error: %v", err)
 		}
+		wafCollector.Stop()
 		logSub.Stop()
 		bus.Close()
 		log.Println("main: shutdown complete")

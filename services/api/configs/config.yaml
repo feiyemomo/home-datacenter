@@ -193,15 +193,13 @@ maintenance:
   # then deleted on Frigate's next cleanup cycle) and logs an alert.
   # When it drops back below, normal retention is restored.
   # 0 disables the automatic action (the tree is still size-alerted).
-  # Set to 380 GiB (≈81.5% of the 466G data volume) so recordings can't
-  # silently fill the disk; on crossing, retention drops 7→4 days.
-  recording_quota_bytes: 408021893120
+  # Set to 300 GiB (≈75% of the 406G recordings partition) so recordings can't
+  # fill the disk; on crossing, retention drops 3→2 days.
+  recording_quota_bytes: 322122547200
   # Normal retention (days) applied by the full config push.
-  # Set to 90 days (3 months) so Frigate does not truncate recordings;
-  # disk quota and hourly FIFO pruning handle real capacity management.
-  recording_retention_days: 90
+  recording_retention_days: 3
   # Retention (days) applied while over quota. Must be < normal.
-  recording_reduced_retention_days: 60
+  recording_reduced_retention_days: 2
 
   # Frigate's own SQLite database, backed up daily alongside app.db.
   # The api container sees it at /media/frigate/config/frigate.db.
@@ -249,6 +247,9 @@ security:
       - 127.0.0.1
       - "::1"
       - 192.168.31.0/24
+      - 172.17.0.0/16
+      - 172.18.0.0/16
+      - 100.64.0.0/10
     host_auth_log_path: "/host/log/auth.log"           # NAS 宿主机认证日志 (Debian/fnOS /var/log/auth.log)
     export_rules_path: "/data/security/blocked_ips.txt" # 导出供宿主机 iptables/ipset 消费的黑名单列表
 

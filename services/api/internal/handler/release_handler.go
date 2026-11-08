@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -85,6 +88,7 @@ type apkFile struct {
 	SizeBytes    int64
 	FileName     string // e.g. "app-debug-v1.6.10.apk"
 	ReleaseNotes string // contents of release-notes-v1.6.10.txt (empty if absent)
+	SHA256       string // sha256 checksum of the apk
 }
 
 // Latest returns metadata about the highest-version APK in the
@@ -133,6 +137,7 @@ func (h *ReleaseHandler) Latest(c *gin.Context) {
 		"flavor":        apk.Flavor,
 		"size_bytes":    apk.SizeBytes,
 		"release_notes": apk.ReleaseNotes,
+		"sha256":        apk.SHA256,
 	})
 }
 
@@ -187,6 +192,20 @@ func (h *ReleaseHandler) findLatest(targetFlavor string) (*apkFile, error) {
 	notesPath := filepath.Join(h.releasesDir, "release-notes-v"+latest.VersionName+".txt")
 	notes, _ := os.ReadFile(notesPath)
 	latest.ReleaseNotes = string(notes)
+
+	// Compute or read sha256 checksum for APK integrity verification.
+	shaPath := filepath.Join(h.releasesDir, latest.FileName+".sha256")
+	if b, err := os.ReadFile(shaPath); err == nil && len(b) > 0 {
+		latest.SHA256 = strings.TrimSpace(string(b))
+	} else if f, err := os.Open(latest.Path); err == nil {
+		defer f.Close()
+		hasher := sha256.New()
+		if _, err := io.Copy(hasher, f); err == nil {
+			latest.SHA256 = hex.EncodeToString(hasher.Sum(nil))
+			_ = os.WriteFile(shaPath, []byte(latest.SHA256), 0644)
+		}
+	}
+
 	return latest, nil
 }
 

@@ -740,7 +740,10 @@ func (dm *DefenseManager) dispatchAlert(subject, ip, alertType, detail, action s
 
 	// 2. QQ SMTP email (throttled by 10-min cooldown per IP)
 	if dm.alertMgr != nil && dm.shouldSendAlert(ip) {
-		dm.alertMgr.SendSecurityEmail(subject, ip, alertType, detail, action)
+		filters := dm.alertMgr.GetAlertFilters()
+		if filters.BruteForceBan {
+			dm.alertMgr.SendSecurityEmail(subject, ip, alertType, detail, action)
+		}
 	}
 
 	// 3. Publish to EventBus for WebSocket dashboard and SystemLog persistence

@@ -1,0 +1,29 @@
+services:
+  ops-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: home-ops-agent
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../../data/sqlite:/data/sqlite
+    environment:
+      - TZ=Asia/Shanghai
+      - DOCKER_SOCKET=/var/run/docker.sock
+      - MQTT_BROKER=home-mosquitto
+      - MQTT_PORT=1883
+      - NEW_API_URL=http://home-new-api:3000/v1
+      - NEW_API_MODEL=agent-fast
+      - API_BASE_URL=http://home-api:8080
+      - DB_PATH=/data/sqlite/app.db
+    deploy:
+      resources:
+        limits:
+          memory: 50M
+    networks:
+      - home-net
+
+networks:
+  home-net:
+    external: true

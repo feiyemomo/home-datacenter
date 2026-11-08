@@ -17,8 +17,9 @@ var (
 
 // Claims is the JWT payload: identity plus standard registered claims.
 type Claims struct {
-	UserID   uint `json:"user_id"`
-	DeviceID uint `json:"device_id"`
+	UserID   uint   `json:"user_id"`
+	DeviceID uint   `json:"device_id"`
+	Username string `json:"user_name,omitempty"`
 
 	// TokenVersion embeds the device's current token_version so the
 	// middleware can reject outdated tokens after an admin rotates them.
@@ -34,12 +35,24 @@ func GenerateToken(
 	deviceID uint,
 	tokenVersion int,
 ) (string, error) {
+	return GenerateTokenWithUsername(userID, deviceID, "", tokenVersion)
+}
+
+// GenerateTokenWithUsername signs a long-lived JWT for (userID, deviceID) with username.
+// Expiry is TokenExpireDays * 24h from now.
+func GenerateTokenWithUsername(
+	userID uint,
+	deviceID uint,
+	username string,
+	tokenVersion int,
+) (string, error) {
 
 	now := time.Now()
 
 	claims := Claims{
 		UserID:       userID,
 		DeviceID:     deviceID,
+		Username:     username,
 		TokenVersion: tokenVersion,
 		RegisteredClaims: jwt.RegisteredClaims{
 			IssuedAt: jwt.NewNumericDate(now),

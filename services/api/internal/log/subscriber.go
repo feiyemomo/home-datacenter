@@ -297,10 +297,10 @@ func (s *Subscriber) buildEntry(topic string, e eventbus.Event) *model.SystemLog
 			modeLabel = fmt.Sprintf("【%s】", p.Mode)
 		}
 		userLabel := p.UpdatedBy
-		if userLabel == "" {
+		if userLabel == "" || userLabel == "user" {
 			userLabel = p.Operator
 		}
-		if userLabel == "" {
+		if userLabel == "" || userLabel == "user" {
 			userLabel = "系统"
 		}
 		message = fmt.Sprintf("用户 %s 将安防布防模式更改为 %s", userLabel, modeLabel)

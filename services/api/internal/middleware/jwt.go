@@ -13,8 +13,10 @@ import (
 )
 
 // JWTAuth validates the Authorization: Bearer <jwt> header,
-// ensures the device still exists and is not revoked, and
-// stores user_id / device_id in the gin context.
+// ensures the device still exists and is not revoked, validates
+// that the associated user exists, and stores user_id / user_name /
+// device_id / device_name / is_admin in the gin context so downstream
+// handlers and audit logs can attribute actions to the exact user.
 //
 // Token resolution order (mirrors auth_handler.go's Verify):
 //  1. Authorization: Bearer <jwt> (the SPA's axios interceptors add
@@ -37,6 +39,7 @@ import (
 // proxies), so the CSRF risk is minimal.
 func JWTAuth(
 	deviceRepo *repository.DeviceRepository,
+	userRepo *repository.UserRepository,
 ) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
@@ -91,7 +94,14 @@ func JWTAuth(
 			return
 		}
 
-		// 6. Token version check: if the admin has rotated the token
+		// 6. Device ownership check: verify device actually belongs to user
+		if device.UserID != claims.UserID {
+			utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthDeviceNotFound, "device user mismatch")
+			c.Abort()
+			return
+		}
+
+		// 7. Token version check: if the admin has rotated the token
 		// (incremented device.TokenVersion), reject tokens issued
 		// against the old version. The client detects "token version
 		// mismatch" in the response and re-binds with its access_key.
@@ -101,9 +111,33 @@ func JWTAuth(
 			return
 		}
 
-		// 7. Expose identity to downstream handlers
+		// 8. Load the user to attach username and admin status
+		var userName string
+		var isAdmin bool
+		if userRepo != nil {
+			user, err := userRepo.GetByID(claims.UserID)
+			if err != nil {
+				if errors.Is(err, gorm.ErrRecordNotFound) {
+					utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthUserNotFound, "user not found")
+				} else {
+					utils.FailWithCode(c, http.StatusUnauthorized, utils.ErrAuthUserNotFound, "user lookup failed")
+				}
+				c.Abort()
+				return
+			}
+			userName = user.Name
+			isAdmin = user.IsAdmin
+		}
+		if userName == "" && claims.Username != "" {
+			userName = claims.Username
+		}
+
+		// 8. Expose full identity context to downstream handlers
 		c.Set("user_id", claims.UserID)
+		c.Set("user_name", userName)
 		c.Set("device_id", claims.DeviceID)
+		c.Set("device_name", device.DeviceName)
+		c.Set("is_admin", isAdmin)
 
 		c.Next()
 	}
