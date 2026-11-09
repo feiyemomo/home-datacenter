@@ -20,6 +20,12 @@ except ImportError:
     paho_mqtt = None
     PAHO_AVAILABLE = False
 
+# Hardcoded emergency container whitelist for local autonomous recovery when Go Core is offline
+EMERGENCY_RESTART_WHITELIST = frozenset({
+    "home-api", "home-web", "home-vision", "home-frigate", "home-mosquitto",
+    "1Panel-openresty-WuDU", "1panel-openresty-wudu"
+})
+
 from config import OpsAgentConfig
 from proposal import ProposalLifecycleManager
 from rule_engine import TwoTierRuleEngine, sanitize_log
@@ -124,7 +130,11 @@ class HomeOpsAgent:
         self.config = config or OpsAgentConfig.load()
         validate_boot_guard(self.config)
         self.rule_engine = TwoTierRuleEngine(self.config)
-        self.proposal_manager = ProposalLifecycleManager(self.config.db_path)
+        self.proposal_manager = ProposalLifecycleManager(
+            db_path=self.config.db_path,
+            go_api_url=self.config.api_base_url,
+            internal_token=self.config.internal_token
+        )
         self.running = False
         self._tasks: list[asyncio.Task] = []
         self._mqtt_client: Optional[Any] = None
@@ -132,6 +142,7 @@ class HomeOpsAgent:
         self._docker_event_queue: asyncio.Queue = asyncio.Queue(maxsize=500)
         self._last_docker_event_time: int = int(time.time())
         self._mqtt_connected: bool = False
+        self._local_restarts: dict[str, list[float]] = {}
 
     def _create_paho_client(self, loop: asyncio.AbstractEventLoop) -> Optional[Any]:
         """Creates and configures standard paho-mqtt client with auth, TLS, LWT, and QoS 1."""
@@ -356,9 +367,22 @@ class HomeOpsAgent:
                             # 1. First attempt authoritative recovery via Go Core FSM
                             recovered = await self._report_event_to_go_core(container_name, exit_code, action, stderr_snippet)
                             if not recovered:
-                                # 2. Fallback to emergency local socket restart if Go Core is unreachable
-                                logger.info(f"[Emergency Autonomy] Go Core unreachable or offline. Executing direct socket restart for {container_name}")
-                                await self._restart_docker_container(container_name, sock_path)
+                                # 2. Fallback to emergency local socket restart only if whitelisted and circuit not broken
+                                if container_name not in EMERGENCY_RESTART_WHITELIST:
+                                    logger.warning(f"[Emergency Autonomy] Container {container_name} is NOT in emergency whitelist. Refusing local restart.")
+                                else:
+                                    now = time.time()
+                                    restarts = [t for t in self._local_restarts.get(container_name, []) if now - t < 60.0]
+                                    if len(restarts) >= 2:
+                                        logger.error(f"[Emergency Autonomy] Circuit breaker tripped for {container_name}: {len(restarts)} restarts in 60s. Refusing restart.")
+                                    else:
+                                        restarts.append(now)
+                                        self._local_restarts[container_name] = restarts
+                                        logger.info(f"[Emergency Autonomy] Go Core unreachable or offline. Executing verified emergency restart for {container_name}")
+                                        await self._restart_docker_container(container_name, sock_path)
+                                    # Housekeeping: prune dead container keys to avoid unbounded memory growth
+                                    if container_name in self._local_restarts and not restarts:
+                                        self._local_restarts.pop(container_name, None)
 
                         elif result.get("action") == "request_diagnostic":
                             prop_id = f"prop-crash-{container_name}-{int(time.time())}"
@@ -388,9 +412,12 @@ class HomeOpsAgent:
             "error_message": error_msg,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         }
+        headers = {"Content-Type": "application/json"}
+        if getattr(self.config, "internal_token", None):
+            headers["X-Internal-Secret"] = self.config.internal_token
         try:
             req_data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(api_url, data=req_data, headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(api_url, data=req_data, headers=headers)
             loop = asyncio.get_running_loop()
             def do_req():
                 with urllib.request.urlopen(req, timeout=3) as resp:
@@ -412,9 +439,12 @@ class HomeOpsAgent:
             "target_component": target_component,
             "estimated_seconds": estimated_seconds
         }
+        headers = {"Content-Type": "application/json"}
+        if getattr(self.config, "internal_token", None):
+            headers["X-Internal-Secret"] = self.config.internal_token
         try:
             req_data = json.dumps(payload).encode("utf-8")
-            req = urllib.request.Request(api_url, data=req_data, headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(api_url, data=req_data, headers=headers)
             loop = asyncio.get_running_loop()
             def do_req():
                 with urllib.request.urlopen(req, timeout=3) as resp:

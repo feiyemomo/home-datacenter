@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -25,29 +26,32 @@ import (
 
 // Standard operation errors
 var (
-	ErrComponentNotWhitelisted = errors.New("component is not in authorized ops whitelist")
-	ErrProbeTimeout            = errors.New("health probe verification timed out")
-	ErrInvalidSpec             = errors.New("invalid operation spec")
-	ErrRollbackFailed          = errors.New("atomic rollback execution failed")
-	ErrBaselineMismatch        = errors.New("baseline hash mismatch: target state has drifted")
-	ErrActionNotSupported      = errors.New("operation action not supported")
-	ErrShellMetacharacter      = errors.New("operation spec contains forbidden shell metacharacter")
-	ErrNotImplemented          = errors.New("operation not implemented or requires unsupported capabilities")
-	ErrProposalAlreadyRunning  = errors.New("proposal is already being executed")
+	ErrComponentNotWhitelisted   = errors.New("component is not in authorized ops whitelist")
+	ErrProbeTimeout              = errors.New("health probe verification timed out")
+	ErrInvalidSpec               = errors.New("invalid operation spec")
+	ErrRollbackFailed            = errors.New("atomic rollback execution failed")
+	ErrBaselineMismatch          = errors.New("baseline hash mismatch: target state has drifted")
+	ErrActionNotSupported        = errors.New("operation action not supported")
+	ErrShellMetacharacter        = errors.New("operation spec contains forbidden shell metacharacter")
+	ErrNotImplemented            = errors.New("operation not implemented or requires unsupported capabilities")
+	ErrProposalAlreadyRunning    = errors.New("proposal is already being executed")
+	ErrProposalUnauthorized      = errors.New("proposal is not authorized for execution")
+	ErrScheduledWindowNotReached = errors.New("scheduled proposal execution window has not arrived")
 )
 
 // Permissible structured action types
 const (
-	ActionDockerRestart    = "docker.restart"
-	ActionDockerRecreate   = "docker.recreate"
-	ActionDockerExec       = "docker.exec"
-	ActionDBCreateIndex    = "db.create_index"
-	ActionDBDropIndex      = "db.drop_index"
-	ActionDBVacuumSnapshot = "db.vacuum_snapshot"
-	ActionWAFReload        = "waf.reload"
-	ActionWAFBanIP         = "waf.ban_ip"
-	ActionWAFUnbanIP       = "waf.unban_ip"
-	ActionCachePurge       = "cache.purge"
+	ActionDockerRestart     = "docker.restart"
+	ActionDockerRecreate    = "docker.recreate"
+	ActionDockerUpdateImage = "docker.update_image"
+	ActionDockerExec        = "docker.exec"
+	ActionDBCreateIndex     = "db.create_index"
+	ActionDBDropIndex       = "db.drop_index"
+	ActionDBVacuumSnapshot  = "db.vacuum_snapshot"
+	ActionWAFReload         = "waf.reload"
+	ActionWAFBanIP          = "waf.ban_ip"
+	ActionWAFUnbanIP        = "waf.unban_ip"
+	ActionCachePurge        = "cache.purge"
 )
 
 // Canonical component names
@@ -447,6 +451,45 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 	return err
 }
 
+// validateScheduledWindow verifies that for SCHEDULED proposals, execution only occurs
+// within the designated low-peak window (02:00-05:00) or after the specific target time.
+func validateScheduledWindow(proposal *model.OpsProposal) error {
+	if proposal == nil || proposal.Status != model.ProposalStatusScheduled {
+		return nil
+	}
+	now := time.Now()
+	nowH, nowM, _ := now.Clock()
+
+	if proposal.ScheduledAt != nil && *proposal.ScheduledAt != "" {
+		schedStr := *proposal.ScheduledAt
+		if len(schedStr) == 5 && strings.Contains(schedStr, ":") {
+			var schedH, schedM int
+			if _, err := fmt.Sscanf(schedStr, "%d:%d", &schedH, &schedM); err == nil {
+				// 1. Off-peak window check (02:00 - 05:00)
+				if !IsOffPeak(now) {
+					return fmt.Errorf("%w: proposal %s scheduled for off-peak window %s (current: %02d:%02d is outside off-peak 02:00-05:00)", ErrScheduledWindowNotReached, proposal.ProposalID, schedStr, nowH, nowM)
+				}
+				// 2. Exact schedule time check
+				if (nowH < schedH) || (nowH == schedH && nowM < schedM) {
+					return fmt.Errorf("%w: proposal %s scheduled for %s (current: %02d:%02d)", ErrScheduledWindowNotReached, proposal.ProposalID, schedStr, nowH, nowM)
+				}
+				return nil
+			}
+		} else if parsedTime, err := time.Parse(time.RFC3339, schedStr); err == nil {
+			if now.Before(parsedTime) {
+				return fmt.Errorf("%w: proposal %s schedule time %s has not arrived yet", ErrScheduledWindowNotReached, proposal.ProposalID, schedStr)
+			}
+			return nil
+		}
+	}
+
+	// Default fallback: scheduled proposals without explicit timestamp require off-peak window
+	if !IsOffPeak(now) {
+		return fmt.Errorf("%w: scheduled proposal %s requires off-peak window (current: %02d:%02d is outside off-peak 02:00-05:00)", ErrScheduledWindowNotReached, proposal.ProposalID, nowH, nowM)
+	}
+	return nil
+}
+
 // ExecuteProposal executes a proposal end-to-end, managing status transitions
 // (EXECUTING -> EXECUTED or ROLLING_BACK -> ROLLED_BACK / ROLLBACK_FAILED) and updating database state.
 func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal *model.OpsProposal) (*ExecutionResult, error) {
@@ -454,15 +497,38 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		return nil, ErrInvalidSpec
 	}
 
-	// CAS atomic update: only execute if proposal is in an authorized pending state
+	// Gate check: forbid AWAITING_APPROVAL and unauthorized PENDING execution
+	if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending {
+		return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, proposal.Status)
+	}
+
+	// CAS atomic update: only execute if proposal is in an authorized state (APPROVED or SCHEDULED)
 	if e.db != nil && proposal.ID > 0 {
+		var curr model.OpsProposal
+		if err := e.db.First(&curr, proposal.ID).Error; err != nil {
+			return nil, fmt.Errorf("proposal %d not found: %w", proposal.ID, err)
+		}
+
+		if curr.Status == model.ProposalStatusExecuting {
+			return nil, ErrProposalAlreadyRunning
+		}
+		if curr.Status == model.ProposalStatusAwaitingApproval || curr.Status == model.ProposalStatusPending {
+			return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, curr.Status)
+		}
+		if curr.Status != model.ProposalStatusApproved && curr.Status != model.ProposalStatusScheduled {
+			return nil, fmt.Errorf("proposal %s is not in an executable state (status: %s)", proposal.ProposalID, curr.Status)
+		}
+
+		// If scheduled, verify schedule window has arrived
+		if err := validateScheduledWindow(&curr); err != nil {
+			return nil, err
+		}
+
 		res := e.db.Model(&model.OpsProposal{}).
-			Where("id = ? AND status IN (?, ?, ?, ?)",
+			Where("id = ? AND status IN (?, ?)",
 				proposal.ID,
 				model.ProposalStatusApproved,
 				model.ProposalStatusScheduled,
-				model.ProposalStatusAwaitingApproval,
-				model.ProposalStatusPending,
 			).
 			Updates(map[string]interface{}{
 				"status":      model.ProposalStatusExecuting,
@@ -472,14 +538,15 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			return nil, res.Error
 		}
 		if res.RowsAffected == 0 {
-			var curr model.OpsProposal
-			if err := e.db.First(&curr, proposal.ID).Error; err == nil {
-				if curr.Status == model.ProposalStatusExecuting {
-					return nil, ErrProposalAlreadyRunning
-				}
-				return nil, fmt.Errorf("proposal %s is not in an executable state (status: %s)", proposal.ProposalID, curr.Status)
-			}
 			return nil, ErrProposalAlreadyRunning
+		}
+	} else {
+		// Enforce state check for in-memory / mock executions without DB
+		if proposal.Status != model.ProposalStatusApproved && proposal.Status != model.ProposalStatusScheduled {
+			return nil, fmt.Errorf("proposal %s is not in an executable state (status: %s)", proposal.ProposalID, proposal.Status)
+		}
+		if err := validateScheduledWindow(proposal); err != nil {
+			return nil, err
 		}
 	}
 	proposal.Status = model.ProposalStatusExecuting
@@ -567,7 +634,7 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 	switch {
 	case strings.Contains(planLower, "restart"):
 		spec.Action = ActionDockerRestart
-	case strings.Contains(planLower, "recreate") || strings.Contains(planLower, "pull"):
+	case strings.Contains(planLower, "update") || strings.Contains(planLower, "recreate") || strings.Contains(planLower, "pull"):
 		spec.Action = ActionDockerRecreate
 	case strings.Contains(planLower, "create index"):
 		spec.Action = ActionDBCreateIndex
@@ -575,6 +642,8 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 		spec.Action = ActionDBDropIndex
 	case strings.Contains(planLower, "reload"):
 		spec.Action = ActionWAFReload
+	case strings.Contains(planLower, "cache") || strings.Contains(planLower, "purge"):
+		spec.Action = ActionCachePurge
 	default:
 		// Default to container restart for whitelisted container operations
 		spec.Action = ActionDockerRestart
@@ -589,10 +658,26 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 		switch {
 		case strings.Contains(rbLower, "drop index"):
 			rbSpec.Action = ActionDBDropIndex
+		case strings.Contains(rbLower, "recreate") || strings.Contains(rbLower, "rollback") || strings.Contains(rbLower, "image") || strings.Contains(rbLower, "version"):
+			rbSpec.Action = ActionDockerRecreate
+			if spec.Params != nil && spec.Params["previous_image"] != nil {
+				rbSpec.Params = map[string]interface{}{
+					"image": spec.Params["previous_image"],
+				}
+			}
 		case strings.Contains(rbLower, "restart"):
 			rbSpec.Action = ActionDockerRestart
 		default:
-			rbSpec.Action = ActionDockerRestart
+			if spec.Action == ActionDockerRecreate || spec.Action == ActionDockerUpdateImage {
+				rbSpec.Action = ActionDockerRecreate
+				if spec.Params != nil && spec.Params["previous_image"] != nil {
+					rbSpec.Params = map[string]interface{}{
+						"image": spec.Params["previous_image"],
+					}
+				}
+			} else {
+				rbSpec.Action = ActionDockerRestart
+			}
 		}
 		spec.RollbackSpec = rbSpec
 	}
@@ -611,7 +696,7 @@ func (e *DefaultOperationExecutor) dispatchAction(ctx context.Context, spec Oper
 	case ActionDockerRestart:
 		return e.executeDockerRestart(ctx, canonical)
 
-	case ActionDockerRecreate:
+	case ActionDockerRecreate, ActionDockerUpdateImage:
 		return e.executeDockerRecreate(ctx, canonical, spec.Params)
 
 	case ActionDockerExec:
@@ -673,9 +758,13 @@ func (e *DefaultOperationExecutor) executeDockerRecreate(ctx context.Context, ca
 		containerName = canonical
 	}
 
-	image, _ := params["image"].(string)
-	if image == "" {
-		return "", fmt.Errorf("%w: docker.recreate requires 'image' parameter in params to recreate container %s safely", ErrNotImplemented, containerName)
+	var image string
+	if params != nil {
+		if img, ok := params["image"].(string); ok && img != "" {
+			image = img
+		} else if img, ok := params["new_image"].(string); ok && img != "" {
+			image = img
+		}
 	}
 
 	if _, err := os.Stat(e.dockerSocket); err != nil {
@@ -699,50 +788,83 @@ func (e *DefaultOperationExecutor) executeCachePurge(ctx context.Context, params
 	switch cacheType {
 	case "docker_builder", "docker_build":
 		// Docker builder prune via socket
-		if _, err := os.Stat(e.dockerSocket); err == nil {
-			tr := &http.Transport{
-				DisableKeepAlives: true,
-				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-					return (&net.Dialer{}).DialContext(ctx, "unix", e.dockerSocket)
-				},
-			}
-			defer tr.CloseIdleConnections()
-			client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
-			req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/build/prune", nil)
-			if err == nil {
-				resp, err := client.Do(req)
-				if err == nil {
-					defer resp.Body.Close()
-					if resp.StatusCode == http.StatusOK {
-						return "docker build cache pruned successfully", nil
-					}
-				}
-			}
+		if _, err := os.Stat(e.dockerSocket); err != nil {
+			return "", fmt.Errorf("docker socket not accessible for builder cache purge: %w", err)
 		}
-		return "docker builder prune completed", nil
+		tr := &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", e.dockerSocket)
+			},
+		}
+		defer tr.CloseIdleConnections()
+		client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/build/prune", nil)
+		if err != nil {
+			return "", fmt.Errorf("failed to build prune request: %w", err)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", fmt.Errorf("failed to prune docker builder cache: %w", err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			return "", fmt.Errorf("docker build prune returned status %d: %s", resp.StatusCode, string(b))
+		}
+		var pruneResult struct {
+			SpaceReclaimed int64    `json:"SpaceReclaimed"`
+			CachesDeleted  []string `json:"CachesDeleted"`
+		}
+		_ = json.NewDecoder(resp.Body).Decode(&pruneResult)
+		return fmt.Sprintf("docker build cache pruned successfully, reclaimed %d bytes (%d caches deleted)", pruneResult.SpaceReclaimed, len(pruneResult.CachesDeleted)), nil
 
 	case "transcode_temp", "video_cache":
 		tempDir := os.Getenv("TRANSCODE_TEMP_DIR")
 		if tempDir == "" {
 			tempDir = "/tmp/transcode"
 		}
-		if _, err := os.Stat(tempDir); err == nil {
-			entries, err := os.ReadDir(tempDir)
-			if err == nil {
-				removed := 0
-				for _, entry := range entries {
-					if !entry.IsDir() {
-						_ = os.Remove(fmt.Sprintf("%s/%s", tempDir, entry.Name()))
-						removed++
-					}
-				}
-				return fmt.Sprintf("purged %d temporary transcode files from %s", removed, tempDir), nil
+		cleanDir := filepath.Clean(tempDir)
+		if cleanDir == "/" || cleanDir == "." || cleanDir == "\\" {
+			return "", fmt.Errorf("forbidden transcode cache directory: %s", cleanDir)
+		}
+		stat, err := os.Stat(cleanDir)
+		if err != nil {
+			return "", fmt.Errorf("transcode cache directory inaccessible: %w", err)
+		}
+		if !stat.IsDir() {
+			return "", fmt.Errorf("transcode cache path is not a directory: %s", cleanDir)
+		}
+		entries, err := os.ReadDir(cleanDir)
+		if err != nil {
+			return "", fmt.Errorf("failed to read transcode cache directory: %w", err)
+		}
+		removed := 0
+		var reclaimedBytes int64 = 0
+		now := time.Now()
+		for _, entry := range entries {
+			if entry.IsDir() {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				continue
+			}
+			// Security guard: Don't purge files currently being written (modified within last 5 minutes)
+			if now.Sub(info.ModTime()) < 5*time.Minute {
+				continue
+			}
+			// Defend against symlink traversal
+			if info.Mode()&os.ModeSymlink != 0 {
+				continue
+			}
+			filePath := filepath.Join(cleanDir, entry.Name())
+			if err := os.Remove(filePath); err == nil {
+				removed++
+				reclaimedBytes += info.Size()
 			}
 		}
-		return "transcode temporary directory clean", nil
-
-	case "in_memory":
-		return "in-memory application caches cleared", nil
+		return fmt.Sprintf("purged %d temporary transcode files from %s, reclaimed %d bytes", removed, cleanDir, reclaimedBytes), nil
 
 	default:
 		return "", fmt.Errorf("%w: unsupported cache purge target '%s'", ErrNotImplemented, cacheType)
@@ -1216,7 +1338,10 @@ func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName 
 	return string(outBytes), nil
 }
 
-// executeDockerSocketRecreate inspects existing container, stops & removes it, then recreates it with new image.
+// executeDockerSocketRecreate inspects existing container, backs it up via rename,
+// creates & starts new container with new image, validates health probe, and only removes
+// the backup container if the new container is healthy. If anything fails, it automatically
+// restores the original container.
 func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, newImage string) (string, error) {
 	tr := &http.Transport{
 		DisableKeepAlives: true,
@@ -1245,16 +1370,28 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 
 	var inspectData struct {
 		Config struct {
+			Image      string            `json:"Image"`
 			Env        []string          `json:"Env"`
 			Cmd        []string          `json:"Cmd"`
 			Entrypoint []string          `json:"Entrypoint"`
 			WorkingDir string            `json:"WorkingDir"`
 			Labels     map[string]string `json:"Labels"`
 		} `json:"Config"`
-		HostConfig map[string]interface{} `json:"HostConfig"`
+		HostConfig      map[string]interface{} `json:"HostConfig"`
+		NetworkSettings struct {
+			Networks map[string]interface{} `json:"Networks"`
+		} `json:"NetworkSettings"`
 	}
 	if err := json.NewDecoder(inspectResp.Body).Decode(&inspectData); err != nil {
 		return "", fmt.Errorf("failed to decode container inspect json: %w", err)
+	}
+
+	targetImage := newImage
+	if targetImage == "" {
+		targetImage = inspectData.Config.Image
+	}
+	if targetImage == "" {
+		return "", fmt.Errorf("%w: cannot recreate container %s: image not specified and not found in container inspect", ErrInvalidSpec, containerName)
 	}
 
 	// 2. Stop container
@@ -1265,17 +1402,59 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		_ = stopResp.Body.Close()
 	}
 
-	// 3. Remove container
-	delURL := fmt.Sprintf("http://localhost/containers/%s?v=false", containerName)
-	delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
-	delResp, err := client.Do(delReq)
-	if err == nil {
-		_ = delResp.Body.Close()
+	// 3. Rename old container to backup (Blue-Green safety)
+	backupName := fmt.Sprintf("%s_bak_%d", containerName, time.Now().UnixNano())
+	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", containerName, backupName)
+	renameReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, renameURL, nil)
+	renameResp, err := client.Do(renameReq)
+	if err != nil || (renameResp != nil && renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK) {
+		status := 0
+		if renameResp != nil {
+			status = renameResp.StatusCode
+			_ = renameResp.Body.Close()
+		}
+		// Attempt to restart original container if rename failed
+		startURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
+		startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
+		if sResp, sErr := client.Do(startReq); sErr == nil {
+			_ = sResp.Body.Close()
+		}
+		return "", fmt.Errorf("failed to rename container %s to backup %s (status %d): %v", containerName, backupName, status, err)
+	}
+	if renameResp != nil {
+		_ = renameResp.Body.Close()
+	}
+
+	// Helper for atomic restoration of backup container with 15s timeout protection
+	restoreOriginal := func(cause error) (string, error) {
+		log.Printf("[executor] recreate failed (%v), restoring original container %s from %s", cause, containerName, backupName)
+		rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+
+		// Delete candidate container if created
+		delCandidateURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", containerName)
+		delReq, _ := http.NewRequestWithContext(rbCtx, http.MethodDelete, delCandidateURL, nil)
+		if dResp, dErr := client.Do(delReq); dErr == nil {
+			_ = dResp.Body.Close()
+		}
+		// Rename backup back to original name
+		restoreRenameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", backupName, containerName)
+		rReq, _ := http.NewRequestWithContext(rbCtx, http.MethodPost, restoreRenameURL, nil)
+		if rResp, rErr := client.Do(rReq); rErr == nil {
+			_ = rResp.Body.Close()
+		}
+		// Start original container
+		origStartURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
+		oReq, _ := http.NewRequestWithContext(rbCtx, http.MethodPost, origStartURL, nil)
+		if oResp, oErr := client.Do(oReq); oErr == nil {
+			_ = oResp.Body.Close()
+		}
+		return "", fmt.Errorf("recreate container %s failed and original container was restored: %w", containerName, cause)
 	}
 
 	// 4. Create container with new image
 	createPayload := map[string]interface{}{
-		"Image":      newImage,
+		"Image":      targetImage,
 		"Env":        inspectData.Config.Env,
 		"Cmd":        inspectData.Config.Cmd,
 		"Entrypoint": inspectData.Config.Entrypoint,
@@ -1283,21 +1462,26 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		"Labels":     inspectData.Config.Labels,
 		"HostConfig": inspectData.HostConfig,
 	}
+	if len(inspectData.NetworkSettings.Networks) > 0 {
+		createPayload["NetworkingConfig"] = map[string]interface{}{
+			"EndpointsConfig": inspectData.NetworkSettings.Networks,
+		}
+	}
 	createBytes, _ := json.Marshal(createPayload)
 	createURL := fmt.Sprintf("http://localhost/containers/create?name=%s", containerName)
 	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(createBytes))
 	if err != nil {
-		return "", err
+		return restoreOriginal(err)
 	}
 	createReq.Header.Set("Content-Type", "application/json")
 	createResp, err := client.Do(createReq)
 	if err != nil {
-		return "", fmt.Errorf("failed to create recreated container %s: %w", containerName, err)
+		return restoreOriginal(fmt.Errorf("failed to create container %s with image %s: %w", containerName, targetImage, err))
 	}
 	defer createResp.Body.Close()
 	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(createResp.Body)
-		return "", fmt.Errorf("recreate create container %s returned %d: %s", containerName, createResp.StatusCode, string(b))
+		return restoreOriginal(fmt.Errorf("create container %s returned %d: %s", containerName, createResp.StatusCode, string(b)))
 	}
 
 	// 5. Start container
@@ -1305,15 +1489,40 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 	startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
 	startResp, err := client.Do(startReq)
 	if err != nil {
-		return "", fmt.Errorf("failed to start recreated container %s: %w", containerName, err)
+		return restoreOriginal(fmt.Errorf("failed to start recreated container %s: %w", containerName, err))
 	}
 	defer startResp.Body.Close()
 	if startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(startResp.Body)
-		return "", fmt.Errorf("recreate start container %s returned %d: %s", containerName, startResp.StatusCode, string(b))
+		return restoreOriginal(fmt.Errorf("start container %s returned %d: %s", containerName, startResp.StatusCode, string(b)))
 	}
 
-	return fmt.Sprintf("container %s recreated successfully with image %s", containerName, newImage), nil
+	// 6. Smoke probe / Running state verification
+	verifyInspectURL := fmt.Sprintf("http://localhost/containers/%s/json", containerName)
+	vReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, verifyInspectURL, nil)
+	vResp, err := client.Do(vReq)
+	if err != nil {
+		return restoreOriginal(fmt.Errorf("failed to verify new container status: %w", err))
+	}
+	defer vResp.Body.Close()
+	var vData struct {
+		State struct {
+			Running bool   `json:"Running"`
+			Status  string `json:"Status"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(vResp.Body).Decode(&vData); err != nil || !vData.State.Running {
+		return restoreOriginal(fmt.Errorf("new container %s is not running (status: %s)", containerName, vData.State.Status))
+	}
+
+	// 7. Success! New container is verified running. Remove old backup container.
+	delBackupURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", backupName)
+	delBackupReq, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete, delBackupURL, nil)
+	if dBResp, dBErr := client.Do(delBackupReq); dBErr == nil {
+		_ = dBResp.Body.Close()
+	}
+
+	return fmt.Sprintf("container %s recreated successfully with image %s", containerName, targetImage), nil
 }
 
 // SweepOrphanProposals inspects proposals left in non-terminal transient states (EXECUTING, ROLLING_BACK)

@@ -26,6 +26,7 @@ class OpsAgentConfig:
     mqtt_client_id: str = os.getenv("MQTT_CLIENT_ID", "")
     mqtt_qos: int = int(os.getenv("MQTT_QOS", "1"))
     api_base_url: str = os.getenv("API_BASE_URL", "http://home-api:8080")
+    internal_token: str = os.getenv("INTERNAL_OPS_TOKEN") or os.getenv("JWT_SECRET", "")
     new_api_url: str = os.getenv("NEW_API_URL", "http://home-new-api:3000/v1")
     new_api_token: str = os.getenv("NEW_API_TOKEN", "")
     new_api_model: str = os.getenv("NEW_API_MODEL", "agent-fast")

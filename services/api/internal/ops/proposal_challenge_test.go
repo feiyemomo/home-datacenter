@@ -307,7 +307,7 @@ func TestChallengeProposal_ActionSpecFidelity(t *testing.T) {
 		Title:           "ActionSpec Fidelity Test",
 		TargetComponent: "home-web",
 		RiskLevel:       model.RiskLevelMedium,
-		Status:          model.ProposalStatusAwaitingApproval,
+		Status:          model.ProposalStatusApproved,
 		ActionSpec:      string(specBytes),
 		CreatedAt:       time.Now(),
 	}

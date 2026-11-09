@@ -153,46 +153,10 @@ func (h *OpsHandler) ListExecutionHistory(c *gin.Context) {
 	}
 
 	if len(histories) == 0 {
-		histories = h.seedInitialHistories()
+		histories = []model.OpsExecutionHistory{}
 	}
 
 	utils.Success(c, histories)
-}
-
-func (h *OpsHandler) seedInitialHistories() []model.OpsExecutionHistory {
-	now := time.Now()
-	items := []model.OpsExecutionHistory{
-		{
-			ExecutionType: "component_update",
-			Component:     "home-api",
-			Action:        "非繁忙期依赖组件检查与安全更新",
-			OldVersion:    "v1.18.8",
-			NewVersion:    "v1.18.9",
-			Status:        "success",
-			SnapshotID:    "/data/backup/sqlite_pre_1108.db",
-			HealthOutput:  "HTTP 200 OK (latency: 12ms)",
-			Detail:        "已执行 SQLite VACUUM 镜像快照备份，新版本服务冒烟测试 100% 通过，旧容器镜像已安全归档。",
-			CreatedAt:     now.Add(-2 * time.Hour),
-		},
-		{
-			ExecutionType: "vuln_patch",
-			Component:     "sqlite",
-			Action:        "Google OSV 漏洞源扫描与安全基线加固",
-			OldVersion:    "3.42.0",
-			NewVersion:    "3.43.0",
-			Status:        "success",
-			SnapshotID:    "/data/backup/sqlite_pre_cve.db",
-			HealthOutput:  "CGO-free pure-Go engine integrity verified",
-			Detail:        "修复 Google OSV 漏洞库中记录的潜在边界越界风险，数据库 WAL 检查点写入正常。",
-			CreatedAt:     now.Add(-6 * time.Hour),
-		},
-	}
-	if h.db != nil {
-		for _, item := range items {
-			_ = h.db.Create(&item).Error
-		}
-	}
-	return items
 }
 
 // GetNASStatus returns CPU, RAM, and Disk pool watermark metrics.

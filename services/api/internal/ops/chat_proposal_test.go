@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
@@ -18,6 +19,34 @@ func setupOpsHandlerForTest(t *testing.T) (*OpsHandler, *gin.Engine) {
 	gin.SetMode(gin.TestMode)
 	db := setupTestDB(t)
 	_ = db.AutoMigrate(&model.OpsChatSession{}, &model.OpsChatMessage{}, &model.OpsProposal{})
+	db.Create(&model.OpsProposal{
+		ProposalID:       "prop-101",
+		Title:            "【高危】Nginx 基础镜像安全升级至 v1.25.4-alpine",
+		Description:      "修复 CVE-2024-24989 缓冲区溢出漏洞，更新 TLS 1.3 密码套件配置与 HTTP/2 流控。",
+		TargetComponent:  "home-web (Nginx)",
+		RiskLevel:        model.RiskLevelHigh,
+		EstimatedSeconds: 45,
+		DowntimeSeconds:  3,
+		ExecutionPlan:    "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
+		RollbackPlan:     "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
+		ActionSpec:       `{"action":"docker.restart","target":"home-web","rollback_spec":{"action":"docker.restart","target":"home-web"}}`,
+		Status:           model.ProposalStatusAwaitingApproval,
+		CreatedAt:        time.Now().Add(-2 * time.Hour),
+	})
+	db.Create(&model.OpsProposal{
+		ProposalID:       "prop-102",
+		Title:            "【中风险】SQLite / PostgreSQL 慢查询复合索引重构",
+		Description:      "为 security_events (timestamp, event_type) 建立索引",
+		TargetComponent:  "home-api (Database)",
+		RiskLevel:        model.RiskLevelMedium,
+		EstimatedSeconds: 90,
+		DowntimeSeconds:  0,
+		ExecutionPlan:    "CREATE INDEX IF NOT EXISTS idx_security_events_time_type ON security_events(created_at, type);",
+		RollbackPlan:     "DROP INDEX IF EXISTS idx_security_events_time_type;",
+		ActionSpec:       `{"action":"db.create_index","target":"home-api","params":{"table_name":"security_events","index_name":"idx_security_events_time_type","columns":["created_at","type"]},"rollback_spec":{"action":"db.drop_index","target":"home-api","params":{"index_name":"idx_security_events_time_type"}}}`,
+		Status:           model.ProposalStatusAwaitingApproval,
+		CreatedAt:        time.Now().Add(-1 * time.Hour),
+	})
 
 	bus := eventbus.New()
 	fallback := NewHostFallbackProvider("", "")
@@ -262,6 +291,34 @@ func TestProposalRejectsNonAdminWithoutContextElevation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := setupTestDB(t)
 	_ = db.AutoMigrate(&model.OpsChatSession{}, &model.OpsChatMessage{}, &model.OpsProposal{})
+	db.Create(&model.OpsProposal{
+		ProposalID:       "prop-101",
+		Title:            "【高危】Nginx 基础镜像安全升级至 v1.25.4-alpine",
+		Description:      "修复 CVE-2024-24989 缓冲区溢出漏洞，更新 TLS 1.3 密码套件配置与 HTTP/2 流控。",
+		TargetComponent:  "home-web (Nginx)",
+		RiskLevel:        model.RiskLevelHigh,
+		EstimatedSeconds: 45,
+		DowntimeSeconds:  3,
+		ExecutionPlan:    "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
+		RollbackPlan:     "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
+		ActionSpec:       `{"action":"docker.restart","target":"home-web","rollback_spec":{"action":"docker.restart","target":"home-web"}}`,
+		Status:           model.ProposalStatusAwaitingApproval,
+		CreatedAt:        time.Now().Add(-2 * time.Hour),
+	})
+	db.Create(&model.OpsProposal{
+		ProposalID:       "prop-102",
+		Title:            "【中风险】SQLite / PostgreSQL 慢查询复合索引重构",
+		Description:      "为 security_events (timestamp, event_type) 建立索引",
+		TargetComponent:  "home-api (Database)",
+		RiskLevel:        model.RiskLevelMedium,
+		EstimatedSeconds: 90,
+		DowntimeSeconds:  0,
+		ExecutionPlan:    "CREATE INDEX IF NOT EXISTS idx_security_events_time_type ON security_events(created_at, type);",
+		RollbackPlan:     "DROP INDEX IF EXISTS idx_security_events_time_type;",
+		ActionSpec:       `{"action":"db.create_index","target":"home-api","params":{"table_name":"security_events","index_name":"idx_security_events_time_type","columns":["created_at","type"]},"rollback_spec":{"action":"db.drop_index","target":"home-api","params":{"index_name":"idx_security_events_time_type"}}}`,
+		Status:           model.ProposalStatusAwaitingApproval,
+		CreatedAt:        time.Now().Add(-1 * time.Hour),
+	})
 
 	bus := eventbus.New()
 	fallback := NewHostFallbackProvider("", "")

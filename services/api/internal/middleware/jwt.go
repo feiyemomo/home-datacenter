@@ -1,8 +1,11 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"errors"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -11,6 +14,15 @@ import (
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/utils"
 )
+
+// isPrivateOrLoopbackIP checks if an IP belongs to localhost or a private network.
+func isPrivateOrLoopbackIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsPrivate()
+}
 
 // JWTAuth validates the Authorization: Bearer <jwt> header,
 // ensures the device still exists and is not revoked, validates
@@ -43,6 +55,29 @@ func JWTAuth(
 ) gin.HandlerFunc {
 
 	return func(c *gin.Context) {
+
+		// 0. Service-to-service internal authentication (Ops Agent / internal daemons)
+		if internalHeader := c.GetHeader("X-Internal-Secret"); internalHeader != "" {
+			internalSecret := os.Getenv("INTERNAL_OPS_TOKEN")
+			if internalSecret == "" {
+				internalSecret = os.Getenv("JWT_SECRET")
+			}
+			if internalSecret != "" && len(internalSecret) >= 16 &&
+				subtle.ConstantTimeCompare([]byte(internalHeader), []byte(internalSecret)) == 1 {
+				// Defense-in-depth: source IP must be loopback or internal private network
+				clientIP := c.ClientIP()
+				if isPrivateOrLoopbackIP(clientIP) {
+					c.Set("user_id", uint(0))
+					c.Set("user_name", "ops-agent-daemon")
+					c.Set("device_id", uint(0))
+					c.Set("device_name", "ops-internal")
+					c.Set("is_admin", true)
+					c.Set("is_internal_service", true)
+					c.Next()
+					return
+				}
+			}
+		}
 
 		// 1. Read Authorization header (primary path)
 		tokenString := ""

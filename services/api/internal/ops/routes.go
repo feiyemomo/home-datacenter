@@ -19,6 +19,7 @@ func (h *OpsHandler) RegisterProposalRoutes(rg *gin.RouterGroup) {
 	rg.GET("/proposals", h.ListProposals)
 	rg.POST("/proposals", middleware.RequireAdmin(h.db), h.CreateProposal)
 	rg.POST("/proposals/:id/approve", middleware.RequireAdmin(h.db), h.ApproveProposal)
+	rg.POST("/proposals/:id/execute", middleware.RequireAdmin(h.db), h.ExecuteProposalEndpoint)
 
 	// Automatically mount FSM & Maintenance Lock routes alongside proposal endpoints
 	h.RegisterFSMRoutes(rg)

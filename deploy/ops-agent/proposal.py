@@ -27,8 +27,15 @@ class ProposalLifecycleManager:
     STATE_EXECUTED = "EXECUTED"
     STATE_FAILED_ROLLEDBACK = "FAILED_ROLLEDBACK"
 
-    def __init__(self, db_path: Optional[str] = None):
+    def __init__(
+        self,
+        db_path: Optional[str] = None,
+        go_api_url: Optional[str] = None,
+        internal_token: Optional[str] = None
+    ):
         self.db_path = db_path
+        self.go_api_url = go_api_url
+        self.internal_token = internal_token
         self.proposals: Dict[str, Dict[str, Any]] = {}
         if self.db_path:
             self._init_sqlite_schema()
@@ -109,9 +116,16 @@ class ProposalLifecycleManager:
         logger.info(msg)
         return True, msg
 
-    def execute_proposal(self, prop_id: str, simulate_failure: bool = False) -> Tuple[bool, str]:
+    def execute_proposal(
+        self,
+        prop_id: str,
+        simulate_failure: bool = False,
+        go_api_url: Optional[str] = None,
+        internal_token: Optional[str] = None
+    ) -> Tuple[bool, str]:
         """
         Executes an approved or scheduled proposal.
+        When connected to Go Core, delegates execution through Go's authoritative API.
         Triggers automatic rollback on execution failure.
         """
         proposal = self.proposals.get(prop_id)
@@ -120,6 +134,42 @@ class ProposalLifecycleManager:
 
         if proposal["status"] not in (self.STATE_APPROVED, self.STATE_SCHEDULED):
             return False, f"Cannot execute proposal in state {proposal['status']}: must be APPROVED first"
+
+        target_go_url = go_api_url or self.go_api_url
+        target_token = internal_token or self.internal_token
+
+        if target_go_url:
+            # Delegate to Go Core OperationExecutor via dedicated execute route
+            import urllib.request
+            api_url = f"{target_go_url.rstrip('/')}/api/v1/ops/proposals/{prop_id}/execute"
+            payload = json.dumps({}).encode("utf-8")
+            headers = {"Content-Type": "application/json"}
+            if target_token:
+                headers["X-Internal-Secret"] = target_token
+            req = urllib.request.Request(api_url, data=payload, headers=headers)
+            try:
+                proposal["status"] = self.STATE_EXECUTING
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    if resp.status == 200:
+                        proposal["status"] = self.STATE_EXECUTED
+                        proposal["executed_at"] = time.time()
+                        if self.db_path:
+                            self._update_sqlite_status(proposal)
+                        logger.info(f"Proposal {prop_id} successfully executed via Go Core OperationExecutor")
+                        return True, "Executed via Go Core"
+                    else:
+                        proposal["status"] = self.STATE_FAILED_ROLLEDBACK
+                        proposal["rollback_executed"] = True
+                        if self.db_path:
+                            self._update_sqlite_status(proposal)
+                        return False, f"Go Core execution returned HTTP {resp.status}"
+            except Exception as e:
+                proposal["status"] = self.STATE_FAILED_ROLLEDBACK
+                proposal["rollback_executed"] = True
+                if self.db_path:
+                    self._update_sqlite_status(proposal)
+                logger.error(f"Proposal {prop_id} execution failed via Go Core: {e}")
+                return False, f"Execution failed via Go Core: {e}"
 
         proposal["status"] = self.STATE_EXECUTING
 

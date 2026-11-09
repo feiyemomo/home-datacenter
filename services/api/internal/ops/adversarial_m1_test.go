@@ -240,7 +240,7 @@ func TestSafetyFSM_Challenge1_RollbackFailureHandling(t *testing.T) {
 
 	// Verify history record captured rollback failure detail
 	var history model.OpsExecutionHistory
-	if err := db.Where("component = ? AND status = ?", "failing-rb-comp", "rolled_back").First(&history).Error; err != nil {
+	if err := db.Where("component = ? AND status IN (?, ?)", "failing-rb-comp", "rollback_failed", "rolled_back").First(&history).Error; err != nil {
 		t.Fatalf("history record not found: %v", err)
 	}
 

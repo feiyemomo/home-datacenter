@@ -40,9 +40,8 @@ func (h *OpsHandler) ListProposals(c *gin.Context) {
 		return
 	}
 
-	// Seed realistic initial proposals if table is empty
-	if len(proposals) == 0 && c.Query("status") == "" {
-		proposals = h.seedInitialProposals()
+	if proposals == nil {
+		proposals = []model.OpsProposal{}
 	}
 
 	if c.Query("envelope") == "true" || c.GetHeader("X-Envelope") == "true" {
@@ -127,6 +126,14 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 //	Route: POST /api/v1/ops/proposals/:id/approve
 func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 	// 1. Role permission gate
+	if c.GetBool("is_internal_service") {
+		c.JSON(http.StatusForbidden, gin.H{
+			"error":   "Permission denied: internal daemon cannot approve proposals",
+			"message": "内部服务探针无权执行提案审批，必须由管理员人工审批",
+		})
+		return
+	}
+
 	isAdmin := c.GetBool("is_admin")
 	if !isAdmin {
 		c.JSON(http.StatusForbidden, gin.H{
@@ -233,6 +240,51 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 	c.JSON(http.StatusOK, proposal)
 }
 
+// ExecuteProposalEndpoint handles POST /proposals/:id/execute
+// Allows authorized callers (admin or internal service) to trigger execution of an already
+// APPROVED or SCHEDULED proposal. Strictly rejects execution of unapproved proposals.
+func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
+	id := c.Param("id")
+	var proposal model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", id, id).First(&proposal).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	// Require either admin or internal service
+	isAdmin := c.GetBool("is_admin")
+	isInternal := c.GetBool("is_internal_service")
+	if !isAdmin && !isInternal {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: admin or internal service required"})
+		return
+	}
+
+	exec := h.GetExecutor()
+	if exec == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Operation executor not configured"})
+		return
+	}
+
+	res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
+	if err != nil {
+		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, ErrProposalAlreadyRunning) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "result": res})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status": proposal.Status,
+		"result": res,
+	})
+}
+
 // ExecuteProposal dispatches proposal execution to the OperationExecutor directly.
 func (h *OpsHandler) ExecuteProposal(ctx context.Context, proposalID string) (*ExecutionResult, error) {
 	exec := h.GetExecutor()
@@ -297,46 +349,6 @@ func (h *OpsHandler) recordProposalAudit(prop *model.OpsProposal, operator, acti
 			log.Printf("[ops] failed to persist proposal audit log: %v", err)
 		}
 	}
-}
-
-// seedInitialProposals provides realistic initial proposals matching datacenter baseline.
-func (h *OpsHandler) seedInitialProposals() []model.OpsProposal {
-	defaults := []model.OpsProposal{
-		{
-			ProposalID:       "prop-101",
-			Title:            "【高危】Nginx 基础镜像安全升级至 v1.25.4-alpine",
-			Description:      "修复 CVE-2024-24989 缓冲区溢出漏洞，更新 TLS 1.3 密码套件配置与 HTTP/2 流控。",
-			TargetComponent:  "home-web (Nginx)",
-			RiskLevel:        model.RiskLevelHigh,
-			EstimatedSeconds: 45,
-			DowntimeSeconds:  3,
-			ExecutionPlan:    "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
-			RollbackPlan:     "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
-			ActionSpec:       `{"action":"docker.restart","target":"home-web","rollback_spec":{"action":"docker.restart","target":"home-web"}}`,
-			Status:           model.ProposalStatusAwaitingApproval,
-			CreatedAt:        time.Now().Add(-2 * time.Hour),
-		},
-		{
-			ProposalID:       "prop-102",
-			Title:            "【中风险】SQLite / PostgreSQL 慢查询复合索引重构",
-			Description:      "为 security_events (timestamp, event_type) 与 recordings (camera_id, start_time) 建立联合覆盖索引，优化查询速度。",
-			TargetComponent:  "home-api (Database)",
-			RiskLevel:        model.RiskLevelMedium,
-			EstimatedSeconds: 90,
-			DowntimeSeconds:  0,
-			ExecutionPlan:    "CREATE INDEX IF NOT EXISTS idx_security_events_time_type ON security_events(created_at, type);",
-			RollbackPlan:     "DROP INDEX IF EXISTS idx_security_events_time_type;",
-			ActionSpec:       `{"action":"db.create_index","target":"home-api","params":{"table_name":"security_events","index_name":"idx_security_events_time_type","columns":["created_at","type"]},"rollback_spec":{"action":"db.drop_index","target":"home-api","params":{"index_name":"idx_security_events_time_type"}}}`,
-			Status:           model.ProposalStatusAwaitingApproval,
-			CreatedAt:        time.Now().Add(-1 * time.Hour),
-		},
-	}
-
-	for i := range defaults {
-		_ = h.db.Create(&defaults[i]).Error
-	}
-
-	return defaults
 }
 
 // ComputeFingerprint calculates a deterministic SHA-256 baseline state fingerprint

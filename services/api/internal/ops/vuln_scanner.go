@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -66,6 +67,13 @@ var DefaultScanTargets = []PackageTarget{
 	{Component: "sqlite", Ecosystem: "Go", Package: "github.com/glebarez/sqlite", Version: "v1.11.0"},
 	{Component: "gorm", Ecosystem: "Go", Package: "gorm.io/gorm", Version: "v1.25.7"},
 }
+
+// Scan status outcomes
+const (
+	ScanStatusSuccess        = "success"
+	ScanStatusPartialFailure = "partial_failure"
+	ScanStatusFailed         = "failed"
+)
 
 // VulnScanner integrates with Google OSV (Open Source Vulnerabilities) API
 // to fetch zero-auth, real-time vulnerability intelligence for project dependencies.
@@ -445,12 +453,14 @@ func (s *VulnScanner) ScanPackage(ctx context.Context, ecosystem, pkgName, versi
 // ScanDefaultPackages scans all baseline datacenter dependencies against Google OSV.
 func (s *VulnScanner) ScanDefaultPackages(ctx context.Context) error {
 	successCount := 0
+	failedCount := 0
 	var lastErr error
 
 	for _, target := range DefaultScanTargets {
 		vulns, err := s.ScanPackage(ctx, target.Ecosystem, target.Package, target.Version)
 		if err != nil {
 			lastErr = err
+			failedCount++
 			log.Printf("[vuln-scanner] scan %s (%s) failed: %v", target.Component, target.Package, err)
 			continue
 		}
@@ -462,15 +472,29 @@ func (s *VulnScanner) ScanDefaultPackages(ctx context.Context) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.lastScanAt = time.Now()
+
+	total := len(DefaultScanTargets)
+	if total == 0 {
+		s.lastScanStatus = ScanStatusFailed
+		s.lastScanError = "zero scan targets configured"
+		return errors.New("zero scan targets configured")
+	}
+
 	if successCount == 0 && lastErr != nil {
-		s.lastScanStatus = "failed"
+		s.lastScanStatus = ScanStatusFailed
 		s.lastScanError = lastErr.Error()
 		return lastErr
 	}
 
-	s.lastScanStatus = "success"
+	if failedCount > 0 {
+		s.lastScanStatus = ScanStatusPartialFailure
+		s.lastScanError = fmt.Sprintf("%d of %d package scans failed (last: %v)", failedCount, total, lastErr)
+		return nil
+	}
+
+	s.lastScanStatus = ScanStatusSuccess
 	s.lastScanError = ""
-	s.lastScanAt = time.Now()
 	return nil
 }
 
@@ -513,15 +537,19 @@ func (s *VulnScanner) ScanWorkspaceDependencies(ctx context.Context, workspaceRo
 
 	var allVulns []OSVVuln
 	successCount := 0
+	failedCount := 0
+	validTargetCount := 0
 	var lastErr error
 
 	for _, target := range targets {
-		if target.Version == "" {
+		if strings.TrimSpace(target.Version) == "" || strings.TrimSpace(target.Package) == "" {
 			continue
 		}
+		validTargetCount++
 		vulns, err := s.ScanPackage(ctx, target.Ecosystem, target.Package, target.Version)
 		if err != nil {
 			lastErr = err
+			failedCount++
 			log.Printf("[vuln-scanner] scan %s (%s) failed: %v", target.Component, target.Package, err)
 			continue
 		}
@@ -534,15 +562,28 @@ func (s *VulnScanner) ScanWorkspaceDependencies(ctx context.Context, workspaceRo
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if successCount == 0 && lastErr != nil {
-		s.lastScanStatus = "failed"
-		s.lastScanError = lastErr.Error()
-		return nil, fmt.Errorf("all dependency scans failed: %w", lastErr)
+	s.lastScanAt = time.Now()
+
+	if validTargetCount == 0 {
+		s.lastScanStatus = ScanStatusFailed
+		s.lastScanError = "zero valid dependencies found to scan"
+		return nil, errors.New("zero valid dependencies found to scan")
 	}
 
-	s.lastScanStatus = "success"
+	if successCount == 0 && lastErr != nil {
+		s.lastScanStatus = ScanStatusFailed
+		s.lastScanError = lastErr.Error()
+		return nil, fmt.Errorf("all %d dependency scans failed: %w", validTargetCount, lastErr)
+	}
+
+	if failedCount > 0 {
+		s.lastScanStatus = ScanStatusPartialFailure
+		s.lastScanError = fmt.Sprintf("%d of %d dependency scans failed (last: %v)", failedCount, validTargetCount, lastErr)
+		return allVulns, nil
+	}
+
+	s.lastScanStatus = ScanStatusSuccess
 	s.lastScanError = ""
-	s.lastScanAt = time.Now()
 	return allVulns, nil
 }
 

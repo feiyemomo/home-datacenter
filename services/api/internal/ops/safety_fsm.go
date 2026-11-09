@@ -124,14 +124,23 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 	f.mu.Unlock()
 	log.Printf("[safety-fsm] Step 2: Applying update for %s (%s -> %s)", component, oldVer, newVer)
 	if applyFn != nil {
-		if err := applyFn(); err != nil {
+		var applyErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					applyErr = fmt.Errorf("panic in applyFn: %v", r)
+				}
+			}()
+			applyErr = applyFn()
+		}()
+		if applyErr != nil {
 			f.mu.Lock()
 			f.currentState = StateFailed
 			f.lastTerminalState = StateFailed
 			f.mu.Unlock()
-			log.Printf("[safety-fsm] apply failed: %v", err)
-			f.recordHistory(component, "组件更新执行失败", oldVer, newVer, "failed", snapshotPath, err.Error(), "")
-			return err
+			log.Printf("[safety-fsm] apply failed: %v", applyErr)
+			f.recordHistory(component, "组件更新执行失败", oldVer, newVer, "failed", snapshotPath, applyErr.Error(), "")
+			return applyErr
 		}
 	}
 
@@ -188,10 +197,28 @@ ProbeLoop:
 		f.mu.Unlock()
 		log.Printf("[safety-fsm] CRITICAL: Health probe failed (%v)! Triggering 10s rollback", lastProbeErr)
 
-		var rbErr error
-		if rollbackFn != nil {
-			rbErr = rollbackFn()
+		if rollbackFn == nil {
+			// Blocker Fix: If no rollback function was provided, do NOT report ROLLED_BACK!
+			f.mu.Lock()
+			f.currentState = StateFailed
+			f.lastTerminalState = StateFailed
+			f.mu.Unlock()
+
+			f.recordHistory(component, "健康检查失败且未定义回滚函数", oldVer, newVer, "failed", snapshotPath,
+				fmt.Sprintf("Probe failed: %v", lastProbeErr), "rollback omitted: no rollback function")
+
+			return fmt.Errorf("component health probe failed (%v); rollback omitted: no rollback function provided", lastProbeErr)
 		}
+
+		var rbErr error
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					rbErr = fmt.Errorf("panic in rollbackFn: %v", r)
+				}
+			}()
+			rbErr = rollbackFn()
+		}()
 
 		f.mu.Lock()
 		if rbErr != nil {
@@ -204,6 +231,9 @@ ProbeLoop:
 		f.mu.Unlock()
 
 		status := "rolled_back"
+		if rbErr != nil {
+			status = "rollback_failed"
+		}
 		f.recordHistory(component, "健康检查失败触发自动回滚", oldVer, newVer, status, snapshotPath,
 			fmt.Sprintf("Probe failed: %v", lastProbeErr), fmt.Sprintf("Rollback result: %v", rbErr))
 
