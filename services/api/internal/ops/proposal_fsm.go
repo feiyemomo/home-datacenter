@@ -1,6 +1,7 @@
 package ops
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,8 +11,10 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -136,6 +139,7 @@ func IsTerminalProposalStatus(status string) bool {
 
 // ProposalTransitionAudit describes an immutable audit entry written atomically on state transition.
 type ProposalTransitionAudit struct {
+	Context     context.Context
 	OperationID string
 	EventType   string
 	Actor       string
@@ -158,8 +162,9 @@ type ProposalTransitionParams struct {
 
 // ProposalFSM manages atomic Compare-And-Swap state transitions for OpsProposal.
 type ProposalFSM struct {
-	db  *gorm.DB
-	bus *eventbus.Bus
+	db          *gorm.DB
+	bus         *eventbus.Bus
+	auditEngine *audit.AgentAuditEngine
 }
 
 // NewProposalFSM initializes a ProposalFSM.
@@ -170,6 +175,24 @@ func NewProposalFSM(db *gorm.DB) *ProposalFSM {
 // NewProposalFSMWithBus initializes a ProposalFSM with EventBus audit publishing.
 func NewProposalFSMWithBus(db *gorm.DB, bus *eventbus.Bus) *ProposalFSM {
 	return &ProposalFSM{db: db, bus: bus}
+}
+
+// SetAuditEngine configures the unified AgentAuditEngine for FSM state transition recording.
+func (fsm *ProposalFSM) SetAuditEngine(engine *audit.AgentAuditEngine) {
+	if fsm != nil {
+		fsm.auditEngine = engine
+	}
+}
+
+func (fsm *ProposalFSM) resolvedAuditEngine() *audit.AgentAuditEngine {
+	if fsm == nil || fsm.db == nil {
+		return nil
+	}
+	if fsm.auditEngine != nil {
+		return fsm.auditEngine
+	}
+	fsm.auditEngine = audit.NewAgentAuditEngine(fsm.db, fsm.bus, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+	return fsm.auditEngine
 }
 
 // TransitionCAS provides backward-compatible 4-arg CAS filtering expectedStatuses against AllowedProposalTransitions.
@@ -269,11 +292,11 @@ func (fsm *ProposalFSM) TransitionStrict(p ProposalTransitionParams) (bool, erro
 			if hasLogTbl {
 				metaMap := make(map[string]interface{}, len(p.Audit.Metadata)+4)
 				for k, v := range p.Audit.Metadata {
-					metaMap[k] = v
+					metaMap[k] = redact.Value(v)
 				}
 				metaMap["proposal_id"] = p.ProposalID
 				metaMap["to_status"] = targetStatus
-				metaMap["actor"] = p.Audit.Actor
+				metaMap["actor"] = redact.SensitiveString(p.Audit.Actor)
 				metaMap["operation_id"] = p.Audit.OperationID
 				metaBytes, _ := json.Marshal(metaMap)
 
@@ -292,8 +315,8 @@ func (fsm *ProposalFSM) TransitionStrict(p ProposalTransitionParams) (bool, erro
 					Level:       lvl,
 					Source:      eventbus.SourceSystem,
 					Context:     p.ProposalID,
-					Message:     p.Audit.Message,
-					Payload:     string(metaBytes),
+					Message:     redact.SensitiveString(p.Audit.Message),
+					Payload:     redact.SensitiveString(string(metaBytes)),
 				}
 				if err := tx.Create(&entry).Error; err != nil {
 					GlobalSecurityMetrics.IncAuditFailed()
@@ -311,29 +334,110 @@ func (fsm *ProposalFSM) TransitionStrict(p ProposalTransitionParams) (bool, erro
 
 	if !won {
 		GlobalSecurityMetrics.IncProposalCASConflict()
-	} else if fsm.bus != nil && p.Audit != nil {
-		payloadBytes, _ := json.Marshal(map[string]any{
-			"event":        p.Audit.EventType,
-			"proposal_id":  p.ProposalID,
-			"to_status":    targetStatus,
-			"actor":        p.Audit.Actor,
-			"operation_id": p.Audit.OperationID,
-			"ts":           now.Unix(),
-		})
-		sev := eventbus.SeverityInfo
-		if p.Audit.Level == model.LevelWarning {
-			sev = eventbus.SeverityWarn
-		} else if p.Audit.Level == model.LevelCritical {
-			sev = eventbus.SeverityCritical
+	} else {
+		if ae := fsm.resolvedAuditEngine(); ae != nil {
+			var propRow model.OpsProposal
+			_ = fsm.db.Where("id = ? OR proposal_id = ?", p.ProposalID, p.ProposalID).First(&propRow).Error
+			hhID := propRow.HouseholdID
+			if hhID == 0 {
+				hhID = 1
+			}
+			actor := "proposal-fsm"
+			opID := ""
+			var msg string
+			var meta map[string]interface{}
+			var evCtx context.Context
+			if p.Audit != nil {
+				evCtx = p.Audit.Context
+				if strings.TrimSpace(p.Audit.Actor) != "" {
+					actor = p.Audit.Actor
+				}
+				opID = p.Audit.OperationID
+				msg = p.Audit.Message
+				meta = p.Audit.Metadata
+			}
+			if evCtx == nil {
+				evCtx = context.Background()
+			}
+			canonEventType, runFinalStatus, dec := mapProposalStatusToAudit(targetStatus)
+			_, _ = ae.EmitEvent(evCtx, audit.EmitEventInput{
+				HouseholdID:    hhID,
+				TriggerSource:  "proposal_fsm",
+				ActorType:      "user",
+				ActorID:        actor,
+				EventType:      canonEventType,
+				Action:         "proposal." + strings.ToLower(targetStatus),
+				Target:         propRow.TargetComponent,
+				Component:      propRow.TargetComponent,
+				Decision:       dec,
+				RiskLevel:      model.AuditRiskHigh,
+				ProposalID:     defaultPropStr(propRow.ProposalID, p.ProposalID),
+				ApprovalID:     propRow.ApprovalDigest,
+				OperationID:    opID,
+				AfterState:     map[string]interface{}{"status": targetStatus, "revision": propRow.Revision, "message": msg},
+				Parameters:     meta,
+				Result:         targetStatus,
+				FinalRunStatus: runFinalStatus,
+				MirrorLegacy:   IsTerminalProposalStatus(targetStatus) || targetStatus == model.ProposalStatusApproved || targetStatus == model.ProposalStatusScheduled,
+				LegacyApprover: propRow.ApprovedBy,
+			})
 		}
-		fsm.bus.Publish(eventbus.Event{
-			Topic:    eventbus.TopicSystemLog,
-			Source:   eventbus.SourceSystem,
-			Severity: sev,
-			Payload:  payloadBytes,
-		})
+		if fsm.bus != nil && p.Audit != nil {
+			payloadBytes, _ := json.Marshal(map[string]any{
+				"event":        p.Audit.EventType,
+				"proposal_id":  p.ProposalID,
+				"to_status":    targetStatus,
+				"actor":        redact.SensitiveString(p.Audit.Actor),
+				"operation_id": p.Audit.OperationID,
+				"ts":           now.Unix(),
+			})
+			sev := eventbus.SeverityInfo
+			if p.Audit.Level == model.LevelWarning {
+				sev = eventbus.SeverityWarn
+			} else if p.Audit.Level == model.LevelCritical {
+				sev = eventbus.SeverityCritical
+			}
+			fsm.bus.Publish(eventbus.Event{
+				Topic:    eventbus.TopicSystemLog,
+				Source:   eventbus.SourceSystem,
+				Severity: sev,
+				Payload:  payloadBytes,
+			})
+		}
 	}
 	return won, nil
+}
+
+func mapProposalStatusToAudit(status string) (eventType, runFinalStatus, decision string) {
+	switch status {
+	case model.ProposalStatusApproved, model.ProposalStatusScheduled:
+		return model.AuditEventApprovalGranted, "", model.AuditDecisionAllow
+	case model.ProposalStatusRejected:
+		return model.AuditEventApprovalRejected, model.AuditRunStatusFailed, model.AuditDecisionDeny
+	case model.ProposalStatusExpired:
+		return model.AuditEventApprovalExpired, model.AuditRunStatusFailed, model.AuditDecisionDeny
+	case model.ProposalStatusCancelled:
+		return model.AuditEventExecutionCancelled, model.AuditRunStatusCancelled, model.AuditDecisionDeny
+	case model.ProposalStatusExecuting:
+		return model.AuditEventExecutionLockAcquired, "", model.AuditDecisionAllow
+	case model.ProposalStatusExecuted, model.ProposalStatusSuccess:
+		return model.AuditEventExecutionCompleted, model.AuditRunStatusCompleted, model.AuditDecisionAllow
+	case model.ProposalStatusRollingBack:
+		return model.AuditEventRollbackStarted, "", model.AuditDecisionAllow
+	case model.ProposalStatusRolledBack, model.ProposalStatusFailedRolledback:
+		return model.AuditEventRollbackCompleted, model.AuditRunStatusRolledBack, model.AuditDecisionAllow
+	case model.ProposalStatusExecutionUnknown, model.ProposalStatusReconciliationRequired:
+		return model.AuditEventExecutionUnknown, model.AuditRunStatusExecutionUnknown, model.AuditDecisionAllow
+	default:
+		return model.AuditEventExecutionFailed, model.AuditRunStatusFailed, model.AuditDecisionAllow
+	}
+}
+
+func defaultPropStr(v, fallback string) string {
+	if strings.TrimSpace(v) != "" {
+		return v
+	}
+	return fallback
 }
 
 // ReconcileProposal transitions an EXECUTION_UNKNOWN or RECONCILIATION_REQUIRED proposal

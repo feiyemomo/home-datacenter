@@ -13,8 +13,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/utils"
 )
@@ -44,10 +46,49 @@ type OpsHandler struct {
 	defenseMgr  *security.DefenseManager
 	executor    OperationExecutor
 	vulnScanner *VulnScanner
+	auditEngine *audit.AgentAuditEngine
 
 	mu                  sync.RWMutex
 	newAPIFailCount     int
 	newAPICooldownUntil time.Time
+}
+
+// SetAuditEngine configures the unified AgentAuditEngine on OpsHandler and its executor.
+func (h *OpsHandler) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	h.mu.Lock()
+	h.auditEngine = ae
+	exec := h.executor
+	h.mu.Unlock()
+	if defExec, ok := exec.(*DefaultOperationExecutor); ok && defExec != nil {
+		defExec.SetAuditEngine(ae)
+	}
+}
+
+func (h *OpsHandler) getAuditEngine() *audit.AgentAuditEngine {
+	h.mu.RLock()
+	ae := h.auditEngine
+	exec := h.executor
+	h.mu.RUnlock()
+	if ae != nil {
+		return ae
+	}
+	if defExec, ok := exec.(*DefaultOperationExecutor); ok && defExec != nil {
+		if exAE := defExec.GetAuditEngine(); exAE != nil {
+			h.mu.Lock()
+			if h.auditEngine == nil {
+				h.auditEngine = exAE
+			}
+			ae = h.auditEngine
+			h.mu.Unlock()
+			return ae
+		}
+	}
+	if h.db != nil {
+		created := audit.NewAgentAuditEngine(h.db, h.bus, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+		h.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // SetVulnScanner configures the VulnScanner for OpsHandler.
@@ -86,6 +127,9 @@ func NewOpsHandler(
 		defenseMgr: defenseMgr,
 	}
 	h.executor = NewOperationExecutor(db, bus, client, fallback, WithBaselineExtractor(h.ComputeFingerprint))
+	if defExec, ok := h.executor.(*DefaultOperationExecutor); ok && defExec != nil {
+		h.auditEngine = defExec.GetAuditEngine()
+	}
 	return h
 }
 
@@ -131,6 +175,34 @@ func (h *OpsHandler) GetOnePanelSession(c *gin.Context) {
 	defer cancel()
 
 	creds, err := h.client.GetSession(ctx)
+	if ae := h.getAuditEngine(); ae != nil {
+		resStr := "SUCCESS"
+		errStr := ""
+		if err != nil {
+			resStr = "FAILED"
+			errStr = err.Error()
+		}
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        getOperatorName(c),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "onepanel.session.fetch",
+			Target:         "1panel",
+			Component:      "1panel",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			Result:         resStr,
+			ErrorCode:      errStr,
+			Evidence:       map[string]interface{}{"client_ip": c.ClientIP()},
+			FinalRunStatus: model.AuditRunStatusCompleted,
+		})
+	}
 	if err != nil {
 		log.Printf("[ops] failed to fetch 1Panel session: %v", err)
 		utils.Fail(c, http.StatusBadGateway, fmt.Sprintf("获取 1Panel 认证会话失败: %v", err))
@@ -144,14 +216,27 @@ func (h *OpsHandler) GetOnePanelSession(c *gin.Context) {
 //
 //	Route: GET /api/v1/ops/history
 func (h *OpsHandler) ListExecutionHistory(c *gin.Context) {
+	if !c.GetBool("is_admin") && !c.GetBool("is_internal_service") {
+		utils.Fail(c, http.StatusForbidden, "管理员权限不足，禁止读取运维执行历史")
+		return
+	}
+	hhID := c.GetUint("household_id")
+	if hhID == 0 {
+		hhID = 1
+	}
+
 	var histories []model.OpsExecutionHistory
 	if h.db != nil {
-		if err := h.db.Order("id DESC").Limit(50).Find(&histories).Error; err != nil {
+		if err := h.db.Where("household_id = ?", hhID).Order("id DESC").Limit(50).Find(&histories).Error; err != nil {
 			utils.Fail(c, http.StatusInternalServerError, err.Error())
 			return
 		}
 	}
 
+	for i := range histories {
+		histories[i].HealthOutput = redact.SensitiveString(histories[i].HealthOutput)
+		histories[i].Detail = redact.SensitiveString(histories[i].Detail)
+	}
 	if len(histories) == 0 {
 		histories = []model.OpsExecutionHistory{}
 	}
@@ -291,6 +376,31 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 	ctx, cancel := contextWithTimeout(c.Request.Context(), 30*time.Second)
 	defer cancel()
 
+	if ae := h.getAuditEngine(); ae != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, runCtx, rErr := ae.StartRun(ctx, audit.StartRunInput{
+			HouseholdID:   hhID,
+			TriggerSource: "api_manual",
+			ActorType:     "user",
+			ActorID:       operator,
+			Action:        ActionDockerRestart,
+			Target:        canonical,
+			Component:     canonical,
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskHigh,
+			Summary:       fmt.Sprintf("Manual admin container restart by %s (%s)", operator, clientIP),
+		})
+		if rErr != nil {
+			h.recordAuditLog(name, operator, clientIP, false, rErr.Error())
+			utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("审计落盘失败，Fail-Closed 阻断重启: %v", rErr))
+			return
+		}
+		ctx = runCtx
+	}
+
 	res, err := exec.Execute(ctx, OperationSpec{
 		Action: ActionDockerRestart,
 		Target: canonical,
@@ -354,9 +464,10 @@ func (h *OpsHandler) GetSecuritySummary(c *gin.Context) {
 
 // recordAuditLog saves container restart audit event to database and EventBus.
 func (h *OpsHandler) recordAuditLog(containerName, operator, clientIP string, success bool, detail string) {
-	msg := fmt.Sprintf("管理员 %s 从 IP %s 安全重启核心容器 [%s]: 状态=%v", operator, clientIP, containerName, success)
+	safeDetail := redact.SensitiveString(detail)
+	msg := redact.SensitiveString(fmt.Sprintf("管理员 %s 从 IP %s 安全重启核心容器 [%s]: 状态=%v", operator, clientIP, containerName, success))
 	if !success {
-		msg += fmt.Sprintf(" (原因: %s)", detail)
+		msg += fmt.Sprintf(" (原因: %s)", safeDetail)
 	}
 
 	payloadMap := map[string]any{
@@ -365,7 +476,7 @@ func (h *OpsHandler) recordAuditLog(containerName, operator, clientIP string, su
 		"operator":       operator,
 		"client_ip":      clientIP,
 		"success":        success,
-		"detail":         detail,
+		"detail":         safeDetail,
 		"ts":             time.Now().Unix(),
 	}
 	payloadBytes, _ := json.Marshal(payloadMap)
@@ -421,86 +532,49 @@ func contextWithTimeout(parent context.Context, timeout time.Duration) (context.
 	return context.WithTimeout(parent, timeout)
 }
 
-// OfflineSyncItem represents a single offline audit log event.
-type OfflineSyncItem struct {
-	EventUUID     string `json:"event_uuid"`
-	ContainerName string `json:"container_name"`
-	Action        string `json:"action"`
-	ExitCode      int    `json:"exit_code"`
-	Success       int    `json:"success"`
-	ExecutedAt    string `json:"executed_at"`
-}
+// OfflineSyncItem is preserved for type compatibility with tests/clients.
+type OfflineSyncItem = audit.OfflineSyncEvent
 
 // OfflineSyncRequest represents the batch of offline emergency audit events.
 type OfflineSyncRequest struct {
-	Events []OfflineSyncItem `json:"events"`
+	Events []audit.OfflineSyncEvent `json:"events"`
 }
 
 // SyncOfflineAuditLogs handles POST /api/v1/ops/audit/offline-sync.
-// Atomically ingests buffered offline events with idempotency deduplication by EventUUID.
+// Atomically ingests buffered offline events with signature/hash verification,
+// idempotent EventUUID deduplication, and explicit accepted_uuids[] acking.
 func (h *OpsHandler) SyncOfflineAuditLogs(c *gin.Context) {
+	if h.db == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "ops database unavailable for offline audit sync")
+		return
+	}
 	var req OfflineSyncRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		utils.Fail(c, http.StatusBadRequest, "invalid payload: "+err.Error())
 		return
 	}
 
-	syncedCount := 0
-	for _, ev := range req.Events {
-		eventUUID := strings.TrimSpace(ev.EventUUID)
-		if eventUUID == "" {
-			continue
-		}
+	ae := h.getAuditEngine()
+	if ae == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "audit engine unavailable")
+		return
+	}
+	hhID := c.GetUint("household_id")
+	if hhID == 0 {
+		hhID = 1
+	}
 
-		// Idempotency check: if event_uuid already exists, skip insertion
-		var existing model.StructuredOpsAuditLog
-		if err := h.db.Where("event_uuid = ?", eventUUID).First(&existing).Error; err == nil {
-			continue
-		}
-
-		createdAt := time.Now()
-		if ev.ExecutedAt != "" {
-			if t, err := time.Parse(time.RFC3339, ev.ExecutedAt); err == nil {
-				createdAt = t
-			}
-		}
-
-		auditRow := model.StructuredOpsAuditLog{
-			EventUUID:       eventUUID,
-			HouseholdID:     1,
-			RequestID:       c.GetString("request_id"),
-			ActorType:       "offline_agent",
-			ActorID:         0,
-			ActorName:       "home-ops-agent",
-			ClientIP:        c.ClientIP(),
-			TargetType:      "container",
-			TargetID:        ev.ContainerName,
-			Action:          "container.emergency_restart",
-			ExecutionResult: fmt.Sprintf(`{"success":%v,"exit_code":%d}`, ev.Success == 1, ev.ExitCode),
-			IsOfflineAction: true,
-			CreatedAt:       createdAt,
-		}
-
-		// Also mirror into existing system_logs for UI dashboard visibility
-		sysLog := model.SystemLog{
-			HouseholdID: 1,
-			Ts:          createdAt.Unix(),
-			EventType:   "ops.container.offline_restart",
-			Level:       model.LevelWarning,
-			Source:      "ops_agent_offline",
-			Context:     ev.ContainerName,
-			Message:     security.RedactSensitiveInfo(fmt.Sprintf("【离线应急自愈】容器 %s 在 Go Core 离线期间执行了受控紧急重启 (状态: %v)", ev.ContainerName, ev.Success == 1)),
-			Payload:     fmt.Sprintf(`{"event_uuid":"%s","exit_code":%d}`, eventUUID, ev.ExitCode),
-		}
-
-		if err := h.db.Create(&auditRow).Error; err == nil {
-			_ = h.db.Create(&sysLog)
-			syncedCount++
-		}
+	res, err := ae.IngestOfflineEvents(c.Request.Context(), req.Events, c.GetString("request_id"), c.ClientIP(), hhID)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("offline audit sync failed: %v", err))
+		return
 	}
 
 	utils.Success(c, gin.H{
-		"synced_count": syncedCount,
-		"message":      fmt.Sprintf("成功同步 %d 条离线应急自愈审计日志", syncedCount),
+		"synced_count":   res.SyncedCount,
+		"accepted_uuids": res.AcceptedUUIDs,
+		"rejected":       res.Rejected,
+		"anchor_seq":     res.AnchorSeq,
+		"message":        fmt.Sprintf("成功同步 %d 条离线应急自愈审计日志", res.SyncedCount),
 	})
 }

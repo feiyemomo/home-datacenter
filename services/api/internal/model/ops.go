@@ -723,21 +723,23 @@ const (
 
 // OpsChatSession models a multi-turn chat session with Ops Copilot.
 type OpsChatSession struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	SessionID string    `gorm:"size:64;uniqueIndex" json:"session_id"`
-	UserID    uint      `gorm:"index;not null;default:0" json:"user_id"`
-	Scope     string    `gorm:"size:32;not null;default:'personal'" json:"scope"` // "personal" | "household"
-	Title     string    `gorm:"size:255" json:"title"`
-	CreatedAt time.Time `gorm:"not null" json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	HouseholdID uint      `gorm:"index;not null;default:1" json:"household_id"`
+	SessionID   string    `gorm:"size:64;uniqueIndex" json:"session_id"`
+	UserID      uint      `gorm:"index;not null;default:0" json:"user_id"`
+	Scope       string    `gorm:"size:32;not null;default:'personal'" json:"scope"` // "personal" | "household"
+	Title       string    `gorm:"size:255" json:"title"`
+	CreatedAt   time.Time `gorm:"not null" json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 func (OpsChatSession) TableName() string { return "ops_chat_sessions" }
 
 // OpsChatMessage models an individual message exchanged in an Ops Chat session.
 type OpsChatMessage struct {
-	ID        uint      `gorm:"primaryKey" json:"id"`
-	MessageID string    `gorm:"size:64;index" json:"message_id"`
+	ID          uint      `gorm:"primaryKey" json:"id"`
+	HouseholdID uint      `gorm:"index;not null;default:1" json:"household_id"`
+	MessageID   string    `gorm:"size:64;index" json:"message_id"`
 	SessionID string    `gorm:"size:64;index" json:"session_id"`
 	UserID    uint      `gorm:"index;not null;default:0" json:"user_id"`
 	Scope     string    `gorm:"size:32;not null;default:'personal'" json:"scope"` // "personal" | "household"
@@ -754,6 +756,7 @@ func (OpsChatMessage) TableName() string { return "ops_chat_messages" }
 // including component auto-updates, DB snapshot backups, health probe rollbacks, and vulnerability patching.
 type OpsExecutionHistory struct {
 	ID            uint      `gorm:"primaryKey" json:"id"`
+	HouseholdID   uint      `gorm:"index;not null;default:1" json:"household_id"`
 	ExecutionType string    `gorm:"size:64;not null;index" json:"execution_type"` // "component_update", "vuln_patch", "auto_rollback", "proposal_exec"
 	Component     string    `gorm:"size:128;not null" json:"component"`          // e.g. "home-api", "sqlite", "frigate"
 	Action        string    `gorm:"size:255;not null" json:"action"`             // Human readable description

@@ -8,7 +8,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/middleware"
+	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -20,6 +22,7 @@ func (h *OpsHandler) RegisterProposalRoutes(rg *gin.RouterGroup) {
 	rg.POST("/proposals", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalCreate), h.CreateProposal)
 	rg.PATCH("/proposals/:id", middleware.RequireAdmin(h.db), h.UpdateProposal)
 	rg.POST("/proposals/:id/approve", middleware.RequireAdmin(h.db), h.ApproveProposal)
+	rg.POST("/proposals/:id/reject", middleware.RequireAdmin(h.db), h.RejectProposal)
 	rg.POST("/proposals/:id/execute", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalExecute), h.ExecuteProposalEndpoint)
 	rg.POST("/proposals/:id/cancel", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalExecute), h.CancelProposal)
 	rg.POST("/proposals/:id/reconcile", middleware.RequireAdmin(h.db), h.ReconcileProposalEndpoint)
@@ -47,6 +50,9 @@ func (h *OpsHandler) RegisterFSMRoutes(rg *gin.RouterGroup) {
 	rg.POST("/fsm/reconcile", middleware.RequireAdmin(h.db), h.ReconcileFSMStorage)
 	rg.GET("/security-metrics", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsTelemetry), h.GetSecurityMetrics)
 	rg.POST("/audit/offline-sync", middleware.OpsAgentAuth(middleware.ScopeOpsAuditSync), h.SyncOfflineAuditLogs)
+
+	// Unified tamper-evident AgentAuditEngine query/verify/export routes
+	h.RegisterAuditRoutes(rg)
 }
 
 // ============================================================================
@@ -99,6 +105,15 @@ func (h *OpsHandler) AcquireMaintenanceLock(c *gin.Context) {
 	fsm := h.GetRecoveryFSM()
 
 	if err := fsm.GetMaintenanceLock().Acquire(operator, req.Reason, ttl); err != nil {
+		if ae := h.getAuditEngine(); ae != nil {
+			_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+				TriggerSource: "api_manual", ActorType: "user", ActorID: operator,
+				EventType: model.AuditEventExecutionFailed, Action: "maintenance.lock.acquire",
+				Target: "system", Component: "maintenance-lock", Decision: model.AuditDecisionDeny,
+				RiskLevel: model.AuditRiskHigh, Result: "CONFLICT", ErrorCode: err.Error(),
+				Parameters: req, FinalRunStatus: model.AuditRunStatusFailed,
+			})
+		}
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   err.Error(),
 			"message": "系统排他维护锁已被占用，无法重复加锁",
@@ -107,6 +122,15 @@ func (h *OpsHandler) AcquireMaintenanceLock(c *gin.Context) {
 	}
 
 	status := fsm.GetMaintenanceLock().GetStatus()
+	if ae := h.getAuditEngine(); ae != nil {
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			TriggerSource: "api_manual", ActorType: "user", ActorID: operator,
+			EventType: model.AuditEventExecutionCompleted, Action: "maintenance.lock.acquire",
+			Target: "system", Component: "maintenance-lock", Decision: model.AuditDecisionAllow,
+			RiskLevel: model.AuditRiskHigh, Parameters: req, AfterState: status,
+			Result: "LOCKED", FinalRunStatus: model.AuditRunStatusCompleted, MirrorLegacy: true,
+		})
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"message": "已成功启动系统维护模式，主动自愈与自动重启已挂起",
 		"status":  status,
@@ -125,12 +149,31 @@ func (h *OpsHandler) ReleaseMaintenanceLock(c *gin.Context) {
 	operator := getOperatorName(c)
 	fsm := h.GetRecoveryFSM()
 	if err := fsm.GetMaintenanceLock().Release(operator); err != nil {
+		if ae := h.getAuditEngine(); ae != nil {
+			_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+				TriggerSource: "api_manual", ActorType: "user", ActorID: operator,
+				EventType: model.AuditEventExecutionFailed, Action: "maintenance.lock.release",
+				Target: "system", Component: "maintenance-lock", Decision: model.AuditDecisionDeny,
+				RiskLevel: model.AuditRiskHigh, Result: "CONFLICT", ErrorCode: err.Error(),
+				FinalRunStatus: model.AuditRunStatusFailed,
+			})
+		}
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   err.Error(),
 			"message": "解除系统维护锁失败：存储持久化或降级锁尚未解除",
 			"status":  fsm.GetMaintenanceLock().GetStatus(),
 		})
 		return
+	}
+
+	if ae := h.getAuditEngine(); ae != nil {
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			TriggerSource: "api_manual", ActorType: "user", ActorID: operator,
+			EventType: model.AuditEventExecutionCompleted, Action: "maintenance.lock.release",
+			Target: "system", Component: "maintenance-lock", Decision: model.AuditDecisionAllow,
+			RiskLevel: model.AuditRiskHigh, AfterState: fsm.GetMaintenanceLock().GetStatus(),
+			Result: "UNLOCKED", FinalRunStatus: model.AuditRunStatusCompleted, MirrorLegacy: true,
+		})
 	}
 
 	c.JSON(http.StatusOK, gin.H{
@@ -181,6 +224,16 @@ func (h *OpsHandler) ResetContainerCircuit(c *gin.Context) {
 		return
 	}
 
+	if ae := h.getAuditEngine(); ae != nil {
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			TriggerSource: "api_manual", ActorType: "user", ActorID: getOperatorName(c),
+			EventType: model.AuditEventExecutionCompleted, Action: "circuit_breaker.reset",
+			Target: canonical, Component: canonical, Decision: model.AuditDecisionAllow,
+			RiskLevel: model.AuditRiskHigh, AfterState: map[string]interface{}{"circuit_state": CircuitClosed},
+			Result: "RESET", FinalRunStatus: model.AuditRunStatusCompleted, MirrorLegacy: true,
+		})
+	}
+
 	c.JSON(http.StatusOK, gin.H{
 		"message":       fmt.Sprintf("容器 %s 的熔断器状态已重置为 CLOSED，崩溃计数器已清零", canonical),
 		"container":     canonical,
@@ -199,11 +252,29 @@ func (h *OpsHandler) ReconcileFSMStorage(c *gin.Context) {
 	operator := getOperatorName(c)
 	fsm := h.GetRecoveryFSM()
 	if err := fsm.ReconcileDegradedState(operator); err != nil {
+		if ae := h.getAuditEngine(); ae != nil {
+			_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+				TriggerSource: "api_manual", ActorType: "user", ActorID: operator,
+				EventType: model.AuditEventExecutionFailed, Action: "fsm.reconcile",
+				Target: "app.db", Component: "sqlite-ops", Decision: model.AuditDecisionDeny,
+				RiskLevel: model.AuditRiskCritical, Result: "FAILED", ErrorCode: err.Error(),
+				FinalRunStatus: model.AuditRunStatusFailed,
+			})
+		}
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   err.Error(),
 			"message": "存储与安全状态对账失败，系统维持 Fail-Closed 冻结保护",
 		})
 		return
+	}
+	if ae := h.getAuditEngine(); ae != nil {
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			TriggerSource: "api_manual", ActorType: "user", ActorID: operator,
+			EventType: model.AuditEventRecoveryVerified, Action: "fsm.reconcile",
+			Target: "app.db", Component: "sqlite-ops", Decision: model.AuditDecisionAllow,
+			RiskLevel: model.AuditRiskCritical, Result: "RECONCILED",
+			FinalRunStatus: model.AuditRunStatusCompleted, MirrorLegacy: true,
+		})
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"message":                  "存储完整性对账通过，Degraded 冻结已安全解除",

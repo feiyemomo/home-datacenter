@@ -100,6 +100,12 @@ const NAV_ITEMS: NavItem[] = [
         adminOnly: true,
     },
     {
+        to: "/ops/audit",
+        label: "审计追溯",
+        icon: <ShieldCheck size={18} />,
+        adminOnly: true,
+    },
+    {
         to: "/security",
         label: "安全防御",
         icon: <ShieldAlert size={18} />,

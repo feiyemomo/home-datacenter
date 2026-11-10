@@ -1,6 +1,7 @@
 package maintenance
 
 import (
+	"context"
 	"io"
 	"log"
 	"os"
@@ -10,6 +11,9 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+
+	"home-datacenter-api/internal/audit"
+	"home-datacenter-api/internal/model"
 )
 
 // SQLiteMaintenance keeps the SQLite database healthy on long-running
@@ -125,6 +129,24 @@ func (m *SQLiteMaintenance) backup() {
 	log.Printf("maintenance: sqlite backup written to %s", dst)
 	m.backupFrigateDB()
 	m.pruneBackups()
+	if m.db != nil {
+		ae := audit.NewAgentAuditEngine(m.db, nil)
+		_, _ = ae.EmitEvent(context.Background(), audit.EmitEventInput{
+			HouseholdID:    1,
+			TriggerSource:  "maintenance",
+			ActorType:      "system_daemon",
+			ActorID:        "sqlite-maintenance",
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "maintenance.sqlite.backup",
+			Target:         dst,
+			Component:      "app.db",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskLow,
+			AfterState:     map[string]interface{}{"backup_file": dst},
+			Result:         "BACKED_UP",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+		})
+	}
 }
 
 // backupFrigateDB snapshots Frigate's own SQLite database (frigate.db)

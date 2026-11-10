@@ -1,0 +1,124 @@
+{
+  "keyring": {
+    "k1": "super-secret-audit-signing-key-32bytes-minimum-test",
+    "k2": "rotated-secret-audit-signing-key-32bytes-test-v2"
+  },
+  "canonical_json_vectors": [
+    {
+      "input": {
+        "b": 2,
+        "a": 1,
+        "z": {
+          "nested_y": true,
+          "nested_a": [
+            3,
+            1.0,
+            null,
+            "中文<tag>&amp;"
+          ]
+        }
+      },
+      "expected_json": "{\"a\":1,\"b\":2,\"z\":{\"nested_a\":[3,1,null,\"中文<tag>&amp;\"],\"nested_y\":true}}"
+    },
+    {
+      "input": {
+        "url": "https://example.com/hook?a=1&b=2",
+        "num": 9007199254740993,
+        "flag": false
+      },
+      "expected_json": "{\"flag\":false,\"num\":9007199254740993,\"url\":\"https://example.com/hook?a=1&b=2\"}"
+    }
+  ],
+  "timestamp_vectors": [
+    {
+      "ms": 1794331200000,
+      "expected_rfc3339_ms": "2026-11-10T17:20:00.000Z"
+    },
+    {
+      "ms": 1794331201045,
+      "expected_rfc3339_ms": "2026-11-10T17:20:01.045Z"
+    }
+  ],
+  "event_vectors": [
+    {
+      "stream_id": "core",
+      "seq": 1,
+      "key_id": "k1",
+      "event": {
+        "audit_id": "aud-gv-0001",
+        "run_id": "run-gv-0001",
+        "parent_event_id": "",
+        "correlation_id": "corr-gv-0001",
+        "household_id": 1,
+        "trigger_source": "docker_fsm",
+        "actor_type": "system_daemon",
+        "actor_id": "home-api",
+        "event_type": "EVENT_RECEIVED",
+        "action": "container.recovery",
+        "target": "home-web",
+        "component": "home-web",
+        "decision": "ALLOW",
+        "risk_level": "HIGH",
+        "policy_version": "v5.0",
+        "proposal_id": "",
+        "approval_id": "",
+        "operation_id": "op-gv-1",
+        "fencing_generation": 1,
+        "before_state": "{\"running\":false}",
+        "after_state": "",
+        "parameters_digest": "5e36c737fc542fbe9407e082bea0238e4827305636ecd8da1d90a49e53bda19f",
+        "parameters_redacted": "{\"target\":\"home-web\"}",
+        "result": "RECEIVED",
+        "error_code": "",
+        "duration_ms": 0,
+        "evidence": "crash exit=137 <ok>&probe",
+        "created_at": "2026-11-10T17:20:00.000Z",
+        "created_at_ms": 1794331200000,
+        "is_offline": false,
+        "previous_hash": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "expected_entry_hash": "1d5e1675ead6f359375ac35d62cc490f258d57f934e5ab13943e0139c14eff13",
+      "expected_hmac": "hmac-sha256:k1:52fc672a3b333433945bc7a269c9859e2975c2ce7d2a21237f6e5db4661dbb87"
+    },
+    {
+      "stream_id": "offline-agent",
+      "seq": 2,
+      "key_id": "k2",
+      "event": {
+        "audit_id": "aud-gv-0002",
+        "run_id": "run-gv-0001",
+        "parent_event_id": "aud-gv-0001",
+        "correlation_id": "corr-gv-0001",
+        "household_id": 1,
+        "trigger_source": "docker_fsm",
+        "actor_type": "system_daemon",
+        "actor_id": "home-api",
+        "event_type": "EXECUTION_COMPLETED",
+        "action": "docker.restart",
+        "target": "home-web",
+        "component": "home-web",
+        "decision": "ALLOW",
+        "risk_level": "HIGH",
+        "policy_version": "v5.0",
+        "proposal_id": "",
+        "approval_id": "",
+        "operation_id": "op-gv-1",
+        "fencing_generation": 1,
+        "before_state": "{\"running\":false}",
+        "after_state": "{\"running\":true}",
+        "parameters_digest": "5e36c737fc542fbe9407e082bea0238e4827305636ecd8da1d90a49e53bda19f",
+        "parameters_redacted": "{\"target\":\"home-web\"}",
+        "result": "SUCCESS",
+        "error_code": "",
+        "duration_ms": 1045,
+        "evidence": "crash exit=137 <ok>&probe",
+        "created_at": "2026-11-10T17:20:01.045Z",
+        "created_at_ms": 1794331201045,
+        "is_offline": true,
+        "previous_hash": "1d5e1675ead6f359375ac35d62cc490f258d57f934e5ab13943e0139c14eff13"
+      },
+      "expected_entry_hash": "e17fff64aa23e1c904b477b7fc91b8f62fe1bfe17abfee7e4c4c6bbb8e625435",
+      "expected_hmac": "hmac-sha256:k2:76f98991ba31b958e3fd1fb6017004a6b84df9389180479fbe5d9dc7e7f77a9e"
+    }
+  ]
+}

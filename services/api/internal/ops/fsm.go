@@ -12,6 +12,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 )
@@ -223,6 +224,14 @@ func ResolveTopologyComponent(name string) string {
 		return "home-h3c-keepalive"
 	case "home-ops-agent", "ops-agent", "home-datacenter-ops-agent":
 		return "home-ops-agent"
+	case "home-new-api", "new-api", "home-datacenter-new-api":
+		return "home-new-api"
+	case "home-backup", "backup", "home-datacenter-backup":
+		return "home-backup"
+	case "mihomo":
+		return "mihomo"
+	case "tailscale":
+		return "tailscale"
 	default:
 		return ""
 	}
@@ -1471,9 +1480,41 @@ type ContainerRecoveryFSM struct {
 	topology     *TopologyEngine
 	breaker      *ContainerCircuitBreaker
 	leaseManager *RecoveryLeaseManager
+	auditEngine  *audit.AgentAuditEngine
 	db           *gorm.DB
 	bus          *eventbus.Bus
 	executor     OperationExecutor
+}
+
+// SetAuditEngine configures the unified AgentAuditEngine on ContainerRecoveryFSM.
+func (fsm *ContainerRecoveryFSM) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
+	fsm.auditEngine = ae
+}
+
+func (fsm *ContainerRecoveryFSM) getAuditEngine() *audit.AgentAuditEngine {
+	fsm.mu.RLock()
+	ae := fsm.auditEngine
+	ex := fsm.executor
+	db := fsm.db
+	bus := fsm.bus
+	fsm.mu.RUnlock()
+	if ae != nil {
+		return ae
+	}
+	if defExec, ok := ex.(*DefaultOperationExecutor); ok && defExec != nil {
+		if exAE := defExec.GetAuditEngine(); exAE != nil {
+			fsm.SetAuditEngine(exAE)
+			return exAE
+		}
+	}
+	if db != nil {
+		created := audit.NewAgentAuditEngine(db, bus, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+		fsm.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // NewContainerRecoveryFSM creates a new container recovery finite state machine.
@@ -1784,6 +1825,7 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 	})
 
 	prop := model.OpsProposal{
+		HouseholdID:      1,
 		ProposalID:       propID,
 		Title:            fmt.Sprintf("【高危告警】%s 连续崩溃触发自愈熔断", canonical),
 		Description:      fmt.Sprintf("容器 %s 在 10 分钟内发生 %d 次连续崩溃，已触发自愈熔断器跳闸。自动重启已挂起，需管理员人工审批与介入排查。", canonical, crashCount),
@@ -1803,6 +1845,35 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 	if err := fsm.db.Create(&prop).Error; err != nil {
 		GlobalSecurityMetrics.IncDatabaseError()
 		return
+	}
+
+	if ae := fsm.getAuditEngine(); ae != nil {
+		_, runCtx, _ := ae.StartRun(context.Background(), audit.StartRunInput{
+			HouseholdID:   1,
+			TriggerSource: "circuit_breaker_trip",
+			ActorType:     "system_daemon",
+			ActorID:       "container-recovery-fsm",
+			Action:        "circuit_breaker.trip",
+			Target:        canonical,
+			Component:     canonical,
+			Decision:      model.AuditDecisionRequireApproval,
+			RiskLevel:     model.AuditRiskHigh,
+			ProposalID:    propID,
+			Summary:       prop.Title,
+		})
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType:    model.AuditEventProposalCreated,
+			Action:       "circuit_breaker.trip_proposal",
+			Target:       canonical,
+			Component:    canonical,
+			Decision:     model.AuditDecisionRequireApproval,
+			RiskLevel:    model.AuditRiskHigh,
+			ProposalID:   propID,
+			Evidence:     map[string]interface{}{"crash_count": crashCount},
+			AfterState:   map[string]interface{}{"circuit_state": CircuitOpen, "proposal_id": propID},
+			Result:       "TRIPPED",
+			MirrorLegacy: true,
+		})
 	}
 
 	if fsm.bus != nil {
@@ -1887,7 +1958,50 @@ func (fsm *ContainerRecoveryFSM) ReconcileDegradedState(actor string) error {
 // ProcessAndRecover performs closed-loop recovery with unified LeaseGuard ownership across the full execution chain (R4-05 ~ R4-08):
 // acquire LeaseGuard -> backoff -> pre-exec fencing -> executor.Execute(leaseCtx) -> circuit breaker persistence -> ReleaseLease.
 func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event ContainerEvent) (*ContainerRecoveryResult, error) {
+	ae := fsm.getAuditEngine()
+	resolvedComp := ResolveTopologyComponent(event.ContainerName)
+	targetLabel := defaultStringVal(resolvedComp, event.ContainerName)
+	if ae != nil {
+		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
+			_, runCtx, _ := ae.StartRun(ctx, audit.StartRunInput{
+				HouseholdID:   1,
+				TriggerSource: "docker_fsm",
+				ActorType:     "system_daemon",
+				ActorID:       "container-recovery-fsm",
+				Action:        "container.recovery",
+				Target:        targetLabel,
+				Component:     targetLabel,
+				RiskLevel:     model.AuditRiskHigh,
+				Summary:       fmt.Sprintf("Container lifecycle event: %s (%s)", event.Action, targetLabel),
+			})
+			ctx = runCtx
+		}
+		_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+			EventType:     model.AuditEventReceived,
+			TriggerSource: "docker_fsm",
+			Action:        "container.event",
+			Target:        targetLabel,
+			Component:     targetLabel,
+			RiskLevel:     model.AuditRiskMedium,
+			Parameters:    map[string]interface{}{"status": event.Action, "exit_code": event.ExitCode, "action": event.Action},
+			Result:        "RECEIVED",
+		})
+	}
+
 	if fsm.lock.IsDegraded() || fsm.breaker.IsDegraded() {
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         "container.recovery.policy",
+				Target:         targetLabel,
+				Component:      targetLabel,
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskCritical,
+				Result:         "BLOCKED",
+				ErrorCode:      ErrFailClosedMode.Error(),
+				FinalRunStatus: model.AuditRunStatusBlocked,
+			})
+		}
 		return &ContainerRecoveryResult{
 			Status:         StatusBlocked,
 			Executed:       false,
@@ -1910,6 +2024,19 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		if err != nil {
 			errMsg = err.Error()
 		}
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         "container.recovery.policy",
+				Target:         targetLabel,
+				Component:      targetLabel,
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskHigh,
+				Result:         string(status),
+				ErrorCode:      errMsg,
+				FinalRunStatus: model.AuditRunStatusBlocked,
+			})
+		}
 		return &ContainerRecoveryResult{
 			Decision:       decision,
 			Status:         status,
@@ -1921,6 +2048,19 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 
 	switch decision.Action {
 	case ActionIgnore:
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         "container.recovery.ignore",
+				Target:         decision.Container,
+				Component:      decision.Container,
+				Decision:       model.AuditDecisionAllow,
+				RiskLevel:      model.AuditRiskLow,
+				Evidence:       map[string]interface{}{"event_class": decision.EventClass, "reason": decision.Reason},
+				Result:         "ACCEPTED",
+				FinalRunStatus: model.AuditRunStatusCompleted,
+			})
+		}
 		return &ContainerRecoveryResult{
 			Decision:       decision,
 			Status:         StatusAccepted,
@@ -1930,6 +2070,20 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		}, nil
 
 	case ActionBlocked, ActionTripped:
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         "container.recovery.blocked",
+				Target:         decision.Container,
+				Component:      decision.Container,
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskHigh,
+				Evidence:       map[string]interface{}{"action": decision.Action, "reason": decision.Reason, "circuit_state": decision.CircuitState},
+				Result:         "BLOCKED",
+				ErrorCode:      decision.Reason,
+				FinalRunStatus: model.AuditRunStatusBlocked,
+			})
+		}
 		return &ContainerRecoveryResult{
 			Decision:       decision,
 			Status:         StatusBlocked,
@@ -1939,6 +2093,18 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		}, nil
 
 	case ActionRestart:
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:  model.AuditEventPolicyEvaluated,
+				Action:     "container.recovery.restart_authorized",
+				Target:     decision.Container,
+				Component:  decision.Container,
+				Decision:   model.AuditDecisionAllow,
+				RiskLevel:  model.AuditRiskHigh,
+				Evidence:   map[string]interface{}{"backoff_sec": decision.BackoffSec, "circuit_state": decision.CircuitState, "probe_token": decision.ProbeToken != ""},
+				Result:     "AUTHORIZED",
+			})
+		}
 		fsm.mu.RLock()
 		exec := fsm.executor
 		leaseMgr := fsm.leaseManager
@@ -1988,6 +2154,19 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			}
 			workCtx = lCtx
 			leaseGuard = guard
+			if ae != nil {
+				_, _ = ae.EmitEvent(workCtx, audit.EmitEventInput{
+					EventType:         model.AuditEventRecoveryLeaseAcquired,
+					Action:            "recovery.lease.acquire",
+					Target:            canonical,
+					Component:         canonical,
+					Decision:          model.AuditDecisionAllow,
+					RiskLevel:         model.AuditRiskHigh,
+					OperationID:       guard.Grant.OperationID,
+					FencingGeneration: guard.Grant.FencingGeneration,
+					Result:            "ACQUIRED",
+				})
+			}
 		}
 
 		releaseLease := func() error {
@@ -2112,6 +2291,20 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			}, relErr
 		}
 
+		if ae != nil {
+			_, _ = ae.EmitEvent(workCtx, audit.EmitEventInput{
+				EventType:      model.AuditEventRecoveryVerified,
+				Action:         "container.recovery.verified",
+				Target:         canonical,
+				Component:      canonical,
+				Decision:       model.AuditDecisionAllow,
+				RiskLevel:      model.AuditRiskHigh,
+				AfterState:     map[string]interface{}{"health_verified": true, "circuit_state": fsm.breaker.GetState(canonical)},
+				Result:         "RECOVERED",
+				FinalRunStatus: model.AuditRunStatusCompleted,
+			})
+		}
+
 		return &ContainerRecoveryResult{
 			Decision:       decision,
 			Status:         StatusRecovered,
@@ -2145,6 +2338,13 @@ func SetGlobalRecoveryFSM(fsm *ContainerRecoveryFSM) {
 	globalRecoveryFSMMu.Lock()
 	defer globalRecoveryFSMMu.Unlock()
 	globalRecoveryFSM = fsm
+}
+
+func defaultStringVal(v, fallback string) string {
+	if strings.TrimSpace(v) != "" {
+		return v
+	}
+	return fallback
 }
 
 // GetGlobalRecoveryFSM returns the singleton recovery FSM instance.

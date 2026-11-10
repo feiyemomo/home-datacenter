@@ -490,3 +490,12 @@
         .stagger-children > *:nth-child(8) { animation-delay: 240ms; }
     }
 }
+
+dialog:modal {
+    overscroll-behavior: contain;
+}
+
+dialog::backdrop {
+    overflow: hidden;
+    overscroll-behavior: contain;
+}

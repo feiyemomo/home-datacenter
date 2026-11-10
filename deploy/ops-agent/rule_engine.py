@@ -16,12 +16,20 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Set
 
+from audit_protocol import (
+    EXECUTION_COMPLETED,
+    EXECUTION_STARTED,
+    append_jsonl_audit_stub,
+    format_rfc3339_ms,
+    redact_sensitive_string,
+)
 from config import OpsAgentConfig
 
 logger = logging.getLogger("home-ops-agent.rule_engine")
@@ -336,14 +344,39 @@ class TwoTierRuleEngine:
             return
 
         try:
-            subprocess.run(
+            proc = subprocess.run(
                 ["iptables", "-I", "INPUT", "-s", str(addr), "-j", "DROP"],
                 check=False,
                 capture_output=True,
                 timeout=2
             )
+            archive_dir = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+            if archive_dir:
+                append_jsonl_audit_stub(archive_dir, "python-rule-audit.jsonl", {
+                    "event_type": EXECUTION_COMPLETED,
+                    "action": "firewall.iptables.drop",
+                    "target": str(addr),
+                    "returncode": proc.returncode,
+                    "executed_at": format_rfc3339_ms(),
+                })
         except Exception as e:
             logger.debug(f"iptables command skipped or simulated: {e}")
+
+    def _is_maintenance_locked_for_prune(self) -> bool:
+        """Fail-closed maintenance check before destructive local docker prune."""
+        db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
+        if not db_path or not os.path.isfile(db_path):
+            return True
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+            row = conn.execute("SELECT active FROM ops_maintenance_locks ORDER BY id DESC LIMIT 1").fetchone()
+            return bool(row and row[0])
+        except Exception:
+            return True
+        finally:
+            if conn:
+                conn.close()
 
     def _purge_temp_cache(self, mount_path: str) -> List[str]:
         """
@@ -353,16 +386,20 @@ class TwoTierRuleEngine:
         """
         purged = []
         if os.environ.get("ENABLE_LOCAL_DOCKER_PRUNE", "").strip() == "1":
-            for docker_args, label in (
-                (["docker", "builder", "prune", "-f"], "docker builder prune -f"),
-                (["docker", "image", "prune", "-f", "--filter", "dangling=true"], "docker image prune -f --filter dangling=true"),
-            ):
-                try:
-                    res = subprocess.run(docker_args, check=False, capture_output=True, timeout=10)
-                    if res.returncode == 0:
-                        purged.append(label)
-                except Exception:
-                    pass
+            if self._is_maintenance_locked_for_prune():
+                logger.warning("[Rule Engine] Refused local docker prune while maintenance lock active/unknown.")
+                purged.append("docker_prune_blocked_by_maintenance_lock")
+            else:
+                for docker_args, label in (
+                    (["docker", "builder", "prune", "-f"], "docker builder prune -f"),
+                    (["docker", "image", "prune", "-f", "--filter", "dangling=true"], "docker image prune -f --filter dangling=true"),
+                ):
+                    try:
+                        res = subprocess.run(docker_args, check=False, capture_output=True, timeout=10)
+                        if res.returncode == 0:
+                            purged.append(label)
+                    except Exception:
+                        pass
 
         for temp_dir in SAFE_TEMP_CACHE_DIRS:
             if not self.is_protected_volume(temp_dir) and os.path.exists(temp_dir):
@@ -373,6 +410,16 @@ class TwoTierRuleEngine:
                     purged.append(f"cleaned {temp_dir}")
                 except Exception:
                     pass
+
+        archive_dir = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+        if archive_dir and purged:
+            append_jsonl_audit_stub(archive_dir, "python-rule-audit.jsonl", {
+                "event_type": EXECUTION_COMPLETED,
+                "action": "disk.temp_cache.purge",
+                "target": redact_sensitive_string(mount_path),
+                "purged_items": purged,
+                "executed_at": format_rfc3339_ms(),
+            })
 
         if not purged:
             purged.append("docker builder prune -f (simulated)")

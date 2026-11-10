@@ -2,6 +2,7 @@ package automation
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -11,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/utils"
@@ -171,6 +173,28 @@ func (h *Handler) Create(c *gin.Context) {
 			Source:  eventbus.SourceSystem,
 		})
 	}
+	if ae := h.Engine.getAuditEngine(); ae != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "automation.rule.create",
+			Target:         fmt.Sprintf("rule:%d:%s", r.ID, r.Name),
+			Component:      "automation",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			AfterState:     r,
+			Result:         "CREATED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
 	utils.Success(c, toResponse(r))
 }
 
@@ -265,6 +289,28 @@ func (h *Handler) Update(c *gin.Context) {
 			Source:  eventbus.SourceSystem,
 		})
 	}
+	if ae := h.Engine.getAuditEngine(); ae != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "automation.rule.update",
+			Target:         fmt.Sprintf("rule:%d:%s", r.ID, r.Name),
+			Component:      "automation",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			AfterState:     r,
+			Result:         "UPDATED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
 	utils.Success(c, toResponse(r))
 }
 
@@ -302,6 +348,28 @@ func (h *Handler) Delete(c *gin.Context) {
 			Source:  eventbus.SourceSystem,
 		})
 	}
+	if ae := h.Engine.getAuditEngine(); ae != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "automation.rule.delete",
+			Target:         fmt.Sprintf("rule:%d:%s", id, snap.Name),
+			Component:      "automation",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			BeforeState:    snap,
+			Result:         "DELETED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
 	utils.Success(c, gin.H{"id": id, "deleted": true})
 }
 
@@ -329,9 +397,72 @@ func (h *Handler) Test(c *gin.Context) {
 		Payload:  []byte(`{}`),
 	}
 	// Run the action synchronously so we can report success/failure
-	// back to the caller.
-	if err := h.Engine.executeAction(r.Action, ev); err != nil {
-		log.Printf("[handler] action failed: %v", err)
+	// back to the caller, and emit unified AgentAuditEngine trace.
+	ae := h.Engine.getAuditEngine()
+	var runCtx = c.Request.Context()
+	if ae != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, rCtx, sErr := ae.StartRun(runCtx, audit.StartRunInput{
+			HouseholdID:   hhID,
+			TriggerSource: "automation_test",
+			ActorType:     "user",
+			ActorID:       fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			Action:        "automation.rule.test",
+			Target:        fmt.Sprintf("rule:%d:%s", r.ID, r.Name),
+			Component:     "automation",
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskMedium,
+		})
+		if sErr != nil {
+			utils.Fail(c, http.StatusInternalServerError, "audit commit failed")
+			return
+		}
+		runCtx = rCtx
+		if _, preErr := ae.RecordPreMutation(runCtx, audit.EmitEventInput{
+			EventType:     model.AuditEventExecutionStarted,
+			Action:        "automation.rule.test",
+			Target:        fmt.Sprintf("rule:%d:%s", r.ID, r.Name),
+			Component:     "automation",
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskMedium,
+			Parameters:    r.Action,
+			FailurePolicy: audit.PolicyFailClosed,
+		}); preErr != nil {
+			utils.Fail(c, http.StatusInternalServerError, "audit commit failed before rule test")
+			return
+		}
+	}
+
+	execErr := h.Engine.executeAction(r.Action, ev)
+	if ae != nil {
+		evType := model.AuditEventExecutionCompleted
+		resLabel := "SUCCESS"
+		errStr := ""
+		runSt := model.AuditRunStatusCompleted
+		if execErr != nil {
+			evType = model.AuditEventExecutionFailed
+			resLabel = "FAILED"
+			errStr = execErr.Error()
+			runSt = model.AuditRunStatusFailed
+		}
+		_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+			EventType:      evType,
+			Action:         "automation.rule.test",
+			Target:         fmt.Sprintf("rule:%d:%s", r.ID, r.Name),
+			Component:      "automation",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			Result:         resLabel,
+			ErrorCode:      errStr,
+			FinalRunStatus: runSt,
+			MirrorLegacy:   true,
+		}, nil)
+	}
+	if execErr != nil {
+		log.Printf("[handler] action failed: %v", execErr)
 		utils.Fail(c, http.StatusInternalServerError, "action failed")
 		return
 	}
@@ -373,6 +504,9 @@ func validateAction(a model.Action) error {
 		}
 		if u.Host == "" {
 			return errAction("webhook url missing host")
+		}
+		if err := assertPublicHost(u.Hostname()); err != nil {
+			return errAction(err.Error())
 		}
 	default:
 		return errAction("unknown action type: " + a.Type)
@@ -465,6 +599,28 @@ func (h *Handler) Cooldown(c *gin.Context) {
 		log.Printf("[handler] failed to set cooldown: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to set cooldown")
 		return
+	}
+	if ae := h.Engine.getAuditEngine(); ae != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "automation.rule.cooldown",
+			Target:         fmt.Sprintf("rule:%d", id),
+			Component:      "automation",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskLow,
+			Parameters:     map[string]interface{}{"seconds": body.Seconds},
+			Result:         "COOLDOWN_PINNED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
 	}
 	utils.Success(c, gin.H{"id": id, "cooldown_s": body.Seconds})
 }

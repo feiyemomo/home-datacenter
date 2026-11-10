@@ -15,6 +15,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/automation"
 	"home-datacenter-api/internal/camera"
 	"home-datacenter-api/internal/config"
@@ -63,6 +64,9 @@ func main() {
 	}
 	if err := model.ValidateApprovalHMACKeyBootGuard(security.IsProductionEnvironment()); err != nil {
 		log.Fatalf("FAIL-FAST BOOT GUARD (HMAC): %v. Set OPS_APPROVAL_HMAC_KEY (>=32 chars) in production.", err)
+	}
+	if err := audit.ValidateAuditHMACKeyBootGuard(security.IsProductionEnvironment()); err != nil {
+		log.Fatalf("FAIL-FAST BOOT GUARD (AUDIT HMAC): %v. Set OPS_AUDIT_HMAC_KEY (>=32 chars) in production.", err)
 	}
 	if strings.TrimSpace(onePanelPassword) == "" && security.IsProductionEnvironment() {
 		log.Println("[BootGuard] ONEPANEL_PASSWORD not set; 1Panel ops integration will fallback to host metrics")
@@ -229,8 +233,11 @@ func main() {
 	logSub.Start()
 
 	// ---- Services & Handlers ----
+	auditEngine := audit.NewAgentAuditEngine(database.DB, bus, audit.WithFailureCallback(ops.GlobalSecurityMetrics.IncAuditFailed))
 	alertMgr := security.NewAlertManager(cfg.Security.Alert, database.DB)
 	defenseMgr := security.NewDefenseManager(database.DB, cfg.Security.Defense, alertMgr, bus)
+	defenseMgr.SetAuditEngine(auditEngine)
+	mqttHandler.SetAuditEngine(auditEngine)
 
 	authService := service.NewAuthService(userRepo, deviceRepo)
 	userService := service.NewUserService(userRepo, deviceRepo)
@@ -277,6 +284,7 @@ func main() {
 
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 	systemHandler.SetOpsTelemetry(onePanelClient, fallbackProvider)
+	systemHandler.SetAuditEngine(auditEngine)
 
 	safetyFSM := ops.NewSafetyFSM(
 		database.DB,
@@ -285,11 +293,16 @@ func main() {
 		filepath.Join(cfg.Maintenance.DiskPath, "backup"),
 		fmt.Sprintf("http://127.0.0.1:%d/health", cfg.Server.Port),
 	)
+	safetyFSM.SetAuditEngine(auditEngine)
 	vulnScanner := ops.NewVulnScanner(database.DB, alertMgr)
+	vulnScanner.SetAuditEngine(auditEngine)
 
 	opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
+	opsHandler.SetAuditEngine(auditEngine)
+	vulnScanner.SetBaselineExtractor(opsHandler.ComputeFingerprint)
 	opsHandler.SetVulnScanner(vulnScanner)
 	recoveryFSM := opsHandler.GetRecoveryFSM()
+	recoveryFSM.SetAuditEngine(auditEngine)
 	safetyFSM.SetRecoveryFSM(recoveryFSM)
 	if defExec, ok := opsHandler.GetExecutor().(*ops.DefaultOperationExecutor); ok && defExec != nil {
 		defExec.SetRecoveryFSM(recoveryFSM)
@@ -320,6 +333,7 @@ func main() {
 		},
 	)
 	wafCollector.SetExecutor(opsHandler.GetExecutor())
+	wafCollector.SetAuditEngine(auditEngine)
 	wafCollector.Start(context.Background())
 	_ = wafCollector.SyncBannedIPs(defenseMgr.ListBanned())
 
@@ -526,6 +540,7 @@ func main() {
 		ServiceStartupDelay: 60 * time.Second,
 	})
 	if bgMonitors != nil && bgMonitors.RecordingSize != nil {
+		bgMonitors.RecordingSize.SetAuditEngine(auditEngine)
 		systemHandler.SetRecordingSizeMonitor(bgMonitors.RecordingSize)
 	}
 
@@ -568,6 +583,7 @@ func main() {
 	// (notify / mqtt / webhook). The mqtt handler is the publish
 	// interface for "mqtt" actions; nil-safe if MQTT is down.
 	automationEngine := automation.NewEngine(database.DB, bus, mqttHandler)
+	automationEngine.SetAuditEngine(auditEngine)
 	automationEngine.Start()
 	defer automationEngine.Stop()
 	automationHandler := automation.NewHandler(database.DB, automationEngine, bus)
@@ -1034,7 +1050,6 @@ func main() {
 			opsHandler.RegisterRoutes(opsGroup)
 			opsHandler.RegisterProposalRoutes(opsGroup)
 			opsHandler.RegisterChatRoutes(opsGroup)
-			opsHandler.RegisterFSMRoutes(opsGroup)
 
 			// Autonomous FSM & Vuln Scanner Triggers (Admin-only + Fail-Closed)
 			opsGroup.POST("/scan-vulns", middleware.RequireAdmin(database.DB), func(c *gin.Context) {
@@ -1115,7 +1130,12 @@ func main() {
 							Action: ops.ActionDockerRestart,
 							Target: canonicalComp,
 						}
-						return executor.ExecuteRollback(context.Background(), spec)
+						rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
+						defer rbCancel()
+						if s, ok := audit.SessionFromContext(checkCtx); ok {
+							rbCtx = audit.ContextWithSession(rbCtx, s)
+						}
+						return executor.ExecuteRollback(rbCtx, spec)
 					}
 					_, _ = safetyFSM.CheckAndPerformOffPeakUpdate(
 						checkCtx,

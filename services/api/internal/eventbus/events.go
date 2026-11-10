@@ -85,15 +85,19 @@ const (
 
 	// --- Automation events (Phase 5) ---
 	TopicAutomationFired = "automation.fired"
+
+	// --- Autonomous Ops Audit events (Phase 12) ---
+	TopicAuditEventRecorded = "audit.event.recorded"
 )
 
 // Source identifiers — recorded on every Event for debugging.
 const (
-	SourceMQTT      = "mqtt"
-	SourceWS        = "ws"
-	SourceSystem    = "system"
-	SourceCamera    = "camera"
+	SourceMQTT       = "mqtt"
+	SourceWS         = "ws"
+	SourceSystem     = "system"
+	SourceCamera     = "camera"
 	SourceAutomation = "automation"
+	SourceOps        = "ops"
 )
 
 // Severity levels for events.

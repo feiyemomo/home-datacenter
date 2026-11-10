@@ -18,6 +18,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/security"
 )
@@ -81,12 +82,39 @@ const (
 type VulnScanner struct {
 	db             *gorm.DB
 	alertMgr       *security.AlertManager
+	auditEngine    *audit.AgentAuditEngine
+	baselineFn     func(string) string
 	httpClient     *http.Client
 	apiURL         string
 	mu             sync.Mutex
 	lastScanAt     time.Time
 	lastScanStatus string // "success", "failed", ""
 	lastScanError  string
+}
+
+// SetAuditEngine attaches an AgentAuditEngine to VulnScanner.
+func (s *VulnScanner) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.auditEngine = ae
+}
+
+// SetBaselineExtractor configures live baseline fingerprint resolution for generated CVE proposals.
+func (s *VulnScanner) SetBaselineExtractor(fn func(string) string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baselineFn = fn
+}
+
+func (s *VulnScanner) getAuditEngine() *audit.AgentAuditEngine {
+	if s.auditEngine != nil {
+		return s.auditEngine
+	}
+	if s.db != nil {
+		s.auditEngine = audit.NewAgentAuditEngine(s.db, nil, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+		return s.auditEngine
+	}
+	return nil
 }
 
 // NewVulnScanner creates a VulnScanner instance.
@@ -618,6 +646,13 @@ func (s *VulnScanner) ProcessVulnerabilities(vulns []OSVVuln, component, version
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	ae := s.getAuditEngine()
+	resolvedExecComp, isKnownExecComp := mapKnownVulnComponent(component)
+	targetComp := component
+	if isKnownExecComp {
+		targetComp = resolvedExecComp
+	}
+
 	for _, v := range vulns {
 		riskLevel, isCritical := EvaluateCVSS(v)
 
@@ -635,21 +670,80 @@ func (s *VulnScanner) ProcessVulnerabilities(vulns []OSVVuln, component, version
 				}
 			}
 
-			// Create OpsProposal
+			baselineHash := ""
+			if s.baselineFn != nil {
+				baselineHash = s.baselineFn(targetComp)
+			}
+			if baselineHash == "" {
+				baselineHash = model.ComputeDefaultBaseline(targetComp)
+			}
+			actionTarget := targetComp
+			if !isKnownExecComp {
+				actionTarget = ComponentHomeAPI
+			}
+			actionSpecBytes, _ := json.Marshal(OperationSpec{
+				Action: ActionDockerRestart,
+				Target: actionTarget,
+			})
+
 			prop := model.OpsProposal{
+				HouseholdID:      1,
 				ProposalID:       fmt.Sprintf("prop-vuln-%d", time.Now().UnixNano()),
 				Title:            fmt.Sprintf("修复 %s: %s %s 漏洞基线加固", cveID, component, version),
-				Description:      fmt.Sprintf("Google OSV 漏洞情报源预警：%s。\n\n详情：%s", v.Summary, v.Details),
-				TargetComponent:  component,
+				Description:      fmt.Sprintf("Google OSV 漏洞情报源预警（影响依赖 %s %s -> 宿主服务 %s）：%s。\n\n详情：%s", component, version, targetComp, v.Summary, v.Details),
+				TargetComponent:  targetComp,
+				ActionSpec:       string(actionSpecBytes),
+				BaselineHash:     baselineHash,
 				RiskLevel:        riskLevel,
 				EstimatedSeconds: 45,
 				DowntimeSeconds:  2,
-				ExecutionPlan:    fmt.Sprintf("1. 备份当前 %s 镜像与数据快照\n2. 拉取安全补丁版本并就地更新\n3. 执行 10 秒 /health 探针校验，若失败立即回滚", component),
-				RollbackPlan:     fmt.Sprintf("docker rollback %s || restore-snapshot", component),
-				Status:           "AWAITING_APPROVAL",
-				CreatedAt:        time.Now(),
+				ExecutionPlan:    fmt.Sprintf("1. 备份当前 %s 镜像与数据快照\n2. 应用安全补丁版本并重启服务\n3. 执行 10 秒 /health 探针校验", targetComp),
+				RollbackPlan:     fmt.Sprintf("docker rollback %s || restore-snapshot", targetComp),
+				Status:           model.ProposalStatusAwaitingApproval,
+				Version:          1,
+				Revision:         1,
+				CreatedAt:        time.Now().UTC(),
 			}
-			_ = s.db.Create(&prop).Error
+			if err := s.db.Create(&prop).Error; err != nil {
+				GlobalSecurityMetrics.IncDatabaseError()
+				log.Printf("[vuln-scanner] failed to persist proposal for %s: %v", cveID, err)
+			} else if ae != nil {
+				_, runCtx, _ := ae.StartRun(context.Background(), audit.StartRunInput{
+					HouseholdID:   1,
+					TriggerSource: "vuln_scanner",
+					ActorType:     "system_daemon",
+					ActorID:       "vuln-scanner",
+					Action:        "vuln.proposal.create",
+					Target:        targetComp,
+					Component:     targetComp,
+					Decision:      model.AuditDecisionRequireApproval,
+					RiskLevel:     riskLevel,
+					ProposalID:    prop.ProposalID,
+					Summary:       prop.Title,
+				})
+				_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+					EventType:  model.AuditEventRiskAssessed,
+					Action:     "vuln.cve.assessed",
+					Target:     targetComp,
+					Component:  targetComp,
+					RiskLevel:  riskLevel,
+					ProposalID: prop.ProposalID,
+					Evidence:   map[string]interface{}{"cve": cveID, "package": component, "version": version},
+					Result:     riskLevel,
+				})
+				_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+					EventType:    model.AuditEventProposalCreated,
+					Action:       "vuln.proposal.create",
+					Target:       targetComp,
+					Component:    targetComp,
+					Decision:     model.AuditDecisionRequireApproval,
+					RiskLevel:    riskLevel,
+					ProposalID:   prop.ProposalID,
+					AfterState:   map[string]interface{}{"status": prop.Status, "baseline_hash": prop.BaselineHash},
+					Result:       "CREATED",
+					MirrorLegacy: true,
+				})
+			}
 		}
 
 		// Dispatch email alert if high/critical risk and enabled
@@ -667,5 +761,28 @@ func (s *VulnScanner) ProcessVulnerabilities(vulns []OSVVuln, component, version
 		}
 
 		log.Printf("[vuln-scanner] Detected %s for %s (%s), risk=%s, critical=%v", cveID, component, version, riskLevel, isCritical)
+	}
+}
+
+func mapKnownVulnComponent(pkg string) (string, bool) {
+	lower := strings.ToLower(strings.TrimSpace(pkg))
+	if canon, err := ResolveComponent(lower); err == nil {
+		return canon, true
+	}
+	switch {
+	case strings.Contains(lower, "gin"), strings.Contains(lower, "gorm"), strings.Contains(lower, "sqlite"), strings.Contains(lower, "golang"), lower == "go":
+		return ComponentHomeAPI, true
+	case strings.Contains(lower, "opencv"), strings.Contains(lower, "onnx"), strings.Contains(lower, "python"), strings.Contains(lower, "vision"):
+		return ComponentHomeVision, true
+	case strings.Contains(lower, "react"), strings.Contains(lower, "vite"), strings.Contains(lower, "nginx"), strings.Contains(lower, "web"):
+		return ComponentHomeWeb, true
+	case strings.Contains(lower, "frigate"):
+		return ComponentFrigate, true
+	case strings.Contains(lower, "mosquitto"), strings.Contains(lower, "mqtt"):
+		return ComponentMosquitto, true
+	case strings.Contains(lower, "openresty"), strings.Contains(lower, "waf"):
+		return ComponentOpenResty, true
+	default:
+		return pkg, false
 	}
 }

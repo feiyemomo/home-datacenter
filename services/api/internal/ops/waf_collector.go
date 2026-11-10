@@ -14,6 +14,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/security"
@@ -45,13 +46,46 @@ type WAFCollector struct {
 	db         *gorm.DB
 	bus        *eventbus.Bus
 	defenseMgr *security.DefenseManager
-	cfg        WAFCollectorConfig
-	executor   OperationExecutor
+	cfg         WAFCollectorConfig
+	executor    OperationExecutor
+	auditEngine *audit.AgentAuditEngine
 
 	mu           sync.Mutex
+	syncFileMu   sync.Mutex
 	lastSyncedID int64
 	running      bool
 	cancel       context.CancelFunc
+}
+
+// SetAuditEngine configures the unified AgentAuditEngine on WAFCollector.
+func (c *WAFCollector) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.auditEngine = ae
+}
+
+func (c *WAFCollector) getAuditEngine() *audit.AgentAuditEngine {
+	c.mu.Lock()
+	ae := c.auditEngine
+	ex := c.executor
+	db := c.db
+	bus := c.bus
+	c.mu.Unlock()
+	if ae != nil {
+		return ae
+	}
+	if defExec, ok := ex.(*DefaultOperationExecutor); ok && defExec != nil {
+		if exAE := defExec.GetAuditEngine(); exAE != nil {
+			c.SetAuditEngine(exAE)
+			return exAE
+		}
+	}
+	if db != nil {
+		created := audit.NewAgentAuditEngine(db, bus, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+		c.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // SetExecutor configures the OperationExecutor for safe WAF operations.
@@ -359,6 +393,44 @@ func (c *WAFCollector) SyncBannedIPs(bannedEntries []security.BanEntry) error {
 		return nil // directory not present
 	}
 
+	c.syncFileMu.Lock()
+	defer c.syncFileMu.Unlock()
+
+	ae := c.getAuditEngine()
+	runCtx := context.Background()
+	var syncRunID string
+	if ae != nil {
+		rID, rCtx, sErr := ae.StartRun(runCtx, audit.StartRunInput{
+			HouseholdID:   1,
+			TriggerSource: "waf_collector",
+			ActorType:     "system_daemon",
+			ActorID:       "waf-collector",
+			Action:        "waf.ipblack.sync",
+			Target:        Component1PWAF,
+			Component:     Component1PWAF,
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskHigh,
+		})
+		if sErr != nil {
+			return sErr
+		}
+		syncRunID = rID
+		runCtx = rCtx
+		if _, preErr := ae.RecordPreMutation(runCtx, audit.EmitEventInput{
+			EventType:     model.AuditEventExecutionStarted,
+			Action:        "waf.ipblack.sync",
+			Target:        Component1PWAF,
+			Component:     Component1PWAF,
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskHigh,
+			Parameters:    map[string]interface{}{"ban_count": len(bannedEntries)},
+			Result:        "STARTED",
+			FailurePolicy: audit.PolicyFailClosed,
+		}); preErr != nil {
+			return preErr
+		}
+	}
+
 	type wafRuleItem struct {
 		State string `json:"state"`
 		Rule  string `json:"rule"`
@@ -397,26 +469,78 @@ func (c *WAFCollector) SyncBannedIPs(bannedEntries []security.BanEntry) error {
 	fileContent := wafRuleFile{Rules: mergedRules}
 	data, err := json.MarshalIndent(fileContent, "", "  ")
 	if err != nil {
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+				EventType: model.AuditEventExecutionFailed, Action: "waf.ipblack.sync",
+				Target: Component1PWAF, Component: Component1PWAF, RiskLevel: model.AuditRiskHigh,
+				Result: "FAILED", ErrorCode: err.Error(), FinalRunStatus: model.AuditRunStatusFailed,
+			}, nil)
+		}
 		return err
 	}
 
 	tmpPath := rulesPath + ".tmp"
 	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+				EventType: model.AuditEventExecutionFailed, Action: "waf.ipblack.sync",
+				Target: Component1PWAF, Component: Component1PWAF, RiskLevel: model.AuditRiskHigh,
+				Result: "FAILED", ErrorCode: err.Error(), FinalRunStatus: model.AuditRunStatusFailed,
+			}, nil)
+		}
 		return fmt.Errorf("failed to write temp %s: %w", tmpPath, err)
 	}
 	if err := os.Rename(tmpPath, rulesPath); err != nil {
 		_ = os.Remove(tmpPath)
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+				EventType: model.AuditEventExecutionFailed, Action: "waf.ipblack.sync",
+				Target: Component1PWAF, Component: Component1PWAF, RiskLevel: model.AuditRiskHigh,
+				Result: "FAILED", ErrorCode: err.Error(), FinalRunStatus: model.AuditRunStatusFailed,
+			}, nil)
+		}
 		return fmt.Errorf("failed to atomically replace %s: %w", rulesPath, err)
 	}
 
+	if ae != nil {
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType:  model.AuditEventExecutionStepCompleted,
+			Action:     "waf.ipblack.write",
+			Target:     Component1PWAF,
+			Component:  Component1PWAF,
+			RiskLevel:  model.AuditRiskMedium,
+			AfterState: map[string]interface{}{"rules_count": len(mergedRules)},
+			Result:     "WRITTEN",
+		})
+	}
+
 	// Trigger OpenResty HUP reload strictly via OperationExecutor (R4-24)
-	if err := c.reloadOpenResty(); err != nil {
+	if err := c.reloadOpenRestyWithContext(runCtx); err != nil {
 		log.Printf("[waf-collector] warning: failed to reload openresty via OperationExecutor: %v", err)
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+				EventType:      model.AuditEventExecutionFailed,
+				Action:         "waf.ipblack.sync",
+				Target:         Component1PWAF,
+				Component:      Component1PWAF,
+				RiskLevel:      model.AuditRiskHigh,
+				Result:         "FAILED",
+				ErrorCode:      err.Error(),
+				FinalRunStatus: model.AuditRunStatusFailed,
+				RunSummary:     fmt.Sprintf("synced %d rules to disk, reload failed: %v", len(mergedRules), err),
+			}, nil)
+		}
+	} else if ae != nil {
+		_ = ae.FinishRun(syncRunID, model.AuditRunStatusCompleted, fmt.Sprintf("synced %d rules", len(mergedRules)), "")
 	}
 	return nil
 }
 
 func (c *WAFCollector) reloadOpenResty() error {
+	return c.reloadOpenRestyWithContext(context.Background())
+}
+
+func (c *WAFCollector) reloadOpenRestyWithContext(parent context.Context) error {
 	c.mu.Lock()
 	exec := c.executor
 	c.mu.Unlock()
@@ -425,7 +549,7 @@ func (c *WAFCollector) reloadOpenResty() error {
 		return fmt.Errorf("operation executor is not configured on WAFCollector; refusing raw docker socket bypass")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
 	_, err := exec.Execute(ctx, OperationSpec{
 		Action: ActionWAFReload,

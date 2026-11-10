@@ -20,8 +20,10 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -62,24 +64,38 @@ const (
 
 // Canonical component names
 const (
-	ComponentHomeAPI    = "home-api"
-	ComponentHomeWeb    = "home-web"
-	ComponentHomeVision = "home-vision"
-	ComponentFrigate    = "frigate"
-	ComponentMosquitto  = "mosquitto"
-	ComponentOpenResty  = "openresty"
-	Component1PWAF      = "1pwaf"
+	ComponentHomeAPI      = "home-api"
+	ComponentHomeWeb      = "home-web"
+	ComponentHomeVision   = "home-vision"
+	ComponentFrigate      = "frigate"
+	ComponentMosquitto    = "mosquitto"
+	ComponentOpenResty    = "openresty"
+	Component1PWAF        = "1pwaf"
+	ComponentCloudflared  = "home-cloudflared"
+	ComponentH3CKeepalive = "home-h3c-keepalive"
+	ComponentNewAPI       = "home-new-api"
+	ComponentOpsAgent     = "home-ops-agent"
+	ComponentHomeBackup   = "home-backup"
+	ComponentMihomo       = "mihomo"
+	ComponentTailscale    = "tailscale"
 )
 
 // coreComponentWhitelist defines the strict bidirectional core component boundary.
 var coreComponentWhitelist = map[string]bool{
-	ComponentHomeAPI:    true,
-	ComponentHomeWeb:    true,
-	ComponentHomeVision: true,
-	ComponentFrigate:    true,
-	ComponentMosquitto:  true,
-	ComponentOpenResty:  true,
-	Component1PWAF:      true,
+	ComponentHomeAPI:      true,
+	ComponentHomeWeb:      true,
+	ComponentHomeVision:   true,
+	ComponentFrigate:      true,
+	ComponentMosquitto:    true,
+	ComponentOpenResty:    true,
+	Component1PWAF:        true,
+	ComponentCloudflared:  true,
+	ComponentH3CKeepalive: true,
+	ComponentNewAPI:       true,
+	ComponentOpsAgent:     true,
+	ComponentHomeBackup:   true,
+	ComponentMihomo:       true,
+	ComponentTailscale:    true,
 }
 
 // componentAliases maps user, LLM, or container aliases to canonical names.
@@ -122,17 +138,38 @@ var componentAliases = map[string]string{
 	"1pwaf":         Component1PWAF,
 	"waf":           Component1PWAF,
 	"openresty-waf": Component1PWAF,
+
+	// cloudflared / h3c / new-api / ops-agent / backup / vpn
+	"home-cloudflared":   ComponentCloudflared,
+	"cloudflared":        ComponentCloudflared,
+	"home-h3c-keepalive": ComponentH3CKeepalive,
+	"h3c":                ComponentH3CKeepalive,
+	"home-new-api":       ComponentNewAPI,
+	"new-api":            ComponentNewAPI,
+	"home-ops-agent":     ComponentOpsAgent,
+	"ops-agent":          ComponentOpsAgent,
+	"home-backup":        ComponentHomeBackup,
+	"backup":             ComponentHomeBackup,
+	"mihomo":             ComponentMihomo,
+	"tailscale":          ComponentTailscale,
 }
 
 // canonicalContainerNames maps canonical component names to Docker container names.
 var canonicalContainerNames = map[string]string{
-	ComponentHomeAPI:    "home-api",
-	ComponentHomeWeb:    "home-web",
-	ComponentHomeVision: "home-vision",
-	ComponentFrigate:    "home-frigate",
-	ComponentMosquitto:  "home-mosquitto",
-	ComponentOpenResty:  "1Panel-openresty-WuDU",
-	Component1PWAF:      "1Panel-openresty-WuDU",
+	ComponentHomeAPI:      "home-api",
+	ComponentHomeWeb:      "home-web",
+	ComponentHomeVision:   "home-vision",
+	ComponentFrigate:      "home-frigate",
+	ComponentMosquitto:    "home-mosquitto",
+	ComponentOpenResty:    "1Panel-openresty-WuDU",
+	Component1PWAF:        "1Panel-openresty-WuDU",
+	ComponentCloudflared:  "home-cloudflared",
+	ComponentH3CKeepalive: "home-h3c-keepalive",
+	ComponentNewAPI:       "home-new-api",
+	ComponentOpsAgent:     "home-ops-agent",
+	ComponentHomeBackup:   "home-backup",
+	ComponentMihomo:       "mihomo",
+	ComponentTailscale:    "tailscale",
 }
 
 // identifierRegex strictly restricts database identifiers (table/index names) to prevent SQL injection.
@@ -206,8 +243,30 @@ type DefaultOperationExecutor struct {
 
 	leaseManager *RecoveryLeaseManager
 	recoveryFSM  *ContainerRecoveryFSM
+	auditEngine  *audit.AgentAuditEngine
 	componentLocks sync.Map // canonical string -> *sync.Mutex
 	mu             sync.RWMutex
+}
+
+// SetAuditEngine attaches a unified AgentAuditEngine to the executor.
+func (e *DefaultOperationExecutor) SetAuditEngine(engine *audit.AgentAuditEngine) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auditEngine = engine
+}
+
+// GetAuditEngine returns the configured AgentAuditEngine (if any).
+func (e *DefaultOperationExecutor) GetAuditEngine() *audit.AgentAuditEngine {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.auditEngine
+}
+
+// WithAuditEngine injects an AgentAuditEngine during executor construction.
+func WithAuditEngine(engine *audit.AgentAuditEngine) ExecutorOption {
+	return func(e *DefaultOperationExecutor) {
+		e.auditEngine = engine
+	}
 }
 
 // SetRecoveryFSM attaches the authoritative ContainerRecoveryFSM for pre-execution safety checks.
@@ -313,6 +372,9 @@ func NewOperationExecutor(
 	}
 	if exec.leaseManager == nil && db != nil {
 		exec.leaseManager = NewRecoveryLeaseManager(db)
+	}
+	if exec.auditEngine == nil && db != nil {
+		exec.auditEngine = audit.NewAgentAuditEngine(db, bus, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
 	}
 	if exec.baselineExtractor == nil {
 		exec.baselineExtractor = func(target string) string {
@@ -476,6 +538,7 @@ func isAmbiguousExecutionError(err error, ctxErr error) bool {
 func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSpec) (*ExecutionResult, error) {
 	startTime := time.Now()
 	opID := GenerateOperationID("exec")
+	ae := e.GetAuditEngine()
 
 	if spec.TimeoutSec > 0 {
 		var cancel context.CancelFunc
@@ -494,8 +557,49 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		return nil, err
 	}
 
+	// Ensure every Execute invocation is correlated inside an AgentAuditRun (without replacing caller runs).
+	if ae != nil {
+		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
+			_, newCtx, rErr := ae.StartRun(ctx, audit.StartRunInput{
+				TriggerSource: "executor",
+				ActorType:     "system_daemon",
+				ActorID:       "operation-executor",
+				Action:        spec.Action,
+				Target:        canonical,
+				Component:     canonical,
+				RiskLevel:     model.AuditRiskHigh,
+				OperationID:   opID,
+			})
+			ctx = newCtx
+			if rErr != nil {
+				return &ExecutionResult{
+					Success:    false,
+					Action:     spec.Action,
+					Target:     canonical,
+					Error:      rErr.Error(),
+					ExecutedAt: startTime,
+				}, rErr
+			}
+		}
+	}
+
 	// 2.0 If no mock runner is installed (production path), enforce closed action whitelist
 	if e.dockerRunner == nil && !isAllowedProductionAction(spec.Action) {
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         spec.Action,
+				Target:         canonical,
+				Component:      canonical,
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskHigh,
+				OperationID:    opID,
+				Parameters:     spec.Params,
+				Result:         "BLOCKED",
+				ErrorCode:      ErrActionNotSupported.Error(),
+				FinalRunStatus: model.AuditRunStatusBlocked,
+			})
+		}
 		return &ExecutionResult{
 			Success:    false,
 			Action:     spec.Action,
@@ -597,7 +701,9 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	}
 
 	// 3.5 Final fencing gate right before external Docker/OS mutation (R4-06)
+	var fencingGen int64
 	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+		fencingGen = guard.Grant.FencingGeneration
 		if fErr := guard.VerifyBeforeMutation(0); fErr != nil {
 			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
 				OperationID:       opID,
@@ -629,6 +735,35 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}, err
 	}
 
+	// 3.8 Pre-execution Fail-Closed Audit Gate (HC-1): external side-effects MUST NOT run if audit fails.
+	if ae != nil {
+		if _, preErr := ae.RecordPreMutation(ctx, audit.EmitEventInput{
+			EventType:         model.AuditEventExecutionStarted,
+			Action:            spec.Action,
+			Target:            canonical,
+			Component:         canonical,
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskHigh,
+			OperationID:       opID,
+			FencingGeneration: fencingGen,
+			Parameters:        spec.Params,
+			BeforeState:       map[string]interface{}{"baseline_hash": spec.BaselineHash},
+			Result:            "STARTED",
+			FailurePolicy:     audit.PolicyFailClosed,
+		}); preErr != nil {
+			_ = releaseOwnLease()
+			return &ExecutionResult{
+				Success:      false,
+				Action:       spec.Action,
+				Target:       canonical,
+				BaselineHash: spec.BaselineHash,
+				DurationMs:   time.Since(startTime).Milliseconds(),
+				Error:        preErr.Error(),
+				ExecutedAt:   startTime,
+			}, preErr
+		}
+	}
+
 	// 4. Dispatch the structured action
 	out, err := e.dispatchAction(ctx, spec, canonical)
 	if err != nil {
@@ -641,19 +776,41 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				Component:   canonical,
 				Message:     fmt.Sprintf("ambiguous mutation failure (%v); blocking automatic rollback/retry", err),
 			})
-			_ = e.recordExecutionHistory(canonical, spec.Action, "execution_unknown", out, fmt.Sprintf("ambiguous failure: %v", err))
+			if ae != nil {
+				_, _ = ae.RecordPostMutation(ctx, audit.EmitEventInput{
+					EventType:         model.AuditEventExecutionUnknown,
+					Action:            spec.Action,
+					Target:            canonical,
+					Component:         canonical,
+					Decision:          model.AuditDecisionAllow,
+					RiskLevel:         model.AuditRiskCritical,
+					OperationID:       opID,
+					FencingGeneration: fencingGen,
+					Result:            "EXECUTION_UNKNOWN",
+					ErrorCode:         err.Error(),
+					DurationMs:        time.Since(startTime).Milliseconds(),
+					Evidence:          map[string]interface{}{"output": redact.SensitiveString(out)},
+					FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
+					MirrorLegacy:      true,
+				}, nil)
+			}
+			histErr := e.recordExecutionHistory(canonical, spec.Action, "execution_unknown", out, fmt.Sprintf("ambiguous failure: %v", err))
 			_ = releaseOwnLease()
+			combErr := fmt.Errorf("%w: %v", ErrExecutionAmbiguous, err)
+			if histErr != nil {
+				combErr = errors.Join(combErr, histErr)
+			}
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
 				Target:       canonical,
-				Output:       out,
+				Output:       redact.SensitiveString(out),
 				BaselineHash: spec.BaselineHash,
 				DurationMs:   time.Since(startTime).Milliseconds(),
 				RolledBack:   false,
 				Error:        fmt.Sprintf("%s: %v", ErrExecutionAmbiguous.Error(), err),
 				ExecutedAt:   startTime,
-			}, fmt.Errorf("%w: %v", ErrExecutionAmbiguous, err)
+			}, combErr
 		}
 
 		// Definite failure -> attempt atomic rollback if specified with decoupled timeout
@@ -663,31 +820,58 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			if guard := RecoveryLeaseFromContext(ctx); guard != nil {
 				rbCtx = WithRecoveryLease(rbCtx, guard)
 			}
+			if sess, ok := audit.SessionFromContext(ctx); ok {
+				rbCtx = audit.ContextWithSession(rbCtx, sess)
+			}
 			rbErr = e.ExecuteRollback(rbCtx, *spec.RollbackSpec)
 			rbCancel()
 		}
 		duration := time.Since(startTime).Milliseconds()
 		status := "failed"
+		finalRunStatus := model.AuditRunStatusFailed
 		if spec.RollbackSpec != nil {
 			if rbErr == nil {
 				status = "rolled_back"
+				finalRunStatus = model.AuditRunStatusRolledBack
 			} else {
 				status = "rollback_failed"
 			}
 		}
-		_ = e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("execution failed: %v; rollback err: %v", err, rbErr))
+		var postAuditErr error
+		if ae != nil {
+			_, postAuditErr = ae.RecordPostMutation(ctx, audit.EmitEventInput{
+				EventType:         model.AuditEventExecutionFailed,
+				Action:            spec.Action,
+				Target:            canonical,
+				Component:         canonical,
+				Decision:          model.AuditDecisionAllow,
+				RiskLevel:         model.AuditRiskHigh,
+				OperationID:       opID,
+				FencingGeneration: fencingGen,
+				Result:            strings.ToUpper(status),
+				ErrorCode:         err.Error(),
+				DurationMs:        duration,
+				Evidence:          map[string]interface{}{"output": redact.SensitiveString(out), "rollback_err": fmt.Sprintf("%v", rbErr)},
+				FinalRunStatus:    finalRunStatus,
+				MirrorLegacy:      true,
+			}, nil)
+		}
+		histErr := e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("execution failed: %v; rollback err: %v", err, rbErr))
 		_ = releaseOwnLease()
 
 		errDetails := err.Error()
 		if rbErr != nil {
 			errDetails = fmt.Sprintf("%s (rollback also failed: %v)", errDetails, rbErr)
 		}
+		if postAuditErr != nil || histErr != nil {
+			err = errors.Join(err, postAuditErr, histErr)
+		}
 
 		return &ExecutionResult{
 			Success:      false,
 			Action:       spec.Action,
 			Target:       canonical,
-			Output:       out,
+			Output:       redact.SensitiveString(out),
 			BaselineHash: spec.BaselineHash,
 			DurationMs:   duration,
 			RolledBack:   spec.RollbackSpec != nil && rbErr == nil,
@@ -697,8 +881,42 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	}
 
 	// 5. Post-mutation 15s health probe polling
+	if ae != nil {
+		_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+			EventType:         model.AuditEventHealthCheckStarted,
+			Action:            spec.Action,
+			Target:            canonical,
+			Component:         canonical,
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskMedium,
+			OperationID:       opID,
+			FencingGeneration: fencingGen,
+			Result:            "PROBING",
+		})
+	}
 	probeErr := e.pollHealth(ctx, canonical)
 	duration := time.Since(startTime).Milliseconds()
+	if ae != nil {
+		hcRes := "HEALTHY"
+		hcErr := ""
+		if probeErr != nil {
+			hcRes = "UNHEALTHY"
+			hcErr = probeErr.Error()
+		}
+		_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+			EventType:         model.AuditEventHealthCheckCompleted,
+			Action:            spec.Action,
+			Target:            canonical,
+			Component:         canonical,
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskMedium,
+			OperationID:       opID,
+			FencingGeneration: fencingGen,
+			Result:            hcRes,
+			ErrorCode:         hcErr,
+			DurationMs:        duration,
+		})
+	}
 
 	if probeErr != nil {
 		var rbErr error
@@ -707,30 +925,57 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			if guard := RecoveryLeaseFromContext(ctx); guard != nil {
 				rbCtx = WithRecoveryLease(rbCtx, guard)
 			}
+			if sess, ok := audit.SessionFromContext(ctx); ok {
+				rbCtx = audit.ContextWithSession(rbCtx, sess)
+			}
 			rbErr = e.ExecuteRollback(rbCtx, *spec.RollbackSpec)
 			rbCancel()
 		}
 		status := "failed"
+		finalRunStatus := model.AuditRunStatusFailed
 		if spec.RollbackSpec != nil {
 			if rbErr == nil {
 				status = "rolled_back"
+				finalRunStatus = model.AuditRunStatusRolledBack
 			} else {
 				status = "rollback_failed"
 			}
 		}
-		_ = e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("health probe failed: %v; rollback err: %v", probeErr, rbErr))
+		var postAuditErr error
+		if ae != nil {
+			_, postAuditErr = ae.RecordPostMutation(ctx, audit.EmitEventInput{
+				EventType:         model.AuditEventExecutionFailed,
+				Action:            spec.Action,
+				Target:            canonical,
+				Component:         canonical,
+				Decision:          model.AuditDecisionAllow,
+				RiskLevel:         model.AuditRiskHigh,
+				OperationID:       opID,
+				FencingGeneration: fencingGen,
+				Result:            strings.ToUpper(status),
+				ErrorCode:         probeErr.Error(),
+				DurationMs:        duration,
+				Evidence:          map[string]interface{}{"output": redact.SensitiveString(out), "rollback_err": fmt.Sprintf("%v", rbErr)},
+				FinalRunStatus:    finalRunStatus,
+				MirrorLegacy:      true,
+			}, nil)
+		}
+		histErr := e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("health probe failed: %v; rollback err: %v", probeErr, rbErr))
 		_ = releaseOwnLease()
 
 		errDetails := fmt.Sprintf("health probe failed: %v", probeErr)
 		if rbErr != nil {
 			errDetails = fmt.Sprintf("%s (rollback also failed: %v)", errDetails, rbErr)
 		}
+		if postAuditErr != nil || histErr != nil {
+			probeErr = errors.Join(probeErr, postAuditErr, histErr)
+		}
 
 		return &ExecutionResult{
 			Success:      false,
 			Action:       spec.Action,
 			Target:       canonical,
-			Output:       out,
+			Output:       redact.SensitiveString(out),
 			BaselineHash: spec.BaselineHash,
 			DurationMs:   duration,
 			RolledBack:   spec.RollbackSpec != nil && rbErr == nil,
@@ -739,20 +984,49 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}, probeErr
 	}
 
-	// 6. Audit persistence & lease release (R4-05, R4-08)
+	// 6. Post-execution audit persistence & lease release (HC-2: never fake SUCCESS if post-audit fails)
+	var postAuditErr error
+	if ae != nil {
+		_, postAuditErr = ae.RecordPostMutation(ctx, audit.EmitEventInput{
+			EventType:         model.AuditEventExecutionCompleted,
+			Action:            spec.Action,
+			Target:            canonical,
+			Component:         canonical,
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskHigh,
+			OperationID:       opID,
+			FencingGeneration: fencingGen,
+			AfterState:        map[string]interface{}{"health": "healthy", "output": redact.SensitiveString(out)},
+			Result:            "SUCCESS",
+			DurationMs:        duration,
+			FinalRunStatus:    model.AuditRunStatusCompleted,
+			MirrorLegacy:      true,
+		}, func(cause error) {
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID: opID,
+				EventType:   "ops.audit.post_commit_failed",
+				Severity:    "critical",
+				Component:   canonical,
+				Message:     fmt.Sprintf("post-execution audit failed after mutation: %v", cause),
+			})
+		})
+	}
 	histErr := e.recordExecutionHistory(canonical, spec.Action, "success", out, "health probe passed")
 	relErr := releaseOwnLease()
-	if histErr != nil || relErr != nil {
-		combinedErr := errors.Join(histErr, relErr)
+	if postAuditErr != nil || histErr != nil || relErr != nil {
+		if postAuditErr != nil || histErr != nil {
+			GlobalSecurityMetrics.IncExecutionUnknown()
+		}
+		combinedErr := fmt.Errorf("%w: lifecycle finalization failed (%v)", ErrExecutionAmbiguous, errors.Join(postAuditErr, histErr, relErr))
 		return &ExecutionResult{
 			Success:      false,
 			Action:       spec.Action,
 			Target:       canonical,
-			Output:       out,
+			Output:       redact.SensitiveString(out),
 			BaselineHash: spec.BaselineHash,
 			DurationMs:   duration,
 			RolledBack:   false,
-			Error:        fmt.Sprintf("execution completed but lifecycle finalization failed: %v", combinedErr),
+			Error:        combinedErr.Error(),
 			ExecutedAt:   startTime,
 		}, combinedErr
 	}
@@ -761,7 +1035,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		Success:      true,
 		Action:       spec.Action,
 		Target:       canonical,
-		Output:       out,
+		Output:       redact.SensitiveString(out),
 		BaselineHash: spec.BaselineHash,
 		DurationMs:   duration,
 		RolledBack:   false,
@@ -771,6 +1045,10 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 
 // ExecuteRollback executes the inverse rollback action specification with component locking & fencing checks.
 func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollbackSpec OperationSpec) error {
+	ae := e.GetAuditEngine()
+	rbOpID := GenerateOperationID("rollback")
+	rbStart := time.Now()
+
 	if err := ValidateSpecSafety(rollbackSpec); err != nil {
 		return err
 	}
@@ -778,6 +1056,36 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 	canonical, err := ResolveComponent(rollbackSpec.Target)
 	if err != nil {
 		return err
+	}
+
+	if ae != nil {
+		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
+			_, newCtx, _ := ae.StartRun(ctx, audit.StartRunInput{
+				TriggerSource: "rollback",
+				ActorType:     "system_daemon",
+				ActorID:       "operation-executor",
+				Action:        "rollback." + rollbackSpec.Action,
+				Target:        canonical,
+				Component:     canonical,
+				RiskLevel:     model.AuditRiskHigh,
+				OperationID:   rbOpID,
+			})
+			ctx = newCtx
+		}
+		if _, preErr := ae.RecordPreMutation(ctx, audit.EmitEventInput{
+			EventType:     model.AuditEventRollbackStarted,
+			Action:        "rollback." + rollbackSpec.Action,
+			Target:        canonical,
+			Component:     canonical,
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskHigh,
+			OperationID:   rbOpID,
+			Parameters:    rollbackSpec.Params,
+			Result:        "STARTED",
+			FailurePolicy: audit.PolicyFailClosed,
+		}); preErr != nil {
+			return preErr
+		}
 	}
 
 	if e.dockerRunner == nil && !isAllowedProductionAction(rollbackSpec.Action) {
@@ -791,13 +1099,43 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 		ctx = withComponentLockHeld(ctx, canonical)
 	}
 
+	var fencingGen int64
 	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+		fencingGen = guard.Grant.FencingGeneration
 		if err := guard.VerifyBeforeMutation(0); err != nil {
 			return err
 		}
 	}
 
-	_, err = e.dispatchAction(ctx, rollbackSpec, canonical)
+	out, err := e.dispatchAction(ctx, rollbackSpec, canonical)
+	durMs := time.Since(rbStart).Milliseconds()
+	if ae != nil {
+		evType := model.AuditEventRollbackCompleted
+		resStr := "ROLLED_BACK"
+		errStr := ""
+		if err != nil {
+			evType = model.AuditEventExecutionFailed
+			resStr = "ROLLBACK_FAILED"
+			errStr = err.Error()
+		}
+		_, postErr := ae.RecordPostMutation(ctx, audit.EmitEventInput{
+			EventType:         evType,
+			Action:            "rollback." + rollbackSpec.Action,
+			Target:            canonical,
+			Component:         canonical,
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskHigh,
+			OperationID:       rbOpID,
+			FencingGeneration: fencingGen,
+			Result:            resStr,
+			ErrorCode:         errStr,
+			DurationMs:        durMs,
+			Evidence:          map[string]interface{}{"output": redact.SensitiveString(out)},
+		}, nil)
+		if err == nil && postErr != nil {
+			return errors.Join(ErrExecutionAmbiguous, postErr)
+		}
+	}
 	return err
 }
 
@@ -907,6 +1245,34 @@ func (e *DefaultOperationExecutor) checkProposalSafetyPreconditions(ctx context.
 func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal *model.OpsProposal) (*ExecutionResult, error) {
 	if proposal == nil {
 		return nil, ErrInvalidSpec
+	}
+
+	ae := e.GetAuditEngine()
+	if ae != nil {
+		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
+			hhID := proposal.HouseholdID
+			if hhID == 0 {
+				hhID = 1
+			}
+			_, newCtx, rErr := ae.StartRun(ctx, audit.StartRunInput{
+				HouseholdID:   hhID,
+				TriggerSource: "proposal_exec",
+				ActorType:     "user",
+				ActorID:       defaultActorName(proposal.ApprovedBy, "admin"),
+				Action:        extractProposalAction(proposal),
+				Target:        proposal.TargetComponent,
+				Component:     proposal.TargetComponent,
+				Decision:      model.AuditDecisionAllow,
+				RiskLevel:     model.AuditRiskHigh,
+				ProposalID:    proposal.ProposalID,
+				ApprovalID:    proposal.ApprovalDigest,
+				Summary:       proposal.Title,
+			})
+			ctx = newCtx
+			if rErr != nil {
+				return nil, rErr
+			}
+		}
 	}
 
 	var execToken string
@@ -1041,6 +1407,9 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			return abortPreClaimed(err)
 		}
 		fsm := NewProposalFSMWithBus(e.db, e.bus)
+		if ae != nil {
+			fsm.SetAuditEngine(ae)
+		}
 
 		if schedulerPreClaimed {
 			execToken = claimToken
@@ -1069,6 +1438,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 					"executed_at":     utils.NullTime{Time: time.Now().UTC(), Valid: true},
 				},
 				Audit: &ProposalTransitionAudit{
+					Context:     ctx,
 					OperationID: execToken,
 					EventType:   "ops.proposal.executing",
 					Actor:       curr.ApprovedBy,
@@ -1138,6 +1508,9 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		propKey = fmt.Sprintf("%d", proposal.ID)
 	}
 	fsm := NewProposalFSMWithBus(e.db, e.bus)
+	if ae != nil {
+		fsm.SetAuditEngine(ae)
+	}
 
 	// Parse verified OperationSpec
 	spec, err := e.parseProposalSpec(proposal)
@@ -1180,6 +1553,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 						"executed_at":   proposal.ExecutedAt,
 					},
 					Audit: &ProposalTransitionAudit{
+						Context:     ctx,
 						OperationID: execToken,
 						EventType:   "ops.proposal.unknown",
 						Actor:       "executor",
@@ -1234,6 +1608,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 					"executed_at":   proposal.ExecutedAt,
 				},
 				Audit: &ProposalTransitionAudit{
+					Context:     ctx,
 					OperationID: execToken,
 					EventType:   "ops.proposal.failed",
 					Actor:       "executor",
@@ -1265,6 +1640,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 				"executed_at":   proposal.ExecutedAt,
 			},
 			Audit: &ProposalTransitionAudit{
+				Context:     ctx,
 				OperationID: execToken,
 				EventType:   "ops.proposal.executed",
 				Actor:       proposal.ApprovedBy,
@@ -2325,6 +2701,9 @@ func executeVerifiedRollback(
 	log.Printf("[executor] initiating 5-stage verified rollback for %s (backup: %s, cause: %v)",
 		containerName, backupName, triggerCause)
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return fmt.Errorf("rollback aborted before stage 1 delete: %w", err)
+	}
 	// Stage 1: Clean up failed candidate container if present
 	delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", containerName)
 	delReq, _ := http.NewRequestWithContext(rbCtx, http.MethodDelete, delURL, nil)
@@ -2332,6 +2711,9 @@ func executeVerifiedRollback(
 		_ = dResp.Body.Close()
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return fmt.Errorf("rollback aborted before stage 2 rename: %w", err)
+	}
 	// Stage 2: Rename backup container back to original name
 	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", backupName, containerName)
 	renameReq, err := http.NewRequestWithContext(rbCtx, http.MethodPost, renameURL, nil)
@@ -2351,6 +2733,9 @@ func executeVerifiedRollback(
 		_ = renameResp.Body.Close()
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return fmt.Errorf("rollback aborted before stage 3 start: %w", err)
+	}
 	// Stage 3: Start original container
 	startURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
 	startReq, err := http.NewRequestWithContext(rbCtx, http.MethodPost, startURL, nil)
@@ -2507,6 +2892,9 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		return "", fmt.Errorf("recreate container %s failed and original container was restored (5-stage verified rollback): %w", containerName, cause)
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return restoreOriginal(fmt.Errorf("recreate aborted before container create due to lease guard: %w", err))
+	}
 	// 4. Create container with new image preserving full security and runtime configurations
 	createPayload := map[string]interface{}{
 		"Image":        targetImage,
@@ -2544,6 +2932,9 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		return restoreOriginal(fmt.Errorf("create container %s returned %d: %s", containerName, createResp.StatusCode, string(b)))
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return restoreOriginal(fmt.Errorf("recreate aborted before container start due to lease guard: %w", err))
+	}
 	// 5. Start container
 	startURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
 	startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
@@ -2575,6 +2966,9 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		return restoreOriginal(fmt.Errorf("new container %s is not running (status: %s)", containerName, vData.State.Status))
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return "", fmt.Errorf("new container healthy, skipped backup cleanup because lease expired: %w", err)
+	}
 	// 7. Success! New container is verified running. Remove old backup container.
 	delBackupURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", backupName)
 	delBackupReq, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete, delBackupURL, nil)
@@ -2672,6 +3066,24 @@ func ReconcileStartupProposals(db *gorm.DB, executor OperationExecutor) error {
 	}
 
 	return nil
+}
+
+func defaultActorName(v, fallback string) string {
+	trimmed := strings.TrimSpace(v)
+	if trimmed == "" {
+		return fallback
+	}
+	return trimmed
+}
+
+func extractProposalAction(p *model.OpsProposal) string {
+	if p != nil && strings.TrimSpace(p.ActionSpec) != "" {
+		var spec OperationSpec
+		if err := json.Unmarshal([]byte(p.ActionSpec), &spec); err == nil && strings.TrimSpace(spec.Action) != "" {
+			return strings.TrimSpace(spec.Action)
+		}
+	}
+	return "proposal.execute"
 }
 
 // SweepOrphanProposals is a backward-compatible wrapper calling ReconcileStartupProposals.

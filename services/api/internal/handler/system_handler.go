@@ -13,9 +13,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/maintenance"
+	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/ops"
 	"home-datacenter-api/internal/utils"
@@ -46,10 +48,16 @@ type SystemHandler struct {
 
 	onePanelClient   *ops.OnePanelClient
 	fallbackProvider *ops.HostFallbackProvider
+	auditEngine      *audit.AgentAuditEngine
 
 	cachedNodeMu      sync.RWMutex
 	cachedNodeTime    time.Time
 	cachedNodeMetrics *cachedTelemetryMetrics
+}
+
+// SetAuditEngine configures the unified AgentAuditEngine on SystemHandler.
+func (h *SystemHandler) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	h.auditEngine = ae
 }
 
 // NewSystemHandler creates a handler for system status and MQTT debug.
@@ -177,7 +185,38 @@ func (h *SystemHandler) Status(c *gin.Context) {
 //
 //	Route: POST /api/v1/system/clean-cache
 func (h *SystemHandler) CleanCache(c *gin.Context) {
+	hhID := c.GetUint("household_id")
+	if hhID == 0 {
+		hhID = 1
+	}
 	reclaimed, count, err := maintenance.CleanTranscodeCache(h.recordingsDir)
+	if h.auditEngine != nil {
+		resLabel := "SUCCESS"
+		errStr := ""
+		runSt := model.AuditRunStatusCompleted
+		if err != nil {
+			resLabel = "FAILED"
+			errStr = err.Error()
+			runSt = model.AuditRunStatusFailed
+		}
+		_, _ = h.auditEngine.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "system.cache.clean",
+			Target:         "transcode_cache",
+			Component:      "maintenance",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskLow,
+			AfterState:     map[string]interface{}{"reclaimed_bytes": reclaimed, "deleted_files": count},
+			Result:         resLabel,
+			ErrorCode:      errStr,
+			FinalRunStatus: runSt,
+			MirrorLegacy:   true,
+		})
+	}
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to clean transcode cache")
 		return
@@ -248,6 +287,29 @@ func (h *SystemHandler) Publish(c *gin.Context) {
 	}
 
 	h.mqttClient.Handler().Publish(req.Topic, req.Payload, qos)
+
+	if h.auditEngine != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = h.auditEngine.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "mqtt.publish",
+			Target:         req.Topic,
+			Component:      "mosquitto",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			Parameters:     map[string]interface{}{"topic": req.Topic, "qos": qos, "payload": req.Payload},
+			Result:         "PUBLISHED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
 
 	utils.Success(c, gin.H{
 		"topic":   req.Topic,
@@ -390,6 +452,30 @@ func (h *SystemHandler) UpdateStorageConfig(c *gin.Context) {
 	data, _ := json.MarshalIndent(cfg, "", "  ")
 	_ = os.WriteFile(storageConfigFile, data, 0644)
 
+	if h.auditEngine != nil {
+		hhID := c.GetUint("household_id")
+		if hhID == 0 {
+			hhID = 1
+		}
+		_, _ = h.auditEngine.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "system.storage_config.update",
+			Target:         storageConfigFile,
+			Component:      "maintenance",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			AfterState:     cfg,
+			Parameters:     req,
+			Result:         "UPDATED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
+
 	if h.bus != nil {
 		payload, _ := json.Marshal(map[string]any{
 			"quota_gb":              req.QuotaGB,
@@ -411,7 +497,38 @@ func (h *SystemHandler) UpdateStorageConfig(c *gin.Context) {
 
 // TriggerArchiveSync — POST /api/v1/system/storage/sync-archive
 func (h *SystemHandler) TriggerArchiveSync(c *gin.Context) {
-	if err := os.WriteFile(archiveTriggerFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644); err != nil {
+	hhID := c.GetUint("household_id")
+	if hhID == 0 {
+		hhID = 1
+	}
+	err := os.WriteFile(archiveTriggerFile, []byte(fmt.Sprintf("%d", time.Now().Unix())), 0644)
+	if h.auditEngine != nil {
+		resLabel := "TRIGGERED"
+		errStr := ""
+		runSt := model.AuditRunStatusCompleted
+		if err != nil {
+			resLabel = "FAILED"
+			errStr = err.Error()
+			runSt = model.AuditRunStatusFailed
+		}
+		_, _ = h.auditEngine.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    hhID,
+			TriggerSource:  "api_manual",
+			ActorType:      "user",
+			ActorID:        fmt.Sprintf("uid:%d", c.GetUint("user_id")),
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "system.archive_sync.trigger",
+			Target:         archiveTriggerFile,
+			Component:      "home-backup",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			Result:         resLabel,
+			ErrorCode:      errStr,
+			FinalRunStatus: runSt,
+			MirrorLegacy:   true,
+		})
+	}
+	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to create trigger file")
 		return
 	}

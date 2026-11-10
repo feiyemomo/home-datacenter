@@ -15,6 +15,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/security"
 )
@@ -45,11 +46,35 @@ type SafetyFSM struct {
 	healthProbe string
 	httpClient  *http.Client
 	recoveryFSM *ContainerRecoveryFSM
+	auditEngine *audit.AgentAuditEngine
 
 	mu                sync.Mutex
 	currentState      UpdateFSMState
 	lastTerminalState UpdateFSMState
 	lastRunAt         time.Time
+}
+
+// SetAuditEngine attaches a unified AgentAuditEngine to SafetyFSM.
+func (f *SafetyFSM) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.auditEngine = ae
+}
+
+func (f *SafetyFSM) getAuditEngine() *audit.AgentAuditEngine {
+	f.mu.Lock()
+	ae := f.auditEngine
+	db := f.db
+	f.mu.Unlock()
+	if ae != nil {
+		return ae
+	}
+	if db != nil {
+		created := audit.NewAgentAuditEngine(db, nil, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+		f.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // SetRecoveryFSM wires the ContainerRecoveryFSM so SafetyFSM enforces Fail-Closed
@@ -125,6 +150,39 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 	}
 
 	now := time.Now()
+	ae := f.getAuditEngine()
+	runCtx := ctx
+	if ae != nil {
+		_, rCtx, sErr := ae.StartRun(ctx, audit.StartRunInput{
+			HouseholdID:   1,
+			TriggerSource: "safety_fsm",
+			ActorType:     "system_daemon",
+			ActorID:       "safety-fsm",
+			Action:        "component.safe_update",
+			Target:        component,
+			Component:     component,
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskHigh,
+			Summary:       fmt.Sprintf("Safe update %s (%s -> %s)", component, oldVer, newVer),
+		})
+		if sErr != nil {
+			return sErr
+		}
+		runCtx = rCtx
+		if _, preErr := ae.RecordPreMutation(runCtx, audit.EmitEventInput{
+			EventType:     model.AuditEventExecutionStarted,
+			Action:        "component.safe_update",
+			Target:        component,
+			Component:     component,
+			Decision:      model.AuditDecisionAllow,
+			RiskLevel:     model.AuditRiskHigh,
+			Parameters:    map[string]interface{}{"old_version": oldVer, "new_version": newVer},
+			Result:        "STARTED",
+			FailurePolicy: audit.PolicyFailClosed,
+		}); preErr != nil {
+			return preErr
+		}
+	}
 
 	// Step 1: Physical snapshot of database
 	snapshotPath, err := f.createPhysicalSnapshot(component, now)
@@ -133,8 +191,31 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 		f.currentState = StateFailed
 		f.lastTerminalState = StateFailed
 		f.mu.Unlock()
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+				EventType:      model.AuditEventExecutionFailed,
+				Action:         "component.safe_update.snapshot",
+				Target:         component,
+				Component:      component,
+				RiskLevel:      model.AuditRiskHigh,
+				Result:         "FAILED",
+				ErrorCode:      err.Error(),
+				FinalRunStatus: model.AuditRunStatusFailed,
+			}, nil)
+		}
 		f.recordHistory(component, "快照创建失败中止更新", oldVer, newVer, "failed", "", err.Error(), "VACUUM INTO failed")
 		return fmt.Errorf("pre-update database snapshot failed: %w", err)
+	}
+	if ae != nil {
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType:  model.AuditEventExecutionStepCompleted,
+			Action:     "component.safe_update.snapshot",
+			Target:     component,
+			Component:  component,
+			RiskLevel:  model.AuditRiskMedium,
+			AfterState: map[string]interface{}{"snapshot_path": snapshotPath},
+			Result:     "SNAPSHOT_CREATED",
+		})
 	}
 
 	// Step 2: Apply Component Update
@@ -158,6 +239,18 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 			f.lastTerminalState = StateFailed
 			f.mu.Unlock()
 			log.Printf("[safety-fsm] apply failed: %v", applyErr)
+			if ae != nil {
+				_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+					EventType:      model.AuditEventExecutionFailed,
+					Action:         "component.safe_update.apply",
+					Target:         component,
+					Component:      component,
+					RiskLevel:      model.AuditRiskHigh,
+					Result:         "FAILED",
+					ErrorCode:      applyErr.Error(),
+					FinalRunStatus: model.AuditRunStatusFailed,
+				}, nil)
+			}
 			f.recordHistory(component, "组件更新执行失败", oldVer, newVer, "failed", snapshotPath, applyErr.Error(), "")
 			return applyErr
 		}
@@ -167,6 +260,16 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 	f.mu.Lock()
 	f.currentState = StateProbing
 	f.mu.Unlock()
+	if ae != nil {
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType: model.AuditEventHealthCheckStarted,
+			Action:    "component.safe_update.probe",
+			Target:    component,
+			Component: component,
+			RiskLevel: model.AuditRiskMedium,
+			Result:    "PROBING",
+		})
+	}
 	log.Printf("[safety-fsm] Step 3: Probing health at %s", f.healthProbe)
 
 	probeSuccess := false
@@ -223,10 +326,35 @@ ProbeLoop:
 			f.lastTerminalState = StateFailed
 			f.mu.Unlock()
 
+			if ae != nil {
+				_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+					EventType:      model.AuditEventExecutionFailed,
+					Action:         "component.safe_update",
+					Target:         component,
+					Component:      component,
+					RiskLevel:      model.AuditRiskHigh,
+					Result:         "FAILED",
+					ErrorCode:      fmt.Sprintf("probe failed: %v; rollback omitted", lastProbeErr),
+					FinalRunStatus: model.AuditRunStatusFailed,
+					MirrorLegacy:   true,
+				}, nil)
+			}
 			f.recordHistory(component, "健康检查失败且未定义回滚函数", oldVer, newVer, "failed", snapshotPath,
 				fmt.Sprintf("Probe failed: %v", lastProbeErr), "rollback omitted: no rollback function")
 
 			return fmt.Errorf("component health probe failed (%v); rollback omitted: no rollback function provided", lastProbeErr)
+		}
+
+		if ae != nil {
+			_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+				EventType: model.AuditEventRollbackStarted,
+				Action:    "component.safe_update.rollback",
+				Target:    component,
+				Component: component,
+				RiskLevel: model.AuditRiskHigh,
+				Result:    "ROLLING_BACK",
+				ErrorCode: fmt.Sprintf("%v", lastProbeErr),
+			})
 		}
 
 		var rbErr error
@@ -250,8 +378,26 @@ ProbeLoop:
 		f.mu.Unlock()
 
 		status := "rolled_back"
+		evType := model.AuditEventRollbackCompleted
+		finalStatus := model.AuditRunStatusRolledBack
 		if rbErr != nil {
 			status = "rollback_failed"
+			evType = model.AuditEventExecutionFailed
+			finalStatus = model.AuditRunStatusFailed
+		}
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+				EventType:      evType,
+				Action:         "component.safe_update.rollback",
+				Target:         component,
+				Component:      component,
+				RiskLevel:      model.AuditRiskHigh,
+				Result:         strings.ToUpper(status),
+				ErrorCode:      fmt.Sprintf("%v", rbErr),
+				Evidence:       map[string]interface{}{"probe_err": fmt.Sprintf("%v", lastProbeErr), "snapshot_path": snapshotPath},
+				FinalRunStatus: finalStatus,
+				MirrorLegacy:   true,
+			}, nil)
 		}
 		f.recordHistory(component, "健康检查失败触发自动回滚", oldVer, newVer, status, snapshotPath,
 			fmt.Sprintf("Probe failed: %v", lastProbeErr), fmt.Sprintf("Rollback result: %v", rbErr))
@@ -282,6 +428,31 @@ ProbeLoop:
 	f.lastTerminalState = StateCommitted
 	f.mu.Unlock()
 	log.Printf("[safety-fsm] SUCCESS: Health probe passed for %s %s", component, newVer)
+
+	if ae != nil {
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType: model.AuditEventHealthCheckCompleted,
+			Action:    "component.safe_update.probe",
+			Target:    component,
+			Component: component,
+			RiskLevel: model.AuditRiskMedium,
+			Result:    "HEALTHY",
+		})
+		if _, postErr := ae.RecordPostMutation(runCtx, audit.EmitEventInput{
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "component.safe_update",
+			Target:         component,
+			Component:      component,
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskHigh,
+			AfterState:     map[string]interface{}{"version": newVer, "snapshot_path": snapshotPath},
+			Result:         "COMMITTED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		}, nil); postErr != nil {
+			return fmt.Errorf("%w: safety update succeeded but post-execution audit failed: %v", ErrExecutionAmbiguous, postErr)
+		}
+	}
 
 	f.recordHistory(component, "非繁忙期自动化安全更新成功", oldVer, newVer, "success", snapshotPath,
 		"HTTP 200 OK (latency < 50ms)", "健康探针与业务基线校验 100% 通过，旧版本镜像已标记为可清理。")

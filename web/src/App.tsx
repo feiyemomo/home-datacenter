@@ -36,6 +36,7 @@ const Cameras = lazy(() => import("@/pages/Cameras"));
 const Network = lazy(() => import("@/pages/Network"));
 const DeviceCreate = lazy(() => import("@/pages/DeviceCreate"));
 const Logs = lazy(() => import("@/pages/Logs"));
+const OpsAudit = lazy(() => import("@/pages/OpsAudit"));
 const MqttDebug = lazy(() => import("@/pages/MqttDebug"));
 const Profile = lazy(() => import("@/pages/Profile"));
 const Users = lazy(() => import("@/pages/Users"));
@@ -114,6 +115,7 @@ function AppRoutes() {
                         {/* Admin-only routes */}
                         <Route element={<ProtectedRoute adminOnly />}>
                             <Route path="/logs" element={<Logs />} />
+                            <Route path="/ops/audit" element={<OpsAudit />} />
                             <Route path="/security" element={<Security />} />
                             <Route path="/cameras/new" element={<DeviceCreate />} />
                             <Route path="/users" element={<Users />} />

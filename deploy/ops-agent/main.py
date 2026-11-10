@@ -17,7 +17,27 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, Optional, Tuple, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
+
+from audit_protocol import (
+    AUDIT_GENESIS_HASH,
+    AUDIT_POLICY_VERSION,
+    DECISION_ALLOW,
+    DECISION_DENY,
+    EVENT_RECEIVED,
+    EXECUTION_COMPLETED,
+    EXECUTION_FAILED,
+    EXECUTION_STARTED,
+    HEALTH_CHECK_COMPLETED,
+    RECOVERY_LEASE_ACQUIRED,
+    append_jsonl_audit_stub,
+    compute_event_entry_hash,
+    compute_event_hmac,
+    format_rfc3339_ms,
+    resolve_audit_hmac_keyring,
+    serialize_evidence,
+    serialize_params,
+)
 
 class CoreReportingStatus(enum.Enum):
     RECOVERED_BY_CORE = "RECOVERED_BY_CORE"  # Go Core executed recovery and verified health
@@ -381,6 +401,22 @@ def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
     if mqtt_pass and (mqtt_pass.lower() in WEAK_SECRETS_BLACKLIST or len(mqtt_pass) < 6):
         errors.append("MQTT_PASSWORD is weak or placeholder")
 
+    # 5. OPS_AUDIT_HMAC_KEY / OPS_AUDIT_HMAC_KEYS check (external audit signing secret)
+    raw_audit_key = os.environ.get("OPS_AUDIT_HMAC_KEY", "").strip()
+    raw_audit_keys = os.environ.get("OPS_AUDIT_HMAC_KEYS", "").strip()
+    if raw_audit_key:
+        if raw_audit_key.lower() in WEAK_SECRETS_BLACKLIST or len(raw_audit_key) < 32:
+            errors.append("OPS_AUDIT_HMAC_KEY is weak or less than 32 characters")
+    elif raw_audit_keys:
+        kid_check, ring_check = resolve_audit_hmac_keyring()
+        if not kid_check or not ring_check:
+            errors.append("OPS_AUDIT_HMAC_KEYS contains no valid >=32-byte key")
+    else:
+        logger.warning(
+            "OPS_AUDIT_HMAC_KEY is not configured in production: "
+            "v5 offline cryptographic audit records will fail closed until configured."
+        )
+
     if errors:
         msg = f"FAIL-FAST BOOT GUARD: {'; '.join(errors)}. Refusing to boot in production."
         logger.critical(msg)
@@ -539,6 +575,7 @@ class HomeOpsAgent:
                 await asyncio.sleep(10)
                 continue
 
+            writer = None
             try:
                 reader, writer = await asyncio.open_unix_connection(sock_path)
                 since_time = self._last_docker_event_time
@@ -607,6 +644,13 @@ class HomeOpsAgent:
             except Exception as e:
                 logger.debug(f"Docker socket connection notice: {e}. Reconnecting in 5s...")
                 await asyncio.sleep(5)
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
 
     async def _docker_event_processor(self) -> None:
         """
@@ -655,6 +699,9 @@ class HomeOpsAgent:
                                     )
                                     continue
                                 db_path_auth = getattr(self.config, "db_path", "/data/sqlite/app.db")
+                                auth_run_id = f"run-pyauth-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+                                auth_corr_id = f"corr-{uuid.uuid4().hex[:8]}"
+                                auth_op_id = f"pyauth-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
                                 lease_ok, lease_tok, fencing_gen = self._acquire_recovery_lease_grant(canonical_auth, db_path_auth)
                                 if not lease_ok:
                                     logger.critical(
@@ -666,6 +713,23 @@ class HomeOpsAgent:
                                         self.metrics.inc("recovery_fencing_rejected")
                                         logger.critical(f"[Fencing Block] Lease invalid before Docker restart for {canonical_auth}.")
                                         continue
+                                    if not self._can_write_offline_audit_table(db_path_auth):
+                                        logger.critical(
+                                            f"[Audit Block] Pre-execution offline audit check failed for AUTHORIZED restart of {canonical_auth}; halting."
+                                        )
+                                        continue
+                                    pre_archive = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+                                    if pre_archive:
+                                        append_jsonl_audit_stub(pre_archive, "python-offline-audit.jsonl", {
+                                            "event_type": EXECUTION_STARTED,
+                                            "run_id": auth_run_id,
+                                            "correlation_id": auth_corr_id,
+                                            "operation_id": auth_op_id,
+                                            "container_name": canonical_auth,
+                                            "action": "authorized_restart",
+                                            "fencing_generation": fencing_gen,
+                                            "executed_at": format_rfc3339_ms(),
+                                        })
                                     logger.info(
                                         f"[Authoritative] Go Core approved restart for {canonical_auth} (gen={fencing_gen}). Executing guarded restart."
                                     )
@@ -674,10 +738,29 @@ class HomeOpsAgent:
                                         logger.critical(f"[Security Block] Cannot resolve docker container for {canonical_auth}.")
                                         continue
                                     restarted = await self._restart_docker_container(docker_name, sock_path)
+                                    health_ok = False
+                                    h_state = DockerHealthState.UNKNOWN
                                     if restarted:
                                         h_state = await self._verify_container_health(docker_name, sock_path)
-                                        if h_state != DockerHealthState.HEALTHY:
+                                        health_ok = (h_state == DockerHealthState.HEALTHY)
+                                        if not health_ok:
                                             logger.error(f"[Post-Restart Failed] Health check returned {h_state} for {canonical_auth}.")
+                                    final_ok = bool(restarted and health_ok)
+                                    self._record_offline_audit_strict(
+                                        canonical_auth,
+                                        "authorized_restart",
+                                        exit_code,
+                                        final_ok,
+                                        operation_id=auth_op_id,
+                                        fencing_generation=fencing_gen,
+                                        run_id=auth_run_id,
+                                        correlation_id=auth_corr_id,
+                                        event_type=EXECUTION_COMPLETED if final_ok else EXECUTION_FAILED,
+                                        trigger_source="go_core_authorized",
+                                        actor_type="internal_service",
+                                        actor_id="home-ops-agent",
+                                        evidence={"health_state": h_state.value, "restarted": restarted},
+                                    )
                                 finally:
                                     self._release_recovery_lease(canonical_auth, lease_tok, db_path_auth, fencing_gen=fencing_gen)
                                 continue
@@ -869,6 +952,27 @@ class HomeOpsAgent:
 
             timestamps.append(now)
             op_id = f"pyop-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+            run_id = f"run-offline-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+            corr_id = f"corr-{uuid.uuid4().hex[:8]}"
+
+            if not self._can_write_offline_audit_table(db_path):
+                logger.critical(
+                    f"[Audit Fail-Closed] Pre-execution offline audit table check failed for op={op_id}. Aborting Docker restart."
+                )
+                return False
+            pre_archive = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+            if pre_archive:
+                append_jsonl_audit_stub(pre_archive, "python-offline-audit.jsonl", {
+                    "event_type": EXECUTION_STARTED,
+                    "run_id": run_id,
+                    "correlation_id": corr_id,
+                    "operation_id": op_id,
+                    "container_name": container_name,
+                    "action": "emergency_restart",
+                    "fencing_generation": fencing_gen,
+                    "executed_at": format_rfc3339_ms(),
+                })
+
             logger.warning(
                 f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
                 f"(attempt {len(timestamps)} in 10m window, gen={fencing_gen}, op={op_id})"
@@ -878,8 +982,10 @@ class HomeOpsAgent:
                 logger.critical(f"[Emergency Autonomy Blocked] Cannot map canonical '{canonical}' to Docker container.")
                 return False
             success = await self._restart_docker_container(docker_container, sock_path)
+            health_detail = "NOT_CHECKED"
             if success:
                 health_state = await self._verify_container_health(docker_container, sock_path)
+                health_detail = health_state.value
                 if health_state == DockerHealthState.UNKNOWN:
                     self.metrics.inc("recovery_health_unknown")
                 if health_state != DockerHealthState.HEALTHY:
@@ -893,6 +999,13 @@ class HomeOpsAgent:
                 success,
                 operation_id=op_id,
                 fencing_generation=fencing_gen,
+                run_id=run_id,
+                correlation_id=corr_id,
+                event_type=EXECUTION_COMPLETED if success else EXECUTION_FAILED,
+                trigger_source="python_offline",
+                actor_type="offline_agent",
+                actor_id="home-ops-agent",
+                evidence={"health_state": health_detail, "canonical": canonical},
             )
             if audit_status != AuditStatus.AUDIT_COMMITTED:
                 logger.critical(
@@ -1787,6 +1900,32 @@ class HomeOpsAgent:
             logger.warning(f"Independent readiness probe for {canonical} failed. State UNHEALTHY.")
             return DockerHealthState.UNHEALTHY
 
+    def _can_write_offline_audit_table(self, db_path: str) -> bool:
+        """Verifies offline_ops_audit exists and is writable under BEGIN IMMEDIATE before Docker mutations."""
+        if not db_path or not os.path.isfile(db_path):
+            self.metrics.inc("recovery_audit_failed")
+            return False
+        conn = None
+        try:
+            conn = open_readwrite_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_ops_audit'")
+            exists = cur.fetchone() is not None
+            cur.execute("ROLLBACK")
+            if not exists:
+                self.metrics.inc("recovery_audit_failed")
+            return exists
+        except Exception:
+            self.metrics.inc("recovery_audit_failed")
+            return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def _record_offline_audit_strict(
         self,
         container_name: str,
@@ -1795,17 +1934,28 @@ class HomeOpsAgent:
         success: bool,
         operation_id: str = "",
         fencing_generation: int = 0,
+        run_id: str = "",
+        correlation_id: str = "",
+        event_type: str = EXECUTION_COMPLETED,
+        trigger_source: str = "python_offline",
+        actor_type: str = "offline_agent",
+        actor_id: str = "home-ops-agent",
+        evidence: Any = None,
+        before_state: Any = None,
+        after_state: Any = None,
     ) -> Tuple[AuditStatus, str]:
         """
-        Persists offline emergency event into EXISTING SQLite offline_ops_audit table using BEGIN IMMEDIATE.
-        NEVER calls os.makedirs or CREATE TABLE IF NOT EXISTS at runtime (R4-15).
+        Persists offline emergency / authorized event into EXISTING SQLite offline_ops_audit
+        table using BEGIN IMMEDIATE, maintaining local hash chain + independent JSONL archive.
+        NEVER calls os.makedirs for DB creation or CREATE TABLE IF NOT EXISTS at runtime (R4-15).
         Returns (AuditStatus, event_uuid).
         """
         event_uuid = f"offline-{uuid.uuid4()}"
-        now_sec = time.time()
-        now_ms = int(now_sec * 1000)
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_sec))
+        now_ms = int(time.time() * 1000)
+        now_iso = format_rfc3339_ms(now_ms)
         op_id = operation_id or event_uuid
+        run_id_val = run_id or f"run-offline-{event_uuid}"
+        corr_id_val = correlation_id or f"corr-{event_uuid}"
         db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
         if not db_path or not os.path.isfile(db_path):
             self.metrics.inc("recovery_audit_failed")
@@ -1813,7 +1963,21 @@ class HomeOpsAgent:
             logger.critical(f"[Offline Audit Failed] Database missing at {db_path}; refusing runtime creation.")
             return AuditStatus.AUDIT_FAILED, ""
 
+        archive_dir = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+        evidence_str = serialize_evidence(evidence)
+        before_str = serialize_evidence(before_state)
+        after_str = serialize_evidence(after_state)
+        params_digest, params_redacted = serialize_params({
+            "container_name": container_name,
+            "action": action,
+            "exit_code": exit_code,
+            "fencing_generation": fencing_generation,
+        })
+
         conn = None
+        entry_hash = ""
+        hmac_sig = ""
+        offline_seq = 0
         try:
             conn = open_readwrite_sqlite(db_path)
             cur = conn.cursor()
@@ -1829,19 +1993,170 @@ class HomeOpsAgent:
             cur.execute("PRAGMA table_info(offline_ops_audit)")
             cols = {str(c[1]).lower() for c in cur.fetchall()}
 
-            if {"operation_id", "holder", "fencing_generation", "audit_status", "executed_at_ms"}.issubset(cols):
+            has_v5_cols = {
+                "run_id", "correlation_id", "event_type", "payload_json",
+                "offline_seq", "local_prev_hash", "entry_hash", "hmac_signature",
+            }.issubset(cols)
+
+            if has_v5_cols:
+                cur.execute(
+                    "SELECT offline_seq, entry_hash FROM offline_ops_audit ORDER BY offline_seq DESC, id DESC LIMIT 1"
+                )
+                prev_row = cur.fetchone()
+                prev_seq = int(prev_row[0]) if prev_row and prev_row[0] else 0
+                prev_hash = str(prev_row[1]) if prev_row and prev_row[1] else AUDIT_GENESIS_HASH
+                if not prev_hash:
+                    prev_hash = AUDIT_GENESIS_HASH
+                offline_seq = prev_seq + 1
+
+                res_label = "SUCCESS" if success else "FAILED"
+                err_msg = "" if success else f"exit_code={exit_code}"
+                kid, ring = resolve_audit_hmac_keyring()
+                has_hmac_key = bool(kid and kid in ring)
+                if not has_hmac_key and (is_production() or os.environ.get("OPS_AUDIT_REQUIRE_HMAC", "") == "1"):
+                    conn.execute("ROLLBACK")
+                    self._last_audit_status = AuditStatus.AUDIT_FAILED
+                    logger.critical("[Offline Audit Failed] External OPS_AUDIT_HMAC_KEY unavailable for v5 audit signing in production; failing closed.")
+                    return AuditStatus.AUDIT_FAILED, ""
+
+                if has_hmac_key:
+                    ev_obj = {
+                        "audit_id": event_uuid,
+                        "run_id": run_id_val,
+                        "parent_event_id": "",
+                        "correlation_id": corr_id_val,
+                        "household_id": 1,
+                        "trigger_source": trigger_source,
+                        "actor_type": actor_type,
+                        "actor_id": actor_id,
+                        "event_type": event_type,
+                        "action": action,
+                        "target": container_name,
+                        "component": resolve_canonical_component(container_name) or container_name,
+                        "decision": DECISION_ALLOW,
+                        "risk_level": "HIGH",
+                        "policy_version": AUDIT_POLICY_VERSION,
+                        "proposal_id": "",
+                        "approval_id": "",
+                        "operation_id": op_id,
+                        "fencing_generation": fencing_generation,
+                        "before_state": before_str,
+                        "after_state": after_str,
+                        "parameters_digest": params_digest,
+                        "parameters_redacted": params_redacted,
+                        "result": res_label,
+                        "error_code": err_msg,
+                        "duration_ms": 0,
+                        "evidence": evidence_str,
+                        "created_at": now_iso,
+                        "created_at_ms": now_ms,
+                        "is_offline": True,
+                        "previous_hash": prev_hash,
+                    }
+                    entry_hash = compute_event_entry_hash(ev_obj)
+                    hmac_sig = compute_event_hmac(kid, ring[kid], "offline-agent", offline_seq, entry_hash, now_ms)
+                else:
+                    # Dev/test compatibility when OPS_AUDIT_HMAC_KEY is not injected: keep origin proof empty so Core treats as legacy row.
+                    offline_seq = 0
+                    prev_hash = ""
+                    entry_hash = ""
+                    hmac_sig = ""
+                    ev_obj = {"component": resolve_canonical_component(container_name) or container_name}
+
+                payload_meta = json.dumps({
+                    "trigger_source": trigger_source,
+                    "actor_type": actor_type,
+                    "actor_id": actor_id,
+                    "component": ev_obj["component"],
+                    "decision": DECISION_ALLOW,
+                    "risk_level": "HIGH",
+                    "before_state": before_str,
+                    "after_state": after_str,
+                    "parameters_digest": params_digest,
+                    "parameters_redacted": params_redacted,
+                    "evidence": evidence_str,
+                    "error_message": err_msg,
+                }, separators=(",", ":"), ensure_ascii=False)
+
+                if "error_message" in cols:
+                    cur.execute(
+                        """
+                        INSERT INTO offline_ops_audit (
+                            event_uuid, operation_id, container_name, action, holder, fencing_generation,
+                            exit_code, success, audit_status, error_message, executed_at, executed_at_ms, synced,
+                            run_id, correlation_id, event_type, payload_json,
+                            offline_seq, local_prev_hash, entry_hash, hmac_signature
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_uuid,
+                            op_id,
+                            container_name,
+                            action,
+                            actor_id,
+                            fencing_generation,
+                            exit_code,
+                            1 if success else 0,
+                            AuditStatus.AUDIT_COMMITTED.value,
+                            err_msg,
+                            now_iso,
+                            now_ms,
+                            run_id_val,
+                            corr_id_val,
+                            event_type,
+                            payload_meta,
+                            offline_seq,
+                            prev_hash,
+                            entry_hash,
+                            hmac_sig,
+                        ),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO offline_ops_audit (
+                            event_uuid, operation_id, container_name, action, holder, fencing_generation,
+                            exit_code, success, audit_status, executed_at, executed_at_ms, synced,
+                            run_id, correlation_id, event_type, payload_json,
+                            offline_seq, local_prev_hash, entry_hash, hmac_signature
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            event_uuid,
+                            op_id,
+                            container_name,
+                            action,
+                            actor_id,
+                            fencing_generation,
+                            exit_code,
+                            1 if success else 0,
+                            AuditStatus.AUDIT_COMMITTED.value,
+                            now_iso,
+                            now_ms,
+                            run_id_val,
+                            corr_id_val,
+                            event_type,
+                            payload_meta,
+                            offline_seq,
+                            prev_hash,
+                            entry_hash,
+                            hmac_sig,
+                        ),
+                    )
+            elif {"operation_id", "holder", "fencing_generation", "audit_status", "executed_at_ms"}.issubset(cols):
                 cur.execute(
                     """
                     INSERT INTO offline_ops_audit (
                         event_uuid, operation_id, container_name, action, holder, fencing_generation,
                         exit_code, success, audit_status, executed_at, executed_at_ms, synced
-                    ) VALUES (?, ?, ?, ?, 'python-offline', ?, ?, ?, ?, ?, ?, 0)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     """,
                     (
                         event_uuid,
                         op_id,
                         container_name,
                         action,
+                        actor_id,
                         fencing_generation,
                         exit_code,
                         1 if success else 0,
@@ -1860,7 +2175,27 @@ class HomeOpsAgent:
                 )
             cur.execute("COMMIT")
             self._last_audit_status = AuditStatus.AUDIT_COMMITTED
-            logger.info(f"[Offline Audit] Recorded offline event {event_uuid} (op={op_id}, gen={fencing_generation}) for container {container_name}")
+            if archive_dir:
+                append_jsonl_audit_stub(
+                    archive_dir,
+                    "python-offline-audit.jsonl",
+                    {
+                        "event_uuid": event_uuid,
+                        "run_id": run_id_val,
+                        "correlation_id": corr_id_val,
+                        "event_type": event_type,
+                        "container_name": container_name,
+                        "action": action,
+                        "success": success,
+                        "offline_seq": offline_seq,
+                        "entry_hash": entry_hash,
+                        "hmac_signature": hmac_sig,
+                        "executed_at": now_iso,
+                    },
+                )
+            logger.info(
+                f"[Offline Audit] Recorded offline event {event_uuid} (run={run_id_val}, op={op_id}, seq={offline_seq}, gen={fencing_generation})"
+            )
             return AuditStatus.AUDIT_COMMITTED, event_uuid
         except Exception as e:
             if conn:
@@ -1928,6 +2263,27 @@ class HomeOpsAgent:
         if not records:
             return 0
 
+        # Enrich records with unpacked payload_json metadata for Go Core AgentAuditEngine verification
+        enriched_records = []
+        for rec in records:
+            out = dict(rec)
+            raw_meta = str(rec.get("payload_json") or "").strip()
+            if raw_meta.startswith("{"):
+                try:
+                    meta = json.loads(raw_meta)
+                    for k in (
+                        "trigger_source", "actor_type", "actor_id", "component",
+                        "decision", "risk_level", "before_state", "after_state",
+                        "parameters_digest", "parameters_redacted", "evidence", "error_message",
+                    ):
+                        if k in meta and not out.get(k):
+                            out[k] = meta[k]
+                except Exception:
+                    pass
+            out.setdefault("audit_id", out.get("event_uuid", ""))
+            out.setdefault("target", out.get("container_name", ""))
+            enriched_records.append(out)
+
         # 3. Push to Go Core
         sync_url = f"{self.config.api_base_url.rstrip('/')}/api/v1/ops/audit/offline-sync"
         headers = {
@@ -1935,29 +2291,51 @@ class HomeOpsAgent:
         }
         if getattr(self.config, "internal_token", None):
             headers["X-Internal-Secret"] = self.config.internal_token
-        sync_payload = json.dumps({"events": records}).encode("utf-8")
+        sync_payload = json.dumps({"events": enriched_records}).encode("utf-8")
 
-        def do_sync() -> bool:
+        def do_sync() -> Tuple[bool, Optional[List[str]]]:
             try:
                 sync_req = urllib.request.Request(sync_url, data=sync_payload, headers=headers)
                 with urllib.request.urlopen(sync_req, timeout=5.0) as resp:
-                    return resp.status in (200, 201)
+                    if resp.status not in (200, 201):
+                        return False, None
+                    raw_body = resp.read()
+                    if isinstance(raw_body, (bytes, bytearray, str)):
+                        text_body = raw_body.decode("utf-8", errors="ignore") if isinstance(raw_body, (bytes, bytearray)) else raw_body
+                        if text_body.strip():
+                            parsed = json.loads(text_body)
+                            data_obj = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                            if isinstance(data_obj, dict) and "accepted_uuids" in data_obj:
+                                acc = data_obj.get("accepted_uuids") or []
+                                return True, [str(u) for u in acc if u]
+                            return True, []
+                    # Fallback for unconfigured unittest MagicMocks with no JSON body
+                    return True, None
             except Exception as err:
                 logger.debug(f"[Offline Audit Sync] Request failed: {err}")
-                return False
+                return False, None
 
-        sync_ok = await loop.run_in_executor(None, do_sync)
+        sync_ok, accepted_uuids = await loop.run_in_executor(None, do_sync)
         if not sync_ok:
             return 0
 
-        # 4. Mark synced = 1 via read-write BEGIN IMMEDIATE transaction
+        if accepted_uuids is not None:
+            accepted_set = set(accepted_uuids)
+            records_to_ack = [r for r in records if r.get("event_uuid") in accepted_set]
+        else:
+            records_to_ack = records
+
+        if not records_to_ack:
+            return 0
+
+        # 4. Mark synced = 1 via read-write BEGIN IMMEDIATE transaction ONLY for accepted records
         def mark_synced():
             if not db_path or not os.path.isfile(db_path):
                 return
             conn = None
             try:
                 conn = open_readwrite_sqlite(db_path)
-                synced_ids = [r["id"] for r in records]
+                synced_ids = [r["id"] for r in records_to_ack]
                 placeholders = ",".join("?" * len(synced_ids))
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(f"UPDATE offline_ops_audit SET synced = 1 WHERE id IN ({placeholders})", synced_ids)
@@ -1974,8 +2352,8 @@ class HomeOpsAgent:
                     conn.close()
 
         await loop.run_in_executor(None, mark_synced)
-        logger.info(f"[Offline Audit Sync] Successfully synchronized {len(records)} offline events to Go Core.")
-        return len(records)
+        logger.info(f"[Offline Audit Sync] Successfully synchronized {len(records_to_ack)} offline events to Go Core.")
+        return len(records_to_ack)
 
     async def _sync_offline_audit_logs_loop(self) -> None:
         """Background task: periodically probes Go Core /health, and syncs buffered events to Go Core."""

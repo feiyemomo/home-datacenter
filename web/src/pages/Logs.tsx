@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Activity, RefreshCw } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Activity, RefreshCw, ShieldCheck } from "lucide-react";
 import { listSystemLogs } from "@/api/system";
 import { useAuth } from "@/hooks/useAuth";
 import { useCachedFetch } from "@/hooks/useCachedFetch";
@@ -55,22 +56,31 @@ export default function Logs() {
     return (
         <div className="space-y-6">
             {/* Page header */}
-            <div className="animate-fade-in flex items-center justify-between pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
+            <div className="animate-fade-in flex flex-wrap items-center justify-between gap-2 pb-4 mb-2 border-b border-[rgb(var(--border)/0.3)]">
                 <div>
                     <h2 className="text-lg font-semibold tracking-tight text-fg">系统日志</h2>
                     <p className="mt-0.5 text-xs text-fg-muted">
                         共 {total} 条日志记录。
                     </p>
                 </div>
-                <button
-                    type="button"
-                    onClick={() => refetch()}
-                    disabled={loading}
-                    className="inline-flex items-center gap-1 text-xs text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
-                >
-                    <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
-                    刷新
-                </button>
+                <div className="flex items-center gap-3">
+                    <Link
+                        to="/ops/audit"
+                        className="inline-flex items-center gap-1 rounded-lg border border-[rgb(var(--border)/0.4)] px-2.5 py-1 text-xs text-fg transition-colors hover:bg-white/5"
+                    >
+                        <ShieldCheck size={13} />
+                        Agent 审计追溯
+                    </Link>
+                    <button
+                        type="button"
+                        onClick={() => refetch()}
+                        disabled={loading}
+                        className="inline-flex items-center gap-1 text-xs text-fg-muted transition-colors hover:text-fg disabled:opacity-50"
+                    >
+                        <RefreshCw size={12} className={loading ? "animate-spin" : ""} />
+                        刷新
+                    </button>
+                </div>
             </div>
 
             {fetchError && (

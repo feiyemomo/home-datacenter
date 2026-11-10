@@ -54,11 +54,15 @@ func (h *OpsHandler) RegisterChatRoutes(rg *gin.RouterGroup) {
 func (h *OpsHandler) ListChatSessions(c *gin.Context) {
 	currentUserID := c.GetUint("user_id")
 	isAdmin := c.GetBool("is_admin")
+	hhID := c.GetUint("household_id")
+	if hhID == 0 {
+		hhID = 1
+	}
 
 	var sessions []model.OpsChatSession
-	query := h.db.Order("id DESC")
+	query := h.db.Where("household_id = ?", hhID).Order("id DESC")
 	if !isAdmin {
-		query = query.Where("user_id = ? OR scope = ?", currentUserID, model.ChatScopeHousehold)
+		query = query.Where("(user_id = ? OR scope = ?)", currentUserID, model.ChatScopeHousehold)
 	}
 	if err := query.Find(&sessions).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -67,12 +71,13 @@ func (h *OpsHandler) ListChatSessions(c *gin.Context) {
 
 	if len(sessions) == 0 {
 		defaultSession := model.OpsChatSession{
-			SessionID: "session-ops-001",
-			UserID:    currentUserID,
-			Scope:     model.ChatScopeHousehold,
-			Title:     "系统日常运维与主动安全 Copilot",
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+			HouseholdID: hhID,
+			SessionID:   "session-ops-001",
+			UserID:      currentUserID,
+			Scope:       model.ChatScopeHousehold,
+			Title:       "系统日常运维与主动安全 Copilot",
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
 		}
 		_ = h.db.Create(&defaultSession).Error
 		sessions = append(sessions, defaultSession)
@@ -92,6 +97,10 @@ func (h *OpsHandler) ListChatSessions(c *gin.Context) {
 func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 	currentUserID := c.GetUint("user_id")
 	isAdmin := c.GetBool("is_admin")
+	hhID := c.GetUint("household_id")
+	if hhID == 0 {
+		hhID = 1
+	}
 
 	var req PostChatMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -118,10 +127,14 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 		modelAlias = "agent-deep"
 	}
 
-	// Session ownership & Anti-IDOR check
+	// Session ownership & Anti-IDOR check (household + user boundary)
 	var session model.OpsChatSession
 	err := h.db.Where("session_id = ?", sessionID).First(&session).Error
 	if err == nil {
+		if session.HouseholdID != 0 && session.HouseholdID != hhID {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Chat session not found"})
+			return
+		}
 		// Session exists: enforce IDOR boundary strictly
 		if !isAdmin && session.Scope != model.ChatScopeHousehold && (session.UserID == 0 || session.UserID != currentUserID) {
 			c.JSON(http.StatusForbidden, gin.H{
@@ -137,12 +150,13 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 			scope = model.ChatScopePersonal
 		}
 		session = model.OpsChatSession{
-			SessionID: sessionID,
-			UserID:    currentUserID,
-			Scope:     scope,
-			Title:     truncateTitle(prompt, 30),
-			CreatedAt: time.Now(),
-			UpdatedAt: time.Now(),
+			HouseholdID: hhID,
+			SessionID:   sessionID,
+			UserID:      currentUserID,
+			Scope:       scope,
+			Title:       truncateTitle(prompt, 30),
+			CreatedAt:   time.Now(),
+			UpdatedAt:   time.Now(),
 		}
 		if err := h.db.Create(&session).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create chat session: " + err.Error()})

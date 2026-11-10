@@ -1,6 +1,7 @@
 package security
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/config"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
@@ -115,10 +117,11 @@ type hourlyDelta struct {
 
 // DefenseManager coordinates attack detection, IP banning, persistence, and alert dispatch.
 type DefenseManager struct {
-	db       *gorm.DB
-	cfg      config.DefenseConfig
-	alertMgr *AlertManager
-	bus      *eventbus.Bus
+	db          *gorm.DB
+	cfg         config.DefenseConfig
+	alertMgr    *AlertManager
+	bus         *eventbus.Bus
+	auditEngine *audit.AgentAuditEngine
 
 	mu             sync.RWMutex
 	failures       map[string]*FailedAttempt
@@ -134,6 +137,30 @@ type DefenseManager struct {
 	// until the janitor flushes them into security_hourly_stats.
 	hourlyMu   sync.Mutex
 	hourlyStat map[string]*hourlyDelta
+}
+
+// SetAuditEngine configures a unified AgentAuditEngine on DefenseManager.
+func (dm *DefenseManager) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.auditEngine = ae
+}
+
+func (dm *DefenseManager) getAuditEngine() *audit.AgentAuditEngine {
+	dm.mu.RLock()
+	ae := dm.auditEngine
+	db := dm.db
+	bus := dm.bus
+	dm.mu.RUnlock()
+	if ae != nil {
+		return ae
+	}
+	if db != nil {
+		created := audit.NewAgentAuditEngine(db, bus)
+		dm.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // NewDefenseManager initializes defense state, loads persisted bans & whitelists, and starts janitor loop.
@@ -672,6 +699,7 @@ func (dm *DefenseManager) UpdateBan(ip string, duration time.Duration, permanent
 		dm.mu.Unlock()
 		return fmt.Errorf("ip %s is not banned", ip)
 	}
+	prevEntry := entry
 	now := time.Now()
 	entry.Permanent = permanent
 	if permanent {
@@ -683,9 +711,35 @@ func (dm *DefenseManager) UpdateBan(ip string, duration time.Duration, permanent
 	dm.mu.Unlock()
 
 	if dm.db != nil {
-		dm.db.Model(&model.IPBan{}).Where("ip = ?", ip).Updates(map[string]any{
+		if err := dm.db.Model(&model.IPBan{}).Where("ip = ?", ip).Updates(map[string]any{
 			"permanent":  entry.Permanent,
 			"expires_at": entry.ExpiresAt,
+		}).Error; err != nil {
+			return err
+		}
+	}
+	dm.dispatchAlert("调整封禁规则", ip, "ban_update",
+		fmt.Sprintf("更新封禁策略: permanent=%v, duration=%v", entry.Permanent, duration),
+		fmt.Sprintf("更新封禁到期时间至 %s", entry.ExpiresAt.Format(time.RFC3339)))
+
+	if ae := dm.getAuditEngine(); ae != nil {
+		_, _ = ae.EmitEvent(context.Background(), audit.EmitEventInput{
+			HouseholdID:    1,
+			TriggerSource:  "security_defense",
+			ActorType:      "user",
+			ActorID:        "admin",
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "defense.ban.update",
+			Target:         ip,
+			Component:      "defense",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			BeforeState:    map[string]interface{}{"permanent": prevEntry.Permanent, "expires_at": prevEntry.ExpiresAt},
+			AfterState:     map[string]interface{}{"permanent": entry.Permanent, "expires_at": entry.ExpiresAt},
+			Parameters:     map[string]interface{}{"ip": ip, "duration_sec": int64(duration.Seconds()), "permanent": permanent},
+			Result:         "UPDATED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
 		})
 	}
 	return nil
@@ -735,8 +789,30 @@ func (dm *DefenseManager) recordSecurityEvent(ip, eventType, detail, action stri
 }
 
 func (dm *DefenseManager) dispatchAlert(subject, ip, alertType, detail, action string) {
-	// 1. Audit to security_events table
+	// 1. Audit to security_events table & AgentAuditEngine
 	dm.recordSecurityEvent(ip, alertType, detail, action)
+	if ae := dm.getAuditEngine(); ae != nil && alertType != "ban_update" {
+		risk := model.AuditRiskMedium
+		if alertType == "auto_ban" || alertType == "manual_ban" {
+			risk = model.AuditRiskHigh
+		}
+		_, _ = ae.EmitEvent(context.Background(), audit.EmitEventInput{
+			HouseholdID:    1,
+			TriggerSource:  "security_defense",
+			ActorType:      "system_daemon",
+			ActorID:        "defense-manager",
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "defense." + defaultDefenseStr(alertType, "event"),
+			Target:         ip,
+			Component:      "defense",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      risk,
+			Evidence:       map[string]interface{}{"subject": subject, "detail": detail, "action": action},
+			Result:         "APPLIED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
 
 	// 2. QQ SMTP email (throttled by 10-min cooldown per IP)
 	if dm.alertMgr != nil && dm.shouldSendAlert(ip) {
@@ -1094,6 +1170,13 @@ func (dm *DefenseManager) UpdateConfig(maxFailures, windowMins, banDurationMins 
 		fmt.Sprintf("阈值调整: 失败 %d 次/窗口 %d 分钟/封禁 %d 分钟", maxFailures, windowMins, banDurationMins),
 		"动态热更新生效")
 	return nil
+}
+
+func defaultDefenseStr(v, fallback string) string {
+	if strings.TrimSpace(v) != "" {
+		return v
+	}
+	return fallback
 }
 
 // janitorLoop periodically sweeps expired failures, syncs hit stats, and removes expired bans.

@@ -1,6 +1,7 @@
 package maintenance
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -13,6 +14,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 )
@@ -60,9 +62,34 @@ type RecordingSizeMonitor struct {
 	onRecover   func() error
 	quotaActive bool
 
-	mu        sync.Mutex
-	sampling  atomic.Bool
-	lastLevel string
+	mu          sync.Mutex
+	sampling    atomic.Bool
+	lastLevel   string
+	auditEngine *audit.AgentAuditEngine
+}
+
+// SetAuditEngine configures AgentAuditEngine on RecordingSizeMonitor.
+func (m *RecordingSizeMonitor) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.auditEngine = ae
+}
+
+func (m *RecordingSizeMonitor) getAuditEngine() *audit.AgentAuditEngine {
+	m.mu.Lock()
+	ae := m.auditEngine
+	db := m.db
+	bus := m.bus
+	m.mu.Unlock()
+	if ae != nil {
+		return ae
+	}
+	if db != nil {
+		created := audit.NewAgentAuditEngine(db, bus)
+		m.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // NewRecordingSizeMonitor creates a monitor for the recordings tree.
@@ -157,9 +184,28 @@ func (m *RecordingSizeMonitor) sample() {
 			res, pruneErr := PruneOldestRecordings(m.root, m.frigateDBPath, excess, 12)
 			if pruneErr != nil {
 				log.Printf("maintenance: recordings FIFO prune failed: %v", pruneErr)
+				if ae := m.getAuditEngine(); ae != nil {
+					_, _ = ae.EmitEvent(context.Background(), audit.EmitEventInput{
+						HouseholdID: 1, TriggerSource: "maintenance", ActorType: "system_daemon",
+						ActorID: "recording-size-monitor", EventType: model.AuditEventExecutionFailed,
+						Action: "maintenance.recordings.prune", Target: m.root, Component: "maintenance",
+						RiskLevel: model.AuditRiskMedium, Result: "FAILED", ErrorCode: pruneErr.Error(),
+						FinalRunStatus: model.AuditRunStatusFailed,
+					})
+				}
 			} else if res.ReclaimedBytes > 0 {
 				log.Printf("maintenance: FIFO pruned %d oldest hour segment(s) (%s), reclaimed %s (recordings size now ~%s)",
 					res.PrunedHours, strings.Join(res.PrunedDirs, ", "), humanBytes(res.ReclaimedBytes), humanBytes(size-res.ReclaimedBytes))
+				if ae := m.getAuditEngine(); ae != nil {
+					_, _ = ae.EmitEvent(context.Background(), audit.EmitEventInput{
+						HouseholdID: 1, TriggerSource: "maintenance", ActorType: "system_daemon",
+						ActorID: "recording-size-monitor", EventType: model.AuditEventExecutionCompleted,
+						Action: "maintenance.recordings.prune", Target: m.root, Component: "maintenance",
+						Decision: model.AuditDecisionAllow, RiskLevel: model.AuditRiskMedium,
+						AfterState: map[string]interface{}{"pruned_hours": res.PrunedHours, "reclaimed_bytes": res.ReclaimedBytes, "pruned_dirs": res.PrunedDirs},
+						Result: "PRUNED", FinalRunStatus: model.AuditRunStatusCompleted, MirrorLegacy: true,
+					})
+				}
 				if size >= res.ReclaimedBytes {
 					size -= res.ReclaimedBytes
 				} else {

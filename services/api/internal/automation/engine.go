@@ -61,6 +61,7 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 )
@@ -94,7 +95,32 @@ type Engine struct {
 	unsub   func()                // EventBus unsubscribe handle
 
 	// Global metrics counters.
-	metrics *Metrics
+	metrics     *Metrics
+	auditEngine *audit.AgentAuditEngine
+}
+
+// SetAuditEngine configures unified AgentAuditEngine on automation.Engine.
+func (e *Engine) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.auditEngine = ae
+}
+
+func (e *Engine) getAuditEngine() *audit.AgentAuditEngine {
+	e.mu.RLock()
+	ae := e.auditEngine
+	db := e.db
+	bus := e.bus
+	e.mu.RUnlock()
+	if ae != nil {
+		return ae
+	}
+	if db != nil {
+		created := audit.NewAgentAuditEngine(db, bus)
+		e.SetAuditEngine(created)
+		return created
+	}
+	return nil
 }
 
 // ruleRuntime is the per-rule hot-path state we keep in memory.
@@ -593,6 +619,35 @@ func (e *Engine) fire(ev eventbus.Event, r model.Rule) {
 			"ts":         now.Unix(),
 		}),
 	})
+
+	if ae := e.getAuditEngine(); ae != nil {
+		evType := model.AuditEventExecutionCompleted
+		resLabel := "FIRED"
+		runSt := model.AuditRunStatusCompleted
+		if err != nil {
+			evType = model.AuditEventExecutionFailed
+			resLabel = "FAILED"
+			runSt = model.AuditRunStatusFailed
+		}
+		_, _ = ae.EmitEvent(context.Background(), audit.EmitEventInput{
+			HouseholdID:    1,
+			TriggerSource:  "automation",
+			ActorType:      "system_daemon",
+			ActorID:        "automation-engine",
+			EventType:      evType,
+			Action:         "automation.rule." + r.Action.Type,
+			Target:         fmt.Sprintf("rule:%d:%s", r.ID, r.Name),
+			Component:      "automation",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			Parameters:     r.Action,
+			Evidence:       map[string]interface{}{"trigger": r.Trigger, "event_topic": ev.Topic, "event_source": ev.Source},
+			Result:         resLabel,
+			ErrorCode:      errString(err),
+			DurationMs:     dur.Milliseconds(),
+			FinalRunStatus: runSt,
+		})
+	}
 }
 
 // errString renders an error for audit JSON; nil → "".

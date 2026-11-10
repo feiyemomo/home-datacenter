@@ -14,6 +14,7 @@ import (
 
 	pahomqtt "github.com/eclipse/paho.mqtt.golang"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/camera"
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/eventbus"
@@ -73,6 +74,14 @@ type Handler struct {
 	sampleCPU    func() float64
 
 	pretranscoder AlertPretranscoder
+	auditEngine   *audit.AgentAuditEngine
+}
+
+// SetAuditEngine configures unified AgentAuditEngine recording for MQTT side-effect dispatches.
+func (h *Handler) SetAuditEngine(ae *audit.AgentAuditEngine) {
+	if h != nil {
+		h.auditEngine = ae
+	}
 }
 
 // AlertPretranscoder schedules background pre-transcoding of recordings for alert periods.
@@ -1078,6 +1087,23 @@ func (h *Handler) SyncFrigateDetection(guardMode string) {
 			t2.Wait()
 		}
 	}
+	if h.auditEngine != nil && len(slugs) > 0 {
+		_, _ = h.auditEngine.EmitEvent(context.Background(), audit.EmitEventInput{
+			HouseholdID:    1,
+			TriggerSource:  "mqtt_sync",
+			ActorType:      "system_daemon",
+			ActorID:        "mqtt-handler",
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "frigate.detection.sync",
+			Target:         fmt.Sprintf("%d cameras", len(slugs)),
+			Component:      "frigate",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskLow,
+			AfterState:     map[string]interface{}{"payload": payload, "guard_mode": guardMode, "slugs": slugs},
+			Result:         "SYNCED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+		})
+	}
 }
 
 // OnDisconnect is called by paho when the client loses the broker
@@ -1104,7 +1130,35 @@ func (h *Handler) PublishDeviceCommand(deviceID uint, command string, params int
 		return err
 	}
 
-	return h.publish(DeviceCommand(deviceID), data, 1)
+	err = h.publish(DeviceCommand(deviceID), data, 1)
+	if h.auditEngine != nil {
+		resLabel := "PUBLISHED"
+		errStr := ""
+		runSt := model.AuditRunStatusCompleted
+		if err != nil {
+			resLabel = "FAILED"
+			errStr = err.Error()
+			runSt = model.AuditRunStatusFailed
+		}
+		_, _ = h.auditEngine.EmitEvent(context.Background(), audit.EmitEventInput{
+			HouseholdID:    1,
+			TriggerSource:  "mqtt_device",
+			ActorType:      "system_daemon",
+			ActorID:        "mqtt-handler",
+			EventType:      model.AuditEventExecutionCompleted,
+			Action:         "mqtt.device.command",
+			Target:         fmt.Sprintf("device:%d", deviceID),
+			Component:      "mosquitto",
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      model.AuditRiskMedium,
+			Parameters:     map[string]interface{}{"device_id": deviceID, "command": command, "params": params},
+			Result:         resLabel,
+			ErrorCode:      errStr,
+			FinalRunStatus: runSt,
+			MirrorLegacy:   true,
+		})
+	}
+	return err
 }
 
 // PublishUserNotification pushes a notification to a user's apps.

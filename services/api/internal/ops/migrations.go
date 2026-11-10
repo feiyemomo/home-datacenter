@@ -30,7 +30,7 @@ const (
 )
 
 const (
-	RequiredOpsSchemaVersion = 4
+	RequiredOpsSchemaVersion = 5
 )
 
 var (
@@ -164,6 +164,15 @@ func EnsureOpsSchema(db *gorm.DB) error {
 			"offline_restart_history",
 			"offline_ops_audit",
 			"pending_proposals",
+		}
+		var bootVer int
+		_ = db.Raw("SELECT COALESCE(MAX(version), 0) FROM ops_schema_migrations").Scan(&bootVer).Error
+		if bootVer >= 5 {
+			criticalTables = append(criticalTables,
+				"agent_audit_runs",
+				"agent_audit_events",
+				"agent_audit_checkpoints",
+			)
 		}
 		for _, tbl := range criticalTables {
 			exists, tErr := tableExists(db, tbl)
@@ -338,6 +347,70 @@ func EnsureOpsSchema(db *gorm.DB) error {
 		}
 	}
 
+	// Migration V5: Unified AgentAuditEngine tables, offline chain columns, and append-only triggers
+	if currentVersion < 5 {
+		if err := db.AutoMigrate(
+			&model.AgentAuditRun{},
+			&model.AgentAuditEvent{},
+			&model.AgentAuditCheckpoint{},
+		); err != nil {
+			GlobalSecurityMetrics.IncDatabaseError()
+			return fmt.Errorf("migration v5 audit automigrate failed: %w", err)
+		}
+		for _, col := range []struct{ tbl, col, ddl string }{
+			{"offline_ops_audit", "run_id", "TEXT NOT NULL DEFAULT ''"},
+			{"offline_ops_audit", "correlation_id", "TEXT NOT NULL DEFAULT ''"},
+			{"offline_ops_audit", "event_type", "TEXT NOT NULL DEFAULT 'EXECUTION_COMPLETED'"},
+			{"offline_ops_audit", "payload_json", "TEXT NOT NULL DEFAULT ''"},
+			{"offline_ops_audit", "offline_seq", "INTEGER NOT NULL DEFAULT 0"},
+			{"offline_ops_audit", "local_prev_hash", "TEXT NOT NULL DEFAULT ''"},
+			{"offline_ops_audit", "entry_hash", "TEXT NOT NULL DEFAULT ''"},
+			{"offline_ops_audit", "hmac_signature", "TEXT NOT NULL DEFAULT ''"},
+			{"ops_chat_sessions", "household_id", "INTEGER NOT NULL DEFAULT 1"},
+			{"ops_chat_messages", "household_id", "INTEGER NOT NULL DEFAULT 1"},
+			{"ops_execution_histories", "household_id", "INTEGER NOT NULL DEFAULT 1"},
+		} {
+			if err := addColumnIfMissing(db, col.tbl, col.col, col.ddl); err != nil {
+				return err
+			}
+		}
+		if err := db.Exec(`
+			CREATE INDEX IF NOT EXISTS idx_audit_events_run_seq ON agent_audit_events (run_id, seq);
+			CREATE INDEX IF NOT EXISTS idx_audit_events_hh_time ON agent_audit_events (household_id, created_at_ms);
+			CREATE INDEX IF NOT EXISTS idx_audit_events_comp_action ON agent_audit_events (component, action);
+
+			CREATE TRIGGER IF NOT EXISTS trg_agent_audit_events_no_update
+			BEFORE UPDATE ON agent_audit_events
+			BEGIN
+				SELECT RAISE(ABORT, 'agent_audit_events is append-only');
+			END;
+
+			CREATE TRIGGER IF NOT EXISTS trg_agent_audit_events_no_delete
+			BEFORE DELETE ON agent_audit_events
+			BEGIN
+				SELECT RAISE(ABORT, 'agent_audit_events is append-only');
+			END;
+
+			CREATE TRIGGER IF NOT EXISTS trg_agent_audit_checkpoints_no_update
+			BEFORE UPDATE ON agent_audit_checkpoints
+			BEGIN
+				SELECT RAISE(ABORT, 'agent_audit_checkpoints is append-only');
+			END;
+
+			CREATE TRIGGER IF NOT EXISTS trg_agent_audit_checkpoints_no_delete
+			BEFORE DELETE ON agent_audit_checkpoints
+			BEGIN
+				SELECT RAISE(ABORT, 'agent_audit_checkpoints is append-only');
+			END;
+		`).Error; err != nil {
+			GlobalSecurityMetrics.IncDatabaseError()
+			return fmt.Errorf("migration v5 audit triggers failed: %w", err)
+		}
+		if err := recordMigration(db, 5, "agent_audit_engine_v5", nowMs, "v5"); err != nil {
+			return err
+		}
+	}
+
 	// Anchor boot sentinel once schema is healthy
 	if err := db.Exec(`
 		INSERT INTO ops_schema_meta (key, value, updated_at_ms)
@@ -428,7 +501,10 @@ func VerifyOpsSchemaIntegrity(db *gorm.DB) error {
 		"ops_maintenance_locks":          {"active", "locked_by", "expires_at"},
 		"pending_proposals":              {"proposal_id", "status", "version", "revision", "baseline_hash", "approval_digest", "execution_token"},
 		"offline_restart_history":        {"container_name", "restart_time", "restart_time_ms"},
-		"offline_ops_audit":              {"event_uuid", "operation_id", "container_name", "audit_status", "fencing_generation"},
+		"offline_ops_audit":              {"event_uuid", "operation_id", "container_name", "audit_status", "fencing_generation", "run_id", "entry_hash", "hmac_signature"},
+		"agent_audit_runs":               {"run_id", "correlation_id", "household_id", "trigger_source", "action", "status", "started_at_ms", "last_entry_hash"},
+		"agent_audit_events":             {"stream_id", "seq", "audit_id", "run_id", "correlation_id", "event_type", "action", "created_at_ms", "previous_hash", "entry_hash", "hmac_signature"},
+		"agent_audit_checkpoints":        {"checkpoint_id", "stream_id", "from_seq", "to_seq", "tail_entry_hash", "chain_digest", "hmac_signature"},
 	}
 
 	for tbl, cols := range requiredColumns {

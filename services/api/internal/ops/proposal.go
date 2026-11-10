@@ -14,8 +14,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -51,10 +53,11 @@ func ComputeProposalApprovalDigest(p *model.OpsProposal) (string, error) {
 func (h *OpsHandler) ListProposals(c *gin.Context) {
 	var proposals []model.OpsProposal
 
-	query := h.db.Model(&model.OpsProposal{})
-	if hid := c.GetUint("household_id"); hid != 0 {
-		query = query.Where("household_id = ?", hid)
+	hid := c.GetUint("household_id")
+	if hid == 0 {
+		hid = 1
 	}
+	query := h.db.Model(&model.OpsProposal{}).Where("household_id = ?", hid)
 	if status := c.Query("status"); status != "" {
 		query = query.Where("status = ?", status)
 	}
@@ -64,6 +67,18 @@ func (h *OpsHandler) ListProposals(c *gin.Context) {
 		return
 	}
 
+	isPrivileged := c.GetBool("is_admin") || c.GetBool("is_internal_service")
+	for i := range proposals {
+		proposals[i].ExecutionLog = redact.SensitiveString(proposals[i].ExecutionLog)
+		if !isPrivileged {
+			// Non-admin household members see summary state without raw privileged specs/tokens
+			proposals[i].ActionSpec = ""
+			proposals[i].ExecutionToken = ""
+			proposals[i].ApprovalDigest = ""
+		} else {
+			proposals[i].ActionSpec = redact.StructuredJSON(proposals[i].ActionSpec)
+		}
+	}
 	if proposals == nil {
 		proposals = []model.OpsProposal{}
 	}
@@ -171,6 +186,51 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 	if err := h.db.Create(&req).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to persist proposal: " + err.Error()})
 		return
+	}
+
+	// Emit unified AgentAuditEngine lifecycle events (PROPOSAL_CREATED + APPROVAL_REQUESTED)
+	if ae := h.getAuditEngine(); ae != nil {
+		actorType := "user"
+		if c.GetBool("is_internal_service") {
+			actorType = "internal_service"
+		}
+		actorID := getOperatorName(c)
+		_, runCtx, _ := ae.StartRun(c.Request.Context(), audit.StartRunInput{
+			HouseholdID:   req.HouseholdID,
+			TriggerSource: "proposal_create",
+			ActorType:     actorType,
+			ActorID:       actorID,
+			Action:        "proposal.create",
+			Target:        req.TargetComponent,
+			Component:     req.TargetComponent,
+			Decision:      auditDecisionForRisk(req.RiskLevel),
+			RiskLevel:     strings.ToUpper(req.RiskLevel),
+			ProposalID:    req.ProposalID,
+			Summary:       req.Title,
+		})
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType:    model.AuditEventProposalCreated,
+			Action:       "proposal.create",
+			Target:       req.TargetComponent,
+			Component:    req.TargetComponent,
+			Decision:     auditDecisionForRisk(req.RiskLevel),
+			RiskLevel:    strings.ToUpper(req.RiskLevel),
+			ProposalID:   req.ProposalID,
+			Parameters:   map[string]interface{}{"action_spec": redact.StructuredJSON(req.ActionSpec), "execution_policy": req.ExecutionPolicy},
+			AfterState:   map[string]interface{}{"status": req.Status, "baseline_hash": req.BaselineHash},
+			Result:       "CREATED",
+			MirrorLegacy: true,
+		})
+		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
+			EventType:  model.AuditEventApprovalRequested,
+			Action:     "proposal.request_approval",
+			Target:     req.TargetComponent,
+			Component:  req.TargetComponent,
+			Decision:   model.AuditDecisionRequireApproval,
+			RiskLevel:  strings.ToUpper(req.RiskLevel),
+			ProposalID: req.ProposalID,
+			Result:     model.ProposalStatusAwaitingApproval,
+		})
 	}
 
 	// Publish proposal creation event to EventBus
@@ -325,6 +385,7 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 	}
 
 	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	fsm.SetAuditEngine(h.getAuditEngine())
 	won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
 		ProposalID:       idParam,
 		ExpectedStatuses: expectedStatuses,
@@ -333,6 +394,7 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		RequireRevision:  &reqRev,
 		Updates:          updates,
 		Audit: &ProposalTransitionAudit{
+			Context:     c.Request.Context(),
 			OperationID: opID,
 			EventType:   "ops.proposal.approved",
 			Actor:       operator,
@@ -547,6 +609,7 @@ func (h *OpsHandler) CancelProposal(c *gin.Context) {
 	}
 
 	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	fsm.SetAuditEngine(h.getAuditEngine())
 	won, err := fsm.TransitionStrict(ProposalTransitionParams{
 		ProposalID:       idParam,
 		ExpectedStatuses: allowedCancelStatuses,
@@ -557,6 +620,7 @@ func (h *OpsHandler) CancelProposal(c *gin.Context) {
 			"execution_log": fmt.Sprintf("Cancelled by %s at %s", operator, time.Now().UTC().Format(time.RFC3339)),
 		},
 		Audit: &ProposalTransitionAudit{
+			Context:     c.Request.Context(),
 			OperationID: GenerateOperationID("cancel"),
 			EventType:   "ops.proposal.cancelled",
 			Actor:       operator,
@@ -598,6 +662,17 @@ func (h *OpsHandler) ReconcileProposalEndpoint(c *gin.Context) {
 		return
 	}
 
+	var prop model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&prop).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && prop.HouseholdID != 0 && prop.HouseholdID != callerHouseholdID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
 	var req struct {
 		ResolvedStatus string `json:"resolved_status" binding:"required"`
 		Note           string `json:"note"`
@@ -609,6 +684,7 @@ func (h *OpsHandler) ReconcileProposalEndpoint(c *gin.Context) {
 
 	operator := getOperatorName(c)
 	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	fsm.SetAuditEngine(h.getAuditEngine())
 	updated, err := fsm.ReconcileProposal(idParam, req.ResolvedStatus, operator, req.Note)
 	if err != nil {
 		if errors.Is(err, ErrInvalidProposalTransition) {
@@ -918,6 +994,110 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 	if err := h.db.First(&refreshed, proposal.ID).Error; err == nil {
 		proposal = refreshed
 	}
+
+	if ae := h.getAuditEngine(); ae != nil {
+		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+			HouseholdID:    proposal.HouseholdID,
+			TriggerSource:  "proposal_update",
+			ActorType:      "user",
+			ActorID:        getOperatorName(c),
+			EventType:      model.AuditEventExecutionStepCompleted,
+			Action:         "proposal.update",
+			Target:         proposal.TargetComponent,
+			Component:      proposal.TargetComponent,
+			Decision:       model.AuditDecisionAllow,
+			RiskLevel:      strings.ToUpper(proposal.RiskLevel),
+			ProposalID:     proposal.ProposalID,
+			BeforeState:    map[string]interface{}{"status": origStatus, "version": origVersion, "revision": origRev},
+			AfterState:     map[string]interface{}{"status": proposal.Status, "version": proposal.Version, "revision": proposal.Revision, "approval_invalidated": boundFieldChanged},
+			Parameters:     updates,
+			Result:         "UPDATED",
+			FinalRunStatus: model.AuditRunStatusCompleted,
+			MirrorLegacy:   true,
+		})
+	}
+
 	c.JSON(http.StatusOK, proposal)
+}
+
+// RejectProposal transitions a pending/awaiting-approval proposal to REJECTED via strict CAS (Admin-Only).
+//
+//	Route: POST /api/v1/ops/proposals/:id/reject
+func (h *OpsHandler) RejectProposal(c *gin.Context) {
+	if c.GetBool("is_internal_service") || !c.GetBool("is_admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: administrator privileges required to reject proposals"})
+		return
+	}
+
+	idParam := strings.TrimSpace(c.Param("id"))
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
+		return
+	}
+
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	_ = c.ShouldBindJSON(&body)
+
+	var prop model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&prop).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && prop.HouseholdID != 0 && prop.HouseholdID != callerHouseholdID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	operator := getOperatorName(c)
+	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	fsm.SetAuditEngine(h.getAuditEngine())
+	won, err := fsm.TransitionStrict(ProposalTransitionParams{
+		ProposalID: prop.ProposalID,
+		ExpectedStatuses: []string{
+			model.ProposalStatusPending,
+			model.ProposalStatusAwaitingApproval,
+			model.ProposalStatusApprovalRequired,
+		},
+		TargetStatus: model.ProposalStatusRejected,
+		Updates: map[string]interface{}{
+			"execution_log": redact.SensitiveString(strings.TrimSpace(body.Reason)),
+		},
+		Audit: &ProposalTransitionAudit{
+			Context:     c.Request.Context(),
+			OperationID: GenerateOperationID("reject"),
+			EventType:   "ops.proposal.rejected",
+			Actor:       operator,
+			Level:       model.LevelWarning,
+			Message:     fmt.Sprintf("管理员 %s 拒绝了系统提案 [%s]: %s", operator, prop.ProposalID, strings.TrimSpace(body.Reason)),
+			Metadata:    map[string]interface{}{"reason": strings.TrimSpace(body.Reason)},
+		},
+	})
+	if err != nil {
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if !won {
+		c.JSON(http.StatusConflict, gin.H{"error": "Proposal is no longer in a rejectable state"})
+		return
+	}
+
+	_ = h.db.First(&prop, prop.ID).Error
+	c.JSON(http.StatusOK, gin.H{
+		"status":   prop.Status,
+		"proposal": prop,
+	})
+}
+
+func auditDecisionForRisk(risk string) string {
+	switch strings.ToUpper(strings.TrimSpace(risk)) {
+	case model.RiskLevelHigh, model.RiskLevelCritical, model.RiskLevelMedium:
+		return model.AuditDecisionRequireApproval
+	default:
+		return model.AuditDecisionRequireApproval
+	}
 }
 
