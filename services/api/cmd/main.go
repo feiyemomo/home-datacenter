@@ -61,6 +61,9 @@ func main() {
 	if err := security.ValidateBootGuard(security.IsProductionEnvironment(), cfg.JWT.Secret, onePanelPassword); err != nil {
 		log.Fatalf("FAIL-FAST BOOT GUARD: %v. Refusing to boot in production.", err)
 	}
+	if err := model.ValidateApprovalHMACKeyBootGuard(security.IsProductionEnvironment()); err != nil {
+		log.Fatalf("FAIL-FAST BOOT GUARD (HMAC): %v. Set OPS_APPROVAL_HMAC_KEY (>=32 chars) in production.", err)
+	}
 	if strings.TrimSpace(onePanelPassword) == "" && security.IsProductionEnvironment() {
 		log.Println("[BootGuard] ONEPANEL_PASSWORD not set; 1Panel ops integration will fallback to host metrics")
 	}
@@ -83,18 +86,19 @@ func main() {
 	log.Println("sqlite initialized successfully")
 	log.Println("system bootstrap completed")
 
-	// Phase 11 / WO 5.2: Auto-migrate ops chat, proposal, execution history, and alert models
+	// Verify/migrate core ops security tables BEFORE any GORM ops operations so dropped
+	// security tables are caught Fail-Closed and never silently recreated by AutoMigrate (Blocker 1).
+	opsSchemaErr := ops.EnsureOpsSchema(database.DB)
+	if opsSchemaErr != nil {
+		log.Printf("[CRITICAL] ops security schema integrity error (FSM & scheduler entering fail-closed degraded mode): %v", opsSchemaErr)
+	}
+
+	// Phase 11 / WO 5.2: Auto-migrate auxiliary non-critical models (ops tables managed strictly by EnsureOpsSchema)
 	if err := database.DB.AutoMigrate(
-		&model.OpsChatSession{},
-		&model.OpsChatMessage{},
-		&model.OpsProposal{},
-		&model.OpsExecutionHistory{},
 		&model.SecurityAlertFilter{},
 		&model.SSOTicket{},
 		&model.Household{},
 		&model.StructuredOpsAuditLog{},
-		&model.OpsMaintenanceLock{},
-		&model.OpsCircuitBreakerState{},
 	); err != nil {
 		log.Fatalf("failed to auto-migrate ops models: %v", err)
 	}
@@ -285,6 +289,11 @@ func main() {
 
 	opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
 	opsHandler.SetVulnScanner(vulnScanner)
+	recoveryFSM := opsHandler.GetRecoveryFSM()
+	safetyFSM.SetRecoveryFSM(recoveryFSM)
+	if defExec, ok := opsHandler.GetExecutor().(*ops.DefaultOperationExecutor); ok && defExec != nil {
+		defExec.SetRecoveryFSM(recoveryFSM)
+	}
 
 	// Startup proposal reconciliation (replacing blind sweeper)
 	if err := ops.ReconcileStartupProposals(database.DB, opsHandler.GetExecutor()); err != nil {
@@ -293,7 +302,11 @@ func main() {
 
 	// Go Core ProposalScheduler as sole background authority for SCHEDULED proposals
 	proposalScheduler := ops.NewProposalScheduler(database.DB, opsHandler.GetExecutor())
-	proposalScheduler.Start()
+	if opsSchemaErr == nil {
+		proposalScheduler.Start()
+	} else {
+		log.Printf("[CRITICAL] refusing to start ProposalScheduler due to fail-closed ops schema error: %v", opsSchemaErr)
+	}
 
 	// Phase 11 / WO 5.4: 1Panel WAF log collector & bi-directional ipBlack.json firewall sync
 	wafCollector := ops.NewWAFCollector(
@@ -306,6 +319,7 @@ func main() {
 			AutoSyncBlack: true,
 		},
 	)
+	wafCollector.SetExecutor(opsHandler.GetExecutor())
 	wafCollector.Start(context.Background())
 	_ = wafCollector.SyncBannedIPs(defenseMgr.ListBanned())
 
@@ -1022,8 +1036,8 @@ func main() {
 			opsHandler.RegisterChatRoutes(opsGroup)
 			opsHandler.RegisterFSMRoutes(opsGroup)
 
-			// Autonomous FSM & Vuln Scanner Triggers
-			opsGroup.POST("/scan-vulns", func(c *gin.Context) {
+			// Autonomous FSM & Vuln Scanner Triggers (Admin-only + Fail-Closed)
+			opsGroup.POST("/scan-vulns", middleware.RequireAdmin(database.DB), func(c *gin.Context) {
 				go func() {
 					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 					defer cancel()
@@ -1042,7 +1056,7 @@ func main() {
 				})
 			})
 
-			opsGroup.POST("/update-check", func(c *gin.Context) {
+			opsGroup.POST("/update-check", middleware.RequireAdmin(database.DB), func(c *gin.Context) {
 				var req struct {
 					Component string `json:"component"`
 					OldVer    string `json:"old_ver"`
@@ -1051,6 +1065,19 @@ func main() {
 				_ = c.ShouldBindJSON(&req)
 				if req.Component == "" {
 					req.Component = "home-api"
+				}
+				canonicalComp, cErr := ops.ResolveComponent(req.Component)
+				if cErr != nil {
+					utils.Fail(c, http.StatusBadRequest, fmt.Sprintf("component '%s' is not whitelisted: %v", req.Component, cErr))
+					return
+				}
+				if recoveryFSM.GetMaintenanceLock().IsDegraded() || recoveryFSM.GetCircuitBreaker().IsDegraded() {
+					utils.Fail(c, http.StatusConflict, ops.ErrFailClosedMode.Error())
+					return
+				}
+				if recoveryFSM.GetMaintenanceLock().IsLocked() {
+					utils.Fail(c, http.StatusConflict, ops.ErrSystemInMaintenance.Error())
+					return
 				}
 				if req.OldVer == "" {
 					req.OldVer = "v1.17.0"
@@ -1069,7 +1096,7 @@ func main() {
 						}
 						spec := ops.OperationSpec{
 							Action: ops.ActionDockerRestart,
-							Target: req.Component,
+							Target: canonicalComp,
 						}
 						res, err := executor.Execute(checkCtx, spec)
 						if err != nil {
@@ -1086,13 +1113,13 @@ func main() {
 						}
 						spec := ops.OperationSpec{
 							Action: ops.ActionDockerRestart,
-							Target: req.Component,
+							Target: canonicalComp,
 						}
 						return executor.ExecuteRollback(context.Background(), spec)
 					}
 					_, _ = safetyFSM.CheckAndPerformOffPeakUpdate(
 						checkCtx,
-						req.Component,
+						canonicalComp,
 						req.OldVer,
 						req.NewVer,
 						applyFn,
@@ -1100,7 +1127,7 @@ func main() {
 					)
 				}()
 				utils.Success(c, gin.H{
-					"message": fmt.Sprintf("已发起 %s 非繁忙期更新安全检测 (基线状态: %s)", req.Component, safetyFSM.CurrentState()),
+					"message": fmt.Sprintf("已发起 %s 非繁忙期更新安全检测 (基线状态: %s)", canonicalComp, safetyFSM.CurrentState()),
 					"state":   safetyFSM.CurrentState(),
 				})
 			})

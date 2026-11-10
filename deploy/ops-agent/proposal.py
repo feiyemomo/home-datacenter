@@ -8,11 +8,25 @@ Human-in-the-Loop Proposal Lifecycle Manager for home-ops-agent:
 
 import json
 import logging
+import os
+import pathlib
+import socket
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("home-ops-agent.proposal")
+
+
+def _open_existing_sqlite(db_path: str, readonly: bool) -> sqlite3.Connection:
+    """Opens an existing SQLite DB using URI mode=ro or mode=rw; NEVER auto-creates files (R4-14)."""
+    if not db_path or not os.path.isfile(db_path):
+        raise FileNotFoundError(f"SQLite DB missing: {db_path}")
+    posix = pathlib.Path(os.path.abspath(db_path)).as_posix()
+    mode = "ro" if readonly else "rw"
+    conn = sqlite3.connect(f"file:{posix}?mode={mode}", uri=True, timeout=5.0)
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
 
 
 class ProposalLifecycleManager:
@@ -26,6 +40,7 @@ class ProposalLifecycleManager:
     STATE_EXECUTING = "EXECUTING"
     STATE_EXECUTED = "EXECUTED"
     STATE_FAILED_ROLLEDBACK = "FAILED_ROLLEDBACK"
+    STATE_EXECUTION_UNKNOWN = "EXECUTION_UNKNOWN"
 
     def __init__(
         self,
@@ -37,8 +52,7 @@ class ProposalLifecycleManager:
         self.go_api_url = go_api_url
         self.internal_token = internal_token
         self.proposals: Dict[str, Dict[str, Any]] = {}
-        if self.db_path:
-            self._init_sqlite_schema()
+        if self.db_path and os.path.isfile(self.db_path):
             self._load_from_sqlite()
 
     def create_proposal(
@@ -139,7 +153,8 @@ class ProposalLifecycleManager:
         target_token = internal_token or self.internal_token
 
         if target_go_url:
-            # Delegate to Go Core OperationExecutor via dedicated execute route
+            # Delegate strictly to Go Core OperationExecutor via dedicated execute route (R4-03)
+            import urllib.error
             import urllib.request
             api_url = f"{target_go_url.rstrip('/')}/api/v1/ops/proposals/{prop_id}/execute"
             payload = json.dumps({}).encode("utf-8")
@@ -157,19 +172,41 @@ class ProposalLifecycleManager:
                             self._update_sqlite_status(proposal)
                         logger.info(f"Proposal {prop_id} successfully executed via Go Core OperationExecutor")
                         return True, "Executed via Go Core"
-                    else:
-                        proposal["status"] = self.STATE_FAILED_ROLLEDBACK
-                        proposal["rollback_executed"] = True
-                        if self.db_path:
-                            self._update_sqlite_status(proposal)
-                        return False, f"Go Core execution returned HTTP {resp.status}"
-            except Exception as e:
-                proposal["status"] = self.STATE_FAILED_ROLLEDBACK
-                proposal["rollback_executed"] = True
+                    proposal["status"] = self.STATE_EXECUTION_UNKNOWN
+                    if self.db_path:
+                        self._update_sqlite_status(proposal)
+                    return False, f"Go Core execution returned HTTP {resp.status}"
+            except urllib.error.HTTPError as http_err:
+                if http_err.code >= 500 or http_err.code == 504:
+                    proposal["status"] = self.STATE_EXECUTION_UNKNOWN
+                else:
+                    proposal["status"] = self.STATE_APPROVED  # Policy/CAS rejected before mutation
                 if self.db_path:
                     self._update_sqlite_status(proposal)
-                logger.error(f"Proposal {prop_id} execution failed via Go Core: {e}")
-                return False, f"Execution failed via Go Core: {e}"
+                logger.error(f"Proposal {prop_id} execution rejected by Go Core (HTTP {http_err.code}): {http_err}")
+                return False, f"Go Core rejected execution (HTTP {http_err.code}): {http_err}"
+            except (urllib.error.URLError, socket.timeout, TimeoutError) as net_err:
+                # Ambiguous transport/timeout outcome MUST transition to EXECUTION_UNKNOWN (R4-03),
+                # never claim local rollback executed when remote outcome is unknown.
+                proposal["status"] = self.STATE_EXECUTION_UNKNOWN
+                if self.db_path:
+                    self._update_sqlite_status(proposal)
+                logger.critical(f"Proposal {prop_id} entered EXECUTION_UNKNOWN on Go Core timeout/network error: {net_err}")
+                return False, f"EXECUTION_UNKNOWN via Go Core timeout/network error: {net_err}"
+            except Exception as e:
+                proposal["status"] = self.STATE_EXECUTION_UNKNOWN
+                if self.db_path:
+                    self._update_sqlite_status(proposal)
+                logger.error(f"Proposal {prop_id} execution ambiguous failure via Go Core: {e}")
+                return False, f"Execution failed via Go Core (EXECUTION_UNKNOWN): {e}"
+
+        env_mode = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", os.environ.get("ENV", ""))).strip().lower()
+        is_prod = env_mode in ("production", "prod") or (
+            env_mode not in ("development", "dev", "test", "testing") and os.path.exists("/.dockerenv")
+        )
+        if is_prod:
+            logger.critical(f"[Fail-Closed] Refusing local proposal {prop_id} execution without Go Core API in production.")
+            return False, "Go Core API URL required for proposal execution in production"
 
         proposal["status"] = self.STATE_EXECUTING
 
@@ -197,7 +234,13 @@ class ProposalLifecycleManager:
         return 3 <= current_hour < 5
 
     def check_and_run_scheduled_proposals(self, current_hour: Optional[int] = None) -> List[Dict[str, Any]]:
-        """If inside low-peak window, triggers execution of scheduled proposals."""
+        """
+        Go Core ProposalScheduler is sole scheduling authority when go_api_url is configured (R4-01).
+        Only executes local unit-test queue when go_api_url is unset outside production.
+        """
+        if self.go_api_url:
+            logger.debug("Skipping local scheduled proposal runner: Go Core ProposalScheduler is sole authority.")
+            return []
         if not self.is_low_peak_window(current_hour):
             return []
 
@@ -211,48 +254,20 @@ class ProposalLifecycleManager:
         return executed
 
     def _init_sqlite_schema(self) -> None:
-        if not self.db_path:
-            return
-        conn = None
-        try:
-            conn = sqlite3.connect(self.db_path)
-            with conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS pending_proposals (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        proposal_id TEXT UNIQUE,
-                        title TEXT NOT NULL,
-                        description TEXT,
-                        target_component TEXT,
-                        risk_level TEXT NOT NULL,
-                        estimated_seconds INTEGER DEFAULT 30,
-                        downtime_seconds INTEGER DEFAULT 0,
-                        execution_plan TEXT NOT NULL,
-                        rollback_plan TEXT NOT NULL,
-                        status TEXT NOT NULL DEFAULT 'AWAITING_APPROVAL',
-                        scheduled_at TEXT,
-                        approved_at TEXT,
-                        approved_by TEXT,
-                        executed_at TEXT,
-                        execution_log TEXT,
-                        created_at TEXT NOT NULL,
-                        updated_at TEXT
-                    )
-                """)
-        except Exception as e:
-            logger.debug(f"SQLite schema init note: {e}")
-        finally:
-            if conn:
-                conn.close()
+        """No-op: Python must never run runtime DDL (CREATE TABLE) against SQLite (R4-14)."""
+        return
 
     def _load_from_sqlite(self) -> None:
-        if not self.db_path:
+        if not self.db_path or not os.path.isfile(self.db_path):
             return
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = _open_existing_sqlite(self.db_path, readonly=True)
             conn.row_factory = sqlite3.Row
             cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_proposals'")
+            if not cur.fetchone():
+                return
             cur.execute("SELECT * FROM pending_proposals")
             for row in cur.fetchall():
                 prop_id = row["proposal_id"] or f"prop-{row['id']}"
@@ -280,16 +295,17 @@ class ProposalLifecycleManager:
                 conn.close()
 
     def _persist_to_sqlite(self, prop: Dict[str, Any]) -> None:
-        if not self.db_path:
+        if not self.db_path or not os.path.isfile(self.db_path):
             return
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = _open_existing_sqlite(self.db_path, readonly=False)
             with conn:
                 conn.execute("""
-                    INSERT OR REPLACE INTO pending_proposals
+                    INSERT INTO pending_proposals
                     (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, status, created_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(proposal_id) DO NOTHING
                 """, (
                     prop["id"],
                     prop["title"],
@@ -308,15 +324,15 @@ class ProposalLifecycleManager:
                 conn.close()
 
     def _update_sqlite_status(self, prop: Dict[str, Any]) -> None:
-        if not self.db_path:
+        if not self.db_path or not os.path.isfile(self.db_path):
             return
-        # Go Core is sole scheduling authority: do not write direct SQLite status updates for SCHEDULED proposals
-        if prop.get("status") == self.STATE_SCHEDULED:
-            logger.debug(f"Skipping direct SQLite status update for SCHEDULED proposal {prop.get('id')}; Go Core is sole scheduling authority")
+        # Go Core is sole authority for SCHEDULED and authoritative status transitions
+        if prop.get("status") == self.STATE_SCHEDULED or self.go_api_url:
+            logger.debug(f"Skipping direct SQLite status write for proposal {prop.get('id')}; Go Core owns authoritative transitions")
             return
         conn = None
         try:
-            conn = sqlite3.connect(self.db_path)
+            conn = _open_existing_sqlite(self.db_path, readonly=False)
             with conn:
                 conn.execute("""
                     UPDATE pending_proposals

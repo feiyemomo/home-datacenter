@@ -77,6 +77,7 @@ func TestChallengeProposal_AuthorizationGuard(t *testing.T) {
 		RiskLevel:        model.RiskLevelLow,
 		Status:           model.ProposalStatusAwaitingApproval,
 		ActionSpec:       `{"action":"docker.restart","target":"home-web"}`,
+		BaselineHash:     model.ComputeDefaultBaseline("home-web"),
 		CreatedAt:        time.Now(),
 	}
 	if err := db.Create(&seedProp).Error; err != nil {
@@ -311,9 +312,7 @@ func TestChallengeProposal_ActionSpecFidelity(t *testing.T) {
 		ActionSpec:      string(specBytes),
 		CreatedAt:       time.Now(),
 	}
-	if err := db.Create(&prop).Error; err != nil {
-		t.Fatalf("failed to create test proposal: %v", err)
-	}
+	seedTestSignedProposal(t, db, &prop)
 
 	// Execute proposal directly through handler/executor to verify parsed spec fidelity
 	res, err := handler.ExecuteProposal(context.Background(), "prop-spec-fidelity-001")
@@ -401,6 +400,7 @@ func TestChallengeProposal_FailedRolledbackStatus(t *testing.T) {
 		RiskLevel:       model.RiskLevelHigh,
 		Status:          model.ProposalStatusAwaitingApproval,
 		ActionSpec:      string(specBytes),
+		BaselineHash:    model.ComputeDefaultBaseline("home-api"),
 		CreatedAt:       time.Now(),
 	}
 	if err := db.Create(&prop).Error; err != nil {

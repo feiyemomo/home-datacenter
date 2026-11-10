@@ -65,8 +65,6 @@ func InitDB(dbPath string) {
 		&model.CameraAlert{},
 		&model.Household{},
 		&model.StructuredOpsAuditLog{},
-		&model.OpsMaintenanceLock{},
-		&model.OpsCircuitBreakerState{},
 	)
 	if err != nil {
 		log.Fatalf("failed to migrate database: %v", err)

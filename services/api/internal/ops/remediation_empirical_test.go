@@ -18,12 +18,16 @@ import (
 	"home-datacenter-api/internal/model"
 )
 
-// setupRemediationTestDB creates an isolated in-memory SQLite database.
+// setupRemediationTestDB creates an isolated per-test SQLite database.
 func setupRemediationTestDB(t *testing.T) *gorm.DB {
 	t.Helper()
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "remediation_test.db")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
-		t.Fatalf("failed to open sqlite in-memory db: %v", err)
+		t.Fatalf("failed to open sqlite db: %v", err)
+	}
+	if sqlDB, sErr := db.DB(); sErr == nil {
+		t.Cleanup(func() { _ = sqlDB.Close() })
 	}
 	if err := db.AutoMigrate(
 		&model.OpsProposal{},
@@ -122,9 +126,7 @@ func TestCASAtomicProposalExecutionGuard(t *testing.T) {
 		ExecutionPlan:   "restart",
 		CreatedAt:       time.Now(),
 	}
-	if err := db.Create(&prop).Error; err != nil {
-		t.Fatalf("failed to create proposal: %v", err)
-	}
+	seedTestSignedProposal(t, db, &prop)
 
 	// Fast mock runner
 	executor := NewOperationExecutor(

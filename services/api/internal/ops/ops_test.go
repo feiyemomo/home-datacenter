@@ -25,7 +25,44 @@ import (
 
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/utils"
 )
+
+func seedTestSignedProposal(t *testing.T, db *gorm.DB, p *model.OpsProposal) {
+	t.Helper()
+	if strings.TrimSpace(p.BaselineHash) == "" && strings.TrimSpace(p.TargetComponent) != "" {
+		p.BaselineHash = model.ComputeDefaultBaseline(p.TargetComponent)
+	}
+	if p.Version <= 0 {
+		p.Version = 1
+	}
+	if p.Revision <= 0 {
+		p.Revision = 1
+	}
+	if p.HouseholdID == 0 {
+		p.HouseholdID = 1
+	}
+	if p.Status == model.ProposalStatusApproved || p.Status == model.ProposalStatusScheduled {
+		if strings.TrimSpace(p.ApprovedBy) == "" {
+			p.ApprovedBy = "admin-fixture"
+		}
+		if !p.ApprovedAt.Valid {
+			p.ApprovedAt = utils.NullTime{Time: time.Now().UTC().Truncate(time.Second), Valid: true}
+		} else {
+			p.ApprovedAt.Time = p.ApprovedAt.Time.UTC().Truncate(time.Second)
+		}
+		if strings.TrimSpace(p.ApprovalDigest) == "" {
+			digest, err := ComputeProposalApprovalDigest(p)
+			if err != nil {
+				t.Fatalf("seedTestSignedProposal failed to sign proposal %s: %v", p.ProposalID, err)
+			}
+			p.ApprovalDigest = digest
+		}
+	}
+	if err := db.Create(p).Error; err != nil {
+		t.Fatalf("seedTestSignedProposal failed to persist proposal %s: %v", p.ProposalID, err)
+	}
+}
 
 // setupMockOnePanelServer simulates a real 1Panel v2 server.
 func setupMockOnePanelServer(t *testing.T) (*httptest.Server, *rsa.PrivateKey) {
@@ -326,6 +363,12 @@ func TestOpsHandlerEndpoints(t *testing.T) {
 	bus := eventbus.New()
 
 	handler := NewOpsHandler(client, fallback, db, bus, nil)
+	// Mock health probe in unit test harness since no live home-web listener exists on :8086
+	handler.SetExecutor(NewOperationExecutor(
+		db, bus, client, fallback,
+		WithBaselineExtractor(handler.ComputeFingerprint),
+		WithHealthChecker(func(context.Context, string) error { return nil }),
+	))
 
 	r := gin.New()
 	rg := r.Group("/api/v1/ops")

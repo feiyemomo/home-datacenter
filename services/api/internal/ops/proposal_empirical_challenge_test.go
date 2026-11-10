@@ -73,6 +73,7 @@ func TestEmpiricalChallenge5_ProposalCrossHouseholdIDOR(t *testing.T) {
 		RiskLevel:       model.RiskLevelLow,
 		Status:          model.ProposalStatusAwaitingApproval,
 		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
+		BaselineHash:    model.ComputeDefaultBaseline("home-web"),
 		CreatedAt:       time.Now(),
 	}
 	db.Create(&propA)
@@ -170,6 +171,7 @@ func TestEmpiricalChallenge6_InternalTokenCannotApproveProposalOrAdminRoutes(t *
 		RiskLevel:       model.RiskLevelLow,
 		Status:          model.ProposalStatusAwaitingApproval,
 		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
+		BaselineHash:    model.ComputeDefaultBaseline("home-web"),
 		CreatedAt:       time.Now(),
 	}
 	db.Create(&prop)

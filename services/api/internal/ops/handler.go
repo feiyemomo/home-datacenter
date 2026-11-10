@@ -254,7 +254,7 @@ func (h *OpsHandler) ListNASContainers(c *gin.Context) {
 	utils.Success(c, fallbackContainers)
 }
 
-// RestartNASContainer restarts a specific container by name (Admin only, audit logged).
+// RestartNASContainer restarts a specific container through OperationExecutor (Admin only, leased & audited).
 //
 //	Route: POST /api/v1/ops/nas/containers/:name/restart
 func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
@@ -268,8 +268,9 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 	rawName := c.Param("name")
 	name := strings.TrimPrefix(strings.TrimSpace(rawName), "/")
 
-	// Security check 2: Whitelist constraint
-	if !AllowedCoreContainers[name] {
+	// Security check 2: Unified whitelist & canonical resolution (no OperationExecutor bypass)
+	canonical, resolveErr := ResolveComponent(name)
+	if resolveErr != nil || !AllowedCoreContainers[name] {
 		utils.Fail(c, http.StatusBadRequest, fmt.Sprintf("容器 '%s' 不在受管安全重启白名单中", name))
 		return
 	}
@@ -280,19 +281,29 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 		clientIP = c.ClientIP()
 	}
 
-	ctx, cancel := contextWithTimeout(c.Request.Context(), 15*time.Second)
-	defer cancel()
-
-	// 1. Attempt restart via 1Panel OpenAPI
-	err := h.client.RestartContainer(ctx, name)
-	if err != nil {
-		log.Printf("[ops] 1Panel restart failed for %s (%v), attempting fallback Docker restart", name, err)
-		err = h.fallback.RestartContainerFallback(ctx, name)
+	exec := h.GetExecutor()
+	if exec == nil {
+		h.recordAuditLog(name, operator, clientIP, false, "operation executor not configured")
+		utils.Fail(c, http.StatusServiceUnavailable, "OperationExecutor 未配置，拒绝绕过安全执行器")
+		return
 	}
 
-	if err != nil {
-		h.recordAuditLog(name, operator, clientIP, false, err.Error())
-		utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("容器重启失败: %v", err))
+	ctx, cancel := contextWithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerRestart,
+		Target: canonical,
+	})
+	if err != nil || (res != nil && !res.Success) {
+		detail := ""
+		if err != nil {
+			detail = err.Error()
+		} else if res != nil {
+			detail = res.Error
+		}
+		h.recordAuditLog(name, operator, clientIP, false, detail)
+		utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("容器重启失败: %s", detail))
 		return
 	}
 
@@ -302,7 +313,7 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 	utils.Success(c, ContainerRestartResponse{
 		Name:        name,
 		Success:     true,
-		Message:     fmt.Sprintf("容器 %s 已成功触发安全重启", name),
+		Message:     fmt.Sprintf("容器 %s 已通过安全执行器完成重启与健康验证", name),
 		Operator:    operator,
 		RestartedAt: time.Now(),
 	})

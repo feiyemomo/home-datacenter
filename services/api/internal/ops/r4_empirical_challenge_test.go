@@ -101,9 +101,7 @@ func TestEmpiricalChallenge1_CancelVsExecute_ConcurrentRace(t *testing.T) {
 				ActionSpec:      `{"action":"restart","target":"home-api"}`,
 				CreatedAt:       time.Now(),
 			}
-			if err := db.Create(&p).Error; err != nil {
-				t.Fatalf("failed to create proposal: %v", err)
-			}
+			seedTestSignedProposal(t, db, &p)
 
 			startBarrier := make(chan struct{})
 			var wg sync.WaitGroup
@@ -688,7 +686,7 @@ func TestEmpiricalChallenge4_FiveStageVerifiedRollback_FailureInjection(t *testi
 			ActionSpec:      `{"action":"restart","target":"home-api","rollback_spec":{"action":"rollback","target":"home-api"}}`,
 			CreatedAt:       time.Now(),
 		}
-		db.Create(&propFail)
+		seedTestSignedProposal(t, db, &propFail)
 
 		_, _ = failingRollbackExecutor.ExecuteProposal(context.Background(), &propFail)
 
@@ -730,7 +728,7 @@ func TestEmpiricalChallenge4_FiveStageVerifiedRollback_FailureInjection(t *testi
 			ActionSpec:      `{"action":"restart","target":"home-api","rollback_spec":{"action":"rollback","target":"home-api"}}`,
 			CreatedAt:       time.Now(),
 		}
-		db.Create(&propSuccess)
+		seedTestSignedProposal(t, db, &propSuccess)
 
 		_, _ = succeedingRollbackExecutor.ExecuteProposal(context.Background(), &propSuccess)
 

@@ -112,7 +112,7 @@ func TestCAS_StrictRejectionOfAwaitingAndPending(t *testing.T) {
 		ActionSpec:       `{"action":"docker.restart","target":"home-web"}`,
 		CreatedAt:        time.Now(),
 	}
-	db.Create(&propScheduledFuture)
+	seedTestSignedProposal(t, db, &propScheduledFuture)
 
 	_, err = executor.ExecuteProposal(context.Background(), &propScheduledFuture)
 	if err == nil {
@@ -131,7 +131,7 @@ func TestCAS_StrictRejectionOfAwaitingAndPending(t *testing.T) {
 		ActionSpec:       `{"action":"docker.restart","target":"home-web"}`,
 		CreatedAt:        time.Now(),
 	}
-	db.Create(&propApproved)
+	seedTestSignedProposal(t, db, &propApproved)
 
 	res, err := executor.ExecuteProposal(context.Background(), &propApproved)
 	if err != nil {
@@ -343,7 +343,7 @@ func TestInternalSecretAuth_EnforcesDualTrack(t *testing.T) {
 	handler.RegisterProposalRoutes(rg)
 
 	// 5.1 Request with valid X-Internal-Secret to create proposal -> SUCCEEDS (201/200)
-	propPayload := `{"proposal_id":"prop-int-001","title":"Internal Daemon Proposal","target_component":"home-web","risk_level":"HIGH","action_spec":"{}"}`
+	propPayload := `{"proposal_id":"prop-int-001","title":"Internal Daemon Proposal","target_component":"home-web","risk_level":"HIGH","action_spec":"{\"action\":\"docker.restart\",\"target\":\"home-web\"}"}`
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest(http.MethodPost, "/api/v1/ops/proposals", strings.NewReader(propPayload))
 	req.Header.Set("Content-Type", "application/json")
@@ -691,7 +691,7 @@ func TestExecuteProposalEndpoint_DualTrackAndStateSafety(t *testing.T) {
 		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
 		CreatedAt:       time.Now(),
 	}
-	db.Create(&propApproved)
+	seedTestSignedProposal(t, db, &propApproved)
 
 	propAwaiting := model.OpsProposal{
 		ProposalID:      "prop-awaiting-exec-002",
@@ -701,7 +701,7 @@ func TestExecuteProposalEndpoint_DualTrackAndStateSafety(t *testing.T) {
 		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
 		CreatedAt:       time.Now(),
 	}
-	db.Create(&propAwaiting)
+	seedTestSignedProposal(t, db, &propAwaiting)
 
 	// Case 1: Unauthenticated -> 401 Unauthorized
 	wNoAuth := httptest.NewRecorder()
@@ -756,7 +756,7 @@ func TestSCHEDULED_DaytimeWindowBlocked(t *testing.T) {
 		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
 		CreatedAt:       time.Now(),
 	}
-	db.Create(&propSched)
+	seedTestSignedProposal(t, db, &propSched)
 
 	// If current time is not off-peak (02:00 - 05:00), ExecuteProposal MUST reject
 	if !IsOffPeak(time.Now()) {

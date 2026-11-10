@@ -30,6 +30,7 @@ func setupOpsHandlerForTest(t *testing.T) (*OpsHandler, *gin.Engine) {
 		ExecutionPlan:    "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
 		RollbackPlan:     "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
 		ActionSpec:       `{"action":"docker.restart","target":"home-web","rollback_spec":{"action":"docker.restart","target":"home-web"}}`,
+		BaselineHash:     model.ComputeDefaultBaseline("home-web"),
 		Status:           model.ProposalStatusAwaitingApproval,
 		CreatedAt:        time.Now().Add(-2 * time.Hour),
 	})
@@ -44,6 +45,7 @@ func setupOpsHandlerForTest(t *testing.T) (*OpsHandler, *gin.Engine) {
 		ExecutionPlan:    "CREATE INDEX IF NOT EXISTS idx_security_events_time_type ON security_events(created_at, type);",
 		RollbackPlan:     "DROP INDEX IF EXISTS idx_security_events_time_type;",
 		ActionSpec:       `{"action":"db.create_index","target":"home-api","params":{"table_name":"security_events","index_name":"idx_security_events_time_type","columns":["created_at","type"]},"rollback_spec":{"action":"db.drop_index","target":"home-api","params":{"index_name":"idx_security_events_time_type"}}}`,
+		BaselineHash:     model.ComputeDefaultBaseline("home-api"),
 		Status:           model.ProposalStatusAwaitingApproval,
 		CreatedAt:        time.Now().Add(-1 * time.Hour),
 	})
@@ -302,6 +304,7 @@ func TestProposalRejectsNonAdminWithoutContextElevation(t *testing.T) {
 		ExecutionPlan:    "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
 		RollbackPlan:     "docker tag home-web:prev home-web:latest && docker-compose restart home-web",
 		ActionSpec:       `{"action":"docker.restart","target":"home-web","rollback_spec":{"action":"docker.restart","target":"home-web"}}`,
+		BaselineHash:     model.ComputeDefaultBaseline("home-web"),
 		Status:           model.ProposalStatusAwaitingApproval,
 		CreatedAt:        time.Now().Add(-2 * time.Hour),
 	})
@@ -316,6 +319,7 @@ func TestProposalRejectsNonAdminWithoutContextElevation(t *testing.T) {
 		ExecutionPlan:    "CREATE INDEX IF NOT EXISTS idx_security_events_time_type ON security_events(created_at, type);",
 		RollbackPlan:     "DROP INDEX IF EXISTS idx_security_events_time_type;",
 		ActionSpec:       `{"action":"db.create_index","target":"home-api","params":{"table_name":"security_events","index_name":"idx_security_events_time_type","columns":["created_at","type"]},"rollback_spec":{"action":"db.drop_index","target":"home-api","params":{"index_name":"idx_security_events_time_type"}}}`,
+		BaselineHash:     model.ComputeDefaultBaseline("home-api"),
 		Status:           model.ProposalStatusAwaitingApproval,
 		CreatedAt:        time.Now().Add(-1 * time.Hour),
 	})

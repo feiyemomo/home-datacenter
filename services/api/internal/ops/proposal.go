@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
 
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
@@ -115,14 +116,23 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 	req.ApprovedAt = utils.NullTime{}
 	req.ExecutedAt = utils.NullTime{}
 	req.ExecutionLog = ""
+	req.ExecutionToken = ""
 	if req.EstimatedSeconds == 0 {
 		req.EstimatedSeconds = 30
 	}
 	if req.ProposalID == "" {
 		req.ProposalID = fmt.Sprintf("prop-%d", time.Now().UnixNano()/1e6)
 	}
-	// BaselineHash Anti-Tampering (R5): Every proposal MUST have a valid non-empty baseline.
+	// Canonical component and BaselineHash Anti-Tampering (R4-17, R5)
 	if req.TargetComponent != "" {
+		canonicalTarget := model.CanonicalizeComponent(req.TargetComponent)
+		if canonicalTarget == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   ErrComponentNotWhitelisted.Error(),
+				"message": "target component is unknown or not permitted",
+			})
+			return
+		}
 		computed := h.ComputeFingerprint(req.TargetComponent)
 		if computed == "" {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -141,11 +151,22 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 		})
 		return
 	}
-	if req.Version <= 0 {
-		req.Version = 1
-	}
+	req.Version = 1
+	req.Revision = 1
 	req.ApprovalDigest = ""
-	req.CreatedAt = time.Now()
+	req.CreatedAt = time.Now().UTC()
+
+	// Validate action_spec structure strictly at creation time if provided
+	if strings.TrimSpace(req.ActionSpec) != "" {
+		exec := &DefaultOperationExecutor{}
+		if _, err := exec.parseProposalSpec(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   err.Error(),
+				"message": "invalid or mismatched action_spec payload",
+			})
+			return
+		}
+	}
 
 	if err := h.db.Create(&req).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to persist proposal: " + err.Error()})
@@ -249,44 +270,108 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 	var req ApproveProposalRequest
 	_ = c.ShouldBindJSON(&req)
 
+	// R4-12/13: Always derive operator identity from authenticated server context;
+	// never trust any request-body approver field. Truncate to second granularity for deterministic SQLite roundtrip.
 	operator := getOperatorName(c)
-	now := time.Now()
+	now := time.Now().UTC().Truncate(time.Second)
 
+	targetStatus := model.ProposalStatusApproved
+	var schedPtr *string
 	if strings.EqualFold(req.Action, "schedule") {
 		schedTime := "03:00"
 		if req.ScheduleTime != "" {
 			schedTime = req.ScheduleTime
 		}
-		proposal.Status = model.ProposalStatusScheduled
-		proposal.ScheduledAt = &schedTime
-		proposal.ApprovedBy = operator
-		proposal.ApprovedAt = utils.NullTime{Time: now, Valid: true}
-	} else {
-		proposal.Status = model.ProposalStatusApproved
-		proposal.ApprovedBy = operator
-		proposal.ApprovedAt = utils.NullTime{Time: now, Valid: true}
+		targetStatus = model.ProposalStatusScheduled
+		schedPtr = &schedTime
+		proposal.ScheduledAt = schedPtr
 	}
+
+	proposal.Status = targetStatus
+	proposal.ApprovedBy = operator
+	proposal.ApprovedAt = utils.NullTime{Time: now, Valid: true}
 
 	if proposal.Version <= 0 {
 		proposal.Version = 1
+	}
+	if proposal.Revision <= 0 {
+		proposal.Revision = 1
 	}
 
 	digest, err := ComputeProposalApprovalDigest(&proposal)
 	if err != nil || digest == "" {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "Failed to compute proposal approval digest: " + err.Error(),
+			"error": fmt.Sprintf("Failed to compute proposal approval digest: %v", err),
 		})
 		return
 	}
-	proposal.ApprovalDigest = digest
 
-	if err := h.db.Save(&proposal).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update proposal: " + err.Error()})
+	expectedStatuses := []string{
+		model.ProposalStatusPending,
+		model.ProposalStatusAwaitingApproval,
+		model.ProposalStatusApprovalRequired,
+	}
+	reqVer := proposal.Version
+	reqRev := proposal.Revision
+	opID := GenerateOperationID("approve")
+
+	updates := map[string]interface{}{
+		"approved_by":     operator,
+		"approved_at":     proposal.ApprovedAt,
+		"approval_digest": digest,
+	}
+	if schedPtr != nil {
+		updates["scheduled_at"] = *schedPtr
+	}
+
+	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
+		ProposalID:       idParam,
+		ExpectedStatuses: expectedStatuses,
+		TargetStatus:     targetStatus,
+		RequireVersion:   &reqVer,
+		RequireRevision:  &reqRev,
+		Updates:          updates,
+		Audit: &ProposalTransitionAudit{
+			OperationID: opID,
+			EventType:   "ops.proposal.approved",
+			Actor:       operator,
+			Level:       model.LevelWarning,
+			Message:     fmt.Sprintf("管理员 %s 审批通过系统提案 [%s] (%s): %s", operator, proposal.ProposalID, proposal.Title, req.Action),
+			Metadata: map[string]interface{}{
+				"title":         proposal.Title,
+				"risk_level":    proposal.RiskLevel,
+				"action":        req.Action,
+				"rollback_plan": proposal.RollbackPlan,
+				"version":       reqVer,
+			},
+		},
+	})
+	if casErr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve proposal via CAS: " + casErr.Error()})
+		return
+	}
+	if !won {
+		// Reload authoritative DB state so caller sees why CAS lost (e.g. CANCELLED concurrently)
+		var authProp model.OpsProposal
+		_ = h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&authProp).Error
+		c.JSON(http.StatusConflict, gin.H{
+			"error":         ErrProposalCASConflict.Error(),
+			"message":       "审批 CAS 冲突：提案状态已由其他请求并发变更，已中止审批且不会触发执行",
+			"actual_status": authProp.Status,
+			"proposal":      authProp,
+		})
 		return
 	}
 
-	// Trigger execution callback via EventBus & SystemLog
-	h.recordProposalAudit(&proposal, operator, req.Action)
+	// Reload authoritative persisted proposal after CAS win before dispatching execution
+	var latest model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&latest).Error; err == nil {
+		proposal = latest
+	} else {
+		proposal.ApprovalDigest = digest
+		proposal.Revision = reqRev + 1
+	}
 
 	// Dispatch execution through OperationExecutor for non-scheduled approvals
 	if !strings.EqualFold(req.Action, "schedule") {
@@ -452,17 +537,43 @@ func (h *OpsHandler) CancelProposal(c *gin.Context) {
 		model.ProposalStatusScheduled,
 	}
 
-	fsm := NewProposalFSM(h.db)
-	won, err := fsm.TransitionCAS(idParam, allowedCancelStatuses, model.ProposalStatusCancelled, map[string]interface{}{
-		"execution_log": fmt.Sprintf("Cancelled by %s at %s", operator, time.Now().Format(time.RFC3339)),
+	reqVer := prop.Version
+	if reqVer <= 0 {
+		reqVer = 1
+	}
+	reqRev := prop.Revision
+	if reqRev <= 0 {
+		reqRev = 1
+	}
+
+	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	won, err := fsm.TransitionStrict(ProposalTransitionParams{
+		ProposalID:       idParam,
+		ExpectedStatuses: allowedCancelStatuses,
+		TargetStatus:     model.ProposalStatusCancelled,
+		RequireVersion:   &reqVer,
+		RequireRevision:  &reqRev,
+		Updates: map[string]interface{}{
+			"execution_log": fmt.Sprintf("Cancelled by %s at %s", operator, time.Now().UTC().Format(time.RFC3339)),
+		},
+		Audit: &ProposalTransitionAudit{
+			OperationID: GenerateOperationID("cancel"),
+			EventType:   "ops.proposal.cancelled",
+			Actor:       operator,
+			Level:       model.LevelWarning,
+			Message:     fmt.Sprintf("操作者 %s 取消系统提案 [%s]", operator, prop.ProposalID),
+		},
 	})
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	if !won {
+		var authProp model.OpsProposal
+		_ = h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&authProp).Error
 		c.JSON(http.StatusConflict, gin.H{
-			"error": "Cancel race lost: proposal state changed concurrently",
+			"error":         "Cancel race lost: proposal state changed concurrently",
+			"actual_status": authProp.Status,
 		})
 		return
 	}
@@ -470,6 +581,51 @@ func (h *OpsHandler) CancelProposal(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Proposal cancelled successfully",
 		"status":  model.ProposalStatusCancelled,
+	})
+}
+
+// ReconcileProposalEndpoint handles POST /api/v1/ops/proposals/:id/reconcile (Admin only).
+// Explicitly resolves EXECUTION_UNKNOWN or RECONCILIATION_REQUIRED proposals via ProposalFSM (R4-02).
+func (h *OpsHandler) ReconcileProposalEndpoint(c *gin.Context) {
+	if !c.GetBool("is_admin") || c.GetBool("is_internal_service") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: human admin role required for proposal reconciliation"})
+		return
+	}
+
+	idParam := strings.TrimSpace(c.Param("id"))
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
+		return
+	}
+
+	var req struct {
+		ResolvedStatus string `json:"resolved_status" binding:"required"`
+		Note           string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid reconciliation payload: " + err.Error()})
+		return
+	}
+
+	operator := getOperatorName(c)
+	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	updated, err := fsm.ReconcileProposal(idParam, req.ResolvedStatus, operator, req.Note)
+	if err != nil {
+		if errors.Is(err, ErrInvalidProposalTransition) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if errors.Is(err, ErrProposalCASConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":  "Proposal reconciled successfully",
+		"proposal": updated,
 	})
 }
 
@@ -534,9 +690,9 @@ func (h *OpsHandler) ComputeFingerprint(component string) string {
 
 	canonical, err := ResolveComponent(clean)
 	if err != nil {
-		canonical = strings.ToLower(clean)
-		if idx := strings.Index(canonical, "("); idx != -1 {
-			canonical = strings.TrimSpace(canonical[:idx])
+		canonical = model.CanonicalizeComponent(clean)
+		if canonical == "" {
+			return ""
 		}
 	}
 
@@ -599,8 +755,13 @@ func InvalidateProposalApproval(p *model.OpsProposal) {
 	p.Version++
 }
 
-// UpdateProposal updates mutable proposal fields and invalidates previous approval if bound fields change.
+// UpdateProposal updates mutable proposal fields using CAS and invalidates previous approval if any bound field changes.
 func (h *OpsHandler) UpdateProposal(c *gin.Context) {
+	if !c.GetBool("is_admin") && !c.GetBool("is_internal_service") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: admin role or internal service required"})
+		return
+	}
+
 	id := strings.TrimSpace(c.Param("id"))
 	var proposal model.OpsProposal
 	if err := h.db.Where("id = ? OR proposal_id = ?", id, id).First(&proposal).Error; err != nil {
@@ -609,8 +770,21 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 	}
 
 	callerHouseholdID := c.GetUint("household_id")
-	if callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+	if !c.GetBool("is_internal_service") && callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	// Only editable prior to execution and prior to terminal states (R4-01, R4-02)
+	if IsTerminalProposalStatus(proposal.Status) ||
+		proposal.Status == model.ProposalStatusExecuting ||
+		proposal.Status == model.ProposalStatusRollingBack ||
+		proposal.Status == model.ProposalStatusExecutionUnknown ||
+		proposal.Status == model.ProposalStatusReconciliationRequired {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  fmt.Sprintf("Cannot update proposal in immutable/active state %s", proposal.Status),
+			"status": proposal.Status,
+		})
 		return
 	}
 
@@ -621,6 +795,8 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 		ActionSpec      *string `json:"action_spec"`
 		ExecutionPlan   *string `json:"execution_plan"`
 		RollbackPlan    *string `json:"rollback_plan"`
+		ExecutionPolicy *string `json:"execution_policy"`
+		ScheduledAt     *string `json:"scheduled_at"`
 		RiskLevel       *string `json:"risk_level"`
 	}
 	if err := c.ShouldBindJSON(&updateReq); err != nil {
@@ -628,42 +804,120 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 		return
 	}
 
+	origStatus := proposal.Status
+	origVersion := proposal.Version
+	if origVersion <= 0 {
+		origVersion = 1
+	}
+	origRev := proposal.Revision
+	if origRev <= 0 {
+		origRev = 1
+	}
+
+	updates := make(map[string]interface{})
 	boundFieldChanged := false
 	if updateReq.TargetComponent != nil && *updateReq.TargetComponent != proposal.TargetComponent {
+		if model.CanonicalizeComponent(*updateReq.TargetComponent) == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": ErrComponentNotWhitelisted.Error()})
+			return
+		}
 		proposal.TargetComponent = *updateReq.TargetComponent
-		proposal.BaselineHash = h.ComputeFingerprint(proposal.TargetComponent)
+		fp := h.ComputeFingerprint(proposal.TargetComponent)
+		if fp == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": ErrEmptyBaseline.Error()})
+			return
+		}
+		proposal.BaselineHash = fp
+		updates["target_component"] = proposal.TargetComponent
+		updates["baseline_hash"] = proposal.BaselineHash
 		boundFieldChanged = true
 	}
 	if updateReq.ActionSpec != nil && *updateReq.ActionSpec != proposal.ActionSpec {
+		tmpProp := proposal
+		tmpProp.ActionSpec = *updateReq.ActionSpec
+		if exec, ok := h.GetExecutor().(*DefaultOperationExecutor); ok && exec != nil {
+			if _, err := exec.parseProposalSpec(&tmpProp); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action_spec: " + err.Error()})
+				return
+			}
+		} else {
+			defExec := &DefaultOperationExecutor{}
+			if _, err := defExec.parseProposalSpec(&tmpProp); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action_spec: " + err.Error()})
+				return
+			}
+		}
 		proposal.ActionSpec = *updateReq.ActionSpec
+		updates["action_spec"] = proposal.ActionSpec
 		boundFieldChanged = true
 	}
 	if updateReq.ExecutionPlan != nil && *updateReq.ExecutionPlan != proposal.ExecutionPlan {
 		proposal.ExecutionPlan = *updateReq.ExecutionPlan
+		updates["execution_plan"] = proposal.ExecutionPlan
+		boundFieldChanged = true
+	}
+	if updateReq.RollbackPlan != nil && *updateReq.RollbackPlan != proposal.RollbackPlan {
+		proposal.RollbackPlan = *updateReq.RollbackPlan
+		updates["rollback_plan"] = proposal.RollbackPlan
+		boundFieldChanged = true
+	}
+	if updateReq.ExecutionPolicy != nil && *updateReq.ExecutionPolicy != proposal.ExecutionPolicy {
+		proposal.ExecutionPolicy = *updateReq.ExecutionPolicy
+		updates["execution_policy"] = proposal.ExecutionPolicy
+		boundFieldChanged = true
+	}
+	if updateReq.ScheduledAt != nil {
+		proposal.ScheduledAt = updateReq.ScheduledAt
+		updates["scheduled_at"] = *updateReq.ScheduledAt
 		boundFieldChanged = true
 	}
 	if updateReq.Title != nil {
 		proposal.Title = *updateReq.Title
+		updates["title"] = proposal.Title
 	}
 	if updateReq.Description != nil {
 		proposal.Description = *updateReq.Description
-	}
-	if updateReq.RollbackPlan != nil {
-		proposal.RollbackPlan = *updateReq.RollbackPlan
+		updates["description"] = proposal.Description
 	}
 	if updateReq.RiskLevel != nil {
 		proposal.RiskLevel = *updateReq.RiskLevel
+		updates["risk_level"] = proposal.RiskLevel
 	}
 
 	if boundFieldChanged {
 		InvalidateProposalApproval(&proposal)
+		updates["status"] = proposal.Status
+		updates["approval_digest"] = ""
+		updates["approved_by"] = ""
+		updates["approved_at"] = utils.NullTime{}
+		updates["version"] = proposal.Version
 	}
 
-	if err := h.db.Save(&proposal).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update proposal: " + err.Error()})
+	if len(updates) == 0 {
+		c.JSON(http.StatusOK, proposal)
 		return
 	}
 
+	updates["updated_at"] = time.Now().UTC()
+	updates["revision"] = gorm.Expr("COALESCE(revision, 1) + 1")
+
+	res := h.db.Model(&model.OpsProposal{}).
+		Where("id = ? AND status = ? AND version = ? AND COALESCE(revision, 1) = ?", proposal.ID, origStatus, origVersion, origRev).
+		Updates(updates)
+	if res.Error != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update proposal: " + res.Error.Error()})
+		return
+	}
+	if res.RowsAffected == 0 {
+		GlobalSecurityMetrics.IncProposalCASConflict()
+		c.JSON(http.StatusConflict, gin.H{"error": ErrProposalCASConflict.Error()})
+		return
+	}
+
+	var refreshed model.OpsProposal
+	if err := h.db.First(&refreshed, proposal.ID).Error; err == nil {
+		proposal = refreshed
+	}
 	c.JSON(http.StatusOK, proposal)
 }
 

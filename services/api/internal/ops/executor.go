@@ -41,6 +41,8 @@ var (
 	ErrProposalNotExecutable     = errors.New("proposal is not in an executable state")
 	ErrProposalUnauthorized      = errors.New("proposal is not authorized for execution")
 	ErrScheduledWindowNotReached = errors.New("scheduled proposal execution window has not arrived")
+	ErrExecutionAmbiguous        = errors.New("external execution outcome is ambiguous; reconciliation required")
+	ErrHealthUnknown             = errors.New("component readiness state is UNKNOWN")
 )
 
 // Permissible structured action types
@@ -138,12 +140,31 @@ var identifierRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{1,64}$`)
 
 // OperationSpec represents a machine-executable, strongly-typed operation specification.
 type OperationSpec struct {
-	Action       string                 `json:"action"`
-	Target       string                 `json:"target"`
-	Params       map[string]interface{} `json:"params,omitempty"`
-	BaselineHash string                 `json:"baseline_hash,omitempty"`
-	RollbackSpec *OperationSpec         `json:"rollback_spec,omitempty"`
-	TimeoutSec   int                    `json:"timeout_sec,omitempty"`
+	Action          string                 `json:"action"`
+	Target          string                 `json:"target"`
+	Params          map[string]interface{} `json:"params,omitempty"`
+	BaselineHash    string                 `json:"baseline_hash,omitempty"`
+	RollbackSpec    *OperationSpec         `json:"rollback_spec,omitempty"`
+	TimeoutSec      int                    `json:"timeout_sec,omitempty"`
+	ExecutionPolicy string                 `json:"execution_policy,omitempty"`
+}
+
+// ReadinessLevel models the 5-tier business readiness health contract (R4-16).
+type ReadinessLevel string
+
+const (
+	ReadinessUnknown         ReadinessLevel = "UNKNOWN"
+	ReadinessProcessRunning  ReadinessLevel = "PROCESS_RUNNING"
+	ReadinessPortOpen        ReadinessLevel = "PORT_OPEN"
+	ReadinessServiceReady    ReadinessLevel = "SERVICE_READY"
+	ReadinessBusinessHealthy ReadinessLevel = "BUSINESS_HEALTHY"
+)
+
+// HealthProbeResult provides detailed 5-tier health telemetry for a component.
+type HealthProbeResult struct {
+	Component string         `json:"component"`
+	Level     ReadinessLevel `json:"level"`
+	Detail    string         `json:"detail"`
 }
 
 // ExecutionResult represents the structured execution output.
@@ -184,8 +205,23 @@ type DefaultOperationExecutor struct {
 	baselineExtractor func(target string) string
 
 	leaseManager *RecoveryLeaseManager
+	recoveryFSM  *ContainerRecoveryFSM
 	componentLocks sync.Map // canonical string -> *sync.Mutex
 	mu             sync.RWMutex
+}
+
+// SetRecoveryFSM attaches the authoritative ContainerRecoveryFSM for pre-execution safety checks.
+func (e *DefaultOperationExecutor) SetRecoveryFSM(fsm *ContainerRecoveryFSM) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.recoveryFSM = fsm
+}
+
+// WithRecoveryFSM attaches a ContainerRecoveryFSM during executor construction.
+func WithRecoveryFSM(fsm *ContainerRecoveryFSM) ExecutorOption {
+	return func(e *DefaultOperationExecutor) {
+		e.recoveryFSM = fsm
+	}
 }
 
 func (e *DefaultOperationExecutor) getComponentLock(canonical string) *sync.Mutex {
@@ -272,11 +308,11 @@ func NewOperationExecutor(
 		probeTimeout:  15 * time.Second,
 		probeInterval: 1 * time.Second,
 	}
-	if db != nil {
-		exec.leaseManager = NewRecoveryLeaseManager(db)
-	}
 	for _, opt := range opts {
 		opt(exec)
+	}
+	if exec.leaseManager == nil && db != nil {
+		exec.leaseManager = NewRecoveryLeaseManager(db)
 	}
 	if exec.baselineExtractor == nil {
 		exec.baselineExtractor = func(target string) string {
@@ -383,30 +419,136 @@ func ValidateSpecSafety(spec OperationSpec) error {
 	return nil
 }
 
+type componentLockHeldKey struct{}
+
+func withComponentLockHeld(ctx context.Context, canonical string) context.Context {
+	return context.WithValue(ctx, componentLockHeldKey{}, canonical)
+}
+
+func isComponentLockHeld(ctx context.Context, canonical string) bool {
+	if ctx == nil {
+		return false
+	}
+	v, ok := ctx.Value(componentLockHeldKey{}).(string)
+	return ok && v == canonical
+}
+
+func isMutatingContainerAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case ActionDockerRestart, ActionDockerRecreate, ActionDockerUpdateImage, ActionDockerExec, ActionWAFReload,
+		"restart", "docker_restart", "container_recreate":
+		return true
+	default:
+		return false
+	}
+}
+
+func isAllowedProductionAction(action string) bool {
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case ActionDockerRestart, ActionDockerRecreate, ActionDockerUpdateImage, ActionDockerExec,
+		ActionDBCreateIndex, ActionDBDropIndex, ActionDBVacuumSnapshot, ActionWAFReload, ActionCachePurge:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAmbiguousExecutionError(err error, ctxErr error) bool {
+	if errors.Is(err, ErrExecutionAmbiguous) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(ctxErr, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled) || errors.Is(ctxErr, context.Canceled) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "deadline exceeded") ||
+		strings.Contains(msg, "timeout") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "unexpected eof") ||
+		strings.Contains(msg, "broken pipe")
+}
+
 // Execute executes an OperationSpec with whitelist validation, TOCTOU baseline check,
-// execution dispatch, health probe verification, and automatic rollback on failure.
+// persistent lease & fencing verification, execution dispatch, health probe verification,
+// audit persistence, and controlled rollback on definite failure.
 func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSpec) (*ExecutionResult, error) {
 	startTime := time.Now()
+	opID := GenerateOperationID("exec")
+
+	if spec.TimeoutSec > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(spec.TimeoutSec)*time.Second)
+		defer cancel()
+	}
 
 	// 1. Validate spec safety against shell metacharacters
 	if err := ValidateSpecSafety(spec); err != nil {
 		return nil, err
 	}
 
-	// 2. Enforce bidirectional component whitelist
+	// 2. Enforce strict bidirectional component whitelist
 	canonical, err := ResolveComponent(spec.Target)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2.1 Acquire per-component lock to prevent concurrent mutating operations (Docker 409 Conflict prevention)
-	lock := e.getComponentLock(canonical)
-	lock.Lock()
-	defer lock.Unlock()
+	// 2.0 If no mock runner is installed (production path), enforce closed action whitelist
+	if e.dockerRunner == nil && !isAllowedProductionAction(spec.Action) {
+		return &ExecutionResult{
+			Success:    false,
+			Action:     spec.Action,
+			Target:     canonical,
+			Error:      fmt.Sprintf("%v: %s", ErrActionNotSupported, spec.Action),
+			ExecutedAt: startTime,
+		}, fmt.Errorf("%w: %s", ErrActionNotSupported, spec.Action)
+	}
 
-	// 2.2 Acquire persistent recovery lease (R13) if lease manager is configured and action is restart
-	if e.leaseManager != nil && spec.Action == ActionDockerRestart {
-		leaseToken, lErr := e.leaseManager.AcquireLease(canonical, "go-core", 30*time.Second)
+	// 2.1 Acquire per-component mutex unless already held by enclosing call frame
+	if !isComponentLockHeld(ctx, canonical) {
+		lock := e.getComponentLock(canonical)
+		lock.Lock()
+		defer lock.Unlock()
+		ctx = withComponentLockHeld(ctx, canonical)
+	}
+
+	// 2.2 Recovery Lease Lifecycle (R4-04 ~ R4-08):
+	// Reuse existing LeaseGuard passed in context from ProcessAndRecover (never re-acquire!),
+	// or acquire our own LeaseGuard if called standalone on a mutating container action.
+	existingGuard := RecoveryLeaseFromContext(ctx)
+	var ownGuard *LeaseGuard
+	if existingGuard != nil {
+		expectedLeaseComp := ResolveTopologyComponent(canonical)
+		if existingGuard.Grant.Component != expectedLeaseComp && existingGuard.Grant.Component != canonical {
+			return &ExecutionResult{
+				Success:    false,
+				Action:     spec.Action,
+				Target:     canonical,
+				Error:      fmt.Sprintf("lease context component mismatch: held %s, requested %s", existingGuard.Grant.Component, canonical),
+				ExecutedAt: startTime,
+			}, ErrInvalidLeaseToken
+		}
+		if err := existingGuard.VerifyBeforeMutation(0); err != nil {
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID:       opID,
+				EventType:         "ops.fencing.rejected",
+				Severity:          "critical",
+				Component:         canonical,
+				Actor:             existingGuard.Grant.Holder,
+				FencingGeneration: existingGuard.Grant.FencingGeneration,
+				Message:           fmt.Sprintf("pre-execution fencing validation failed: %v", err),
+			})
+			return &ExecutionResult{
+				Success:    false,
+				Action:     spec.Action,
+				Target:     canonical,
+				Error:      err.Error(),
+				ExecutedAt: startTime,
+			}, err
+		}
+	} else if e.leaseManager != nil && isMutatingContainerAction(spec.Action) {
+		leaseCtx, guard, lErr := AcquireLeaseGuard(ctx, e.leaseManager, canonical, opID, 30*time.Second, e.db, e.bus)
 		if lErr != nil {
 			return &ExecutionResult{
 				Success:    false,
@@ -416,14 +558,21 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				ExecutedAt: startTime,
 			}, fmt.Errorf("persistent recovery lease conflict for %s: %w", canonical, lErr)
 		}
-		defer func() {
-			_ = e.leaseManager.ReleaseLease(canonical, leaseToken)
-		}()
+		ctx = leaseCtx
+		ownGuard = guard
+	}
+
+	releaseOwnLease := func() error {
+		if ownGuard == nil {
+			return nil
+		}
+		return ownGuard.Release(e.db, e.bus)
 	}
 
 	// 3. Anti-TOCTOU baseline hash verification (Fail-Closed: calculation failure or drift strictly blocks execution)
 	if spec.BaselineHash != "" {
 		if e.baselineExtractor == nil {
+			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
@@ -435,6 +584,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}
 		currentHash := e.baselineExtractor(canonical)
 		if currentHash == "" || currentHash != spec.BaselineHash {
+			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
@@ -446,15 +596,75 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}
 	}
 
+	// 3.5 Final fencing gate right before external Docker/OS mutation (R4-06)
+	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+		if fErr := guard.VerifyBeforeMutation(0); fErr != nil {
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID:       opID,
+				EventType:         "ops.fencing.rejected",
+				Severity:          "critical",
+				Component:         canonical,
+				Actor:             guard.Grant.Holder,
+				FencingGeneration: guard.Grant.FencingGeneration,
+				Message:           fmt.Sprintf("stale lease or expired fencing token blocked right before Docker dispatch: %v", fErr),
+			})
+			_ = releaseOwnLease()
+			return &ExecutionResult{
+				Success:    false,
+				Action:     spec.Action,
+				Target:     canonical,
+				Error:      fErr.Error(),
+				ExecutedAt: startTime,
+			}, fErr
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		_ = releaseOwnLease()
+		return &ExecutionResult{
+			Success:    false,
+			Action:     spec.Action,
+			Target:     canonical,
+			Error:      err.Error(),
+			ExecutedAt: startTime,
+		}, err
+	}
+
 	// 4. Dispatch the structured action
 	out, err := e.dispatchAction(ctx, spec, canonical)
 	if err != nil {
-		// Execution mutation failed -> attempt atomic rollback if specified with decoupled context
+		if isAmbiguousExecutionError(err, ctx.Err()) {
+			GlobalSecurityMetrics.IncExecutionUnknown()
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID: opID,
+				EventType:   "ops.execution.unknown",
+				Severity:    "critical",
+				Component:   canonical,
+				Message:     fmt.Sprintf("ambiguous mutation failure (%v); blocking automatic rollback/retry", err),
+			})
+			_ = e.recordExecutionHistory(canonical, spec.Action, "execution_unknown", out, fmt.Sprintf("ambiguous failure: %v", err))
+			_ = releaseOwnLease()
+			return &ExecutionResult{
+				Success:      false,
+				Action:       spec.Action,
+				Target:       canonical,
+				Output:       out,
+				BaselineHash: spec.BaselineHash,
+				DurationMs:   time.Since(startTime).Milliseconds(),
+				RolledBack:   false,
+				Error:        fmt.Sprintf("%s: %v", ErrExecutionAmbiguous.Error(), err),
+				ExecutedAt:   startTime,
+			}, fmt.Errorf("%w: %v", ErrExecutionAmbiguous, err)
+		}
+
+		// Definite failure -> attempt atomic rollback if specified with decoupled timeout
 		var rbErr error
 		if spec.RollbackSpec != nil {
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer rbCancel()
+			rbCtx, rbCancel := context.WithTimeout(withComponentLockHeld(context.Background(), canonical), 30*time.Second)
+			if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+				rbCtx = WithRecoveryLease(rbCtx, guard)
+			}
 			rbErr = e.ExecuteRollback(rbCtx, *spec.RollbackSpec)
+			rbCancel()
 		}
 		duration := time.Since(startTime).Milliseconds()
 		status := "failed"
@@ -465,7 +675,8 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				status = "rollback_failed"
 			}
 		}
-		e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("execution failed: %v; rollback err: %v", err, rbErr))
+		_ = e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("execution failed: %v; rollback err: %v", err, rbErr))
+		_ = releaseOwnLease()
 
 		errDetails := err.Error()
 		if rbErr != nil {
@@ -490,12 +701,14 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	duration := time.Since(startTime).Milliseconds()
 
 	if probeErr != nil {
-		// Health probe failed! Trigger atomic rollback with decoupled timeout context (Blocker 1 fix)
 		var rbErr error
 		if spec.RollbackSpec != nil {
-			rbCtx, rbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer rbCancel()
+			rbCtx, rbCancel := context.WithTimeout(withComponentLockHeld(context.Background(), canonical), 30*time.Second)
+			if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+				rbCtx = WithRecoveryLease(rbCtx, guard)
+			}
 			rbErr = e.ExecuteRollback(rbCtx, *spec.RollbackSpec)
+			rbCancel()
 		}
 		status := "failed"
 		if spec.RollbackSpec != nil {
@@ -505,7 +718,8 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				status = "rollback_failed"
 			}
 		}
-		e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("health probe failed: %v; rollback err: %v", probeErr, rbErr))
+		_ = e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("health probe failed: %v; rollback err: %v", probeErr, rbErr))
+		_ = releaseOwnLease()
 
 		errDetails := fmt.Sprintf("health probe failed: %v", probeErr)
 		if rbErr != nil {
@@ -525,8 +739,24 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}, probeErr
 	}
 
-	// 6. Success
-	e.recordExecutionHistory(canonical, spec.Action, "success", out, "health probe passed")
+	// 6. Audit persistence & lease release (R4-05, R4-08)
+	histErr := e.recordExecutionHistory(canonical, spec.Action, "success", out, "health probe passed")
+	relErr := releaseOwnLease()
+	if histErr != nil || relErr != nil {
+		combinedErr := errors.Join(histErr, relErr)
+		return &ExecutionResult{
+			Success:      false,
+			Action:       spec.Action,
+			Target:       canonical,
+			Output:       out,
+			BaselineHash: spec.BaselineHash,
+			DurationMs:   duration,
+			RolledBack:   false,
+			Error:        fmt.Sprintf("execution completed but lifecycle finalization failed: %v", combinedErr),
+			ExecutedAt:   startTime,
+		}, combinedErr
+	}
+
 	return &ExecutionResult{
 		Success:      true,
 		Action:       spec.Action,
@@ -539,7 +769,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	}, nil
 }
 
-// ExecuteRollback executes the inverse rollback action specification.
+// ExecuteRollback executes the inverse rollback action specification with component locking & fencing checks.
 func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollbackSpec OperationSpec) error {
 	if err := ValidateSpecSafety(rollbackSpec); err != nil {
 		return err
@@ -548,6 +778,23 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 	canonical, err := ResolveComponent(rollbackSpec.Target)
 	if err != nil {
 		return err
+	}
+
+	if e.dockerRunner == nil && !isAllowedProductionAction(rollbackSpec.Action) {
+		return fmt.Errorf("%w: rollback action %s not permitted", ErrActionNotSupported, rollbackSpec.Action)
+	}
+
+	if !isComponentLockHeld(ctx, canonical) {
+		lock := e.getComponentLock(canonical)
+		lock.Lock()
+		defer lock.Unlock()
+		ctx = withComponentLockHeld(ctx, canonical)
+	}
+
+	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+		if err := guard.VerifyBeforeMutation(0); err != nil {
+			return err
+		}
 	}
 
 	_, err = e.dispatchAction(ctx, rollbackSpec, canonical)
@@ -593,227 +840,469 @@ func validateScheduledWindow(proposal *model.OpsProposal) error {
 	return nil
 }
 
-// ExecuteProposal executes a proposal end-to-end, managing status transitions
-// (EXECUTING -> EXECUTED or ROLLING_BACK -> ROLLED_BACK / ROLLBACK_FAILED) and updating database state.
+// checkProposalSafetyPreconditions validates maintenance lock, circuit breaker, and dependency topology
+// before an approved proposal is allowed to mutate external state (R4-13).
+func (e *DefaultOperationExecutor) checkProposalSafetyPreconditions(ctx context.Context, canonicalTarget string) error {
+	e.mu.RLock()
+	fsm := e.recoveryFSM
+	e.mu.RUnlock()
+
+	if fsm != nil {
+		if fsm.lock.IsDegraded() {
+			GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
+			return ErrFailClosedMode
+		}
+		if fsm.lock.IsLocked() {
+			return ErrSystemInMaintenance
+		}
+		if fsm.breaker.IsDegraded() {
+			GlobalSecurityMetrics.SetCircuitBreakerDegraded(true)
+			return ErrFailClosedMode
+		}
+		if cbState := fsm.breaker.GetState(canonicalTarget); cbState == CircuitOpen {
+			return ErrCircuitBreakerOpen
+		}
+		if topErr := fsm.topology.PreflightDependencyCheck(ctx, canonicalTarget); topErr != nil {
+			return topErr
+		}
+		return nil
+	}
+
+	if e.db != nil {
+		if hasLockTbl, err := tableExists(e.db, "ops_maintenance_locks"); err == nil && hasLockTbl {
+			var lockRow model.OpsMaintenanceLock
+			qErr := e.db.Order("id DESC").First(&lockRow).Error
+			if qErr != nil && !errors.Is(qErr, gorm.ErrRecordNotFound) {
+				GlobalSecurityMetrics.IncDatabaseError()
+				return ErrFailClosedMode
+			}
+			if qErr == nil && lockRow.Active && time.Now().UTC().Before(lockRow.ExpiresAt.UTC()) {
+				return ErrSystemInMaintenance
+			}
+		}
+		if hasCBTbl, err := tableExists(e.db, "ops_circuit_breaker_states"); err == nil && hasCBTbl {
+			topoCanon := ResolveTopologyComponent(canonicalTarget)
+			var cbRow model.OpsCircuitBreakerState
+			qErr := e.db.Where("container = ? OR container = ?", topoCanon, canonicalTarget).First(&cbRow).Error
+			if qErr != nil && !errors.Is(qErr, gorm.ErrRecordNotFound) {
+				GlobalSecurityMetrics.IncDatabaseError()
+				return ErrFailClosedMode
+			}
+			if qErr == nil {
+				if cbRow.Degraded {
+					return ErrFailClosedMode
+				}
+				if strings.EqualFold(cbRow.State, string(CircuitOpen)) {
+					return ErrCircuitBreakerOpen
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// ExecuteProposal executes a proposal end-to-end using unified CAS state transitions (ProposalFSM),
+// full canonical HMAC-SHA256 verification, pre-execution baseline & safety verification, and non-retryable
+// EXECUTION_UNKNOWN handling for ambiguous transport/timeout outcomes (R4-01 ~ R4-03, R4-11 ~ R4-13).
 func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal *model.OpsProposal) (*ExecutionResult, error) {
 	if proposal == nil {
 		return nil, ErrInvalidSpec
 	}
 
-	// Gate check: forbid AWAITING_APPROVAL and unauthorized PENDING execution
-	if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending || proposal.Status == model.ProposalStatusApprovalRequired {
-		return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, proposal.Status)
-	}
+	var execToken string
+	var currRev int
 
-	// CAS atomic update: only execute if proposal is in an authorized state (APPROVED or SCHEDULED)
-	if e.db != nil && proposal.ID > 0 {
+	if e.db != nil {
 		var curr model.OpsProposal
-		if err := e.db.First(&curr, proposal.ID).Error; err != nil {
-			return nil, fmt.Errorf("proposal %d not found: %w", proposal.ID, err)
+		var findErr error
+		if proposal.ID > 0 {
+			findErr = e.db.First(&curr, proposal.ID).Error
+		} else if strings.TrimSpace(proposal.ProposalID) != "" {
+			findErr = e.db.Where("proposal_id = ?", proposal.ProposalID).First(&curr).Error
+		} else {
+			return nil, ErrInvalidSpec
+		}
+		if findErr != nil {
+			return nil, fmt.Errorf("proposal %s (%d) not found: %w", proposal.ProposalID, proposal.ID, findErr)
 		}
 
-		if curr.Status == model.ProposalStatusExecuting || curr.Status == model.ProposalStatusRollingBack {
-			proposal.Status = curr.Status
-			return nil, ErrProposalAlreadyRunning
+		propKey := curr.ProposalID
+		if propKey == "" {
+			propKey = fmt.Sprintf("%d", curr.ID)
 		}
-		if curr.Status == model.ProposalStatusAwaitingApproval || curr.Status == model.ProposalStatusPending || curr.Status == model.ProposalStatusApprovalRequired {
-			proposal.Status = curr.Status
-			return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, curr.Status)
+
+		claimToken, hasSchedulerClaim := SchedulerClaimFromContext(ctx, propKey)
+		if !hasSchedulerClaim && curr.ProposalID != "" {
+			claimToken, hasSchedulerClaim = SchedulerClaimFromContext(ctx, curr.ProposalID)
 		}
-		if curr.Status != model.ProposalStatusApproved && curr.Status != model.ProposalStatusScheduled {
-			proposal.Status = curr.Status
-			return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, curr.Status)
+		schedulerPreClaimed := hasSchedulerClaim && curr.Status == model.ProposalStatusExecuting && curr.ExecutionToken != "" && curr.ExecutionToken == claimToken
+
+		abortPreClaimed := func(cause error) (*ExecutionResult, error) {
+			if schedulerPreClaimed {
+				abortFSM := NewProposalFSMWithBus(e.db, e.bus)
+				_, _ = abortFSM.TransitionStrict(ProposalTransitionParams{
+					ProposalID:            propKey,
+					ExpectedStatuses:      []string{model.ProposalStatusExecuting},
+					TargetStatus:          model.ProposalStatusFailed,
+					RequireExecutionToken: claimToken,
+					Updates: map[string]interface{}{
+						"execution_token": "",
+						"execution_log":   fmt.Sprintf("Pre-execution guard aborted scheduler-claimed proposal: %v", cause),
+					},
+					Audit: &ProposalTransitionAudit{
+						OperationID: GenerateOperationID("abort-sched"),
+						EventType:   "ops.proposal.precheck_aborted",
+						Actor:       "proposal-scheduler",
+						Level:       model.LevelCritical,
+						Message:     fmt.Sprintf("提案 [%s] 预检未通过并终止执行 (%v)", propKey, cause),
+					},
+				})
+				proposal.Status = model.ProposalStatusFailed
+			}
+			return nil, cause
+		}
+
+		if !schedulerPreClaimed {
+			if curr.Status == model.ProposalStatusExecuting || curr.Status == model.ProposalStatusRollingBack {
+				proposal.Status = curr.Status
+				return nil, ErrProposalAlreadyRunning
+			}
+			if curr.Status == model.ProposalStatusAwaitingApproval || curr.Status == model.ProposalStatusPending || curr.Status == model.ProposalStatusApprovalRequired {
+				proposal.Status = curr.Status
+				return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, curr.ProposalID, curr.Status)
+			}
+			if curr.Status != model.ProposalStatusApproved && curr.Status != model.ProposalStatusScheduled {
+				proposal.Status = curr.Status
+				return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, curr.ProposalID, curr.Status)
+			}
 		}
 
 		// R5: BaselineHash anti-tampering check (Fail-Closed)
 		if strings.TrimSpace(curr.BaselineHash) == "" {
-			return nil, ErrEmptyBaseline
+			return abortPreClaimed(ErrEmptyBaseline)
 		}
 
-		// R9: ApprovalDigest cryptographic binding verification against database state
-		if strings.TrimSpace(curr.ApprovalDigest) == "" {
-			return nil, fmt.Errorf("%w: proposal in database lacks approval digest", ErrApprovalDigestMismatch)
-		}
-		expectedDigestDB, err := ComputeProposalApprovalDigest(&curr)
-		if err != nil || expectedDigestDB != curr.ApprovalDigest {
-			return nil, fmt.Errorf("%w: database proposal record was tampered with post-approval (expected %s, computed %s)", ErrApprovalDigestMismatch, curr.ApprovalDigest, expectedDigestDB)
+		// R4-11/R4-12: Full canonical HMAC-SHA256 signature verification against authoritative DB record
+		if err := model.VerifyProposalApprovalDigest(&curr); err != nil {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID: GenerateOperationID("execprop"),
+				EventType:   "ops.proposal.digest_mismatch",
+				Severity:    "critical",
+				Component:   curr.TargetComponent,
+				ProposalID:  curr.ProposalID,
+				Message:     fmt.Sprintf("proposal approval signature verification failed: %v", err),
+			})
+			return abortPreClaimed(fmt.Errorf("%w: %v", ErrApprovalDigestMismatch, err))
 		}
 
-		// Memory vs DB approval digest consistency
+		// Memory vs DB integrity consistency checks
 		if proposal.ApprovalDigest != "" && proposal.ApprovalDigest != curr.ApprovalDigest {
-			return nil, fmt.Errorf("%w: memory proposal approval digest does not match database record", ErrApprovalDigestMismatch)
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory proposal approval digest does not match database record", ErrApprovalDigestMismatch))
 		}
+		if proposal.ActionSpec != "" && proposal.ActionSpec != curr.ActionSpec {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory action_spec differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.TargetComponent != "" && model.CanonicalizeComponent(proposal.TargetComponent) != model.CanonicalizeComponent(curr.TargetComponent) {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory target_component differs from database record", ErrApprovalDigestMismatch))
+		}
+
+		// Validate strict spec, params, whitelist, and rollback spec before acquiring execution token
+		canonicalTarget, err := ResolveComponent(curr.TargetComponent)
+		if err != nil {
+			return abortPreClaimed(err)
+		}
+		specPreview, parseErr := e.parseProposalSpec(&curr)
+		if parseErr != nil {
+			return abortPreClaimed(parseErr)
+		}
+		_ = specPreview
 
 		// R5: Pre-execution baseline re-validation against live component state (anti-TOCTOU)
 		if e.baselineExtractor != nil {
-			canonicalTarget, err := ResolveComponent(curr.TargetComponent)
-			if err == nil {
-				currentHash := e.baselineExtractor(canonicalTarget)
-				if currentHash == "" || currentHash != curr.BaselineHash {
-					return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, curr.BaselineHash, currentHash)
-				}
+			currentHash := e.baselineExtractor(canonicalTarget)
+			if currentHash == "" || currentHash != curr.BaselineHash {
+				return abortPreClaimed(fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, curr.BaselineHash, currentHash))
 			}
 		}
 
-		// If scheduled, verify schedule window has arrived
-		if err := validateScheduledWindow(&curr); err != nil {
-			return nil, err
+		// Verify scheduled window prior to claiming if not already claimed by scheduler
+		if !schedulerPreClaimed {
+			if err := validateScheduledWindow(&curr); err != nil {
+				return nil, err
+			}
 		}
 
-		res := e.db.Model(&model.OpsProposal{}).
-			Where("id = ? AND status IN (?, ?)",
-				proposal.ID,
-				model.ProposalStatusApproved,
-				model.ProposalStatusScheduled,
-			).
-			Updates(map[string]interface{}{
-				"status":      model.ProposalStatusExecuting,
-				"executed_at": utils.NullTime{Time: time.Now(), Valid: true},
+		// R4-13: Validate maintenance lock, circuit breaker, and topology dependencies
+		if err := e.checkProposalSafetyPreconditions(ctx, canonicalTarget); err != nil {
+			return abortPreClaimed(err)
+		}
+		fsm := NewProposalFSMWithBus(e.db, e.bus)
+
+		if schedulerPreClaimed {
+			execToken = claimToken
+			currRev = curr.Revision
+			if currRev <= 0 {
+				currRev = 1
+			}
+		} else {
+			execToken = GenerateOperationID("exec")
+			reqVer := curr.Version
+			if reqVer <= 0 {
+				reqVer = 1
+			}
+			currRev = curr.Revision
+			if currRev <= 0 {
+				currRev = 1
+			}
+			won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
+				ProposalID:       propKey,
+				ExpectedStatuses: []string{model.ProposalStatusApproved, model.ProposalStatusScheduled},
+				TargetStatus:     model.ProposalStatusExecuting,
+				RequireVersion:   &reqVer,
+				RequireRevision:  &currRev,
+				Updates: map[string]interface{}{
+					"execution_token": execToken,
+					"executed_at":     utils.NullTime{Time: time.Now().UTC(), Valid: true},
+				},
+				Audit: &ProposalTransitionAudit{
+					OperationID: execToken,
+					EventType:   "ops.proposal.executing",
+					Actor:       curr.ApprovedBy,
+					Level:       model.LevelInfo,
+					Message:     fmt.Sprintf("开始执行已审批提案 [%s] (target=%s)", curr.ProposalID, canonicalTarget),
+				},
 			})
-		if res.Error != nil {
-			return nil, res.Error
-		}
-		if res.RowsAffected == 0 {
-			var latest model.OpsProposal
-			if err := e.db.First(&latest, proposal.ID).Error; err == nil {
-				proposal.Status = latest.Status
-				if latest.Status != model.ProposalStatusApproved && latest.Status != model.ProposalStatusScheduled {
-					return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, latest.Status)
-				}
+			if casErr != nil {
+				return nil, casErr
 			}
-			return nil, ErrProposalAlreadyRunning
+			if !won {
+				var latest model.OpsProposal
+				if err := e.db.First(&latest, curr.ID).Error; err == nil {
+					proposal.Status = latest.Status
+					if latest.Status != model.ProposalStatusApproved && latest.Status != model.ProposalStatusScheduled && latest.Status != model.ProposalStatusExecuting {
+						return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, latest.Status)
+					}
+				}
+				return nil, ErrProposalAlreadyRunning
+			}
+			currRev++
 		}
 
 		// Synchronize authoritative DB fields to memory proposal
-		proposal.TargetComponent = curr.TargetComponent
-		proposal.ActionSpec = curr.ActionSpec
-		proposal.ExecutionPlan = curr.ExecutionPlan
-		proposal.BaselineHash = curr.BaselineHash
-		proposal.ApprovalDigest = curr.ApprovalDigest
-		proposal.Version = curr.Version
+		*proposal = curr
+		proposal.Status = model.ProposalStatusExecuting
+		proposal.ExecutionToken = execToken
+		proposal.Revision = currRev
 	} else {
-		// Enforce state check for in-memory / mock executions without DB
+		// In-memory / mock execution without DB
 		if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending || proposal.Status == model.ProposalStatusApprovalRequired {
 			return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, proposal.Status)
 		}
 		if proposal.Status != model.ProposalStatusApproved && proposal.Status != model.ProposalStatusScheduled {
 			return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, proposal.Status)
 		}
-
-		// R5: Verify baseline is present
 		if strings.TrimSpace(proposal.BaselineHash) == "" {
 			return nil, ErrEmptyBaseline
 		}
-
-		// R9: Verify approval digest
-		if strings.TrimSpace(proposal.ApprovalDigest) == "" {
-			return nil, fmt.Errorf("%w: in-memory proposal lacks approval digest", ErrApprovalDigestMismatch)
+		if err := model.VerifyProposalApprovalDigest(proposal); err != nil {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return nil, fmt.Errorf("%w: %v", ErrApprovalDigestMismatch, err)
 		}
-		expectedDigestMem, err := ComputeProposalApprovalDigest(proposal)
-		if err != nil || expectedDigestMem != proposal.ApprovalDigest {
-			return nil, fmt.Errorf("%w: in-memory proposal parameters do not match approval digest", ErrApprovalDigestMismatch)
-		}
-
-		// R5: Pre-execution baseline re-validation against live component state
 		if e.baselineExtractor != nil {
 			canonicalTarget, err := ResolveComponent(proposal.TargetComponent)
-			if err == nil {
-				currentHash := e.baselineExtractor(canonicalTarget)
-				if currentHash == "" || currentHash != proposal.BaselineHash {
-					return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, proposal.BaselineHash, currentHash)
-				}
+			if err != nil {
+				return nil, err
+			}
+			currentHash := e.baselineExtractor(canonicalTarget)
+			if currentHash == "" || currentHash != proposal.BaselineHash {
+				return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, proposal.BaselineHash, currentHash)
 			}
 		}
-
 		if err := validateScheduledWindow(proposal); err != nil {
 			return nil, err
 		}
+		if canonicalTarget, err := ResolveComponent(proposal.TargetComponent); err == nil {
+			if sErr := e.checkProposalSafetyPreconditions(ctx, canonicalTarget); sErr != nil {
+				return nil, sErr
+			}
+		}
+		proposal.Status = model.ProposalStatusExecuting
 	}
-	proposal.Status = model.ProposalStatusExecuting
 
-	// Parse or build OperationSpec
+	propKey := proposal.ProposalID
+	if propKey == "" {
+		propKey = fmt.Sprintf("%d", proposal.ID)
+	}
+	fsm := NewProposalFSMWithBus(e.db, e.bus)
+
+	// Parse verified OperationSpec
 	spec, err := e.parseProposalSpec(proposal)
 	if err != nil {
 		proposal.Status = model.ProposalStatusFailed
 		proposal.ExecutionLog = fmt.Sprintf("failed to parse operation spec: %v", err)
-		proposal.ExecutedAt = utils.NullTime{Time: time.Now(), Valid: true}
+		proposal.ExecutedAt = utils.NullTime{Time: time.Now().UTC(), Valid: true}
 		if e.db != nil {
-			_ = e.db.Save(proposal)
+			_, _ = fsm.TransitionStrict(ProposalTransitionParams{
+				ProposalID:            propKey,
+				ExpectedStatuses:      []string{model.ProposalStatusExecuting},
+				TargetStatus:          model.ProposalStatusFailed,
+				RequireExecutionToken: execToken,
+				Updates: map[string]interface{}{
+					"execution_log": proposal.ExecutionLog,
+					"executed_at":   proposal.ExecutedAt,
+				},
+			})
 		}
 		return nil, err
 	}
 
 	// Execute via OperationExecutor
 	res, execErr := e.Execute(ctx, spec)
-	now := time.Now()
+	now := time.Now().UTC()
 	proposal.ExecutedAt = utils.NullTime{Time: now, Valid: true}
 
 	if execErr != nil || (res != nil && !res.Success) {
-		// If execution timed out or produced unknown HTTP/network state
-		if errors.Is(execErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) ||
-			(execErr != nil && strings.Contains(strings.ToLower(execErr.Error()), "deadline exceeded")) ||
-			(execErr != nil && strings.Contains(strings.ToLower(execErr.Error()), "timeout")) {
+		if errors.Is(execErr, ErrExecutionAmbiguous) || isAmbiguousExecutionError(execErr, ctx.Err()) {
 			proposal.Status = model.ProposalStatusExecutionUnknown
 			proposal.ExecutionLog = fmt.Sprintf("execution timed out or produced unknown state (%v); manual reconciliation required", execErr)
 			if e.db != nil {
-				_ = e.db.Save(proposal)
+				won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
+					ProposalID:            propKey,
+					ExpectedStatuses:      []string{model.ProposalStatusExecuting},
+					TargetStatus:          model.ProposalStatusExecutionUnknown,
+					RequireExecutionToken: execToken,
+					Updates: map[string]interface{}{
+						"execution_log": proposal.ExecutionLog,
+						"executed_at":   proposal.ExecutedAt,
+					},
+					Audit: &ProposalTransitionAudit{
+						OperationID: execToken,
+						EventType:   "ops.proposal.unknown",
+						Actor:       "executor",
+						Level:       model.LevelCritical,
+						Message:     proposal.ExecutionLog,
+					},
+				})
+				if casErr != nil || !won {
+					return res, fmt.Errorf("%w (additionally failed to persist EXECUTION_UNKNOWN: won=%v err=%v)", execErr, won, casErr)
+				}
 			}
 			e.publishEvent(eventbus.SeverityError, "ops.proposal.unknown", proposal)
 			return res, execErr
 		}
 
-		// If rollback spec was defined, transition to ROLLING_BACK first in DB
-		if spec.RollbackSpec != nil && e.db != nil && proposal.ID > 0 {
-			_ = e.db.Model(&model.OpsProposal{}).Where("id = ?", proposal.ID).Update("status", model.ProposalStatusRollingBack)
-		}
-
-		if spec.RollbackSpec != nil {
-			if res != nil && res.RolledBack {
-				proposal.Status = model.ProposalStatusRolledBack
-			} else {
-				proposal.Status = model.ProposalStatusRollbackFailed
-			}
-		} else {
-			proposal.Status = model.ProposalStatusFailed
-		}
-
+		finalStatus := model.ProposalStatusFailed
 		logMsg := fmt.Sprintf("execution failed: %v", execErr)
 		if res != nil {
 			logMsg = fmt.Sprintf("execution failed (%s); rolled back: %v; output: %s", res.Error, res.RolledBack, res.Output)
 		}
 		proposal.ExecutionLog = logMsg
+
+		if spec.RollbackSpec != nil {
+			if e.db != nil {
+				_, _ = fsm.TransitionStrict(ProposalTransitionParams{
+					ProposalID:            propKey,
+					ExpectedStatuses:      []string{model.ProposalStatusExecuting},
+					TargetStatus:          model.ProposalStatusRollingBack,
+					RequireExecutionToken: execToken,
+				})
+			}
+			if res != nil && res.RolledBack {
+				finalStatus = model.ProposalStatusRolledBack
+			} else {
+				finalStatus = model.ProposalStatusRollbackFailed
+			}
+		}
+		proposal.Status = finalStatus
+
 		if e.db != nil {
-			_ = e.db.Save(proposal)
+			expectedPrev := []string{model.ProposalStatusExecuting}
+			if spec.RollbackSpec != nil {
+				expectedPrev = []string{model.ProposalStatusRollingBack, model.ProposalStatusExecuting}
+			}
+			won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
+				ProposalID:            propKey,
+				ExpectedStatuses:      expectedPrev,
+				TargetStatus:          finalStatus,
+				RequireExecutionToken: execToken,
+				Updates: map[string]interface{}{
+					"execution_log": proposal.ExecutionLog,
+					"executed_at":   proposal.ExecutedAt,
+				},
+				Audit: &ProposalTransitionAudit{
+					OperationID: execToken,
+					EventType:   "ops.proposal.failed",
+					Actor:       "executor",
+					Level:       model.LevelCritical,
+					Message:     logMsg,
+				},
+			})
+			if casErr != nil || !won {
+				return res, fmt.Errorf("%w (additionally failed to persist %s: won=%v err=%v)", execErr, finalStatus, won, casErr)
+			}
 		}
 		e.publishEvent(eventbus.SeverityError, "ops.proposal.failed", proposal)
 		return res, execErr
 	}
 
-	// Success -> transition to EXECUTED
+	// Success -> transition EXECUTING -> EXECUTED via strict CAS
 	proposal.Status = model.ProposalStatusExecuted
 	if res != nil {
 		proposal.ExecutionLog = res.Output
 	}
 	if e.db != nil {
-		_ = e.db.Save(proposal)
+		won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
+			ProposalID:            propKey,
+			ExpectedStatuses:      []string{model.ProposalStatusExecuting},
+			TargetStatus:          model.ProposalStatusExecuted,
+			RequireExecutionToken: execToken,
+			Updates: map[string]interface{}{
+				"execution_log": proposal.ExecutionLog,
+				"executed_at":   proposal.ExecutedAt,
+			},
+			Audit: &ProposalTransitionAudit{
+				OperationID: execToken,
+				EventType:   "ops.proposal.executed",
+				Actor:       proposal.ApprovedBy,
+				Level:       model.LevelInfo,
+				Message:     fmt.Sprintf("提案 [%s] 执行并健康验证通过", proposal.ProposalID),
+			},
+		})
+		if casErr != nil || !won {
+			return res, fmt.Errorf("proposal executed but failed to persist final EXECUTED status via CAS (won=%v err=%v)", won, casErr)
+		}
 	}
 	e.publishEvent(eventbus.SeverityInfo, "ops.proposal.executed", proposal)
 	return res, nil
 }
 
-// parseProposalSpec converts proposal fields into a typed OperationSpec.
-// Strictly enforces component consistency between ActionSpec and Proposal.TargetComponent,
-// validates rollback spec target consistency, and prevents ActionSpec tampering.
+// parseProposalSpec converts proposal fields into a typed OperationSpec with strict JSON checking.
 func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal) (OperationSpec, error) {
 	canonicalProposalTarget, err := ResolveComponent(proposal.TargetComponent)
 	if err != nil {
 		return OperationSpec{}, fmt.Errorf("invalid proposal target component: %w", err)
 	}
 
-	if proposal.ActionSpec != "" {
+	if strings.TrimSpace(proposal.ActionSpec) != "" {
 		var spec OperationSpec
-		if err := json.Unmarshal([]byte(proposal.ActionSpec), &spec); err != nil {
+		dec := json.NewDecoder(strings.NewReader(proposal.ActionSpec))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&spec); err != nil {
+			if strings.Contains(err.Error(), "unknown field") {
+				return OperationSpec{}, fmt.Errorf("%w: %v", model.ErrApprovalUnknownField, err)
+			}
 			return OperationSpec{}, fmt.Errorf("%w: failed to parse proposal action spec: %v", ErrInvalidSpec, err)
+		}
+		if dec.More() {
+			return OperationSpec{}, fmt.Errorf("%w: trailing tokens in action_spec", ErrInvalidSpec)
+		}
+		var extra interface{}
+		if err := dec.Decode(&extra); err != io.EOF {
+			return OperationSpec{}, fmt.Errorf("%w: extra JSON object in action_spec", ErrInvalidSpec)
 		}
 		if spec.Action == "" {
 			return OperationSpec{}, fmt.Errorf("%w: action spec missing action field", ErrInvalidSpec)
@@ -836,7 +1325,17 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 			spec.BaselineHash = proposal.BaselineHash
 		}
 
+		if spec.ExecutionPolicy != "" && proposal.ExecutionPolicy != "" && spec.ExecutionPolicy != proposal.ExecutionPolicy {
+			return OperationSpec{}, fmt.Errorf("%w: action spec execution_policy mismatch", ErrInvalidSpec)
+		}
+		if spec.ExecutionPolicy == "" {
+			spec.ExecutionPolicy = proposal.ExecutionPolicy
+		}
+
 		if spec.RollbackSpec != nil {
+			if strings.TrimSpace(spec.RollbackSpec.Action) == "" {
+				return OperationSpec{}, fmt.Errorf("%w: rollback_spec missing action", ErrInvalidSpec)
+			}
 			if spec.RollbackSpec.Target != "" {
 				rbTarget, err := ResolveComponent(spec.RollbackSpec.Target)
 				if err != nil || rbTarget != canonicalSpecTarget {
@@ -846,6 +1345,16 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 			} else {
 				spec.RollbackSpec.Target = canonicalSpecTarget
 			}
+			if err := ValidateSpecSafety(*spec.RollbackSpec); err != nil {
+				return OperationSpec{}, err
+			}
+			if e.dockerRunner == nil && !isAllowedProductionAction(spec.RollbackSpec.Action) {
+				return OperationSpec{}, fmt.Errorf("%w: unsupported rollback action %s", ErrActionNotSupported, spec.RollbackSpec.Action)
+			}
+		}
+
+		if e.dockerRunner == nil && !isAllowedProductionAction(spec.Action) {
+			return OperationSpec{}, fmt.Errorf("%w: unsupported production action %s", ErrActionNotSupported, spec.Action)
 		}
 
 		if err := ValidateSpecSafety(spec); err != nil {
@@ -957,33 +1466,38 @@ func (e *DefaultOperationExecutor) dispatchAction(ctx context.Context, spec Oper
 	}
 }
 
-// executeDockerRestart restarts a whitelisted container via 1Panel client or Docker socket without shell.
+// executeDockerRestart restarts a whitelisted container via a single deterministic provider
+// without blind multi-provider retries after an ambiguous transport/timeout failure (R4-03).
 func (e *DefaultOperationExecutor) executeDockerRestart(ctx context.Context, canonical string) (string, error) {
 	containerName := canonicalContainerNames[canonical]
 	if containerName == "" {
 		containerName = canonical
 	}
 
-	// 1. Try 1Panel client if available
-	if e.client != nil {
-		if err := e.client.RestartContainer(ctx, containerName); err == nil {
-			return fmt.Sprintf("container %s restarted via 1Panel API", containerName), nil
+	// Deterministic channel selection: prefer direct Docker socket when accessible (lowest latency,
+	// atomic fencing before write), otherwise 1Panel OpenAPI if configured.
+	if _, statErr := os.Stat(e.dockerSocket); statErr == nil {
+		if err := executeDockerSocketRestart(ctx, e.dockerSocket, containerName); err != nil {
+			return "", err
 		}
-	}
-
-	// 2. Fall back to Docker socket HTTP client
-	if e.fallback != nil {
-		if err := e.fallback.RestartContainerFallback(ctx, containerName); err == nil {
-			return fmt.Sprintf("container %s restarted via Docker socket", containerName), nil
-		}
-	}
-
-	// 3. Direct Docker socket execution
-	if err := executeDockerSocketRestart(ctx, e.dockerSocket, containerName); err == nil {
 		return fmt.Sprintf("container %s restarted via direct Docker socket", containerName), nil
 	}
 
-	return "", fmt.Errorf("failed to restart container %s: all providers unavailable", containerName)
+	if e.client != nil && strings.TrimSpace(e.client.baseURL) != "" {
+		if err := e.client.RestartContainer(ctx, containerName); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("container %s restarted via 1Panel API", containerName), nil
+	}
+
+	if e.fallback != nil {
+		if err := e.fallback.RestartContainerFallback(ctx, containerName); err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("container %s restarted via Docker socket fallback", containerName), nil
+	}
+
+	return "", fmt.Errorf("failed to restart container %s: no restart provider available", containerName)
 }
 
 // executeDockerRecreate recreates a container via Docker socket API without shell.
@@ -1350,52 +1864,124 @@ func getProbeHost(canonical string) string {
 	return "127.0.0.1"
 }
 
-// CheckHealth verifies target availability via HTTP GET or TCP connect.
-func (e *DefaultOperationExecutor) CheckHealth(ctx context.Context, target string) error {
-	if e.healthCheckFn != nil {
-		return e.healthCheckFn(ctx, target)
+// probeMQTTHandshake connects to Mosquitto on host:1883 and sends a minimal MQTT v3.1.1 CONNECT packet,
+// requiring a valid CONNACK (0x20 0x02 ... 0x00) to confirm broker readiness rather than bare TCP port open (R4-16).
+func probeMQTTHandshake(ctx context.Context, host string) (ReadinessLevel, error) {
+	d := net.Dialer{Timeout: 2 * time.Second}
+	conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:1883", host))
+	if err != nil {
+		return ReadinessUnknown, fmt.Errorf("mosquitto tcp dial failed: %w", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	clientID := []byte("home-api-health")
+	username := strings.TrimSpace(os.Getenv("MQTT_USERNAME"))
+	password := os.Getenv("MQTT_PASSWORD")
+
+	var flags byte = 0x02 // clean session
+	payload := make([]byte, 0, 64)
+	payload = append(payload, byte(len(clientID)>>8), byte(len(clientID)))
+	payload = append(payload, clientID...)
+	if username != "" {
+		flags |= 0x80
+		payload = append(payload, byte(len(username)>>8), byte(len(username)))
+		payload = append(payload, username...)
+		if password != "" {
+			flags |= 0x40
+			payload = append(payload, byte(len(password)>>8), byte(len(password)))
+			payload = append(payload, password...)
+		}
 	}
 
+	varHeader := []byte{
+		0x00, 0x04, 'M', 'Q', 'T', 'T',
+		0x04, // MQTT 3.1.1
+		flags,
+		0x00, 0x0A, // keepalive 10s
+	}
+	remLen := len(varHeader) + len(payload)
+	pkt := make([]byte, 0, 2+remLen)
+	pkt = append(pkt, 0x10, byte(remLen))
+	pkt = append(pkt, varHeader...)
+	pkt = append(pkt, payload...)
+
+	if _, err := conn.Write(pkt); err != nil {
+		return ReadinessPortOpen, fmt.Errorf("mosquitto MQTT CONNECT write failed: %w", err)
+	}
+	ack := make([]byte, 4)
+	if _, err := io.ReadFull(conn, ack); err != nil {
+		return ReadinessPortOpen, fmt.Errorf("mosquitto MQTT CONNACK read failed: %w", err)
+	}
+	if ack[0] != 0x20 || ack[1] != 0x02 {
+		return ReadinessUnknown, fmt.Errorf("mosquitto invalid CONNACK header: %x", ack)
+	}
+	if ack[3] != 0x00 {
+		return ReadinessServiceReady, fmt.Errorf("mosquitto CONNACK rejected connection (rc=%d)", ack[3])
+	}
+	return ReadinessBusinessHealthy, nil
+}
+
+// CheckReadiness evaluates the 5-tier business readiness state for a whitelisted component (R4-16).
+func (e *DefaultOperationExecutor) CheckReadiness(ctx context.Context, target string) (HealthProbeResult, error) {
 	canonical, err := ResolveComponent(target)
 	if err != nil {
-		return err
+		return HealthProbeResult{Component: target, Level: ReadinessUnknown, Detail: err.Error()}, err
+	}
+
+	if e.healthCheckFn != nil {
+		if err := e.healthCheckFn(ctx, target); err != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "custom health probe passed"}, nil
 	}
 
 	client := &http.Client{Timeout: 2 * time.Second}
 
 	switch canonical {
 	case ComponentHomeAPI:
-		// 1. If DB connection is configured, verify DB connectivity
 		if e.db != nil {
 			sqlDB, err := e.db.DB()
 			if err != nil {
-				return fmt.Errorf("home-api db handle error: %w", err)
+				GlobalSecurityMetrics.IncHealthUnknown()
+				return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, fmt.Errorf("home-api db handle error: %w", err)
 			}
 			if pingErr := sqlDB.PingContext(ctx); pingErr != nil {
-				return fmt.Errorf("home-api db ping failed: %w", pingErr)
+				GlobalSecurityMetrics.IncHealthUnknown()
+				return HealthProbeResult{Component: canonical, Level: ReadinessProcessRunning, Detail: pingErr.Error()}, fmt.Errorf("home-api db ping failed: %w", pingErr)
 			}
-			// In standalone / unit-test mode with local DB and no docker or custom probe host,
-			// DB ping verification confirms home-api state without relying on local host port conflicts.
-			if !inDockerEnv() && os.Getenv("PROBE_HOST_HOME_API") == "" {
-				return nil
+			if !inDockerEnv() && os.Getenv("PROBE_HOST_HOME_API") == "" && os.Getenv("PROBE_HEALTH_URL") == "" {
+				return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "db dependency healthy (standalone mode)"}, nil
 			}
 		}
 
 		host := getProbeHost(ComponentHomeAPI)
-		healthURL := fmt.Sprintf("http://%s:8080/health", host)
+		healthURL := fmt.Sprintf("http://%s:8080/health/ready", host)
 		if customURL := os.Getenv("PROBE_HEALTH_URL"); customURL != "" {
 			healthURL = customURL
 		}
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, nil)
+		if err != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
+		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return fmt.Errorf("home-api http health check failed: %w", err)
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, fmt.Errorf("home-api http health check failed: %w", err)
 		}
 		defer resp.Body.Close()
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("home-api health check returned %d", resp.StatusCode)
+			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("status %d", resp.StatusCode)}, fmt.Errorf("home-api health check returned %d", resp.StatusCode)
 		}
-		return nil
+		var payload map[string]interface{}
+		if json.Unmarshal(bodyBytes, &payload) != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: "invalid JSON health response"}, fmt.Errorf("%w: home-api returned non-JSON health response", ErrHealthUnknown)
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "home-api ready with verified dependencies"}, nil
 
 	case ComponentHomeWeb:
 		host := getProbeHost(ComponentHomeWeb)
@@ -1406,69 +1992,108 @@ func (e *DefaultOperationExecutor) CheckHealth(ctx context.Context, target strin
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:%d/", host, port), nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			return err
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
 		}
 		defer resp.Body.Close()
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-			return fmt.Errorf("home-web health check returned %d", resp.StatusCode)
+			return HealthProbeResult{Component: canonical, Level: ReadinessPortOpen, Detail: fmt.Sprintf("http status %d", resp.StatusCode)}, fmt.Errorf("home-web health check returned %d", resp.StatusCode)
 		}
-		return nil
+		if len(bytes.TrimSpace(bodyBytes)) == 0 {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: "empty body"}, fmt.Errorf("%w: home-web returned empty response", ErrHealthUnknown)
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "home-web serving frontend content"}, nil
 
 	case ComponentHomeVision:
 		host := getProbeHost(ComponentHomeVision)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:8090/health", host), nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			return err
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
 		}
 		defer resp.Body.Close()
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("home-vision health check returned %d", resp.StatusCode)
+			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("status %d", resp.StatusCode)}, fmt.Errorf("home-vision health check returned %d", resp.StatusCode)
 		}
-		return nil
+		var payload map[string]interface{}
+		if json.Unmarshal(bodyBytes, &payload) != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: "invalid JSON"}, fmt.Errorf("%w: home-vision returned non-JSON health response", ErrHealthUnknown)
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "home-vision health JSON verified"}, nil
 
 	case ComponentFrigate:
 		host := getProbeHost(ComponentFrigate)
 		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:5000/api/config", host), nil)
 		resp, err := client.Do(req)
 		if err != nil {
-			return err
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
 		}
 		defer resp.Body.Close()
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return fmt.Errorf("frigate health check returned %d", resp.StatusCode)
+			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("status %d", resp.StatusCode)}, fmt.Errorf("frigate health check returned %d", resp.StatusCode)
 		}
-		return nil
+		var cfgJSON map[string]interface{}
+		if json.Unmarshal(bodyBytes, &cfgJSON) != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: "invalid JSON config"}, fmt.Errorf("%w: frigate returned non-JSON config response", ErrHealthUnknown)
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "frigate API ready"}, nil
 
 	case ComponentMosquitto:
 		host := getProbeHost(ComponentMosquitto)
-		d := net.Dialer{Timeout: 2 * time.Second}
-		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:1883", host))
+		lvl, err := probeMQTTHandshake(ctx, host)
 		if err != nil {
-			return err
+			if lvl == ReadinessUnknown {
+				GlobalSecurityMetrics.IncHealthUnknown()
+			}
+			return HealthProbeResult{Component: canonical, Level: lvl, Detail: err.Error()}, err
 		}
-		_ = conn.Close()
-		return nil
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "MQTT CONNECT/CONNACK verified"}, nil
 
 	case ComponentOpenResty, Component1PWAF:
 		host := getProbeHost(ComponentOpenResty)
-		d := net.Dialer{Timeout: 2 * time.Second}
-		conn, err := d.DialContext(ctx, "tcp", fmt.Sprintf("%s:80", host))
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:80/", host), nil)
+		resp, err := client.Do(req)
 		if err != nil {
-			return fmt.Errorf("openresty tcp check failed: %w", err)
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, fmt.Errorf("openresty HTTP check failed: %w", err)
 		}
-		_ = conn.Close()
-		return nil
+		defer resp.Body.Close()
+		if resp.StatusCode >= 500 {
+			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("upstream error %d", resp.StatusCode)}, fmt.Errorf("openresty gateway/upstream returned %d", resp.StatusCode)
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: fmt.Sprintf("openresty HTTP status %d", resp.StatusCode)}, nil
 
 	default:
-		return ErrComponentNotWhitelisted
+		return HealthProbeResult{Component: target, Level: ReadinessUnknown, Detail: ErrComponentNotWhitelisted.Error()}, ErrComponentNotWhitelisted
 	}
 }
 
-// recordExecutionHistory writes an immutable audit record to ops_execution_histories.
-func (e *DefaultOperationExecutor) recordExecutionHistory(component, action, status, output, detail string) {
+// CheckHealth verifies target business readiness (BUSINESS_HEALTHY required).
+func (e *DefaultOperationExecutor) CheckHealth(ctx context.Context, target string) error {
+	_, err := e.CheckReadiness(ctx, target)
+	return err
+}
+
+// recordExecutionHistory writes an immutable audit record to ops_execution_histories and propagates write errors.
+func (e *DefaultOperationExecutor) recordExecutionHistory(component, action, status, output, detail string) error {
 	if e.db == nil {
-		return
+		return nil
+	}
+	exists, err := tableExists(e.db, "ops_execution_histories")
+	if err != nil {
+		GlobalSecurityMetrics.IncAuditFailed()
+		return err
+	}
+	if !exists {
+		return nil
 	}
 	history := model.OpsExecutionHistory{
 		ExecutionType: "proposal_exec",
@@ -1477,9 +2102,13 @@ func (e *DefaultOperationExecutor) recordExecutionHistory(component, action, sta
 		Status:        status,
 		HealthOutput:  output,
 		Detail:        detail,
-		CreatedAt:     time.Now(),
+		CreatedAt:     time.Now().UTC(),
 	}
-	_ = e.db.Create(&history)
+	if err := e.db.Create(&history).Error; err != nil {
+		GlobalSecurityMetrics.IncAuditFailed()
+		return fmt.Errorf("failed to persist execution audit history: %w", err)
+	}
+	return nil
 }
 
 // publishEvent sends an event to EventBus if configured.
@@ -1503,8 +2132,25 @@ func (e *DefaultOperationExecutor) publishEvent(severity string, eventType strin
 	})
 }
 
+// verifyContextLeaseBeforeSocket ensures that if a LeaseGuard is bound to ctx, its token and fencing
+// generation remain authoritative immediately prior to dialing/writing Docker Unix Socket.
+// NOTE: Once HTTP request bytes are committed to Docker Unix socket, Docker Engine cannot natively
+// evaluate fencing tokens on an in-flight daemon syscall; pre-write verification + context deadlines
+// minimize that external race window to sub-millisecond transport commit time (R4-06).
+func verifyContextLeaseBeforeSocket(ctx context.Context) error {
+	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+		if err := guard.VerifyBeforeMutation(0); err != nil {
+			return err
+		}
+	}
+	return ctx.Err()
+}
+
 // executeDockerSocketRestart issues a container restart via Docker Unix Socket HTTP API.
 func executeDockerSocketRestart(ctx context.Context, sockPath, containerName string) error {
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return err
+	}
 	if _, err := os.Stat(sockPath); err != nil {
 		return fmt.Errorf("docker socket not accessible: %w", err)
 	}
@@ -1545,6 +2191,9 @@ func executeDockerSocketExec(ctx context.Context, sockPath, containerName string
 
 // executeDockerSocketExecOutput issues exec and captures output via Docker Unix Socket.
 func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName string, cmd []string) (string, error) {
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return "", err
+	}
 	if _, err := os.Stat(sockPath); err != nil {
 		return "", fmt.Errorf("docker socket not accessible: %w", err)
 	}
@@ -1811,6 +2460,9 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		return "", fmt.Errorf("%w: cannot recreate container %s: image not specified and not found in container inspect", ErrInvalidSpec, containerName)
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return "", err
+	}
 	// 2. Stop container
 	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=10", containerName)
 	stopReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, stopURL, nil)
@@ -1819,6 +2471,9 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		_ = stopResp.Body.Close()
 	}
 
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		return "", err
+	}
 	// 3. Rename old container to backup (Blue-Green safety)
 	backupName := fmt.Sprintf("%s_bak_%d", containerName, time.Now().UnixNano())
 	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", containerName, backupName)
@@ -1931,53 +2586,90 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 }
 
 // ReconcileStartupProposals inspects proposals left in non-terminal transient states
-// (EXECUTING, ROLLING_BACK) on startup and marks them EXECUTION_UNKNOWN or RECONCILIATION_REQUIRED.
+// (EXECUTING, ROLLING_BACK) on startup and converges them via ProposalFSM CAS into
+// EXECUTION_UNKNOWN or RECONCILIATION_REQUIRED (never blind retry).
 func ReconcileStartupProposals(db *gorm.DB, executor OperationExecutor) error {
 	if db == nil {
 		return nil
 	}
-	now := time.Now()
+	now := time.Now().UTC()
+	fsm := NewProposalFSM(db)
 
-	// 1. EXECUTING proposals on startup:
-	// If executor is available and can verify health, check target container state.
-	// Otherwise, mark as RECONCILIATION_REQUIRED / EXECUTION_UNKNOWN.
 	var executingProps []model.OpsProposal
-	if err := db.Where("status = ?", model.ProposalStatusExecuting).Find(&executingProps).Error; err == nil {
-		for _, prop := range executingProps {
-			targetStatus := model.ProposalStatusReconciliationRequired
-			execLog := "Service restarted while proposal was EXECUTING; marked RECONCILIATION_REQUIRED for human review"
+	if err := db.Where("status = ?", model.ProposalStatusExecuting).Find(&executingProps).Error; err != nil {
+		GlobalSecurityMetrics.IncDatabaseError()
+		return err
+	}
+	for _, prop := range executingProps {
+		targetStatus := model.ProposalStatusReconciliationRequired
+		execLog := "Service restarted while proposal was EXECUTING; marked RECONCILIATION_REQUIRED for human review"
 
-			if executor != nil && prop.TargetComponent != "" {
-				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-				if err := executor.CheckHealth(ctx, prop.TargetComponent); err == nil {
-					// Container is healthy, but we cannot confirm whether this proposal's exact mutation completed
-					targetStatus = model.ProposalStatusExecutionUnknown
-					execLog = "Service restarted while proposal was EXECUTING; target container is healthy, but mutation state requires verification (EXECUTION_UNKNOWN)"
-				}
-				cancel()
+		if executor != nil && prop.TargetComponent != "" {
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			if err := executor.CheckHealth(ctx, prop.TargetComponent); err == nil {
+				targetStatus = model.ProposalStatusExecutionUnknown
+				execLog = "Service restarted while proposal was EXECUTING; target component healthy, mutation verification required (EXECUTION_UNKNOWN)"
 			}
+			cancel()
+		}
 
-			_ = db.Model(&model.OpsProposal{}).Where("id = ?", prop.ID).Updates(map[string]interface{}{
-				"status":        targetStatus,
+		propKey := prop.ProposalID
+		if propKey == "" {
+			propKey = fmt.Sprintf("%d", prop.ID)
+		}
+		GlobalSecurityMetrics.IncExecutionUnknown()
+		if _, err := fsm.TransitionStrict(ProposalTransitionParams{
+			ProposalID:       propKey,
+			ExpectedStatuses: []string{model.ProposalStatusExecuting},
+			TargetStatus:     targetStatus,
+			Updates: map[string]interface{}{
 				"execution_log": execLog,
 				"executed_at":   utils.NullTime{Time: now, Valid: true},
 				"reconciled_at": utils.NullTime{Time: now, Valid: true},
-				"updated_at":    now,
-			})
+			},
+			Audit: &ProposalTransitionAudit{
+				OperationID: GenerateOperationID("startup-reconcile"),
+				EventType:   "ops.proposal.startup_reconciled",
+				Actor:       "startup-reconciler",
+				Level:       model.LevelCritical,
+				Message:     execLog,
+			},
+		}); err != nil {
+			return err
 		}
 	}
 
-	// 2. ROLLING_BACK proposals on startup:
-	// Rollback was interrupted by restart -> MUST flag RECONCILIATION_REQUIRED
-	_ = db.Model(&model.OpsProposal{}).
-		Where("status = ?", model.ProposalStatusRollingBack).
-		Updates(map[string]interface{}{
-			"status":        model.ProposalStatusReconciliationRequired,
-			"execution_log": "Service restarted while proposal was ROLLING_BACK; container state is inconsistent (RECONCILIATION_REQUIRED)",
-			"executed_at":   utils.NullTime{Time: now, Valid: true},
-			"reconciled_at": utils.NullTime{Time: now, Valid: true},
-			"updated_at":    now,
-		})
+	var rollingBackProps []model.OpsProposal
+	if err := db.Where("status = ?", model.ProposalStatusRollingBack).Find(&rollingBackProps).Error; err != nil {
+		GlobalSecurityMetrics.IncDatabaseError()
+		return err
+	}
+	for _, prop := range rollingBackProps {
+		propKey := prop.ProposalID
+		if propKey == "" {
+			propKey = fmt.Sprintf("%d", prop.ID)
+		}
+		execLog := "Service restarted while proposal was ROLLING_BACK; container state requires human reconciliation (RECONCILIATION_REQUIRED)"
+		if _, err := fsm.TransitionStrict(ProposalTransitionParams{
+			ProposalID:       propKey,
+			ExpectedStatuses: []string{model.ProposalStatusRollingBack},
+			TargetStatus:     model.ProposalStatusReconciliationRequired,
+			Updates: map[string]interface{}{
+				"execution_log": execLog,
+				"executed_at":   utils.NullTime{Time: now, Valid: true},
+				"reconciled_at": utils.NullTime{Time: now, Valid: true},
+			},
+			Audit: &ProposalTransitionAudit{
+				OperationID: GenerateOperationID("startup-reconcile"),
+				EventType:   "ops.proposal.rollback_interrupted",
+				Actor:       "startup-reconciler",
+				Level:       model.LevelCritical,
+				Message:     execLog,
+			},
+		}); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }

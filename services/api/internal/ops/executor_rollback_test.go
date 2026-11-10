@@ -358,7 +358,7 @@ func TestExecuteProposal_TimeoutTransitionsToExecutionUnknown(t *testing.T) {
 		Status:          model.ProposalStatusApproved,
 		CreatedAt:       time.Now(),
 	}
-	db.Create(&prop)
+	seedTestSignedProposal(t, db, &prop)
 
 	_, err := executor.ExecuteProposal(context.Background(), &prop)
 	if err == nil {

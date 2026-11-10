@@ -453,10 +453,10 @@ func TestChallenge_DependencyTopology_CyclicAndUnknownDependencies(t *testing.T)
 	topo := NewTopologyEngine()
 	ctx := context.Background()
 
-	// Inject cyclic dependency graph: cycle-a -> cycle-b -> cycle-a
+	// Inject cyclic dependency graph on whitelisted components: home-vision -> home-cloudflared -> home-vision
 	topo.mu.Lock()
-	topo.graph["cycle-a"] = []string{"cycle-b"}
-	topo.graph["cycle-b"] = []string{"cycle-a"}
+	topo.graph["home-vision"] = []string{"home-cloudflared"}
+	topo.graph["home-cloudflared"] = []string{"home-vision"}
 	topo.mu.Unlock()
 
 	topo.SetHealthChecker(func(ctx context.Context, comp string) (bool, error) {
@@ -466,7 +466,7 @@ func TestChallenge_DependencyTopology_CyclicAndUnknownDependencies(t *testing.T)
 	// Must complete cleanly without stack overflow, infinite recursion, or panic
 	done := make(chan error, 1)
 	go func() {
-		err := topo.PreflightDependencyCheck(ctx, "cycle-a")
+		err := topo.PreflightDependencyCheck(ctx, "home-vision")
 		done <- err
 	}()
 
@@ -479,10 +479,10 @@ func TestChallenge_DependencyTopology_CyclicAndUnknownDependencies(t *testing.T)
 		t.Fatalf("preflight check deadlocked or looped infinitely on cyclic graph!")
 	}
 
-	// Test unknown container target -> should return nil without panic
+	// Test unknown container target -> Fail-Closed (R4-17: MUST return ErrComponentNotWhitelisted without panic)
 	errUnknown := topo.PreflightDependencyCheck(ctx, "nonexistent-container-xyz")
-	if errUnknown != nil {
-		t.Fatalf("expected unknown target to pass gracefully, got error: %v", errUnknown)
+	if !errors.Is(errUnknown, ErrComponentNotWhitelisted) {
+		t.Fatalf("expected unknown target to fail closed with ErrComponentNotWhitelisted, got: %v", errUnknown)
 	}
 }
 

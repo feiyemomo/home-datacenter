@@ -82,8 +82,8 @@ func TestRound3_P2_CanonicalComponentIDs(t *testing.T) {
 		{"home-h3c-keepalive", "home-h3c-keepalive"},
 		{"home-ops-agent", "home-ops-agent"},
 
-		// Custom unmapped
-		{"custom-service", "custom-service"},
+		// Custom unmapped must fail-closed to "" (R4-17)
+		{"custom-service", ""},
 	}
 
 	for _, tc := range testCases {
@@ -135,14 +135,15 @@ func TestRound3_P2_DualPathLeaseManager(t *testing.T) {
 		t.Fatalf("expected ErrLeaseHeld for concurrent holder, got %v", err)
 	}
 
-	// 4. Same holder renewal: go-core re-acquires / renews successfully
-	token2, err := mgr.AcquireLease("frigate", "go-core", 2*time.Second)
-	if err != nil {
-		t.Fatalf("expected same holder to renew lease, got error: %v", err)
+	// 4. Same-holder AcquireLease re-entry is strictly forbidden (R4-04); must use RenewLease
+	_, err = mgr.AcquireLease("frigate", "go-core", 2*time.Second)
+	if !errors.Is(err, ErrLeaseHeld) {
+		t.Fatalf("expected ErrLeaseHeld for same-holder re-entry via AcquireLease, got: %v", err)
 	}
-	if token2 == "" {
-		t.Fatal("expected valid renewed token")
+	if _, err := mgr.RenewLease("frigate", token1, 2*time.Second); err != nil {
+		t.Fatalf("expected RenewLease with valid token to succeed, got: %v", err)
 	}
+	token2 := token1
 
 	// 5. Release lease with invalid token fails
 	if err := mgr.ReleaseLease("frigate", "invalid-token"); !errors.Is(err, ErrInvalidLeaseToken) {

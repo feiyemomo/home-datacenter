@@ -311,11 +311,11 @@ func TestProposalSecurity_ApprovalDigestGeneratedUponApproval(t *testing.T) {
 	if dbProp.ApprovalDigest == "" {
 		t.Fatalf("expected ApprovalDigest to be saved in DB upon approval, got empty string")
 	}
-	if !strings.HasPrefix(dbProp.ApprovalDigest, "sha256:") {
-		t.Errorf("expected ApprovalDigest to have 'sha256:' prefix, got: %s", dbProp.ApprovalDigest)
+	if !strings.HasPrefix(dbProp.ApprovalDigest, "hmac-sha256:") {
+		t.Errorf("expected ApprovalDigest to have 'hmac-sha256:' prefix, got: %s", dbProp.ApprovalDigest)
 	}
-	if len(dbProp.ApprovalDigest) != 71 {
-		t.Errorf("expected ApprovalDigest length 71 (sha256: + 64 hex), got: %d (%s)", len(dbProp.ApprovalDigest), dbProp.ApprovalDigest)
+	if len(dbProp.ApprovalDigest) < 78 {
+		t.Errorf("expected ApprovalDigest HMAC length >= 78 (hmac-sha256:<kid>:<64 hex>), got: %d (%s)", len(dbProp.ApprovalDigest), dbProp.ApprovalDigest)
 	}
 	if dbProp.Version != 1 {
 		t.Errorf("expected proposal version 1, got: %d", dbProp.Version)

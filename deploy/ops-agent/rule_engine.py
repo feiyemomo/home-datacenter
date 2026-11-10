@@ -10,6 +10,7 @@ Two-Tier Funnel Cost Control Rule Engine for home-ops-agent:
   - New API gateway querying (http://127.0.0.1:3000/v1) using model agent-fast / agent-deep
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -316,11 +317,27 @@ class TwoTierRuleEngine:
         }
 
     def _execute_firewall_drop(self, ip: str, cmd: str) -> None:
-        """Executes iptables command if running in container with NET_ADMIN or logs action."""
+        """
+        Records or executes validated IP drop; strictly prevents self-banning loopback,
+        unspecified, or link-local addresses and gates direct host iptables behind explicit opt-in (R4-24).
+        """
         try:
-            # Check if iptables exists on system
+            addr = ipaddress.ip_address((ip or "").strip())
+        except ValueError:
+            logger.warning(f"[Rule Engine] Rejected malformed IP '{ip}' from firewall drop.")
+            return
+
+        if addr.is_loopback or addr.is_unspecified or addr.is_link_local or addr.is_multicast:
+            logger.warning(f"[Rule Engine] Refused self-ban of protected local/gateway address {addr}.")
+            return
+
+        if os.environ.get("ENABLE_LOCAL_IPTABLES", "").strip() != "1":
+            logger.info(f"[Rule Engine] Recorded ban intent for {addr} (delegated to Go Core WAF/DefenseManager).")
+            return
+
+        try:
             subprocess.run(
-                ["iptables", "-I", "INPUT", "-s", ip, "-j", "DROP"],
+                ["iptables", "-I", "INPUT", "-s", str(addr), "-j", "DROP"],
                 check=False,
                 capture_output=True,
                 timeout=2
@@ -331,33 +348,21 @@ class TwoTierRuleEngine:
     def _purge_temp_cache(self, mount_path: str) -> List[str]:
         """
         Executes safe cache cleanup commands.
-        Only targets docker builder prune and temporary build cache folders.
-        Never touches protected persistent data volumes.
+        Guards unapproved destructive docker prune behind explicit opt-in and maintenance lock awareness,
+        while safely pruning whitelisted ephemeral cache files only (R4-24).
         """
         purged = []
-        try:
-            res = subprocess.run(
-                ["docker", "builder", "prune", "-f"],
-                check=False,
-                capture_output=True,
-                timeout=10
-            )
-            if res.returncode == 0:
-                purged.append("docker builder prune -f")
-        except Exception:
-            pass
-
-        try:
-            res = subprocess.run(
-                ["docker", "image", "prune", "-f", "--filter", "dangling=true"],
-                check=False,
-                capture_output=True,
-                timeout=10
-            )
-            if res.returncode == 0:
-                purged.append("docker image prune -f --filter dangling=true")
-        except Exception:
-            pass
+        if os.environ.get("ENABLE_LOCAL_DOCKER_PRUNE", "").strip() == "1":
+            for docker_args, label in (
+                (["docker", "builder", "prune", "-f"], "docker builder prune -f"),
+                (["docker", "image", "prune", "-f", "--filter", "dangling=true"], "docker image prune -f --filter dangling=true"),
+            ):
+                try:
+                    res = subprocess.run(docker_args, check=False, capture_output=True, timeout=10)
+                    if res.returncode == 0:
+                        purged.append(label)
+                except Exception:
+                    pass
 
         for temp_dir in SAFE_TEMP_CACHE_DIRS:
             if not self.is_protected_volume(temp_dir) and os.path.exists(temp_dir):

@@ -44,6 +44,73 @@ class DockerHealthState(str, enum.Enum):
     RUNNING_UNHEALTHCHECKED = "RUNNING_UNHEALTHCHECKED"
     UNKNOWN = "UNKNOWN"
 
+class SQLiteFaultClass(str, enum.Enum):
+    DATABASE_MISSING = "DATABASE_MISSING"
+    DATABASE_CORRUPT = "DATABASE_CORRUPT"
+    TABLE_MISSING = "TABLE_MISSING"
+    COLUMN_MISSING = "COLUMN_MISSING"
+    SCHEMA_VERSION_MISMATCH = "SCHEMA_VERSION_MISMATCH"
+    DATABASE_READONLY = "DATABASE_READONLY"
+    SQLITE_BUSY = "SQLITE_BUSY"
+    SQLITE_FULL = "SQLITE_FULL"
+    TRANSACTION_FAILED = "TRANSACTION_FAILED"
+    TIMESTAMP_INVALID = "TIMESTAMP_INVALID"
+    RECORD_INCONSISTENT = "RECORD_INCONSISTENT"
+
+class AuditStatus(str, enum.Enum):
+    AUDIT_COMMITTED = "AUDIT_COMMITTED"
+    AUDIT_PENDING = "AUDIT_PENDING"
+    AUDIT_FAILED = "AUDIT_FAILED"
+    AUDIT_UNKNOWN = "AUDIT_UNKNOWN"
+
+REQUIRED_OPS_SCHEMA_VERSION = 4
+
+def classify_sqlite_error(exc: Exception) -> SQLiteFaultClass:
+    msg = str(exc).lower()
+    if isinstance(exc, FileNotFoundError) or "unable to open database" in msg or "no such file" in msg:
+        return SQLiteFaultClass.DATABASE_MISSING
+    if "no such table" in msg:
+        return SQLiteFaultClass.TABLE_MISSING
+    if "no such column" in msg or "has no column named" in msg:
+        return SQLiteFaultClass.COLUMN_MISSING
+    if "readonly" in msg or "read-only" in msg or "attempt to write a readonly database" in msg:
+        return SQLiteFaultClass.DATABASE_READONLY
+    if "locked" in msg or "busy" in msg:
+        return SQLiteFaultClass.SQLITE_BUSY
+    if "disk full" in msg or "database or disk is full" in msg:
+        return SQLiteFaultClass.SQLITE_FULL
+    if "not a database" in msg or "malformed" in msg or "corrupt" in msg:
+        return SQLiteFaultClass.DATABASE_CORRUPT
+    return SQLiteFaultClass.TRANSACTION_FAILED
+
+class SecurityMetricsCollector:
+    """In-process telemetry counters and security event emitter (R4-25)."""
+
+    def __init__(self):
+        self.counters: Dict[str, int] = {
+            "recovery_lease_active": 0,
+            "recovery_lease_expired": 0,
+            "recovery_lease_renewal_failed": 0,
+            "recovery_fencing_rejected": 0,
+            "recovery_execution_unknown": 0,
+            "recovery_audit_failed": 0,
+            "circuit_breaker_degraded": 0,
+            "maintenance_lock_degraded": 0,
+            "proposal_cas_conflict": 0,
+            "proposal_digest_mismatch": 0,
+            "recovery_health_unknown": 0,
+            "recovery_database_error": 0,
+        }
+
+    def inc(self, name: str, delta: int = 1) -> None:
+        self.counters[name] = self.counters.get(name, 0) + delta
+
+    def set_gauge(self, name: str, val: int) -> None:
+        self.counters[name] = val
+
+    def snapshot(self) -> Dict[str, int]:
+        return dict(self.counters)
+
 # Canonical Component Resolution (1-to-1 with Go Core ResolveTopologyComponent)
 CANONICAL_COMPONENT_MAP = {
     "home-mosquitto": "mosquitto",
@@ -118,14 +185,22 @@ CANONICAL_TO_DOCKER_CONTAINER = {
 }
 
 def resolve_canonical_component(name: str) -> str:
+    """Normalizes known component names and aliases; returns '' (Fail-Closed) on unknown (R4-17)."""
     cleaned = (name or "").strip().lower().lstrip("/")
     if "(" in cleaned:
-        cleaned = cleaned.split("(")[0].strip()
-    return CANONICAL_COMPONENT_MAP.get(cleaned, cleaned)
+        prefix = cleaned.split("(")[0].strip()
+        if prefix:
+            cleaned = prefix
+    if not cleaned:
+        return ""
+    return CANONICAL_COMPONENT_MAP.get(cleaned, "")
 
 def resolve_docker_container_name(canonical: str) -> str:
-    cleaned = resolve_canonical_component(canonical).strip().lower()
-    return CANONICAL_TO_DOCKER_CONTAINER.get(cleaned, canonical)
+    """Resolves canonical component name to Docker container name; returns '' on unknown (R4-17)."""
+    cleaned = resolve_canonical_component(canonical)
+    if not cleaned:
+        return ""
+    return CANONICAL_TO_DOCKER_CONTAINER.get(cleaned, "")
 
 def open_readonly_sqlite(db_path: str) -> sqlite3.Connection:
     """
@@ -138,7 +213,24 @@ def open_readonly_sqlite(db_path: str) -> sqlite3.Connection:
     import pathlib
     posix_path = pathlib.Path(os.path.abspath(db_path)).as_posix()
     uri = f"file:{posix_path}?mode=ro"
-    return sqlite3.connect(uri, uri=True, timeout=2.0)
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
+
+def open_readwrite_sqlite(db_path: str) -> sqlite3.Connection:
+    """
+    Opens an EXISTING SQLite database in read-write mode (URI mode=rw) with manual transaction
+    control so callers can issue BEGIN IMMEDIATE for cross-process serialization.
+    NEVER auto-creates a missing database file (R4-14, R4-15, R4-18).
+    """
+    if not db_path or not os.path.isfile(db_path):
+        raise FileNotFoundError(f"SQLite database file not found or is not a file: {db_path}")
+    import pathlib
+    posix_path = pathlib.Path(os.path.abspath(db_path)).as_posix()
+    uri = f"file:{posix_path}?mode=rw"
+    conn = sqlite3.connect(uri, uri=True, timeout=5.0, isolation_level=None)
+    conn.execute("PRAGMA busy_timeout=5000;")
+    return conn
 
 def parse_sqlite_timestamp(val: Any) -> Tuple[Optional[float], bool]:
     """
@@ -239,13 +331,13 @@ WEAK_SECRETS_BLACKLIST = {
 
 
 def is_production() -> bool:
-    """Returns True if running in production mode."""
+    """Returns True if running in production mode (explicit env or Docker container without dev override)."""
     env = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", os.environ.get("ENV", ""))).lower().strip()
     if env in ("development", "dev", "test", "testing"):
         return False
     if env in ("production", "prod"):
         return True
-    return False
+    return os.path.exists("/.dockerenv")
 
 
 def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
@@ -318,6 +410,9 @@ class HomeOpsAgent:
         self._last_docker_event_time: int = int(time.time())
         self._mqtt_connected: bool = False
         self._local_restarts: dict[str, list[float]] = {}
+        self.metrics = SecurityMetricsCollector()
+        self._last_audit_status: AuditStatus = AuditStatus.AUDIT_UNKNOWN
+        self._active_lease_generations: dict[str, int] = {}
 
     def _create_paho_client(self, loop: asyncio.AbstractEventLoop) -> Optional[Any]:
         """Creates and configures standard paho-mqtt client with auth, TLS, LWT, and QoS 1."""
@@ -553,8 +648,38 @@ class HomeOpsAgent:
                                 continue
 
                             if status == CoreReportingStatus.AUTHORIZED:
-                                logger.info(f"[Authoritative] Go Core approved restart for {container_name}. Executing restart.")
-                                await self._restart_docker_container(container_name, sock_path)
+                                canonical_auth = resolve_canonical_component(container_name)
+                                if not canonical_auth:
+                                    logger.critical(
+                                        f"[Security Block] Refusing Go Core AUTHORIZED restart for non-whitelisted container '{container_name}'."
+                                    )
+                                    continue
+                                db_path_auth = getattr(self.config, "db_path", "/data/sqlite/app.db")
+                                lease_ok, lease_tok, fencing_gen = self._acquire_recovery_lease_grant(canonical_auth, db_path_auth)
+                                if not lease_ok:
+                                    logger.critical(
+                                        f"[Lease Block] Failed to acquire recovery lease for AUTHORIZED container {canonical_auth}. Halting restart."
+                                    )
+                                    continue
+                                try:
+                                    if not self._verify_recovery_lease(canonical_auth, lease_tok, fencing_gen, db_path_auth):
+                                        self.metrics.inc("recovery_fencing_rejected")
+                                        logger.critical(f"[Fencing Block] Lease invalid before Docker restart for {canonical_auth}.")
+                                        continue
+                                    logger.info(
+                                        f"[Authoritative] Go Core approved restart for {canonical_auth} (gen={fencing_gen}). Executing guarded restart."
+                                    )
+                                    docker_name = resolve_docker_container_name(canonical_auth)
+                                    if not docker_name:
+                                        logger.critical(f"[Security Block] Cannot resolve docker container for {canonical_auth}.")
+                                        continue
+                                    restarted = await self._restart_docker_container(docker_name, sock_path)
+                                    if restarted:
+                                        h_state = await self._verify_container_health(docker_name, sock_path)
+                                        if h_state != DockerHealthState.HEALTHY:
+                                            logger.error(f"[Post-Restart Failed] Health check returned {h_state} for {canonical_auth}.")
+                                finally:
+                                    self._release_recovery_lease(canonical_auth, lease_tok, db_path_auth, fencing_gen=fencing_gen)
                                 continue
 
                             if status in (CoreReportingStatus.POLICY_REJECTED, CoreReportingStatus.BLOCKED_BY_FSM):
@@ -606,6 +731,11 @@ class HomeOpsAgent:
             return False
 
         canonical = resolve_canonical_component(container_name)
+        if not canonical:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Unknown or non-whitelisted component '{container_name}' (R4-17). Refusing offline restart."
+            )
+            return False
 
         # Guard 2a: Forbidden component check (core storage / database forbidden from offline autonomous restart)
         if container_name in OFFLINE_FORBIDDEN_COMPONENTS or canonical in OFFLINE_FORBIDDEN_COMPONENTS:
@@ -622,6 +752,17 @@ class HomeOpsAgent:
             return False
 
         db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
+
+        # Guard 2b-pre: Pre-flight schema & storage integrity check (R4-14, R4-18)
+        schema_ok, fault_cls, schema_reason = self._verify_ops_schema(db_path)
+        if not schema_ok:
+            self.metrics.inc("recovery_database_error")
+            self.metrics.set_gauge("circuit_breaker_degraded", 1)
+            self.metrics.set_gauge("maintenance_lock_degraded", 1)
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Storage schema verification failed [{fault_cls}]: {schema_reason}. Fail-Closed."
+            )
+            return False
 
         # Guard 2c: Maintenance Lock Verification (Fail-Closed)
         lock_state = self._is_maintenance_locked_offline(db_path, container_name)
@@ -671,9 +812,10 @@ class HomeOpsAgent:
             )
             return False
 
-        # Guard 2e: Dual-Path Execution Lease Mutual Exclusion (R13)
-        lease_acquired, lease_token = self._acquire_recovery_lease(canonical, db_path)
+        # Guard 2e: Dual-Path Execution Lease Mutual Exclusion with Monotonic Fencing Generation (R4-04 ~ R4-07)
+        lease_acquired, lease_token, fencing_gen = self._acquire_recovery_lease_grant(canonical, db_path)
         if not lease_acquired:
+            self.metrics.inc("recovery_fencing_rejected")
             logger.critical(
                 f"[Emergency Autonomy Blocked] Unable to acquire recovery lease for {canonical}. "
                 f"Lease held by another path or DB error. Halting offline restart."
@@ -693,7 +835,7 @@ class HomeOpsAgent:
 
             if persisted_short is None or persisted_long is None:
                 logger.critical(
-                    f"[Emergency Autonomy Blocked] Persisted restart count is UNKNOWN (query error). Halting restart."
+                    f"[Emergency Autonomy Blocked] Persisted restart count is UNKNOWN (query error or missing table). Halting restart."
                 )
                 return False
 
@@ -717,33 +859,135 @@ class HomeOpsAgent:
                 )
                 return False
 
+            # R4-06: Pre-mutation lease & fencing gate right before Docker socket dispatch
+            if not self._verify_recovery_lease(canonical, lease_token, fencing_gen, db_path):
+                self.metrics.inc("recovery_fencing_rejected")
+                logger.critical(
+                    f"[Fencing Gate] Lease token or fencing generation ({fencing_gen}) became invalid right before Docker restart for {canonical}. Aborting."
+                )
+                return False
+
             timestamps.append(now)
+            op_id = f"pyop-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
             logger.warning(
                 f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
-                f"(attempt {len(timestamps)} in 10m window)"
+                f"(attempt {len(timestamps)} in 10m window, gen={fencing_gen}, op={op_id})"
             )
             docker_container = resolve_docker_container_name(canonical)
+            if not docker_container:
+                logger.critical(f"[Emergency Autonomy Blocked] Cannot map canonical '{canonical}' to Docker container.")
+                return False
             success = await self._restart_docker_container(docker_container, sock_path)
             if success:
                 health_state = await self._verify_container_health(docker_container, sock_path)
+                if health_state == DockerHealthState.UNKNOWN:
+                    self.metrics.inc("recovery_health_unknown")
                 if health_state != DockerHealthState.HEALTHY:
                     logger.error(f"[Emergency Recovery Failed] Post-restart health check returned {health_state} for {container_name}.")
                     success = False
 
-            self._record_offline_audit(container_name, "emergency_restart", exit_code, success)
+            audit_status, _ = self._record_offline_audit_strict(
+                container_name,
+                "emergency_restart",
+                exit_code,
+                success,
+                operation_id=op_id,
+                fencing_generation=fencing_gen,
+            )
+            if audit_status != AuditStatus.AUDIT_COMMITTED:
+                logger.critical(
+                    f"[Audit Integrity Failure] Offline audit persistence returned {audit_status} for op={op_id}. Cannot report recovery success."
+                )
+                return False
             return success
         finally:
-            self._release_recovery_lease(canonical, lease_token, db_path)
+            released = self._release_recovery_lease(canonical, lease_token, db_path, fencing_gen=fencing_gen)
+            if not released:
+                self.metrics.inc("recovery_database_error")
+                logger.critical(f"[Lease Release Failed] Failed to cleanly release recovery lease for {canonical} (gen={fencing_gen}).")
+
+    def _verify_ops_schema(self, db_path: str) -> Tuple[bool, str, str]:
+        """
+        Pre-flight SQLite storage integrity, version, and security table/column verification (R4-14, R4-18).
+        Returns (ok, fault_class, reason). Fails closed on missing/corrupt DB, missing migrations, or dropped tables.
+        """
+        if not db_path or not os.path.isfile(db_path):
+            return False, SQLiteFaultClass.DATABASE_MISSING.value, f"SQLite file missing: {db_path}"
+        conn = None
+        try:
+            conn = open_readonly_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("PRAGMA quick_check(1)")
+            qc = cur.fetchone()
+            if not qc or str(qc[0]).lower() != "ok":
+                return False, SQLiteFaultClass.DATABASE_CORRUPT.value, f"PRAGMA quick_check failed: {qc}"
+
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_schema_migrations'")
+            if not cur.fetchone():
+                return False, SQLiteFaultClass.TABLE_MISSING.value, "table ops_schema_migrations missing"
+
+            cur.execute("SELECT COALESCE(MAX(version), 0) FROM ops_schema_migrations")
+            ver_row = cur.fetchone()
+            schema_ver = int(ver_row[0]) if ver_row and ver_row[0] is not None else 0
+            if schema_ver < REQUIRED_OPS_SCHEMA_VERSION:
+                return False, SQLiteFaultClass.SCHEMA_VERSION_MISMATCH.value, (
+                    f"schema version {schema_ver} < required {REQUIRED_OPS_SCHEMA_VERSION}"
+                )
+
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_schema_meta'")
+            if not cur.fetchone():
+                return False, SQLiteFaultClass.TABLE_MISSING.value, "table ops_schema_meta missing"
+            cur.execute("SELECT value FROM ops_schema_meta WHERE key='bootstrapped'")
+            meta_row = cur.fetchone()
+            if not meta_row or str(meta_row[0]) != "1":
+                return False, SQLiteFaultClass.SCHEMA_VERSION_MISMATCH.value, "ops_schema_meta bootstrapped sentinel missing"
+
+            required_cols = {
+                "ops_maintenance_locks": {"active", "expires_at"},
+                "ops_circuit_breaker_states": {"container", "state"},
+                "ops_recovery_leases": {
+                    "component", "holder", "lease_token", "fencing_generation",
+                    "acquired_at_ms", "expires_at_ms", "state",
+                },
+                "ops_recovery_lease_generations": {"component", "last_generation"},
+                "offline_restart_history": {"container_name", "restart_time"},
+                "offline_ops_audit": {"event_uuid", "container_name", "action", "success", "executed_at", "synced"},
+            }
+            for tbl, req in required_cols.items():
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (tbl,))
+                if not cur.fetchone():
+                    return False, SQLiteFaultClass.TABLE_MISSING.value, f"required table '{tbl}' missing"
+                cur.execute(f"PRAGMA table_info({tbl})")
+                cols = {str(col[1]).lower() for col in cur.fetchall()}
+                missing = req - cols
+                if missing:
+                    return False, SQLiteFaultClass.COLUMN_MISSING.value, f"table '{tbl}' missing columns {sorted(missing)}"
+
+            return True, "", "ok"
+        except Exception as e:
+            return False, classify_sqlite_error(e).value, str(e)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def _is_maintenance_locked_offline(self, db_path: str, container_name: Optional[str] = None) -> MaintenanceLockState:
         """
         Checks if system or component maintenance lock is active in local SQLite.
         Returns MaintenanceLockState: LOCKED, UNLOCKED, or UNKNOWN.
-        Fails closed: missing DB, corrupted DB, missing table, incomplete columns -> UNKNOWN.
+        Fails closed: missing DB, corrupted DB, missing table, incomplete columns, invalid component -> UNKNOWN.
         """
         if not db_path or not os.path.isfile(db_path):
             logger.error(f"[Fail-Closed] SQLite database file missing at {db_path}. Maintenance lock state UNKNOWN.")
             return MaintenanceLockState.UNKNOWN
+        canonical = ""
+        if container_name:
+            canonical = resolve_canonical_component(container_name)
+            if not canonical:
+                logger.error(f"[Fail-Closed] Unknown component '{container_name}' in maintenance lock check. State UNKNOWN.")
+                return MaintenanceLockState.UNKNOWN
         conn = None
         try:
             conn = open_readonly_sqlite(db_path)
@@ -759,26 +1003,48 @@ class HomeOpsAgent:
                 logger.error(f"[Fail-Closed] Table ops_maintenance_locks missing required columns. State UNKNOWN.")
                 return MaintenanceLockState.UNKNOWN
 
+            has_degraded = "degraded" in cols
+            has_exp_ms = "expires_at_ms" in cols
+            extra_sel = ""
+            if has_degraded:
+                extra_sel += ", degraded"
+            if has_exp_ms:
+                extra_sel += ", expires_at_ms"
+
             has_component = "component" in cols or "target_component" in cols
             comp_col = "component" if "component" in cols else ("target_component" if "target_component" in cols else "")
 
             if has_component and container_name:
-                canonical = resolve_canonical_component(container_name)
                 cursor.execute(
-                    f"SELECT {active_col}, expires_at FROM ops_maintenance_locks "
+                    f"SELECT {active_col}, expires_at{extra_sel} FROM ops_maintenance_locks "
                     f"WHERE {comp_col} IS NULL OR {comp_col} = '' OR {comp_col} = '*' "
                     f"OR {comp_col} = ? OR {comp_col} = ? ORDER BY id DESC LIMIT 1",
                     (canonical, container_name)
                 )
             else:
-                cursor.execute(f"SELECT {active_col}, expires_at FROM ops_maintenance_locks ORDER BY id DESC LIMIT 1")
+                cursor.execute(f"SELECT {active_col}, expires_at{extra_sel} FROM ops_maintenance_locks ORDER BY id DESC LIMIT 1")
 
             row = cursor.fetchone()
             if not row:
                 return MaintenanceLockState.UNLOCKED
 
+            idx = 2
+            if has_degraded:
+                if bool(row[idx]):
+                    self.metrics.set_gauge("maintenance_lock_degraded", 1)
+                    logger.critical("[Fail-Closed] ops_maintenance_locks row flagged degraded=true. State UNKNOWN.")
+                    return MaintenanceLockState.UNKNOWN
+                idx += 1
+
+            exp_ms_val = row[idx] if has_exp_ms else None
+
             is_active = bool(row[0])
             if not is_active:
+                return MaintenanceLockState.UNLOCKED
+
+            if exp_ms_val is not None and isinstance(exp_ms_val, (int, float)) and exp_ms_val > 0:
+                if float(exp_ms_val) > time.time() * 1000.0:
+                    return MaintenanceLockState.LOCKED
                 return MaintenanceLockState.UNLOCKED
 
             expires_at_raw = row[1]
@@ -795,6 +1061,7 @@ class HomeOpsAgent:
 
             return MaintenanceLockState.UNLOCKED
         except Exception as e:
+            self.metrics.inc("recovery_database_error")
             logger.error(f"[Fail-Closed] Error querying offline maintenance lock: {e}. State UNKNOWN.")
             return MaintenanceLockState.UNKNOWN
         finally:
@@ -808,12 +1075,15 @@ class HomeOpsAgent:
         """
         Checks if container circuit breaker is OPEN, HALF_OPEN, or CLOSED in local SQLite.
         Returns CircuitBreakerState: OPEN, HALF_OPEN, CLOSED, or UNKNOWN.
-        Fails closed: missing DB, corrupted DB, missing table, incomplete columns -> UNKNOWN.
+        Fails closed: missing DB, corrupted DB, missing table, incomplete columns, degraded flag -> UNKNOWN.
         """
         if not db_path or not os.path.isfile(db_path):
             logger.error(f"[Fail-Closed] SQLite database file missing at {db_path}. Circuit breaker state UNKNOWN.")
             return CircuitBreakerState.UNKNOWN
         canonical = resolve_canonical_component(container_name)
+        if not canonical:
+            logger.error(f"[Fail-Closed] Unknown component '{container_name}' in circuit breaker check. State UNKNOWN.")
+            return CircuitBreakerState.UNKNOWN
         conn = None
         try:
             conn = open_readonly_sqlite(db_path)
@@ -829,13 +1099,39 @@ class HomeOpsAgent:
                 logger.error(f"[Fail-Closed] Table ops_circuit_breaker_states schema incomplete. State UNKNOWN.")
                 return CircuitBreakerState.UNKNOWN
 
+            has_degraded = "degraded" in cols
+            has_ts = "crash_timestamps" in cols
+            sel_cols = "state"
+            if has_degraded:
+                sel_cols += ", degraded"
+            if has_ts:
+                sel_cols += ", crash_timestamps"
+
             cursor.execute(
-                f"SELECT state FROM ops_circuit_breaker_states WHERE {container_col} = ? OR {container_col} = ? LIMIT 1",
+                f"SELECT {sel_cols} FROM ops_circuit_breaker_states WHERE {container_col} = ? OR {container_col} = ? LIMIT 1",
                 (canonical, container_name)
             )
             row = cursor.fetchone()
             if not row:
                 return CircuitBreakerState.CLOSED
+
+            idx = 1
+            if has_degraded:
+                if bool(row[idx]):
+                    self.metrics.set_gauge("circuit_breaker_degraded", 1)
+                    logger.critical(f"[Fail-Closed] Circuit breaker for '{canonical}' marked degraded=true. State UNKNOWN.")
+                    return CircuitBreakerState.UNKNOWN
+                idx += 1
+            if has_ts:
+                ts_raw = row[idx]
+                if ts_raw is not None and str(ts_raw).strip() != "":
+                    try:
+                        parsed_ts = json.loads(str(ts_raw))
+                        if not isinstance(parsed_ts, list):
+                            return CircuitBreakerState.UNKNOWN
+                    except Exception:
+                        logger.critical(f"[Fail-Closed] Malformed crash_timestamps JSON for '{canonical}'. State UNKNOWN.")
+                        return CircuitBreakerState.UNKNOWN
 
             state_str = str(row[0]).strip().upper()
             if state_str == "OPEN":
@@ -848,6 +1144,7 @@ class HomeOpsAgent:
                 logger.error(f"[Fail-Closed] Unrecognized circuit breaker state '{state_str}'. State UNKNOWN.")
                 return CircuitBreakerState.UNKNOWN
         except Exception as e:
+            self.metrics.inc("recovery_database_error")
             logger.error(f"[Fail-Closed] Error querying offline circuit breaker: {e}. State UNKNOWN.")
             return CircuitBreakerState.UNKNOWN
         finally:
@@ -860,28 +1157,39 @@ class HomeOpsAgent:
     def _get_persisted_restart_count(self, container_name: str, window_seconds: float, db_path: str) -> Optional[int]:
         """
         Returns number of restarts recorded in SQLite within window_seconds.
-        Returns None if DB is missing, corrupted, or query fails (Fail-Closed).
-        DO NOT auto-create empty DB file.
+        Returns None if DB is missing, corrupted, table missing, or component invalid (Fail-Closed: NEVER 0 on missing table) (R4-14).
         """
         if not db_path or not os.path.isfile(db_path):
             logger.error(f"[Fail-Closed] DB file missing at {db_path}. Persisted restart count UNKNOWN.")
             return None
         canonical = resolve_canonical_component(container_name)
+        if not canonical:
+            logger.error(f"[Fail-Closed] Unknown component '{container_name}'. Persisted restart count UNKNOWN.")
+            return None
         conn = None
         try:
             conn = open_readonly_sqlite(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_restart_history'")
             if not cursor.fetchone():
-                return 0
-            cutoff = time.time() - window_seconds
+                logger.critical(f"[Fail-Closed] Table offline_restart_history missing in {db_path}. Persisted restart count UNKNOWN.")
+                return None
+            # Reject corrupt/non-numeric restart_time values in history table
             cursor.execute(
-                "SELECT COUNT(*) FROM offline_restart_history WHERE (container_name = ? OR container_name = ?) AND restart_time >= ?",
-                (canonical, container_name, cutoff)
+                "SELECT restart_time FROM offline_restart_history WHERE container_name = ? OR container_name = ?",
+                (canonical, container_name)
             )
-            row = cursor.fetchone()
-            return row[0] if row else 0
+            cutoff = time.time() - window_seconds
+            count = 0
+            for (rt_val,) in cursor.fetchall():
+                if not isinstance(rt_val, (int, float)):
+                    logger.critical(f"[Fail-Closed] Corrupt restart_time value '{rt_val}' in offline_restart_history.")
+                    return None
+                if float(rt_val) >= cutoff:
+                    count += 1
+            return count
         except Exception as e:
+            self.metrics.inc("recovery_database_error")
             logger.error(f"[Fail-Closed] Failed to query offline_restart_history: {e}")
             return None
         finally:
@@ -893,31 +1201,49 @@ class HomeOpsAgent:
 
     def _record_persisted_restart(self, container_name: str, db_path: str) -> bool:
         """
-        Records restart timestamp into SQLite offline_restart_history.
-        Returns True on success, False on failure.
-        DO NOT auto-create empty DB file if db_path does not exist.
+        Records restart timestamp into EXISTING SQLite offline_restart_history table using BEGIN IMMEDIATE.
+        NEVER auto-creates database files or tables at runtime (R4-14).
         """
         if not db_path or not os.path.isfile(db_path):
             logger.error(f"[Fail-Closed] Cannot record restart: DB file {db_path} does not exist.")
             return False
         canonical = resolve_canonical_component(container_name)
+        if not canonical:
+            logger.error(f"[Fail-Closed] Cannot record restart for unknown component '{container_name}'.")
+            return False
         conn = None
         try:
-            conn = sqlite3.connect(db_path, timeout=5.0)
-            with conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS offline_restart_history (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        container_name TEXT NOT NULL,
-                        restart_time REAL NOT NULL
-                    )
-                """)
-                conn.execute(
-                    "INSERT INTO offline_restart_history (container_name, restart_time) VALUES (?, ?)",
-                    (canonical, time.time())
+            conn = open_readwrite_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_restart_history'")
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                logger.critical(f"[Fail-Closed] Table offline_restart_history missing in {db_path}. Refusing runtime DDL.")
+                return False
+            cur.execute("PRAGMA table_info(offline_restart_history)")
+            cols = {str(c[1]).lower() for c in cur.fetchall()}
+            now_sec = time.time()
+            now_ms = int(now_sec * 1000)
+            if "restart_time_ms" in cols:
+                cur.execute(
+                    "INSERT INTO offline_restart_history (container_name, restart_time, restart_time_ms) VALUES (?, ?, ?)",
+                    (canonical, now_sec, now_ms)
                 )
+            else:
+                cur.execute(
+                    "INSERT INTO offline_restart_history (container_name, restart_time) VALUES (?, ?)",
+                    (canonical, now_sec)
+                )
+            cur.execute("COMMIT")
             return True
         except Exception as e:
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            self.metrics.inc("recovery_database_error")
             logger.error(f"[Fail-Closed] Failed to record offline restart timestamp: {e}")
             return False
         finally:
@@ -927,61 +1253,161 @@ class HomeOpsAgent:
                 except Exception:
                     pass
 
-    def _acquire_recovery_lease(self, component: str, db_path: str, lease_duration: float = 30.0) -> Tuple[bool, str]:
+    def _acquire_recovery_lease_grant(
+        self, component: str, db_path: str, lease_duration: float = 30.0
+    ) -> Tuple[bool, str, int]:
         """
-        Attempts to atomically acquire an exclusive persistent recovery lease in SQLite.
-        Prevents dual-path race conditions between Go Core and Python Offline Emergency.
-        Returns (acquired: bool, lease_token: str).
+        Atomically acquires an exclusive persistent recovery lease in SQLite using BEGIN IMMEDIATE,
+        integer UTC milliseconds (acquired_at_ms, expires_at_ms), and monotonic fencing_generation.
+        Strictly forbids same-holder re-entry while active (R4-04 ~ R4-07).
+        Returns (acquired: bool, lease_token: str, fencing_generation: int).
         """
-        if not db_path or not os.path.isfile(db_path):
-            return False, ""
+        if not db_path or not os.path.isfile(db_path) or lease_duration <= 0:
+            return False, "", 0
         canonical = resolve_canonical_component(component)
+        if not canonical:
+            logger.error(f"[Fail-Closed] Cannot acquire lease for unknown component '{component}'.")
+            return False, "", 0
         token = f"py-{uuid.uuid4()}"
         now_epoch = time.time()
+        now_ms = int(now_epoch * 1000)
+        exp_ms = now_ms + int(lease_duration * 1000)
+        if now_ms <= 0 or exp_ms <= now_ms:
+            return False, "", 0
         now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch))
         exp_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + lease_duration))
+
         conn = None
         try:
-            conn = sqlite3.connect(db_path, timeout=5.0)
-            with conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS ops_recovery_leases (
-                        component TEXT PRIMARY KEY,
-                        holder TEXT NOT NULL,
-                        lease_token TEXT NOT NULL,
-                        acquired_at DATETIME NOT NULL,
-                        expires_at DATETIME NOT NULL
-                    )
-                """)
-                cursor = conn.cursor()
-                cursor.execute("SELECT holder, expires_at FROM ops_recovery_leases WHERE component = ?", (canonical,))
-                row = cursor.fetchone()
-                if row:
-                    holder, exp_raw = row[0], row[1]
-                    exp_ts, valid = parse_sqlite_timestamp(exp_raw)
-                    if not valid or (exp_ts is not None and exp_ts > now_epoch and holder != "python-offline"):
-                        logger.warning(f"[Lease Conflict] Recovery lease for {canonical} held by '{holder}' until {exp_raw}.")
-                        return False, ""
-                    cursor.execute("""
-                        UPDATE ops_recovery_leases
-                        SET holder = 'python-offline', lease_token = ?, acquired_at = ?, expires_at = ?
-                        WHERE component = ? AND (holder = 'python-offline' OR expires_at = ?)
-                    """, (token, now_iso, exp_iso, canonical, exp_raw))
-                    if cursor.rowcount == 0:
-                        return False, ""
-                    return True, token
+            conn = open_readwrite_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_recovery_leases'")
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                logger.critical("[Fail-Closed] Table ops_recovery_leases missing. Refusing runtime DDL.")
+                return False, "", 0
+            cur.execute("PRAGMA table_info(ops_recovery_leases)")
+            cols = {str(c[1]).lower() for c in cur.fetchall()}
+            required_lease_cols = {
+                "component", "holder", "lease_token", "fencing_generation",
+                "acquired_at_ms", "expires_at_ms", "state",
+            }
+            if not required_lease_cols.issubset(cols):
+                cur.execute("ROLLBACK")
+                logger.critical("[Fail-Closed] Table ops_recovery_leases missing v4 columns. Fail-Closed.")
+                return False, "", 0
+
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_recovery_lease_generations'")
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                logger.critical("[Fail-Closed] Table ops_recovery_lease_generations missing. Fail-Closed.")
+                return False, "", 0
+
+            cur.execute(
+                "SELECT holder, lease_token, fencing_generation, acquired_at_ms, expires_at_ms, state, expires_at "
+                "FROM ops_recovery_leases WHERE component = ?",
+                (canonical,)
+            )
+            row = cur.fetchone()
+            exist_gen = 0
+            if row:
+                holder, _tok, exist_gen_raw, acq_ms_raw, exp_ms_raw, state_raw, exp_raw = row
+                try:
+                    exist_gen = int(exist_gen_raw or 0)
+                    acq_ms = int(acq_ms_raw or 0)
+                    exp_ms_val = int(exp_ms_raw or 0)
+                except (TypeError, ValueError):
+                    cur.execute("ROLLBACK")
+                    self.metrics.inc("recovery_database_error")
+                    logger.critical(f"[Fail-Closed] Non-integer lease fields for {canonical}.")
+                    return False, "", 0
+
+                state_str = str(state_raw or "ACTIVE").strip().upper()
+                if state_str not in ("ACTIVE", "RELEASED", "EXPIRED"):
+                    cur.execute("ROLLBACK")
+                    self.metrics.inc("recovery_database_error")
+                    logger.critical(f"[Fail-Closed] Invalid lease state '{state_str}' for {canonical}.")
+                    return False, "", 0
+
+                if exp_ms_val > 0:
+                    if acq_ms <= 0 or exp_ms_val <= acq_ms:
+                        cur.execute("ROLLBACK")
+                        self.metrics.inc("recovery_database_error")
+                        logger.critical(f"[Fail-Closed] Malformed lease ms timestamps acq={acq_ms} exp={exp_ms_val}.")
+                        return False, "", 0
+                    eff_exp_ms = exp_ms_val
                 else:
-                    try:
-                        conn.execute("""
-                            INSERT INTO ops_recovery_leases (component, holder, lease_token, acquired_at, expires_at)
-                            VALUES (?, 'python-offline', ?, ?, ?)
-                        """, (canonical, token, now_iso, exp_iso))
-                        return True, token
-                    except sqlite3.IntegrityError:
-                        return False, ""
+                    exp_ts, ts_ok = parse_sqlite_timestamp(exp_raw)
+                    if not ts_ok or exp_ts is None:
+                        cur.execute("ROLLBACK")
+                        self.metrics.inc("recovery_database_error")
+                        logger.critical(f"[Fail-Closed] Missing/malformed expires_at '{exp_raw}' for {canonical}.")
+                        return False, "", 0
+                    eff_exp_ms = int(exp_ts * 1000)
+
+                if state_str == "ACTIVE" and eff_exp_ms > now_ms:
+                    cur.execute("ROLLBACK")
+                    logger.warning(
+                        f"[Lease Conflict] Recovery lease for {canonical} actively held by '{holder}' "
+                        f"(gen={exist_gen}, exp_ms={eff_exp_ms} > now_ms={now_ms})."
+                    )
+                    return False, "", 0
+                if state_str == "ACTIVE" and eff_exp_ms <= now_ms:
+                    self.metrics.inc("recovery_lease_expired")
+
+            cur.execute(
+                "SELECT last_generation FROM ops_recovery_lease_generations WHERE component = ?",
+                (canonical,)
+            )
+            gen_row = cur.fetchone()
+            persisted_gen = int(gen_row[0]) if gen_row and gen_row[0] is not None else 0
+            next_gen = max(exist_gen, persisted_gen) + 1
+
+            cur.execute(
+                """
+                INSERT INTO ops_recovery_lease_generations (component, last_generation) VALUES (?, ?)
+                ON CONFLICT(component) DO UPDATE SET last_generation = excluded.last_generation
+                WHERE excluded.last_generation > ops_recovery_lease_generations.last_generation
+                """,
+                (canonical, next_gen),
+            )
+
+            if row:
+                cur.execute(
+                    """
+                    UPDATE ops_recovery_leases
+                    SET holder = 'python-offline', lease_token = ?, fencing_generation = ?,
+                        acquired_at = ?, expires_at = ?, acquired_at_ms = ?, expires_at_ms = ?, state = 'ACTIVE'
+                    WHERE component = ?
+                    """,
+                    (token, next_gen, now_iso, exp_iso, now_ms, exp_ms, canonical),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO ops_recovery_leases (
+                        component, holder, lease_token, fencing_generation,
+                        acquired_at, expires_at, acquired_at_ms, expires_at_ms, state
+                    ) VALUES (?, 'python-offline', ?, ?, ?, ?, ?, ?, 'ACTIVE')
+                    """,
+                    (canonical, token, next_gen, now_iso, exp_iso, now_ms, exp_ms),
+                )
+
+            cur.execute("COMMIT")
+            self.metrics.inc("recovery_lease_active")
+            self._active_lease_generations[token] = next_gen
+            return True, token, next_gen
         except Exception as e:
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            self.metrics.inc("recovery_database_error")
             logger.error(f"[Fail-Closed] Failed to acquire recovery lease for {canonical}: {e}")
-            return False, ""
+            return False, "", 0
         finally:
             if conn:
                 try:
@@ -989,23 +1415,136 @@ class HomeOpsAgent:
                 except Exception:
                     pass
 
-    def _release_recovery_lease(self, component: str, lease_token: str, db_path: str) -> bool:
-        """Releases recovery lease held by this agent. Returns True if released, False otherwise."""
+    def _acquire_recovery_lease(self, component: str, db_path: str, lease_duration: float = 30.0) -> Tuple[bool, str]:
+        """Backward-compatible wrapper returning (acquired, lease_token)."""
+        ok, token, _gen = self._acquire_recovery_lease_grant(component, db_path, lease_duration=lease_duration)
+        return ok, token
+
+    def _renew_recovery_lease(
+        self, component: str, lease_token: str, fencing_gen: int, db_path: str, lease_duration: float = 30.0
+    ) -> Tuple[bool, int]:
+        """Atomically extends active lease ONLY for matching holder token, generation, and unexpired state."""
+        if not db_path or not lease_token or fencing_gen <= 0 or not os.path.isfile(db_path):
+            self.metrics.inc("recovery_lease_renewal_failed")
+            return False, 0
+        canonical = resolve_canonical_component(component)
+        if not canonical or lease_duration <= 0:
+            self.metrics.inc("recovery_lease_renewal_failed")
+            return False, 0
+        now_epoch = time.time()
+        now_ms = int(now_epoch * 1000)
+        new_exp_ms = now_ms + int(lease_duration * 1000)
+        new_exp_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + lease_duration))
+        conn = None
+        try:
+            conn = open_readwrite_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                """
+                UPDATE ops_recovery_leases
+                SET expires_at = ?, expires_at_ms = ?
+                WHERE component = ? AND lease_token = ? AND fencing_generation = ?
+                  AND state = 'ACTIVE' AND expires_at_ms > ?
+                """,
+                (new_exp_iso, new_exp_ms, canonical, lease_token, fencing_gen, now_ms),
+            )
+            if cur.rowcount != 1:
+                cur.execute("ROLLBACK")
+                self.metrics.inc("recovery_lease_renewal_failed")
+                return False, 0
+            cur.execute("COMMIT")
+            return True, new_exp_ms
+        except Exception as e:
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            self.metrics.inc("recovery_lease_renewal_failed")
+            logger.error(f"[Lease Renew Failed] {canonical}: {e}")
+            return False, 0
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _verify_recovery_lease(self, component: str, lease_token: str, fencing_gen: int, db_path: str) -> bool:
+        """Verifies right before external Docker mutation that this token & fencing generation still own the lease (R4-06)."""
+        if not db_path or not lease_token or fencing_gen <= 0 or not os.path.isfile(db_path):
+            return False
+        canonical = resolve_canonical_component(component)
+        if not canonical:
+            return False
+        now_ms = int(time.time() * 1000)
+        conn = None
+        try:
+            conn = open_readonly_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT lease_token, fencing_generation, expires_at_ms, state FROM ops_recovery_leases WHERE component = ?",
+                (canonical,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return False
+            db_tok, db_gen, db_exp_ms, db_state = row
+            if str(db_tok) != lease_token or int(db_gen or 0) != fencing_gen:
+                return False
+            if str(db_state or "").upper() != "ACTIVE" or int(db_exp_ms or 0) <= now_ms:
+                return False
+            return True
+        except Exception as e:
+            self.metrics.inc("recovery_database_error")
+            logger.error(f"[Fencing Verify Error] {canonical}: {e}")
+            return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _release_recovery_lease(self, component: str, lease_token: str, db_path: str, fencing_gen: int = 0) -> bool:
+        """Releases recovery lease held by this agent (verifying token and generation). Returns True only if released."""
         if not db_path or not lease_token or not os.path.isfile(db_path):
             return False
         canonical = resolve_canonical_component(component)
+        if not canonical:
+            return False
         conn = None
         try:
-            conn = sqlite3.connect(db_path, timeout=5.0)
-            with conn:
-                cursor = conn.cursor()
-                cursor.execute(
+            conn = open_readwrite_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            if fencing_gen > 0:
+                cur.execute(
+                    "DELETE FROM ops_recovery_leases WHERE component = ? AND lease_token = ? AND fencing_generation = ?",
+                    (canonical, lease_token, fencing_gen)
+                )
+            else:
+                cur.execute(
                     "DELETE FROM ops_recovery_leases WHERE component = ? AND lease_token = ?",
                     (canonical, lease_token)
                 )
-                return cursor.rowcount > 0
+            released = cur.rowcount > 0
+            cur.execute("COMMIT")
+            if released:
+                self._active_lease_generations.pop(lease_token, None)
+                cur_active = self.metrics.counters.get("recovery_lease_active", 0)
+                if cur_active > 0:
+                    self.metrics.set_gauge("recovery_lease_active", cur_active - 1)
+            return released
         except Exception as e:
-            logger.debug(f"Failed to release recovery lease for {canonical}: {e}")
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            self.metrics.inc("recovery_database_error")
+            logger.error(f"Failed to release recovery lease for {canonical}: {e}")
             return False
         finally:
             if conn:
@@ -1097,58 +1636,110 @@ class HomeOpsAgent:
 
     async def _check_service_readiness(self, canonical: str, container_name: str = "") -> bool:
         """
-        Executes independent TCP/HTTP readiness probes for services without Docker HEALTHCHECK.
+        Executes 5-tier protocol-level readiness probes for services without Docker HEALTHCHECK (R4-16):
+        - mosquitto: real MQTT v3.1.1 CONNECT + CONNACK (0x20 .. 0x00)
+        - home-api / home-vision: HTTP 200 GET /health with valid JSON payload
+        - frigate: HTTP < 400 GET /api/config or /
+        - home-web / openresty: HTTP < 400 GET / with non-empty body (never bare TCP connect)
         """
         if hasattr(self, "_readiness_probe_override") and callable(self._readiness_probe_override):
             return await self._readiness_probe_override(canonical)
 
+        canon = resolve_canonical_component(canonical)
+        if not canon:
+            logger.warning(f"[Fail-Closed] Readiness probe rejected unknown component '{canonical}'.")
+            return False
+
         probe_host = os.environ.get("PROBE_HOST", "127.0.0.1")
 
-        async def probe_tcp(host: str, port: int, timeout: float = 2.0) -> bool:
-            try:
-                _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-                writer.close()
-                await writer.wait_closed()
-                return True
-            except Exception:
-                return False
-
-        async def probe_http(host: str, port: int, path: str = "/", timeout: float = 2.0) -> bool:
+        async def probe_mqtt(host: str, port: int, timeout: float = 2.5) -> bool:
+            writer = None
             try:
                 reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
-                req = f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: home-ops-agent-probe\r\nConnection: close\r\n\r\n".encode("utf-8")
-                writer.write(req)
-                await writer.drain()
-                resp = await asyncio.wait_for(reader.read(1024), timeout=timeout)
-                writer.close()
-                await writer.wait_closed()
-                return (
-                    b"200 OK" in resp or b"HTTP/1.1 200" in resp or b"HTTP/1.0 200" in resp or
-                    b"HTTP/1.1 204" in resp or b"HTTP/1.1 3" in resp
-                )
+                client_id = b"ops-probe"
+                var_header = bytearray([0x00, 0x04, ord("M"), ord("Q"), ord("T"), ord("T"), 0x04, 0x02, 0x00, 0x05])
+                payload = bytearray([0x00, len(client_id)]) + client_id
+                rem_len = len(var_header) + len(payload)
+                pkt = bytearray([0x10, rem_len]) + var_header + payload
+                writer.write(pkt)
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+                connack = await asyncio.wait_for(reader.readexactly(4), timeout=timeout)
+                return len(connack) == 4 and connack[0] == 0x20 and connack[3] == 0x00
             except Exception:
                 return False
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
 
-        if canonical == "mosquitto":
-            return await probe_tcp(probe_host, 1883)
-        elif canonical == "frigate":
-            ok = await probe_http(probe_host, 5000, "/")
+        async def probe_http(host: str, port: int, path: str = "/", require_json: bool = False, timeout: float = 2.5) -> bool:
+            writer = None
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+                req = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {host}:{port}\r\n"
+                    f"User-Agent: home-ops-agent-probe\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("utf-8")
+                writer.write(req)
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
+                raw = await asyncio.wait_for(reader.read(8192), timeout=timeout)
+                if not raw:
+                    return False
+                head, _, body = raw.partition(b"\r\n\r\n")
+                status_line = head.split(b"\r\n", 1)[0].decode("ascii", errors="ignore")
+                parts = status_line.split()
+                if len(parts) < 2 or not parts[1].isdigit():
+                    return False
+                status_code = int(parts[1])
+                if not (200 <= status_code < 400):
+                    return False
+                if require_json:
+                    try:
+                        data = json.loads(body.decode("utf-8", errors="ignore"))
+                        if not isinstance(data, dict):
+                            return False
+                        st = str(data.get("status", "ok")).lower().strip()
+                        return st in ("ok", "healthy", "up", "ready")
+                    except Exception:
+                        return False
+                return len(body.strip()) > 0 or status_code == 204
+            except Exception:
+                return False
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+
+        if canon == "mosquitto":
+            return await probe_mqtt(probe_host, 1883)
+        elif canon == "frigate":
+            ok = await probe_http(probe_host, 5000, "/api/config", require_json=False)
             if not ok:
-                ok = await probe_http(probe_host, 1984, "/")
-            return ok
-        elif canonical == "home-api":
-            return await probe_http(probe_host, 8080, "/health")
-        elif canonical == "home-web":
-            ok = await probe_http(probe_host, 80, "/")
+                ok = await probe_http(probe_host, 5000, "/", require_json=False)
             if not ok:
-                ok = await probe_http(probe_host, 5173, "/")
+                ok = await probe_http(probe_host, 1984, "/", require_json=False)
             return ok
-        elif canonical == "home-vision":
-            return await probe_http(probe_host, 8090, "/health")
-        elif canonical == "openresty":
-            return await probe_tcp(probe_host, 80)
+        elif canon == "home-api":
+            return await probe_http(probe_host, 8080, "/health", require_json=True)
+        elif canon == "home-web":
+            ok = await probe_http(probe_host, 80, "/", require_json=False)
+            if not ok:
+                ok = await probe_http(probe_host, 5173, "/", require_json=False)
+            return ok
+        elif canon == "home-vision":
+            return await probe_http(probe_host, 8090, "/health", require_json=True)
+        elif canon == "openresty":
+            return await probe_http(probe_host, 80, "/", require_json=False)
         else:
-            logger.warning(f"No independent readiness probe defined for component '{canonical}'.")
+            logger.warning(f"No independent readiness probe defined for component '{canon}'.")
             return False
 
     async def _verify_container_health(self, container_name: str, sock_path: str) -> DockerHealthState:
@@ -1196,45 +1787,102 @@ class HomeOpsAgent:
             logger.warning(f"Independent readiness probe for {canonical} failed. State UNHEALTHY.")
             return DockerHealthState.UNHEALTHY
 
-    def _record_offline_audit(self, container_name: str, action: str, exit_code: int, success: bool) -> str:
-        """Persists offline emergency event into local SQLite offline_ops_audit table with unique UUID."""
+    def _record_offline_audit_strict(
+        self,
+        container_name: str,
+        action: str,
+        exit_code: int,
+        success: bool,
+        operation_id: str = "",
+        fencing_generation: int = 0,
+    ) -> Tuple[AuditStatus, str]:
+        """
+        Persists offline emergency event into EXISTING SQLite offline_ops_audit table using BEGIN IMMEDIATE.
+        NEVER calls os.makedirs or CREATE TABLE IF NOT EXISTS at runtime (R4-15).
+        Returns (AuditStatus, event_uuid).
+        """
         event_uuid = f"offline-{uuid.uuid4()}"
-        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        now_sec = time.time()
+        now_ms = int(now_sec * 1000)
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_sec))
+        op_id = operation_id or event_uuid
         db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
+        if not db_path or not os.path.isfile(db_path):
+            self.metrics.inc("recovery_audit_failed")
+            self._last_audit_status = AuditStatus.AUDIT_FAILED
+            logger.critical(f"[Offline Audit Failed] Database missing at {db_path}; refusing runtime creation.")
+            return AuditStatus.AUDIT_FAILED, ""
+
         conn = None
         try:
-            parent_dir = os.path.dirname(os.path.abspath(db_path))
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-            conn = sqlite3.connect(db_path)
-            with conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS offline_ops_audit (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        event_uuid TEXT UNIQUE,
-                        container_name TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        exit_code INTEGER,
-                        success INTEGER,
-                        executed_at TEXT NOT NULL,
-                        synced INTEGER DEFAULT 0
-                    )
-                """)
-                conn.execute("""
+            conn = open_readwrite_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_ops_audit'")
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                self.metrics.inc("recovery_audit_failed")
+                self._last_audit_status = AuditStatus.AUDIT_FAILED
+                logger.critical("[Offline Audit Failed] Table offline_ops_audit missing; refusing runtime DDL.")
+                return AuditStatus.AUDIT_FAILED, ""
+
+            cur.execute("PRAGMA table_info(offline_ops_audit)")
+            cols = {str(c[1]).lower() for c in cur.fetchall()}
+
+            if {"operation_id", "holder", "fencing_generation", "audit_status", "executed_at_ms"}.issubset(cols):
+                cur.execute(
+                    """
+                    INSERT INTO offline_ops_audit (
+                        event_uuid, operation_id, container_name, action, holder, fencing_generation,
+                        exit_code, success, audit_status, executed_at, executed_at_ms, synced
+                    ) VALUES (?, ?, ?, ?, 'python-offline', ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    (
+                        event_uuid,
+                        op_id,
+                        container_name,
+                        action,
+                        fencing_generation,
+                        exit_code,
+                        1 if success else 0,
+                        AuditStatus.AUDIT_COMMITTED.value,
+                        now_iso,
+                        now_ms,
+                    ),
+                )
+            else:
+                cur.execute(
+                    """
                     INSERT INTO offline_ops_audit (event_uuid, container_name, action, exit_code, success, executed_at, synced)
                     VALUES (?, ?, ?, ?, ?, ?, 0)
-                """, (event_uuid, container_name, action, exit_code, 1 if success else 0, now_iso))
-            logger.info(f"[Offline Audit] Recorded offline event {event_uuid} for container {container_name}")
-            return event_uuid
+                    """,
+                    (event_uuid, container_name, action, exit_code, 1 if success else 0, now_iso),
+                )
+            cur.execute("COMMIT")
+            self._last_audit_status = AuditStatus.AUDIT_COMMITTED
+            logger.info(f"[Offline Audit] Recorded offline event {event_uuid} (op={op_id}, gen={fencing_generation}) for container {container_name}")
+            return AuditStatus.AUDIT_COMMITTED, event_uuid
         except Exception as e:
-            logger.error(f"[Offline Audit] Failed to persist offline log: {e}")
-            return ""
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            self.metrics.inc("recovery_audit_failed")
+            self._last_audit_status = AuditStatus.AUDIT_FAILED
+            logger.critical(f"[Offline Audit Failed] Failed to persist offline audit log: {e}")
+            return AuditStatus.AUDIT_FAILED, ""
         finally:
             if conn:
                 try:
                     conn.close()
                 except Exception:
                     pass
+
+    def _record_offline_audit(self, container_name: str, action: str, exit_code: int, success: bool) -> str:
+        """Backward-compatible wrapper returning event_uuid string (or '' on failure)."""
+        _st, event_uuid = self._record_offline_audit_strict(container_name, action, exit_code, success)
+        return event_uuid
 
     async def sync_offline_audit_logs(self) -> int:
         """Probes Go Core /health, and if alive, pushes buffered offline audit logs to Go Core."""
@@ -1258,11 +1906,14 @@ class HomeOpsAgent:
         if not is_alive:
             return 0
 
-        # 2. Query unsynced events from SQLite
+        # 2. Query unsynced events from SQLite (never auto-create DB)
         def read_unsynced():
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
+            if not db_path or not os.path.isfile(db_path):
+                return []
+            conn = None
             try:
+                conn = open_readonly_sqlite(db_path)
+                conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
                 cursor.execute("SELECT * FROM offline_ops_audit WHERE synced = 0 ORDER BY id ASC LIMIT 50")
                 rows = cursor.fetchall()
@@ -1270,7 +1921,8 @@ class HomeOpsAgent:
             except sqlite3.OperationalError:
                 return []
             finally:
-                conn.close()
+                if conn:
+                    conn.close()
 
         records = await loop.run_in_executor(None, read_unsynced)
         if not records:
@@ -1298,16 +1950,28 @@ class HomeOpsAgent:
         if not sync_ok:
             return 0
 
-        # 4. Mark synced = 1
+        # 4. Mark synced = 1 via read-write BEGIN IMMEDIATE transaction
         def mark_synced():
-            conn = sqlite3.connect(db_path)
+            if not db_path or not os.path.isfile(db_path):
+                return
+            conn = None
             try:
+                conn = open_readwrite_sqlite(db_path)
                 synced_ids = [r["id"] for r in records]
                 placeholders = ",".join("?" * len(synced_ids))
-                with conn:
-                    conn.execute(f"UPDATE offline_ops_audit SET synced = 1 WHERE id IN ({placeholders})", synced_ids)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(f"UPDATE offline_ops_audit SET synced = 1 WHERE id IN ({placeholders})", synced_ids)
+                conn.execute("COMMIT")
+            except Exception as err:
+                if conn:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except Exception:
+                        pass
+                logger.error(f"[Offline Audit Sync] Failed to mark synced: {err}")
             finally:
-                conn.close()
+                if conn:
+                    conn.close()
 
         await loop.run_in_executor(None, mark_synced)
         logger.info(f"[Offline Audit Sync] Successfully synchronized {len(records)} offline events to Go Core.")
@@ -1375,7 +2039,10 @@ class HomeOpsAgent:
                             return CoreReportingStatus.RECOVERED_BY_CORE, resp_json
                         return CoreReportingStatus.AUTHORIZED, resp_json
                     else:
-                        return CoreReportingStatus.AUTHORIZED, resp_json
+                        logger.warning(
+                            f"[Fail-Closed Policy Guard] Unrecognized Go Core response status='{exec_status}' action='{dec_action}' for {container_name}; suppressing local restart."
+                        )
+                        return CoreReportingStatus.BLOCKED_BY_FSM, resp_json
 
             except urllib.error.HTTPError as http_err:
                 status_code = http_err.code
@@ -1411,7 +2078,7 @@ class HomeOpsAgent:
             "proposal_id": prop_id,
             "title": title,
             "risk_level": risk_level,
-            "action": action,
+            "execution_plan": action,
             "rollback_plan": rollback_cmd,
             "target_component": target_component,
             "estimated_seconds": estimated_seconds

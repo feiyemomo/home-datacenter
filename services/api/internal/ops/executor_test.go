@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,9 +21,13 @@ import (
 
 // setupExecutorTestDB initializes an in-memory SQLite database for testing.
 func setupExecutorTestDB(t *testing.T) *gorm.DB {
-	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
+	dbPath := filepath.Join(t.TempDir(), "executor_test.db")
+	db, err := gorm.Open(sqlite.Open(dbPath), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open test sqlite db: %v", err)
+	}
+	if sqlDB, sErr := db.DB(); sErr == nil {
+		t.Cleanup(func() { _ = sqlDB.Close() })
 	}
 	err = db.AutoMigrate(
 		&model.OpsProposal{},
@@ -314,9 +319,7 @@ func TestExecutor_ProposalExecution_TransitionsToFailedRolledback(t *testing.T) 
 		ActionSpec:      string(actionSpecJSON),
 		CreatedAt:       time.Now(),
 	}
-	if err := db.Create(&prop).Error; err != nil {
-		t.Fatalf("failed to create test proposal: %v", err)
-	}
+	seedTestSignedProposal(t, db, &prop)
 
 	res, err := executor.ExecuteProposal(context.Background(), &prop)
 	if err == nil {
@@ -478,6 +481,7 @@ func TestApproveProposal_WiresToOperationExecutor(t *testing.T) {
 		RiskLevel:       model.RiskLevelLow,
 		Status:          model.ProposalStatusAwaitingApproval,
 		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
+		BaselineHash:    model.ComputeDefaultBaseline("home-web"),
 		CreatedAt:       time.Now(),
 	}
 	if err := db.Create(&prop).Error; err != nil {

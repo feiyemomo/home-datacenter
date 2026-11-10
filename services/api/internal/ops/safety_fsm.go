@@ -44,11 +44,20 @@ type SafetyFSM struct {
 	backupDir   string
 	healthProbe string
 	httpClient  *http.Client
+	recoveryFSM *ContainerRecoveryFSM
 
 	mu                sync.Mutex
 	currentState      UpdateFSMState
 	lastTerminalState UpdateFSMState
 	lastRunAt         time.Time
+}
+
+// SetRecoveryFSM wires the ContainerRecoveryFSM so SafetyFSM enforces Fail-Closed
+// degraded state and maintenance lock checks before mutating state (R4-24).
+func (f *SafetyFSM) SetRecoveryFSM(rfsm *ContainerRecoveryFSM) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.recoveryFSM = rfsm
 }
 
 // NewSafetyFSM creates a configured SafetyFSM instance.
@@ -95,6 +104,7 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 		f.mu.Unlock()
 		return fmt.Errorf("safety FSM is busy (state: %s)", f.currentState)
 	}
+	rfsm := f.recoveryFSM
 	f.currentState = StateSnapshotting
 	f.mu.Unlock()
 
@@ -104,6 +114,15 @@ func (f *SafetyFSM) ExecuteSafeUpdate(ctx context.Context, component, oldVer, ne
 		f.lastRunAt = time.Now()
 		f.mu.Unlock()
 	}()
+
+	if rfsm != nil {
+		if rfsm.GetMaintenanceLock().IsDegraded() || rfsm.GetCircuitBreaker().IsDegraded() {
+			return fmt.Errorf("%w: update blocked during storage degraded state", ErrFailClosedMode)
+		}
+		if rfsm.GetMaintenanceLock().IsLocked() {
+			return fmt.Errorf("%w: update blocked during active maintenance window", ErrSystemInMaintenance)
+		}
+	}
 
 	now := time.Now()
 

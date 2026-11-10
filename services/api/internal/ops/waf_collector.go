@@ -400,12 +400,19 @@ func (c *WAFCollector) SyncBannedIPs(bannedEntries []security.BanEntry) error {
 		return err
 	}
 
-	if err := os.WriteFile(rulesPath, data, 0644); err != nil {
-		return fmt.Errorf("failed to write %s: %w", rulesPath, err)
+	tmpPath := rulesPath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temp %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, rulesPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("failed to atomically replace %s: %w", rulesPath, err)
 	}
 
-	// Trigger OpenResty HUP reload via docker or local nginx if available
-	_ = c.reloadOpenResty()
+	// Trigger OpenResty HUP reload strictly via OperationExecutor (R4-24)
+	if err := c.reloadOpenResty(); err != nil {
+		log.Printf("[waf-collector] warning: failed to reload openresty via OperationExecutor: %v", err)
+	}
 	return nil
 }
 
@@ -414,24 +421,15 @@ func (c *WAFCollector) reloadOpenResty() error {
 	exec := c.executor
 	c.mu.Unlock()
 
-	if exec != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		_, err := exec.Execute(ctx, OperationSpec{
-			Action: ActionWAFReload,
-			Target: ComponentOpenResty,
-		})
-		return err
+	if exec == nil {
+		return fmt.Errorf("operation executor is not configured on WAFCollector; refusing raw docker socket bypass")
 	}
 
-	// Route through Docker socket without bare shell exec if socket is available
-	sockPath := "/var/run/docker.sock"
-	if _, err := os.Stat(sockPath); err != nil {
-		return nil
-	}
-	containerName := os.Getenv("OPENRESTY_CONTAINER_NAME")
-	if containerName == "" {
-		containerName = "1Panel-openresty-WuDU"
-	}
-	return executeDockerSocketExec(context.Background(), sockPath, containerName, []string{"nginx", "-s", "reload"})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionWAFReload,
+		Target: ComponentOpenResty,
+	})
+	return err
 }

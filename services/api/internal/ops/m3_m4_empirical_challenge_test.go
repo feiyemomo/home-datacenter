@@ -184,13 +184,10 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 			t.Fatalf("expected fallback hash %s, got %s", expectedFallbackHash, hashFallback)
 		}
 
-		// Non-core / uncreated container in fallback returns offline hash
+		// Unknown / non-whitelisted component MUST Fail-Closed to empty string (R4-17)
 		hashUncreated := handler.ComputeFingerprint("uncreated-service")
-		hOffline := sha256.New()
-		hOffline.Write([]byte("uncreated-service:offline:none"))
-		expectedUncreatedHash := fmt.Sprintf("sha256:%x", hOffline.Sum(nil))
-		if hashUncreated != expectedUncreatedHash {
-			t.Fatalf("expected uncreated hash %s, got %s", expectedUncreatedHash, hashUncreated)
+		if hashUncreated != "" {
+			t.Fatalf("expected empty Fail-Closed fingerprint for unknown component, got %s", hashUncreated)
 		}
 	})
 

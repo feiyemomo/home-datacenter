@@ -17,8 +17,10 @@ from unittest.mock import AsyncMock, patch
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PARENT_DIR = os.path.dirname(CURRENT_DIR)
 sys.path.insert(0, PARENT_DIR)
+sys.path.insert(0, CURRENT_DIR)
 
 from config import OpsAgentConfig
+from schema_helper import init_ops_v4_schema
 from main import (
     CircuitBreakerState,
     DockerHealthState,
@@ -56,40 +58,7 @@ class TestOfflineEmergencyRecoveryFailClosed(unittest.IsolatedAsyncioTestCase):
 
     def _init_clean_db(self, db_path: str = None) -> str:
         target = db_path or self.db_path
-        conn = sqlite3.connect(target)
-        with conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ops_maintenance_locks (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    active INTEGER NOT NULL DEFAULT 0,
-                    locked_by TEXT,
-                    reason TEXT,
-                    locked_at TEXT,
-                    expires_at TEXT,
-                    updated_at TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ops_circuit_breaker_states (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    container TEXT UNIQUE NOT NULL,
-                    state TEXT NOT NULL DEFAULT 'CLOSED',
-                    opened_at TEXT,
-                    crash_timestamps TEXT,
-                    updated_at TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS ops_recovery_leases (
-                    component TEXT PRIMARY KEY,
-                    holder TEXT NOT NULL,
-                    lease_token TEXT NOT NULL,
-                    acquired_at DATETIME NOT NULL,
-                    expires_at DATETIME NOT NULL
-                )
-            """)
-        conn.close()
-        return target
+        return init_ops_v4_schema(target)
 
     # =========================================================================
     # 1. SQLite 文件不存在测试

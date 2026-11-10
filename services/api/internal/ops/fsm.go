@@ -2,12 +2,12 @@ package ops
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"gorm.io/gorm"
@@ -190,7 +190,8 @@ func IsCoreDependency(component string) bool {
 	return CoreDependencies[canonical]
 }
 
-// ResolveTopologyComponent normalizes container names and aliases to canonical topology identifiers (R4).
+// ResolveTopologyComponent normalizes container names and aliases to canonical topology identifiers (R4-17).
+// Unknown components strictly return "" (Fail-Closed) so they cannot bypass whitelist or dependency checks.
 func ResolveTopologyComponent(name string) string {
 	clean := strings.TrimSpace(name)
 	clean = strings.TrimPrefix(clean, "/")
@@ -223,7 +224,7 @@ func ResolveTopologyComponent(name string) string {
 	case "home-ops-agent", "ops-agent", "home-datacenter-ops-agent":
 		return "home-ops-agent"
 	default:
-		return lower
+		return ""
 	}
 }
 
@@ -239,6 +240,7 @@ func (t *TopologyEngine) GetLevel(target string) int {
 }
 
 // PreflightDependencyCheck validates that all upstream dependencies are healthy before restarting.
+// Unknown components fail closed immediately (R4-17).
 // Level 1 and Level 2 containers cannot be restarted unless Level 0 dependencies are running and healthy.
 // Core dependencies (app.db, mosquitto, frigate, home-api) FAIL CLOSED on check failure, timeout, or missing checker.
 func (t *TopologyEngine) PreflightDependencyCheck(ctx context.Context, target string) error {
@@ -246,8 +248,14 @@ func (t *TopologyEngine) PreflightDependencyCheck(ctx context.Context, target st
 	defer t.mu.RUnlock()
 
 	canonical := ResolveTopologyComponent(target)
+	if canonical == "" {
+		return fmt.Errorf("%w: unknown topology component %q", ErrComponentNotWhitelisted, target)
+	}
 	deps, exists := t.graph[canonical]
-	if !exists || len(deps) == 0 {
+	if !exists {
+		return fmt.Errorf("%w: component %q is absent from topology graph", ErrComponentNotWhitelisted, canonical)
+	}
+	if len(deps) == 0 {
 		// Level 0 or independent component: no dependencies required
 		return nil
 	}
@@ -349,7 +357,10 @@ type ContainerCircuitBreaker struct {
 	activeProbes     map[string]ProbeTicket
 	onTrip           func(container string, crashCount int)
 	db               *gorm.DB
+	bus              *eventbus.Bus
 	isDegraded       bool
+	degradeReason    string
+	nowFn            func() time.Time
 }
 
 // NewContainerCircuitBreaker creates a default circuit breaker (3 crashes in 10 minutes).
@@ -363,7 +374,26 @@ func NewContainerCircuitBreaker() *ContainerCircuitBreaker {
 		states:           make(map[string]CircuitState),
 		openedAt:         make(map[string]time.Time),
 		activeProbes:     make(map[string]ProbeTicket),
+		nowFn:            func() time.Time { return time.Now().UTC() },
 	}
+}
+
+// SetNowFunc configures a deterministic clock source for unit tests.
+func (cb *ContainerCircuitBreaker) SetNowFunc(fn func() time.Time) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if fn == nil {
+		cb.nowFn = func() time.Time { return time.Now().UTC() }
+	} else {
+		cb.nowFn = fn
+	}
+}
+
+func (cb *ContainerCircuitBreaker) now() time.Time {
+	if cb.nowFn == nil {
+		return time.Now().UTC()
+	}
+	return cb.nowFn().UTC()
 }
 
 // SetDB binds the database instance for persistent state recording.
@@ -373,8 +403,43 @@ func (cb *ContainerCircuitBreaker) SetDB(db *gorm.DB) {
 	cb.db = db
 }
 
-// LoadPersistedState restores circuit breaker states and crash windows from SQLite.
-// If loading fails due to database errors, enters fail-closed degraded mode.
+// SetBus attaches EventBus for degraded security telemetry.
+func (cb *ContainerCircuitBreaker) SetBus(bus *eventbus.Bus) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.bus = bus
+}
+
+// markDegraded locks the circuit breaker into fail-closed degraded mode and emits observability alerts.
+// Caller must hold cb.mu.Lock().
+func (cb *ContainerCircuitBreaker) markDegraded(reason string) {
+	cb.isDegraded = true
+	cb.degradeReason = reason
+	GlobalSecurityMetrics.SetCircuitBreakerDegraded(true)
+	GlobalSecurityMetrics.IncDatabaseError()
+	RecordSecurityEvent(nil, cb.bus, OpsSecurityEvent{
+		OperationID: GenerateOperationID("cb-degrade"),
+		EventType:   "ops.circuit_breaker.degraded",
+		Severity:    "critical",
+		Actor:       "circuit-breaker",
+		FaultClass:  string(FaultTransactionFailed),
+		Message:     "circuit breaker entered fail-closed degraded mode: " + reason,
+	})
+}
+
+// GetDegradeReason returns the diagnostic reason for fail-closed degraded state.
+func (cb *ContainerCircuitBreaker) GetDegradeReason() string {
+	cb.mu.RLock()
+	defer cb.mu.RUnlock()
+	return cb.degradeReason
+}
+
+func isValidCircuitState(state CircuitState) bool {
+	return state == CircuitClosed || state == CircuitOpen || state == CircuitHalfOpen
+}
+
+// LoadPersistedState restores circuit breaker states, crash windows, and probe metadata from SQLite.
+// Fails closed (Degraded) on schema corruption, unrecognized states, or malformed timestamps/JSON (R4-10).
 func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
 	if db == nil {
 		return
@@ -383,52 +448,98 @@ func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
 	defer cb.mu.Unlock()
 	cb.db = db
 
-	var rows []model.OpsCircuitBreakerState
-	if err := db.Find(&rows).Error; err != nil {
-		cb.isDegraded = true
+	hasTbl, tblErr := tableExists(db, "ops_circuit_breaker_states")
+	if tblErr != nil || !hasTbl {
+		cb.markDegraded(fmt.Sprintf("ops_circuit_breaker_states missing or unreadable (err=%v)", tblErr))
+		return
+	}
+	cols, colErr := getTableColumns(db, "ops_circuit_breaker_states")
+	if colErr != nil || !cols["container"] || !cols["state"] || !cols["crash_timestamps"] {
+		cb.markDegraded(fmt.Sprintf("ops_circuit_breaker_states schema incomplete (err=%v)", colErr))
 		return
 	}
 
-	cutoff := time.Now().Add(-cb.windowDuration)
+	var rows []model.OpsCircuitBreakerState
+	if err := db.Find(&rows).Error; err != nil {
+		cb.markDegraded("failed querying ops_circuit_breaker_states: " + err.Error())
+		return
+	}
+
+	cutoff := cb.now().Add(-cb.windowDuration)
 	for _, r := range rows {
 		canonical := ResolveTopologyComponent(r.Container)
-		state := CircuitState(r.State)
-		if state == "" {
-			state = CircuitClosed
+		if canonical == "" {
+			cb.markDegraded(fmt.Sprintf("unknown container %q in ops_circuit_breaker_states", r.Container))
+			continue
 		}
 
-		// R10.6: Any in-flight probe before restart is an orphaned zombie probe.
-		// Reset HALF_OPEN state to CircuitOpen with openedAt preserved so that
-		// once cooldown elapses, a fresh probe can be cleanly acquired.
-		if state == CircuitHalfOpen {
+		state := CircuitState(strings.ToUpper(strings.TrimSpace(r.State)))
+		if !isValidCircuitState(state) {
+			// R4-10 #6: Never default unrecognized or empty state to CLOSED
+			cb.states[canonical] = CircuitOpen
+			cb.openedAt[canonical] = cb.now()
+			cb.markDegraded(fmt.Sprintf("unrecognized circuit state %q for container %s", r.State, canonical))
+			continue
+		}
+
+		if r.Degraded {
+			cb.markDegraded(fmt.Sprintf("persisted degraded flag set on container %s", canonical))
+		}
+
+		if state == CircuitHalfOpen || strings.TrimSpace(r.ActiveProbeToken) != "" {
+			// R4-10: Any interrupted HALF_OPEN or active probe across process restart resets to OPEN
 			state = CircuitOpen
-			if r.OpenedAt.IsZero() {
-				cb.openedAt[canonical] = time.Now()
+			if !r.OpenedAt.IsZero() {
+				cb.openedAt[canonical] = r.OpenedAt.UTC()
+			} else if r.OpenedAtMs > 0 {
+				cb.openedAt[canonical] = time.UnixMilli(r.OpenedAtMs).UTC()
 			} else {
-				cb.openedAt[canonical] = r.OpenedAt
+				cb.openedAt[canonical] = cb.now()
 			}
+			delete(cb.activeProbes, canonical)
 		} else if !r.OpenedAt.IsZero() {
-			cb.openedAt[canonical] = r.OpenedAt
+			cb.openedAt[canonical] = r.OpenedAt.UTC()
+		} else if r.OpenedAtMs > 0 {
+			cb.openedAt[canonical] = time.UnixMilli(r.OpenedAtMs).UTC()
+		} else if state == CircuitOpen {
+			cb.markDegraded(fmt.Sprintf("OPEN circuit for %s missing valid opened_at timestamp", canonical))
+			cb.openedAt[canonical] = cb.now()
 		}
 		cb.states[canonical] = state
 
-		if r.CrashTimestamps != "" {
+		if strings.TrimSpace(r.CrashTimestamps) != "" {
 			var tsStrings []string
-			if err := json.Unmarshal([]byte(r.CrashTimestamps), &tsStrings); err == nil {
-				var validTimes []time.Time
-				for _, s := range tsStrings {
-					if t, err := time.Parse(time.RFC3339Nano, s); err == nil && t.After(cutoff) {
-						validTimes = append(validTimes, t)
-					}
+			if err := json.Unmarshal([]byte(r.CrashTimestamps), &tsStrings); err != nil {
+				cb.states[canonical] = CircuitOpen
+				cb.openedAt[canonical] = cb.now()
+				cb.markDegraded(fmt.Sprintf("corrupt crash_timestamps JSON for %s: %v", canonical, err))
+				continue
+			}
+			var validTimes []time.Time
+			for _, s := range tsStrings {
+				t, parseErr := time.Parse(time.RFC3339Nano, s)
+				if parseErr != nil {
+					t, parseErr = time.Parse(time.RFC3339, s)
 				}
+				if parseErr != nil {
+					cb.states[canonical] = CircuitOpen
+					cb.openedAt[canonical] = cb.now()
+					cb.markDegraded(fmt.Sprintf("invalid timestamp %q in crash_timestamps for %s", s, canonical))
+					validTimes = nil
+					break
+				}
+				if t.After(cutoff) {
+					validTimes = append(validTimes, t)
+				}
+			}
+			if validTimes != nil {
 				cb.crashTimestamps[canonical] = validTimes
 			}
 		}
 	}
 }
 
-// persistState saves a container's current state to the database atomically.
-// Must be called with lock held. Returns actual database error (R6.1).
+// persistState saves a container's current state to SQLite atomically with caller holding cb.mu.Lock().
 func (cb *ContainerCircuitBreaker) persistState(canonical string) error {
 	if cb.db == nil {
 		return nil
@@ -437,20 +548,40 @@ func (cb *ContainerCircuitBreaker) persistState(canonical string) error {
 	if state == "" {
 		state = CircuitClosed
 	}
+	now := cb.now()
 	openedAt := cb.openedAt[canonical]
+	var openedAtMs int64
+	if !openedAt.IsZero() {
+		openedAtMs = openedAt.UTC().UnixMilli()
+	}
+
 	tsList := cb.crashTimestamps[canonical]
 	tsStrings := make([]string, 0, len(tsList))
 	for _, t := range tsList {
-		tsStrings = append(tsStrings, t.Format(time.RFC3339Nano))
+		tsStrings = append(tsStrings, t.UTC().Format(time.RFC3339Nano))
 	}
 	rawJSON, _ := json.Marshal(tsStrings)
 
+	var probeTok string
+	var probeIssMs, probeExpMs int64
+	if active, ok := cb.activeProbes[canonical]; ok {
+		probeTok = active.Token
+		probeIssMs = active.IssuedAt.UTC().UnixMilli()
+		probeExpMs = active.ExpiresAt.UTC().UnixMilli()
+	}
+
 	row := model.OpsCircuitBreakerState{
-		Container:       canonical,
-		State:           string(state),
-		OpenedAt:        openedAt,
-		CrashTimestamps: string(rawJSON),
-		UpdatedAt:       time.Now(),
+		Container:            canonical,
+		State:                string(state),
+		OpenedAt:             openedAt,
+		OpenedAtMs:           openedAtMs,
+		CrashTimestamps:      string(rawJSON),
+		ActiveProbeToken:     probeTok,
+		ActiveProbeIssuedMs:  probeIssMs,
+		ActiveProbeExpiresMs: probeExpMs,
+		Degraded:             cb.isDegraded,
+		UpdatedAt:            now,
+		UpdatedAtMs:          now.UnixMilli(),
 	}
 
 	return cb.db.Transaction(func(tx *gorm.DB) error {
@@ -462,10 +593,16 @@ func (cb *ContainerCircuitBreaker) persistState(canonical string) error {
 			return err
 		}
 		return tx.Model(&existing).Updates(map[string]interface{}{
-			"state":            row.State,
-			"opened_at":        row.OpenedAt,
-			"crash_timestamps": row.CrashTimestamps,
-			"updated_at":       row.UpdatedAt,
+			"state":                   row.State,
+			"opened_at":               row.OpenedAt,
+			"opened_at_ms":            row.OpenedAtMs,
+			"crash_timestamps":        row.CrashTimestamps,
+			"active_probe_token":      row.ActiveProbeToken,
+			"active_probe_issued_ms":  row.ActiveProbeIssuedMs,
+			"active_probe_expires_ms": row.ActiveProbeExpiresMs,
+			"degraded":                row.Degraded,
+			"updated_at":              row.UpdatedAt,
+			"updated_at_ms":           row.UpdatedAtMs,
 		}).Error
 	})
 }
@@ -478,16 +615,19 @@ func (cb *ContainerCircuitBreaker) SetOnTrip(fn func(container string, crashCoun
 }
 
 // RecordCrash records a crash event for the container in the sliding window.
-// Returns the resulting circuit state and true if this crash tripped the breaker.
+// Any database persistence error immediately engages Fail-Closed Degraded mode (R4-09).
 func (cb *ContainerCircuitBreaker) RecordCrash(container string) (CircuitState, bool) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	canonical := ResolveTopologyComponent(container)
-	now := time.Now()
+	if canonical == "" {
+		return CircuitOpen, false
+	}
+
+	now := cb.now()
 	cutoff := now.Add(-cb.windowDuration)
 
-	// Prune timestamps older than the sliding window
 	existing := cb.crashTimestamps[canonical]
 	filtered := make([]time.Time, 0, len(existing)+1)
 	for _, t := range existing {
@@ -497,6 +637,11 @@ func (cb *ContainerCircuitBreaker) RecordCrash(container string) (CircuitState, 
 	}
 	filtered = append(filtered, now)
 	cb.crashTimestamps[canonical] = filtered
+
+	if cb.isDegraded {
+		cb.states[canonical] = CircuitOpen
+		return CircuitOpen, false
+	}
 
 	crashes := len(filtered)
 	currentState := cb.states[canonical]
@@ -509,7 +654,9 @@ func (cb *ContainerCircuitBreaker) RecordCrash(container string) (CircuitState, 
 		cb.states[canonical] = CircuitOpen
 		cb.openedAt[canonical] = now
 		delete(cb.activeProbes, canonical)
-		_ = cb.persistState(canonical)
+		if err := cb.persistState(canonical); err != nil {
+			cb.markDegraded("persistState failed in RecordCrash(HALF_OPEN->OPEN): " + err.Error())
+		}
 		tripCallback := cb.onTrip
 		if tripCallback != nil {
 			go tripCallback(canonical, crashes)
@@ -519,28 +666,39 @@ func (cb *ContainerCircuitBreaker) RecordCrash(container string) (CircuitState, 
 
 	// Trip condition: >= 3 crashes in sliding window
 	if crashes >= cb.maxCrashes {
-		if currentState != CircuitOpen {
-			cb.states[canonical] = CircuitOpen
+		wasOpen := currentState == CircuitOpen
+		cb.states[canonical] = CircuitOpen
+		if !wasOpen {
 			cb.openedAt[canonical] = now
-			delete(cb.activeProbes, canonical)
-			_ = cb.persistState(canonical)
+		}
+		delete(cb.activeProbes, canonical)
+		if err := cb.persistState(canonical); err != nil {
+			cb.markDegraded("persistState failed in RecordCrash(OPEN): " + err.Error())
+			return CircuitOpen, !wasOpen
+		}
+		if !wasOpen {
 			tripCallback := cb.onTrip
 			if tripCallback != nil {
 				go tripCallback(canonical, crashes)
 			}
 			return CircuitOpen, true
 		}
-		_ = cb.persistState(canonical)
 		return CircuitOpen, false
 	}
 
 	cb.states[canonical] = CircuitClosed
-	_ = cb.persistState(canonical)
+	if err := cb.persistState(canonical); err != nil {
+		cb.states[canonical] = CircuitOpen
+		cb.openedAt[canonical] = now
+		cb.markDegraded("persistState failed in RecordCrash(CLOSED): " + err.Error())
+		return CircuitOpen, true
+	}
 	return CircuitClosed, false
 }
 
 // CanAttemptRecovery verifies whether automated recovery may proceed for the container.
 // If transitioning to HALF_OPEN, atomically issues a unique ProbeTicket with lease TTL (R10.1, R10.2).
+// Persistence failure rolls back transition and activates Degraded mode (R4-09).
 func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, *ProbeTicket, error) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
@@ -550,16 +708,18 @@ func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, *
 	}
 
 	canonical := ResolveTopologyComponent(container)
+	if canonical == "" {
+		return false, nil, ErrComponentNotWhitelisted
+	}
 	state := cb.states[canonical]
 	if state == "" {
 		state = CircuitClosed
 	}
 
-	now := time.Now()
+	now := cb.now()
 
 	if state == CircuitOpen {
 		openTime, hasOpened := cb.openedAt[canonical]
-		// Check whether quiet cooldown period has passed to transition to HALF_OPEN
 		if hasOpened && now.Sub(openTime) >= cb.cooldownDuration {
 			ttl := cb.probeTTL
 			if ttl <= 0 {
@@ -572,14 +732,13 @@ func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, *
 				ExpiresAt: now.Add(ttl),
 			}
 
-			// Optimistically set state and persist
 			cb.states[canonical] = CircuitHalfOpen
 			cb.activeProbes[canonical] = ticket
 			if err := cb.persistState(canonical); err != nil {
-				// Rollback memory state on persistence failure (R6.3, R11.1)
 				cb.states[canonical] = CircuitOpen
 				delete(cb.activeProbes, canonical)
-				return false, nil, fmt.Errorf("failed to persist circuit breaker transition to HALF_OPEN: %w", err)
+				cb.markDegraded("persistState failed transitioning OPEN->HALF_OPEN: " + err.Error())
+				return false, nil, fmt.Errorf("%w: %v", ErrFailClosedMode, err)
 			}
 			return true, &ticket, nil
 		}
@@ -589,24 +748,23 @@ func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, *
 	if state == CircuitHalfOpen {
 		active, exists := cb.activeProbes[canonical]
 		if exists {
-			// Check if active probe has expired
 			if now.After(active.ExpiresAt) {
-				// Probe timed out! Trip back to OPEN (R10.4)
 				delete(cb.activeProbes, canonical)
 				cb.states[canonical] = CircuitOpen
 				cb.openedAt[canonical] = now
-				_ = cb.persistState(canonical)
+				if err := cb.persistState(canonical); err != nil {
+					cb.markDegraded("persistState failed expiring HALF_OPEN probe: " + err.Error())
+					return false, nil, fmt.Errorf("%w: %v", ErrFailClosedMode, err)
+				}
 				tripCallback := cb.onTrip
 				if tripCallback != nil {
 					go tripCallback(canonical, cb.maxCrashes)
 				}
 				return false, nil, ErrProbeTimeout
 			}
-			// Probe currently in progress; reject concurrent attempts (R10.2)
 			return false, nil, ErrProbeInProgress
 		}
 
-		// In HALF_OPEN without active probe (e.g. fresh attempt): issue probe
 		ttl := cb.probeTTL
 		if ttl <= 0 {
 			ttl = 30 * time.Second
@@ -621,32 +779,40 @@ func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, *
 		if err := cb.persistState(canonical); err != nil {
 			delete(cb.activeProbes, canonical)
 			cb.states[canonical] = CircuitOpen
-			return false, nil, fmt.Errorf("failed to persist probe ticket: %w", err)
+			cb.openedAt[canonical] = now
+			cb.markDegraded("persistState failed issuing HALF_OPEN probe ticket: " + err.Error())
+			return false, nil, fmt.Errorf("%w: %v", ErrFailClosedMode, err)
 		}
 		return true, &ticket, nil
 	}
 
-	// CLOSED: allow recovery attempt without probe ticket
 	return true, nil, nil
 }
 
 // RecordRecoverySuccess resets circuit to CLOSED after successful recovery.
-// When in HALF_OPEN, validates that token matches the active probe and has not expired (R10.3, R10.5).
+// When in HALF_OPEN, validates that token matches the active probe, has not expired, and DB write succeeds.
 func (cb *ContainerCircuitBreaker) RecordRecoverySuccess(container string, tokens ...string) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if cb.isDegraded {
+		return ErrFailClosedMode
+	}
+
 	canonical := ResolveTopologyComponent(container)
+	if canonical == "" {
+		return ErrComponentNotWhitelisted
+	}
 	currentState := cb.states[canonical]
 	if currentState == "" {
 		currentState = CircuitClosed
 	}
 
-	// Late callback while in OPEN must be rejected (R10.5)
 	if currentState == CircuitOpen {
 		return ErrStaleProbeToken
 	}
 
+	now := cb.now()
 	if currentState == CircuitHalfOpen {
 		var token string
 		if len(tokens) > 0 {
@@ -656,34 +822,47 @@ func (cb *ContainerCircuitBreaker) RecordRecoverySuccess(container string, token
 		if !exists || token == "" || active.Token != token {
 			return ErrStaleProbeToken
 		}
-		if time.Now().After(active.ExpiresAt) {
-			// Probe expired: trip back to OPEN
+		if now.After(active.ExpiresAt) {
 			delete(cb.activeProbes, canonical)
 			cb.states[canonical] = CircuitOpen
-			cb.openedAt[canonical] = time.Now()
-			_ = cb.persistState(canonical)
+			cb.openedAt[canonical] = now
+			if err := cb.persistState(canonical); err != nil {
+				cb.markDegraded("persistState failed on expired HALF_OPEN probe success: " + err.Error())
+				return fmt.Errorf("%w: %v", ErrFailClosedMode, err)
+			}
 			return ErrProbeExpired
 		}
 
-		// Transition from HALF_OPEN to CLOSED: probe succeeded!
+		prevCrashes := cb.crashTimestamps[canonical]
+		prevOpened := cb.openedAt[canonical]
+
 		cb.states[canonical] = CircuitClosed
 		delete(cb.crashTimestamps, canonical)
 		delete(cb.openedAt, canonical)
 		delete(cb.activeProbes, canonical)
-		return cb.persistState(canonical)
+		if err := cb.persistState(canonical); err != nil {
+			// Fail-closed rollback to OPEN + Degraded if DB persistence failed
+			cb.states[canonical] = CircuitOpen
+			cb.crashTimestamps[canonical] = prevCrashes
+			cb.openedAt[canonical] = prevOpened
+			cb.markDegraded("persistState failed transitioning HALF_OPEN->CLOSED: " + err.Error())
+			return fmt.Errorf("%w: %v", ErrFailClosedMode, err)
+		}
+		return nil
 	}
 
-	// In CLOSED: state is already CLOSED; keep sliding window history
 	return nil
 }
 
 // RecordRecoveryFailure records a recovery failure for a container in HALF_OPEN.
-// Validates token, trips circuit back to OPEN, persists state, and triggers onTrip (R2.4, R10.3).
 func (cb *ContainerCircuitBreaker) RecordRecoveryFailure(container string, token string, reason string) error {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
 	canonical := ResolveTopologyComponent(container)
+	if canonical == "" {
+		return ErrComponentNotWhitelisted
+	}
 	currentState := cb.states[canonical]
 
 	if currentState != CircuitHalfOpen {
@@ -695,11 +874,14 @@ func (cb *ContainerCircuitBreaker) RecordRecoveryFailure(container string, token
 		return ErrStaleProbeToken
 	}
 
-	now := time.Now()
+	now := cb.now()
 	cb.states[canonical] = CircuitOpen
 	cb.openedAt[canonical] = now
 	delete(cb.activeProbes, canonical)
 	err := cb.persistState(canonical)
+	if err != nil {
+		cb.markDegraded("persistState failed in RecordRecoveryFailure: " + err.Error())
+	}
 
 	tripCallback := cb.onTrip
 	if tripCallback != nil {
@@ -709,23 +891,124 @@ func (cb *ContainerCircuitBreaker) RecordRecoveryFailure(container string, token
 	return err
 }
 
-// Reset manually resets a container's circuit breaker to CLOSED.
+// Reset manually resets a container's circuit breaker to CLOSED ONLY when not degraded and persistence succeeds.
 func (cb *ContainerCircuitBreaker) Reset(container string) {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if cb.isDegraded {
+		// Strictly refuse clearing protection while storage state is unreconciled (R4-09 #7)
+		return
+	}
+
 	canonical := ResolveTopologyComponent(container)
+	if canonical == "" {
+		return
+	}
+	prevState := cb.states[canonical]
+	prevCrashes := cb.crashTimestamps[canonical]
+	prevOpened := cb.openedAt[canonical]
+
 	cb.states[canonical] = CircuitClosed
 	delete(cb.crashTimestamps, canonical)
 	delete(cb.openedAt, canonical)
 	delete(cb.activeProbes, canonical)
-	_ = cb.persistState(canonical)
+	if err := cb.persistState(canonical); err != nil {
+		cb.states[canonical] = prevState
+		cb.crashTimestamps[canonical] = prevCrashes
+		cb.openedAt[canonical] = prevOpened
+		cb.markDegraded("persistState failed during Reset: " + err.Error())
+	}
 }
 
-// ResetAll resets all tracked containers to CLOSED.
+// ReconcileFromDB verifies SQLite integrity, reconciles authoritative DB state into memory,
+// and only clears isDegraded when schema & storage read/write are confirmed healthy (R4-09 #7, R4-10 #7).
+func (cb *ContainerCircuitBreaker) ReconcileFromDB() error {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+
+	if cb.db == nil {
+		return ErrLeaseDBRequired
+	}
+	if err := VerifyOpsSchemaIntegrity(cb.db); err != nil {
+		cb.markDegraded("schema verification failed during reconcile: " + err.Error())
+		return err
+	}
+
+	// Perform clean write probe on existing rows or verify transaction works
+	var rows []model.OpsCircuitBreakerState
+	if err := cb.db.Find(&rows).Error; err != nil {
+		cb.markDegraded("db read failed during reconcile: " + err.Error())
+		return err
+	}
+
+	newStates := make(map[string]CircuitState)
+	newOpened := make(map[string]time.Time)
+	newCrashes := make(map[string][]time.Time)
+	cutoff := cb.now().Add(-cb.windowDuration)
+
+	for _, r := range rows {
+		canonical := ResolveTopologyComponent(r.Container)
+		if canonical == "" {
+			return fmt.Errorf("%w: invalid container %q in ops_circuit_breaker_states", ErrRecordInconsistent, r.Container)
+		}
+		st := CircuitState(strings.ToUpper(strings.TrimSpace(r.State)))
+		if !isValidCircuitState(st) {
+			return fmt.Errorf("%w: invalid state %q for %s", ErrRecordInconsistent, r.State, canonical)
+		}
+		if st == CircuitHalfOpen {
+			st = CircuitOpen
+		}
+		newStates[canonical] = st
+		if !r.OpenedAt.IsZero() {
+			newOpened[canonical] = r.OpenedAt.UTC()
+		} else if r.OpenedAtMs > 0 {
+			newOpened[canonical] = time.UnixMilli(r.OpenedAtMs).UTC()
+		}
+		if strings.TrimSpace(r.CrashTimestamps) != "" {
+			var tsStrings []string
+			if err := json.Unmarshal([]byte(r.CrashTimestamps), &tsStrings); err != nil {
+				return fmt.Errorf("%w: corrupt crash_timestamps JSON for %s", ErrRecordInconsistent, canonical)
+			}
+			var parsed []time.Time
+			for _, s := range tsStrings {
+				t, pErr := time.Parse(time.RFC3339Nano, s)
+				if pErr != nil {
+					t, pErr = time.Parse(time.RFC3339, s)
+				}
+				if pErr != nil {
+					return fmt.Errorf("%w: malformed timestamp %q for %s", ErrTimestampInvalid, s, canonical)
+				}
+				if t.After(cutoff) {
+					parsed = append(parsed, t)
+				}
+			}
+			newCrashes[canonical] = parsed
+		}
+	}
+
+	if err := cb.db.Model(&model.OpsCircuitBreakerState{}).Where("degraded = ?", true).Update("degraded", false).Error; err != nil {
+		cb.markDegraded("failed clearing degraded flag during reconcile: " + err.Error())
+		return err
+	}
+
+	cb.states = newStates
+	cb.openedAt = newOpened
+	cb.crashTimestamps = newCrashes
+	cb.activeProbes = make(map[string]ProbeTicket)
+	cb.isDegraded = false
+	cb.degradeReason = ""
+	GlobalSecurityMetrics.SetCircuitBreakerDegraded(false)
+	return nil
+}
+
+// ResetAll resets all tracked containers to CLOSED when not degraded.
 func (cb *ContainerCircuitBreaker) ResetAll() {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
+	if cb.isDegraded {
+		return
+	}
 
 	cb.states = make(map[string]CircuitState)
 	cb.crashTimestamps = make(map[string][]time.Time)
@@ -738,7 +1021,14 @@ func (cb *ContainerCircuitBreaker) GetState(container string) CircuitState {
 	cb.mu.Lock()
 	defer cb.mu.Unlock()
 
+	if cb.isDegraded {
+		return CircuitOpen
+	}
+
 	canonical := ResolveTopologyComponent(container)
+	if canonical == "" {
+		return CircuitOpen
+	}
 	state := cb.states[canonical]
 	if state == "" {
 		return CircuitClosed
@@ -746,11 +1036,13 @@ func (cb *ContainerCircuitBreaker) GetState(container string) CircuitState {
 
 	// If in HALF_OPEN, check if active probe has expired
 	if state == CircuitHalfOpen {
-		if active, exists := cb.activeProbes[canonical]; exists && time.Now().After(active.ExpiresAt) {
+		if active, exists := cb.activeProbes[canonical]; exists && cb.now().After(active.ExpiresAt) {
 			delete(cb.activeProbes, canonical)
 			cb.states[canonical] = CircuitOpen
-			cb.openedAt[canonical] = time.Now()
-			_ = cb.persistState(canonical)
+			cb.openedAt[canonical] = cb.now()
+			if err := cb.persistState(canonical); err != nil {
+				cb.markDegraded("persistState failed expiring probe in GetState: " + err.Error())
+			}
 			return CircuitOpen
 		}
 	}
@@ -805,7 +1097,7 @@ func (cb *ContainerCircuitBreaker) GetCrashCount(container string) int {
 	defer cb.mu.RUnlock()
 
 	canonical := ResolveTopologyComponent(container)
-	now := time.Now()
+	now := cb.now()
 	cutoff := now.Add(-cb.windowDuration)
 
 	count := 0
@@ -857,7 +1149,7 @@ func (l *MaintenanceLock) SetDB(db *gorm.DB) {
 }
 
 // LoadPersistedState restores active maintenance lock from SQLite.
-// If query fails with unexpected database error (not RecordNotFound), fails closed (R6.5, R11.4).
+// If query fails or schema is incomplete, enters fail-closed degraded mode (R4-09, R4-18).
 func (l *MaintenanceLock) LoadPersistedState(db *gorm.DB) {
 	if db == nil {
 		return
@@ -866,6 +1158,19 @@ func (l *MaintenanceLock) LoadPersistedState(db *gorm.DB) {
 	defer l.mu.Unlock()
 	l.db = db
 
+	hasTbl, tblErr := tableExists(db, "ops_maintenance_locks")
+	if tblErr != nil || !hasTbl {
+		l.Active = true
+		l.isDegraded = true
+		l.LockedBy = "system-fail-closed"
+		l.Reason = fmt.Sprintf("ops_maintenance_locks missing or unreadable (err=%v)", tblErr)
+		l.LockedAt = time.Now().UTC()
+		l.ExpiresAt = time.Now().UTC().Add(24 * time.Hour)
+		GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
+		GlobalSecurityMetrics.IncDatabaseError()
+		return
+	}
+
 	var lockRow model.OpsMaintenanceLock
 	err := db.Order("id DESC").First(&lockRow).Error
 	if err != nil {
@@ -873,25 +1178,43 @@ func (l *MaintenanceLock) LoadPersistedState(db *gorm.DB) {
 			l.Active = false
 			return
 		}
-		// Unexpected DB error: enter fail-closed degraded mode (R6.5, R11.4)
 		l.Active = true
 		l.isDegraded = true
 		l.LockedBy = "system-fail-closed"
 		l.Reason = "persistence error, degraded protection: " + err.Error()
-		l.LockedAt = time.Now()
-		l.ExpiresAt = time.Now().Add(24 * time.Hour)
+		l.LockedAt = time.Now().UTC()
+		l.ExpiresAt = time.Now().UTC().Add(24 * time.Hour)
+		GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
+		GlobalSecurityMetrics.IncDatabaseError()
 		return
 	}
 
-	if lockRow.Active && time.Now().Before(lockRow.ExpiresAt) {
-		l.Active = true
-		l.LockedBy = lockRow.LockedBy
-		l.Reason = lockRow.Reason
-		l.LockedAt = lockRow.LockedAt
-		l.ExpiresAt = lockRow.ExpiresAt
-	} else {
-		l.Active = false
+	if lockRow.Active {
+		if lockRow.ExpiresAt.IsZero() && lockRow.ExpiresAtMs <= 0 {
+			l.Active = true
+			l.isDegraded = true
+			l.LockedBy = "system-fail-closed"
+			l.Reason = "active maintenance lock has invalid zero expiration timestamp"
+			l.LockedAt = time.Now().UTC()
+			l.ExpiresAt = time.Now().UTC().Add(24 * time.Hour)
+			GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
+			GlobalSecurityMetrics.IncDatabaseError()
+			return
+		}
+		exp := lockRow.ExpiresAt.UTC()
+		if lockRow.ExpiresAtMs > 0 {
+			exp = time.UnixMilli(lockRow.ExpiresAtMs).UTC()
+		}
+		if time.Now().UTC().Before(exp) {
+			l.Active = true
+			l.LockedBy = lockRow.LockedBy
+			l.Reason = lockRow.Reason
+			l.LockedAt = lockRow.LockedAt
+			l.ExpiresAt = exp
+			return
+		}
 	}
+	l.Active = false
 }
 
 // persistState saves lock state to database and returns actual error (R6.1).
@@ -900,12 +1223,13 @@ func (l *MaintenanceLock) persistState() error {
 		return nil
 	}
 	row := model.OpsMaintenanceLock{
-		Active:    l.Active,
-		LockedBy:  l.LockedBy,
-		Reason:    l.Reason,
-		LockedAt:  l.LockedAt,
-		ExpiresAt: l.ExpiresAt,
-		UpdatedAt: time.Now(),
+		Active:      l.Active,
+		LockedBy:    l.LockedBy,
+		Reason:      l.Reason,
+		LockedAt:    l.LockedAt,
+		ExpiresAt:   l.ExpiresAt,
+		ExpiresAtMs: l.ExpiresAt.UTC().UnixMilli(),
+		UpdatedAt:   time.Now().UTC(),
 	}
 	return l.db.Create(&row).Error
 }
@@ -920,42 +1244,42 @@ func (l *MaintenanceLock) Acquire(lockedBy string, reason string, ttl time.Durat
 		return ErrFailClosedMode
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	if ttl <= 0 {
 		ttl = 60 * time.Minute // Default: 60 minutes
 	}
 
 	if l.Active && now.Before(l.ExpiresAt) {
-		// Allow re-acquisition by same operator or forced admin refresh
 		if l.LockedBy != "" && l.LockedBy != lockedBy && !strings.Contains(strings.ToLower(lockedBy), "admin") {
 			return ErrMaintenanceLockActive
 		}
 	}
 
-	// Snapshot previous state for rollback on persistence failure
 	prevActive := l.Active
 	prevLockedBy := l.LockedBy
 	prevReason := l.Reason
 	prevLockedAt := l.LockedAt
 	prevExpiresAt := l.ExpiresAt
 
+	exp := now.Add(ttl)
 	row := model.OpsMaintenanceLock{
-		Active:    true,
-		LockedBy:  lockedBy,
-		Reason:    reason,
-		LockedAt:  now,
-		ExpiresAt: now.Add(ttl),
-		UpdatedAt: now,
+		Active:      true,
+		LockedBy:    lockedBy,
+		Reason:      reason,
+		LockedAt:    now,
+		ExpiresAt:   exp,
+		ExpiresAtMs: exp.UnixMilli(),
+		UpdatedAt:   now,
 	}
 
 	if l.db != nil {
 		if err := l.db.Create(&row).Error; err != nil {
-			// Rollback memory state on persistence failure (R6.6)
 			l.Active = prevActive
 			l.LockedBy = prevLockedBy
 			l.Reason = prevReason
 			l.LockedAt = prevLockedAt
 			l.ExpiresAt = prevExpiresAt
+			GlobalSecurityMetrics.IncDatabaseError()
 			return fmt.Errorf("failed to persist maintenance lock acquisition: %w", err)
 		}
 	}
@@ -964,33 +1288,41 @@ func (l *MaintenanceLock) Acquire(lockedBy string, reason string, ttl time.Durat
 	l.LockedBy = lockedBy
 	l.Reason = reason
 	l.LockedAt = now
-	l.ExpiresAt = now.Add(ttl)
+	l.ExpiresAt = exp
 	return nil
 }
 
 // Release clears the maintenance lock.
-// MUST persist to DB first! If DB write fails, DO NOT clear memory lock! (R6.6, R11.1).
+// MUST persist to DB first! If DB write fails, DO NOT clear memory lock.
+// Never clears isDegraded directly; storage reconciliation is required via ReconcileFromDB (R4-09).
 func (l *MaintenanceLock) Release(releasedBy string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+
+	if l.isDegraded {
+		return ErrFailClosedMode
+	}
 
 	if !l.Active {
 		return nil
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	row := model.OpsMaintenanceLock{
-		Active:    false,
-		LockedBy:  "",
-		Reason:    fmt.Sprintf("Released by %s", releasedBy),
-		LockedAt:  l.LockedAt,
-		ExpiresAt: time.Time{},
-		UpdatedAt: now,
+		Active:      false,
+		LockedBy:    "",
+		Reason:      fmt.Sprintf("Released by %s", releasedBy),
+		LockedAt:    l.LockedAt,
+		ExpiresAt:   time.Time{},
+		ExpiresAtMs: 0,
+		UpdatedAt:   now,
 	}
 
 	if l.db != nil {
 		if err := l.db.Create(&row).Error; err != nil {
-			// Retention on failure: DO NOT clear in-memory lock! (R6.6, R11.1)
+			l.isDegraded = true
+			GlobalSecurityMetrics.IncDatabaseError()
+			GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
 			return fmt.Errorf("failed to persist maintenance lock release: %w (memory lock retained)", err)
 		}
 	}
@@ -999,7 +1331,50 @@ func (l *MaintenanceLock) Release(releasedBy string) error {
 	l.LockedBy = ""
 	l.Reason = ""
 	l.ExpiresAt = time.Time{}
+	return nil
+}
+
+// ReconcileFromDB validates schema integrity and reloads maintenance lock state before clearing degraded flag.
+func (l *MaintenanceLock) ReconcileFromDB() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.db == nil {
+		return ErrLeaseDBRequired
+	}
+	if err := VerifyOpsSchemaIntegrity(l.db); err != nil {
+		l.isDegraded = true
+		GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
+		return err
+	}
+	var lockRow model.OpsMaintenanceLock
+	err := l.db.Order("id DESC").First(&lockRow).Error
+	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
+		l.isDegraded = true
+		GlobalSecurityMetrics.SetMaintenanceLockDegraded(true)
+		return err
+	}
+	if err == nil && lockRow.Active {
+		exp := lockRow.ExpiresAt.UTC()
+		if lockRow.ExpiresAtMs > 0 {
+			exp = time.UnixMilli(lockRow.ExpiresAtMs).UTC()
+		}
+		if time.Now().UTC().Before(exp) {
+			l.Active = true
+			l.LockedBy = lockRow.LockedBy
+			l.Reason = lockRow.Reason
+			l.LockedAt = lockRow.LockedAt
+			l.ExpiresAt = exp
+			l.isDegraded = false
+			GlobalSecurityMetrics.SetMaintenanceLockDegraded(false)
+			return nil
+		}
+	}
+	l.Active = false
+	l.LockedBy = ""
+	l.Reason = ""
+	l.ExpiresAt = time.Time{}
 	l.isDegraded = false
+	GlobalSecurityMetrics.SetMaintenanceLockDegraded(false)
 	return nil
 }
 
@@ -1150,10 +1525,20 @@ func NewContainerRecoveryFSM(db *gorm.DB, bus *eventbus.Bus, executor OperationE
 	})
 
 	if db != nil {
-		_ = db.AutoMigrate(&model.OpsMaintenanceLock{}, &model.OpsCircuitBreakerState{})
+		if sErr := EnsureOpsSchema(db); sErr != nil {
+			fsm.lock.SetDB(db)
+			fsm.lock.SetDegraded(true)
+			fsm.breaker.SetDB(db)
+			fsm.breaker.SetBus(bus)
+			fsm.breaker.mu.Lock()
+			fsm.breaker.markDegraded("schema verification failed at FSM init: " + sErr.Error())
+			fsm.breaker.mu.Unlock()
+			return fsm
+		}
 		fsm.lock.SetDB(db)
 		fsm.lock.LoadPersistedState(db)
 		fsm.breaker.SetDB(db)
+		fsm.breaker.SetBus(bus)
 		fsm.breaker.LoadPersistedState(db)
 	}
 
@@ -1200,6 +1585,15 @@ func (fsm *ContainerRecoveryFSM) ProcessContainerEvent(ctx context.Context, even
 	defer fsm.mu.Unlock()
 
 	container := ResolveTopologyComponent(event.ContainerName)
+	if container == "" {
+		return &RecoveryDecision{
+			Action:       ActionBlocked,
+			EventClass:   ClassifyContainerEvent(event, false),
+			Container:    event.ContainerName,
+			Reason:       fmt.Sprintf("Unknown or unwhitelisted container component %q (fail-closed)", event.ContainerName),
+			CircuitState: CircuitOpen,
+		}, ErrComponentNotWhitelisted
+	}
 	circuitState := fsm.breaker.GetState(container)
 
 	// 1. Maintenance Lock Check
@@ -1264,7 +1658,7 @@ func (fsm *ContainerRecoveryFSM) ProcessContainerEvent(ctx context.Context, even
 				Action:       ActionBlocked,
 				EventClass:   eventClass,
 				Container:    container,
-				Reason:       "Container circuit breaker is OPEN (crash loop protection active)",
+				Reason:       "Container circuit breaker is OPEN or degraded (fail-closed protection active)",
 				CircuitState: fsm.breaker.GetState(container),
 			}, cbErr
 		}
@@ -1284,17 +1678,23 @@ func (fsm *ContainerRecoveryFSM) ProcessContainerEvent(ctx context.Context, even
 		}
 
 		// 5. Decouple crash event from recovery probe (R2)
-		// If in HALF_OPEN (ticket != nil), DO NOT call RecordCrash!
-		// The incoming crash was the trigger to start recovery probe.
 		var newState CircuitState
 		var probeToken string
 		if ticket != nil {
 			newState = CircuitHalfOpen
 			probeToken = ticket.Token
 		} else {
-			// In CLOSED: record crash in sliding window and check if threshold reached
 			var justTripped bool
 			newState, justTripped = fsm.breaker.RecordCrash(container)
+			if fsm.breaker.IsDegraded() {
+				return &RecoveryDecision{
+					Action:       ActionBlocked,
+					EventClass:   eventClass,
+					Container:    container,
+					Reason:       "Circuit breaker entered fail-closed degraded mode on persistence failure: " + fsm.breaker.GetDegradeReason(),
+					CircuitState: CircuitOpen,
+				}, ErrFailClosedMode
+			}
 			if justTripped {
 				return &RecoveryDecision{
 					Action:       ActionTripped,
@@ -1351,35 +1751,57 @@ func (fsm *ContainerRecoveryFSM) ProcessContainerEvent(ctx context.Context, even
 	}
 }
 
+var circuitTripSeq uint64
+
 // createCircuitTripProposal creates a Tier 2 HIGH proposal when a container circuit breaker trips.
 func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, crashCount int) {
 	if fsm.db == nil {
 		return
 	}
 
-	now := time.Now()
-	propID := fmt.Sprintf("prop-cb-%s-%d", container, now.UnixNano())
+	now := time.Now().UTC()
+	seq := atomic.AddUint64(&circuitTripSeq, 1)
 	canonical := ResolveTopologyComponent(container)
-	h := sha256.New()
-	h.Write([]byte(fmt.Sprintf("%s:offline:none", canonical)))
-	baselineHash := fmt.Sprintf("sha256:%x", h.Sum(nil))
+	if canonical == "" {
+		return
+	}
+	propID := fmt.Sprintf("prop-cb-%s-%d-%d", canonical, now.UnixNano(), seq)
+
+	var baselineHash string
+	fsm.mu.RLock()
+	curExec := fsm.executor
+	fsm.mu.RUnlock()
+	if defExec, ok := curExec.(*DefaultOperationExecutor); ok && defExec != nil && defExec.baselineExtractor != nil {
+		baselineHash = defExec.baselineExtractor(canonical)
+	}
+	if baselineHash == "" {
+		baselineHash = model.ComputeDefaultBaseline(canonical)
+	}
+
+	actionSpec, _ := json.Marshal(OperationSpec{
+		Action: ActionDockerRestart,
+		Target: canonical,
+	})
 
 	prop := model.OpsProposal{
 		ProposalID:       propID,
-		Title:            fmt.Sprintf("【高危告警】%s 连续崩溃触发自愈熔断", container),
-		Description:      fmt.Sprintf("容器 %s 在 10 分钟内发生 %d 次连续崩溃，已触发自愈熔断器跳闸。自动重启已挂起，需管理员人工审批与介入排查。", container, crashCount),
-		TargetComponent:  container,
+		Title:            fmt.Sprintf("【高危告警】%s 连续崩溃触发自愈熔断", canonical),
+		Description:      fmt.Sprintf("容器 %s 在 10 分钟内发生 %d 次连续崩溃，已触发自愈熔断器跳闸。自动重启已挂起，需管理员人工审批与介入排查。", canonical, crashCount),
+		TargetComponent:  canonical,
 		RiskLevel:        model.RiskLevelHigh,
 		Status:           model.ProposalStatusAwaitingApproval,
 		EstimatedSeconds: 60,
-		ExecutionPlan:    fmt.Sprintf("docker restart %s", container),
-		RollbackPlan:     fmt.Sprintf("docker logs --tail 200 %s", container),
+		ExecutionPlan:    fmt.Sprintf("docker restart %s", canonical),
+		RollbackPlan:     fmt.Sprintf("docker logs --tail 200 %s", canonical),
+		ActionSpec:       string(actionSpec),
 		BaselineHash:     baselineHash,
+		Version:          1,
+		Revision:         1,
 		CreatedAt:        now,
 	}
 
 	if err := fsm.db.Create(&prop).Error; err != nil {
-		// Log or handle error silently
+		GlobalSecurityMetrics.IncDatabaseError()
 		return
 	}
 
@@ -1388,7 +1810,7 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 			Topic:    eventbus.TopicSystemLog,
 			Source:   eventbus.SourceSystem,
 			Severity: eventbus.SeverityCritical,
-			Payload:  []byte(fmt.Sprintf("容器 %s 连续崩溃 %d 次触发自愈熔断器跳闸，已创建高危审批提案: %s", container, crashCount, propID)),
+			Payload:  []byte(fmt.Sprintf("容器 %s 连续崩溃 %d 次触发自愈熔断器跳闸，已创建高危审批提案: %s", canonical, crashCount, propID)),
 		})
 	}
 }
@@ -1422,6 +1844,9 @@ func (fsm *ContainerRecoveryFSM) SetExecutor(executor OperationExecutor) {
 	if executor != nil {
 		fsm.topology.SetHealthChecker(func(ctx context.Context, component string) (bool, error) {
 			canonical := ResolveTopologyComponent(component)
+			if canonical == "" {
+				return false, ErrComponentNotWhitelisted
+			}
 			if canonical == "app.db" {
 				if fsm.db != nil {
 					if sqlDB, err := fsm.db.DB(); err == nil {
@@ -1440,16 +1865,43 @@ func (fsm *ContainerRecoveryFSM) SetExecutor(executor OperationExecutor) {
 	}
 }
 
-// ProcessAndRecover performs closed-loop recovery: evaluates the container event via FSM,
-// and if RESTART is decided, invokes OperationExecutor to execute physical Docker recovery,
-// conducts health probe verification, records recovery success in the circuit breaker,
-// and returns a structured ContainerRecoveryResult.
+// ReconcileDegradedState runs storage integrity checks and reloads persisted lock and circuit breaker states
+// before clearing fail-closed Degraded protection (R4-09, R4-10, R4-18).
+func (fsm *ContainerRecoveryFSM) ReconcileDegradedState(actor string) error {
+	if err := fsm.lock.ReconcileFromDB(); err != nil {
+		return err
+	}
+	if err := fsm.breaker.ReconcileFromDB(); err != nil {
+		return err
+	}
+	RecordSecurityEvent(fsm.db, fsm.bus, OpsSecurityEvent{
+		OperationID: GenerateOperationID("reconcile"),
+		EventType:   "ops.fsm.reconciled",
+		Severity:    "warning",
+		Actor:       actor,
+		Message:     fmt.Sprintf("storage and security state reconciled by %s; degraded freeze lifted", actor),
+	})
+	return nil
+}
+
+// ProcessAndRecover performs closed-loop recovery with unified LeaseGuard ownership across the full execution chain (R4-05 ~ R4-08):
+// acquire LeaseGuard -> backoff -> pre-exec fencing -> executor.Execute(leaseCtx) -> circuit breaker persistence -> ReleaseLease.
 func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event ContainerEvent) (*ContainerRecoveryResult, error) {
+	if fsm.lock.IsDegraded() || fsm.breaker.IsDegraded() {
+		return &ContainerRecoveryResult{
+			Status:         StatusBlocked,
+			Executed:       false,
+			Error:          ErrFailClosedMode.Error(),
+			HealthVerified: false,
+		}, ErrFailClosedMode
+	}
+
 	decision, err := fsm.ProcessContainerEvent(ctx, event)
 	if err != nil || decision == nil {
 		status := StatusBlocked
 		if errors.Is(err, ErrMaintenanceLockActive) || errors.Is(err, ErrSystemInMaintenance) ||
-			errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrDependencyUnhealthy) {
+			errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrDependencyUnhealthy) ||
+			errors.Is(err, ErrFailClosedMode) || errors.Is(err, ErrComponentNotWhitelisted) {
 			status = StatusBlocked
 		} else {
 			status = StatusFailed
@@ -1493,6 +1945,15 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		fsm.mu.RUnlock()
 
 		canonical := ResolveTopologyComponent(decision.Container)
+		if canonical == "" {
+			return &ContainerRecoveryResult{
+				Decision:       decision,
+				Status:         StatusBlocked,
+				Executed:       false,
+				Error:          ErrComponentNotWhitelisted.Error(),
+				HealthVerified: false,
+			}, ErrComponentNotWhitelisted
+		}
 
 		if exec == nil {
 			if decision.ProbeToken != "" {
@@ -1507,10 +1968,12 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			}, errors.New("operation executor not available")
 		}
 
-		// R13: Acquire persistent recovery lease before autonomous execution
-		var leaseToken string
+		// R4-05 / R4-06: Single-ownership LeaseGuard passed via ctx to OperationExecutor (no double-acquire!)
+		workCtx := ctx
+		var leaseGuard *LeaseGuard
 		if leaseMgr != nil {
-			token, lErr := leaseMgr.AcquireLease(canonical, "go-core", 30*time.Second)
+			holderID := GenerateOperationID("go-core")
+			lCtx, guard, lErr := AcquireLeaseGuard(ctx, leaseMgr, canonical, holderID, 30*time.Second, fsm.db, fsm.bus)
 			if lErr != nil {
 				if decision.ProbeToken != "" {
 					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "recovery lease acquisition failed: "+lErr.Error())
@@ -1523,26 +1986,49 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 					HealthVerified: false,
 				}, fmt.Errorf("failed to acquire recovery lease for %s: %w", canonical, lErr)
 			}
-			leaseToken = token
-			defer func() {
-				_ = leaseMgr.ReleaseLease(canonical, leaseToken)
-			}()
+			workCtx = lCtx
+			leaseGuard = guard
+		}
+
+		releaseLease := func() error {
+			if leaseGuard == nil {
+				return nil
+			}
+			return leaseGuard.Release(fsm.db, fsm.bus)
 		}
 
 		if decision.BackoffSec > 0 {
 			select {
 			case <-time.After(time.Duration(decision.BackoffSec) * time.Second):
-			case <-ctx.Done():
+			case <-workCtx.Done():
 				if decision.ProbeToken != "" {
-					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "context cancelled during backoff: "+ctx.Err().Error())
+					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "context cancelled during backoff: "+workCtx.Err().Error())
 				}
+				_ = releaseLease()
 				return &ContainerRecoveryResult{
 					Decision:       decision,
 					Status:         StatusFailed,
 					Executed:       false,
-					Error:          ctx.Err().Error(),
+					Error:          workCtx.Err().Error(),
 					HealthVerified: false,
-				}, ctx.Err()
+				}, workCtx.Err()
+			}
+		}
+
+		// Re-verify lease & maintenance/degraded state right before invoking executor (R4-08)
+		if leaseGuard != nil {
+			if fErr := leaseGuard.VerifyBeforeMutation(0); fErr != nil {
+				if decision.ProbeToken != "" {
+					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "lease fencing check failed before execute: "+fErr.Error())
+				}
+				_ = releaseLease()
+				return &ContainerRecoveryResult{
+					Decision:       decision,
+					Status:         StatusBlocked,
+					Executed:       false,
+					Error:          fErr.Error(),
+					HealthVerified: false,
+				}, fErr
 			}
 		}
 
@@ -1551,7 +2037,7 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			Target: canonical,
 		}
 
-		execRes, execErr := exec.Execute(ctx, spec)
+		execRes, execErr := exec.Execute(workCtx, spec)
 		if execErr != nil || (execRes != nil && !execRes.Success) {
 			errStr := ""
 			if execErr != nil {
@@ -1563,10 +2049,10 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			if execRes != nil {
 				outStr = execRes.Output
 			}
-			// Probe failure: release probe ticket and trip back to OPEN (R2, R10)
 			if decision.ProbeToken != "" {
 				_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, errStr)
 			}
+			_ = releaseLease()
 			return &ContainerRecoveryResult{
 				Decision:       decision,
 				Status:         StatusFailed,
@@ -1577,11 +2063,53 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			}, execErr
 		}
 
-		// Recovery succeeded and health probe verified by executor -> update circuit breaker
+		// Verify lease is still valid before recording circuit breaker success
+		if leaseGuard != nil {
+			if fErr := leaseGuard.VerifyBeforeMutation(0); fErr != nil {
+				if decision.ProbeToken != "" {
+					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "lease lost before circuit recovery commit: "+fErr.Error())
+				}
+				_ = releaseLease()
+				return &ContainerRecoveryResult{
+					Decision:       decision,
+					Status:         StatusFailed,
+					Executed:       true,
+					Output:         execRes.Output,
+					Error:          fErr.Error(),
+					HealthVerified: false,
+				}, fErr
+			}
+		}
+
+		// Update circuit breaker and strictly verify persistence succeeded (R4-09)
+		var cbUpdateErr error
 		if decision.ProbeToken != "" {
-			_ = fsm.breaker.RecordRecoverySuccess(canonical, decision.ProbeToken)
+			cbUpdateErr = fsm.breaker.RecordRecoverySuccess(canonical, decision.ProbeToken)
 		} else {
-			_ = fsm.breaker.RecordRecoverySuccess(canonical)
+			cbUpdateErr = fsm.breaker.RecordRecoverySuccess(canonical)
+		}
+		if cbUpdateErr != nil {
+			_ = releaseLease()
+			return &ContainerRecoveryResult{
+				Decision:       decision,
+				Status:         StatusFailed,
+				Executed:       true,
+				Output:         execRes.Output,
+				Error:          fmt.Sprintf("recovery executed but circuit breaker state commit failed: %v", cbUpdateErr),
+				HealthVerified: true,
+			}, cbUpdateErr
+		}
+
+		// Explicitly release lease and forbid reporting RECOVERED if release failed (R4-05, R4-08)
+		if relErr := releaseLease(); relErr != nil {
+			return &ContainerRecoveryResult{
+				Decision:       decision,
+				Status:         StatusFailed,
+				Executed:       true,
+				Output:         execRes.Output,
+				Error:          fmt.Sprintf("recovery completed but persistent lease release failed: %v", relErr),
+				HealthVerified: true,
+			}, relErr
 		}
 
 		return &ContainerRecoveryResult{
@@ -1624,48 +2152,5 @@ func GetGlobalRecoveryFSM() *ContainerRecoveryFSM {
 	globalRecoveryFSMMu.RLock()
 	defer globalRecoveryFSMMu.RUnlock()
 	return globalRecoveryFSM
-}
-
-// ============================================================================
-// 6. Proposal Lifecycle Finite State Machine (CAS Transitions)
-// ============================================================================
-
-// ProposalFSM manages atomic state transitions for OpsProposal.
-type ProposalFSM struct {
-	db *gorm.DB
-}
-
-// NewProposalFSM initializes a ProposalFSM.
-func NewProposalFSM(db *gorm.DB) *ProposalFSM {
-	return &ProposalFSM{db: db}
-}
-
-// TransitionCAS executes an atomic Compare-And-Swap state change for a proposal.
-// It matches by proposal ID or numeric ID, ensures the current status is in expectedStatuses,
-// and applies updates including the targetStatus atomically.
-func (fsm *ProposalFSM) TransitionCAS(
-	proposalID string,
-	expectedStatuses []string,
-	targetStatus string,
-	updates map[string]interface{},
-) (bool, error) {
-	if fsm.db == nil {
-		return true, nil
-	}
-
-	if updates == nil {
-		updates = make(map[string]interface{})
-	}
-	updates["status"] = targetStatus
-	updates["updated_at"] = time.Now()
-
-	res := fsm.db.Model(&model.OpsProposal{}).
-		Where("(id = ? OR proposal_id = ?) AND status IN (?)", proposalID, proposalID, expectedStatuses).
-		Updates(updates)
-
-	if res.Error != nil {
-		return false, res.Error
-	}
-	return res.RowsAffected > 0, nil
 }
 

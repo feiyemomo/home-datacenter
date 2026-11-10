@@ -550,10 +550,11 @@ func TestRound3_CircuitTripProposal_NanoTimestamp_NoCollision(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(count)
 
+	validContainers := []string{"home-web", "home-api", "frigate", "mosquitto", "home-vision"}
 	for i := 0; i < count; i++ {
 		go func(idx int) {
 			defer wg.Done()
-			fsm.createCircuitTripProposal(fmt.Sprintf("container-%d", idx), 3)
+			fsm.createCircuitTripProposal(validContainers[idx%len(validContainers)], 3)
 		}(i)
 	}
 
