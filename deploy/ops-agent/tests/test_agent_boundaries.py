@@ -22,6 +22,7 @@ sys.path.insert(0, PARENT_DIR)
 from config import OpsAgentConfig
 from main import (
     CoreReportingStatus,
+    DockerHealthState,
     EMERGENCY_RESTART_WHITELIST,
     WEAK_SECRETS_BLACKLIST,
     HomeOpsAgent,
@@ -32,6 +33,30 @@ class TestAgentBoundaries(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp_dir.name, "test_app.db")
+        conn = sqlite3.connect(self.db_path)
+        with conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ops_maintenance_locks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    active INTEGER NOT NULL DEFAULT 0,
+                    locked_by TEXT,
+                    reason TEXT,
+                    locked_at TEXT,
+                    expires_at TEXT,
+                    updated_at TEXT
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS ops_circuit_breaker_states (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    container TEXT UNIQUE NOT NULL,
+                    state TEXT NOT NULL DEFAULT 'CLOSED',
+                    opened_at TEXT,
+                    crash_timestamps TEXT,
+                    updated_at TEXT
+                )
+            """)
+        conn.close()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
             internal_token="test-internal-token-32-chars-long",
@@ -253,6 +278,7 @@ class TestAgentBoundaries(unittest.IsolatedAsyncioTestCase):
     async def test_offline_guard_4_circuit_breaker_trips(self):
         """Guard 4: Cooldown & circuit breaker (>2 restarts in 60s or >=3 in 10m)."""
         self.agent._restart_docker_container = AsyncMock(return_value=True)
+        self.agent._verify_container_health = AsyncMock(return_value=DockerHealthState.HEALTHY)
         token = "valid-long-emergency-token-1234"
 
         with patch.dict(os.environ, {"EMERGENCY_OVERRIDE_TOKEN": token}):
@@ -272,6 +298,7 @@ class TestAgentBoundaries(unittest.IsolatedAsyncioTestCase):
     async def test_offline_guard_5_sqlite_audit_persistence(self):
         """Guard 5: Successful offline restart creates an offline_ops_audit row in SQLite."""
         self.agent._restart_docker_container = AsyncMock(return_value=True)
+        self.agent._verify_container_health = AsyncMock(return_value=DockerHealthState.HEALTHY)
         token = "valid-long-emergency-token-1234"
 
         with patch.dict(os.environ, {"EMERGENCY_OVERRIDE_TOKEN": token}):

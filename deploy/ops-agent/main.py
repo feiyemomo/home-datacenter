@@ -17,7 +17,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Callable, Awaitable
 
 class CoreReportingStatus(enum.Enum):
     RECOVERED_BY_CORE = "RECOVERED_BY_CORE"  # Go Core executed recovery and verified health
@@ -26,6 +26,161 @@ class CoreReportingStatus(enum.Enum):
     BLOCKED_BY_FSM = "BLOCKED_BY_FSM"        # Go Core returned 200, but decision is BLOCKED/IGNORE/TRIPPED
     SERVER_ERROR = "SERVER_ERROR"            # Go Core returned 5xx
     OFFLINE = "OFFLINE"                      # Genuine network error: connection refused/timeout
+
+class MaintenanceLockState(str, enum.Enum):
+    LOCKED = "LOCKED"
+    UNLOCKED = "UNLOCKED"
+    UNKNOWN = "UNKNOWN"
+
+class CircuitBreakerState(str, enum.Enum):
+    OPEN = "OPEN"
+    HALF_OPEN = "HALF_OPEN"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+class DockerHealthState(str, enum.Enum):
+    HEALTHY = "HEALTHY"
+    UNHEALTHY = "UNHEALTHY"
+    RUNNING_UNHEALTHCHECKED = "RUNNING_UNHEALTHCHECKED"
+    UNKNOWN = "UNKNOWN"
+
+# Canonical Component Resolution (1-to-1 with Go Core ResolveTopologyComponent)
+CANONICAL_COMPONENT_MAP = {
+    "home-mosquitto": "mosquitto",
+    "mosquitto": "mosquitto",
+    "mqtt": "mosquitto",
+    "broker": "mosquitto",
+    "mosquitto-broker": "mosquitto",
+    "home-datacenter-mosquitto": "mosquitto",
+
+    "home-frigate": "frigate",
+    "nvr": "frigate",
+    "frigate": "frigate",
+    "go2rtc": "frigate",
+    "home-datacenter-frigate": "frigate",
+
+    "app.db": "app.db",
+    "database": "app.db",
+    "sqlite": "app.db",
+    "db": "app.db",
+
+    "home-api": "home-api",
+    "api": "home-api",
+    "backend": "home-api",
+    "go-api": "home-api",
+    "home-datacenter-api": "home-api",
+
+    "home-web": "home-web",
+    "web": "home-web",
+    "frontend": "home-web",
+    "nginx": "home-web",
+    "home-datacenter-web": "home-web",
+
+    "home-vision": "home-vision",
+    "vision": "home-vision",
+    "ai-vision": "home-vision",
+    "home-datacenter-vision": "home-vision",
+
+    "home-cloudflared": "home-cloudflared",
+    "cloudflared": "home-cloudflared",
+    "home-datacenter-cloudflared": "home-cloudflared",
+
+    "home-h3c-keepalive": "home-h3c-keepalive",
+    "h3c": "home-h3c-keepalive",
+    "home-datacenter-h3c-keepalive": "home-h3c-keepalive",
+
+    "home-ops-agent": "home-ops-agent",
+    "ops-agent": "home-ops-agent",
+    "home-datacenter-ops-agent": "home-ops-agent",
+
+    "1panel-openresty-wudu": "openresty",
+    "1panel-openresty": "openresty",
+    "openresty": "openresty",
+    "nginx-proxy": "openresty",
+    "1pwaf": "openresty",
+    "waf": "openresty",
+    "openresty-waf": "openresty",
+    "home-gateway": "openresty",
+    "gateway": "openresty",
+    "home-datacenter-gateway": "openresty",
+}
+
+CANONICAL_TO_DOCKER_CONTAINER = {
+    "frigate": "home-frigate",
+    "mosquitto": "home-mosquitto",
+    "home-api": "home-api",
+    "home-web": "home-web",
+    "home-vision": "home-vision",
+    "openresty": "1Panel-openresty-WuDU",
+    "home-cloudflared": "home-cloudflared",
+    "home-h3c-keepalive": "home-h3c-keepalive",
+    "home-ops-agent": "home-ops-agent",
+}
+
+def resolve_canonical_component(name: str) -> str:
+    cleaned = (name or "").strip().lower().lstrip("/")
+    if "(" in cleaned:
+        cleaned = cleaned.split("(")[0].strip()
+    return CANONICAL_COMPONENT_MAP.get(cleaned, cleaned)
+
+def resolve_docker_container_name(canonical: str) -> str:
+    cleaned = resolve_canonical_component(canonical).strip().lower()
+    return CANONICAL_TO_DOCKER_CONTAINER.get(cleaned, canonical)
+
+def open_readonly_sqlite(db_path: str) -> sqlite3.Connection:
+    """
+    Opens a SQLite database strictly in read-only mode (URI mode=ro).
+    Will NEVER create the database file if it does not exist.
+    Raises FileNotFoundError if file is missing or not a file.
+    """
+    if not db_path or not os.path.isfile(db_path):
+        raise FileNotFoundError(f"SQLite database file not found or is not a file: {db_path}")
+    import pathlib
+    posix_path = pathlib.Path(os.path.abspath(db_path)).as_posix()
+    uri = f"file:{posix_path}?mode=ro"
+    return sqlite3.connect(uri, uri=True, timeout=2.0)
+
+def parse_sqlite_timestamp(val: Any) -> Tuple[Optional[float], bool]:
+    """
+    Parses datetime values stored in SQLite by GORM / pure-Go SQLite / Python.
+    Returns (timestamp_epoch, is_valid).
+    If val is None or empty string -> (None, True) (represents no expiration).
+    If val is a valid timestamp -> (timestamp_float, True).
+    If val is malformed/unparseable -> (None, False).
+    """
+    if val is None:
+        return None, True
+    if isinstance(val, (int, float)):
+        return float(val), True
+    if isinstance(val, str):
+        s = val.strip()
+        if not s:
+            return None, True
+        try:
+            return float(s), True
+        except ValueError:
+            pass
+        from datetime import datetime, timezone
+        try:
+            dt = datetime.fromisoformat(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp(), True
+        except (ValueError, TypeError):
+            pass
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+            "%Y-%m-%dT%H:%M:%S.%f",
+        ):
+            try:
+                dt = datetime.strptime(s[:26], fmt).replace(tzinfo=timezone.utc)
+                return dt.timestamp(), True
+            except (ValueError, TypeError):
+                continue
+        return None, False
+    return None, False
 
 try:
     import paho.mqtt.client as paho_mqtt
@@ -37,12 +192,13 @@ except ImportError:
 # Hardcoded emergency container whitelist for local autonomous recovery when Go Core is offline
 EMERGENCY_RESTART_WHITELIST = frozenset({
     "home-api", "home-web", "home-vision", "home-frigate",
-    "1Panel-openresty-WuDU", "1panel-openresty-wudu"
+    "1Panel-openresty-WuDU", "1panel-openresty-wudu",
+    "api", "web", "vision", "frigate", "openresty"
 })
 
 # Forbidden components that must NEVER be restarted offline without Go Core coordination
 OFFLINE_FORBIDDEN_COMPONENTS = frozenset({
-    "app.db", "mosquitto", "home-mosquitto", "database", "sqlite"
+    "app.db", "mosquitto", "home-mosquitto", "database", "sqlite", "db", "mqtt"
 })
 
 from config import OpsAgentConfig
@@ -436,7 +592,10 @@ class HomeOpsAgent:
                 logger.debug(f"Docker event processing error: {e}")
 
     async def _handle_offline_emergency_restart(self, container_name: str, exit_code: int, sock_path: str) -> bool:
-        """Controlled 5-guard offline emergency recovery mode."""
+        """
+        Controlled 5-guard offline emergency recovery mode with fail-closed semantics.
+        All safety checks must be explicitly confirmed safe. Any UNKNOWN or failure halts restart.
+        """
         # Guard 1: Validate EMERGENCY_OVERRIDE_TOKEN (must be >= 16 chars, fail-secure if missing or weak)
         override_token = os.environ.get("EMERGENCY_OVERRIDE_TOKEN", "").strip()
         if not override_token or len(override_token) < 16 or override_token.lower() in WEAK_SECRETS_BLACKLIST:
@@ -446,184 +605,305 @@ class HomeOpsAgent:
             )
             return False
 
+        canonical = resolve_canonical_component(container_name)
+
         # Guard 2a: Forbidden component check (core storage / database forbidden from offline autonomous restart)
-        if container_name in OFFLINE_FORBIDDEN_COMPONENTS:
+        if container_name in OFFLINE_FORBIDDEN_COMPONENTS or canonical in OFFLINE_FORBIDDEN_COMPONENTS:
             logger.critical(
-                f"[Emergency Autonomy Blocked] Container {container_name} is in OFFLINE_FORBIDDEN_COMPONENTS. Refusing offline restart."
+                f"[Emergency Autonomy Blocked] Container {container_name} ({canonical}) is in OFFLINE_FORBIDDEN_COMPONENTS. Refusing offline restart."
             )
             return False
 
         # Guard 2b: Restrict to container whitelist
-        if container_name not in EMERGENCY_RESTART_WHITELIST:
+        if container_name not in EMERGENCY_RESTART_WHITELIST and canonical not in EMERGENCY_RESTART_WHITELIST:
             logger.warning(
-                f"[Emergency Autonomy Blocked] Container {container_name} is NOT in EMERGENCY_RESTART_WHITELIST. Refusing restart."
+                f"[Emergency Autonomy Blocked] Container {container_name} ({canonical}) is NOT in EMERGENCY_RESTART_WHITELIST. Refusing restart."
             )
             return False
 
         db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
 
         # Guard 2c: Maintenance Lock Verification (Fail-Closed)
-        if self._is_maintenance_locked_offline(db_path):
+        lock_state = self._is_maintenance_locked_offline(db_path, container_name)
+        if lock_state == MaintenanceLockState.LOCKED:
             logger.critical(
                 f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
                 f"System maintenance lock is ACTIVE in local DB."
             )
             return False
+        elif lock_state == MaintenanceLockState.UNKNOWN:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
+                f"Maintenance lock state is UNKNOWN (DB missing, unreadable, or schema invalid). Fail-Closed."
+            )
+            return False
+        elif lock_state != MaintenanceLockState.UNLOCKED:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
+                f"Unexpected maintenance lock state {lock_state}. Fail-Closed."
+            )
+            return False
 
         # Guard 2d: Circuit Breaker State Verification (Fail-Closed)
-        if self._is_circuit_open_offline(container_name, db_path):
+        cb_state = self._is_circuit_open_offline(container_name, db_path)
+        if cb_state == CircuitBreakerState.OPEN:
             logger.critical(
                 f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
                 f"Container circuit breaker is OPEN in local DB."
             )
             return False
-
-        # Guard 3: Action scope strictly limited to container restart (enforced via _restart_docker_container)
-
-        # Guard 4: Persistent cooldown and circuit breaker (<= 2 restarts in 60s, <= 3 crashes in 10m)
-        now = time.time()
-        timestamps = self._local_restarts.setdefault(container_name, [])
-        timestamps = [t for t in timestamps if now - t < 600.0]  # 10 minute window
-        self._local_restarts[container_name] = timestamps
-
-        short_window = [t for t in timestamps if now - t < 60.0]  # 60 second window
-        persisted_short = self._get_persisted_restart_count(container_name, 60.0, db_path)
-        persisted_long = self._get_persisted_restart_count(container_name, 600.0, db_path)
-
-        if len(short_window) >= 2 or persisted_short >= 2:
-            logger.error(
-                f"[Emergency Autonomy Breaker] Tripped for {container_name}: {max(len(short_window), persisted_short)} restarts in 60s. Halted."
-            )
-            return False
-
-        if len(timestamps) >= 3 or persisted_long >= 3:
+        elif cb_state == CircuitBreakerState.HALF_OPEN:
             logger.critical(
-                f"[Emergency Autonomy Breaker] 10-minute circuit tripped for {container_name}: {max(len(timestamps), persisted_long)} crashes. Halted."
+                f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
+                f"Container circuit breaker is HALF_OPEN. Offline emergency agent forbidden to probe HALF_OPEN."
+            )
+            return False
+        elif cb_state == CircuitBreakerState.UNKNOWN:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
+                f"Container circuit breaker state is UNKNOWN (DB error or schema invalid). Fail-Closed."
+            )
+            return False
+        elif cb_state != CircuitBreakerState.CLOSED:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Refusing offline restart for {container_name}: "
+                f"Unexpected circuit breaker state {cb_state}. Fail-Closed."
             )
             return False
 
-        # Guard 5: Local SQLite persistence in offline_restart_history and offline_ops_audit
-        self._record_persisted_restart(container_name, db_path)
-        timestamps.append(now)
-        logger.warning(
-            f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
-            f"(attempt {len(timestamps)} in 10m window)"
-        )
-        success = await self._restart_docker_container(container_name, sock_path)
-        if success:
-            health_ok = await self._verify_container_health(container_name, sock_path)
-            if not health_ok:
-                logger.error(f"[Emergency Recovery Failed] Post-restart health check failed for {container_name}.")
-                success = False
-
-        self._record_offline_audit(container_name, "emergency_restart", exit_code, success)
-        return success
-
-    def _is_maintenance_locked_offline(self, db_path: str) -> bool:
-        """Checks if system maintenance lock is active in local SQLite."""
-        if not os.path.exists(db_path):
+        # Guard 2e: Dual-Path Execution Lease Mutual Exclusion (R13)
+        lease_acquired, lease_token = self._acquire_recovery_lease(canonical, db_path)
+        if not lease_acquired:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Unable to acquire recovery lease for {canonical}. "
+                f"Lease held by another path or DB error. Halting offline restart."
+            )
             return False
+
+        try:
+            # Guard 4: Persistent cooldown and circuit breaker (<= 2 restarts in 60s, <= 3 crashes in 10m)
+            now = time.time()
+            timestamps = self._local_restarts.setdefault(container_name, [])
+            timestamps = [t for t in timestamps if now - t < 600.0]  # 10 minute window
+            self._local_restarts[container_name] = timestamps
+
+            short_window = [t for t in timestamps if now - t < 60.0]  # 60 second window
+            persisted_short = self._get_persisted_restart_count(container_name, 60.0, db_path)
+            persisted_long = self._get_persisted_restart_count(container_name, 600.0, db_path)
+
+            if persisted_short is None or persisted_long is None:
+                logger.critical(
+                    f"[Emergency Autonomy Blocked] Persisted restart count is UNKNOWN (query error). Halting restart."
+                )
+                return False
+
+            if len(short_window) >= 2 or persisted_short >= 2:
+                logger.error(
+                    f"[Emergency Autonomy Breaker] Tripped for {container_name}: {max(len(short_window), persisted_short)} restarts in 60s. Halted."
+                )
+                return False
+
+            if len(timestamps) >= 3 or persisted_long >= 3:
+                logger.critical(
+                    f"[Emergency Autonomy Breaker] 10-minute circuit tripped for {container_name}: {max(len(timestamps), persisted_long)} crashes. Halted."
+                )
+                return False
+
+            # Guard 5: Local SQLite persistence in offline_restart_history
+            rec_ok = self._record_persisted_restart(container_name, db_path)
+            if not rec_ok:
+                logger.critical(
+                    f"[Emergency Autonomy Blocked] Failed to write persisted restart record for {container_name}. Halting restart."
+                )
+                return False
+
+            timestamps.append(now)
+            logger.warning(
+                f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
+                f"(attempt {len(timestamps)} in 10m window)"
+            )
+            docker_container = resolve_docker_container_name(canonical)
+            success = await self._restart_docker_container(docker_container, sock_path)
+            if success:
+                health_state = await self._verify_container_health(docker_container, sock_path)
+                if health_state != DockerHealthState.HEALTHY:
+                    logger.error(f"[Emergency Recovery Failed] Post-restart health check returned {health_state} for {container_name}.")
+                    success = False
+
+            self._record_offline_audit(container_name, "emergency_restart", exit_code, success)
+            return success
+        finally:
+            self._release_recovery_lease(canonical, lease_token, db_path)
+
+    def _is_maintenance_locked_offline(self, db_path: str, container_name: Optional[str] = None) -> MaintenanceLockState:
+        """
+        Checks if system or component maintenance lock is active in local SQLite.
+        Returns MaintenanceLockState: LOCKED, UNLOCKED, or UNKNOWN.
+        Fails closed: missing DB, corrupted DB, missing table, incomplete columns -> UNKNOWN.
+        """
+        if not db_path or not os.path.isfile(db_path):
+            logger.error(f"[Fail-Closed] SQLite database file missing at {db_path}. Maintenance lock state UNKNOWN.")
+            return MaintenanceLockState.UNKNOWN
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = open_readonly_sqlite(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_maintenance_locks'")
             if not cursor.fetchone():
-                return False
+                logger.error(f"[Fail-Closed] Table ops_maintenance_locks missing in {db_path}. State UNKNOWN.")
+                return MaintenanceLockState.UNKNOWN
             cursor.execute("PRAGMA table_info(ops_maintenance_locks)")
-            cols = [col[1] for col in cursor.fetchall()]
+            cols = {col[1] for col in cursor.fetchall()}
             active_col = "active" if "active" in cols else ("locked" if "locked" in cols else "")
-            if not active_col:
-                return False
-            cursor.execute(f"SELECT {active_col}, expires_at FROM ops_maintenance_locks ORDER BY id DESC LIMIT 1")
+            if not active_col or "expires_at" not in cols:
+                logger.error(f"[Fail-Closed] Table ops_maintenance_locks missing required columns. State UNKNOWN.")
+                return MaintenanceLockState.UNKNOWN
+
+            has_component = "component" in cols or "target_component" in cols
+            comp_col = "component" if "component" in cols else ("target_component" if "target_component" in cols else "")
+
+            if has_component and container_name:
+                canonical = resolve_canonical_component(container_name)
+                cursor.execute(
+                    f"SELECT {active_col}, expires_at FROM ops_maintenance_locks "
+                    f"WHERE {comp_col} IS NULL OR {comp_col} = '' OR {comp_col} = '*' "
+                    f"OR {comp_col} = ? OR {comp_col} = ? ORDER BY id DESC LIMIT 1",
+                    (canonical, container_name)
+                )
+            else:
+                cursor.execute(f"SELECT {active_col}, expires_at FROM ops_maintenance_locks ORDER BY id DESC LIMIT 1")
+
             row = cursor.fetchone()
-            if row and row[0]:
-                expires_at_str = row[1]
-                if expires_at_str:
-                    try:
-                        exp_time = time.strptime(expires_at_str[:19], "%Y-%m-%dT%H:%M:%S")
-                        if time.mktime(exp_time) > time.time():
-                            return True
-                    except Exception:
-                        return bool(row[0])
-                else:
-                    return bool(row[0])
-            return False
+            if not row:
+                return MaintenanceLockState.UNLOCKED
+
+            is_active = bool(row[0])
+            if not is_active:
+                return MaintenanceLockState.UNLOCKED
+
+            expires_at_raw = row[1]
+            exp_time, is_valid = parse_sqlite_timestamp(expires_at_raw)
+            if not is_valid:
+                logger.critical(f"[Fail-Closed] Malformed expires_at timestamp: '{expires_at_raw}'. State UNKNOWN.")
+                return MaintenanceLockState.UNKNOWN
+
+            if exp_time is None:
+                return MaintenanceLockState.LOCKED
+
+            if exp_time > time.time():
+                return MaintenanceLockState.LOCKED
+
+            return MaintenanceLockState.UNLOCKED
         except Exception as e:
-            logger.debug(f"Failed to check offline maintenance lock: {e}")
-            return False
+            logger.error(f"[Fail-Closed] Error querying offline maintenance lock: {e}. State UNKNOWN.")
+            return MaintenanceLockState.UNKNOWN
         finally:
             if conn:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-    def _is_circuit_open_offline(self, container_name: str, db_path: str) -> bool:
-        """Checks if container circuit breaker is OPEN in local SQLite."""
-        if not os.path.exists(db_path):
-            return False
+    def _is_circuit_open_offline(self, container_name: str, db_path: str) -> CircuitBreakerState:
+        """
+        Checks if container circuit breaker is OPEN, HALF_OPEN, or CLOSED in local SQLite.
+        Returns CircuitBreakerState: OPEN, HALF_OPEN, CLOSED, or UNKNOWN.
+        Fails closed: missing DB, corrupted DB, missing table, incomplete columns -> UNKNOWN.
+        """
+        if not db_path or not os.path.isfile(db_path):
+            logger.error(f"[Fail-Closed] SQLite database file missing at {db_path}. Circuit breaker state UNKNOWN.")
+            return CircuitBreakerState.UNKNOWN
+        canonical = resolve_canonical_component(container_name)
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = open_readonly_sqlite(db_path)
             cursor = conn.cursor()
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_circuit_breaker_states'")
             if not cursor.fetchone():
-                return False
+                logger.error(f"[Fail-Closed] Table ops_circuit_breaker_states missing in {db_path}. State UNKNOWN.")
+                return CircuitBreakerState.UNKNOWN
             cursor.execute("PRAGMA table_info(ops_circuit_breaker_states)")
-            cols = [col[1] for col in cursor.fetchall()]
+            cols = {col[1] for col in cursor.fetchall()}
             container_col = "container" if "container" in cols else ("container_name" if "container_name" in cols else "")
-            if not container_col:
-                return False
-            cursor.execute(f"SELECT state FROM ops_circuit_breaker_states WHERE {container_col} = ? LIMIT 1", (container_name,))
+            if not container_col or "state" not in cols:
+                logger.error(f"[Fail-Closed] Table ops_circuit_breaker_states schema incomplete. State UNKNOWN.")
+                return CircuitBreakerState.UNKNOWN
+
+            cursor.execute(
+                f"SELECT state FROM ops_circuit_breaker_states WHERE {container_col} = ? OR {container_col} = ? LIMIT 1",
+                (canonical, container_name)
+            )
             row = cursor.fetchone()
-            if row and str(row[0]).upper() == "OPEN":
-                return True
-            return False
+            if not row:
+                return CircuitBreakerState.CLOSED
+
+            state_str = str(row[0]).strip().upper()
+            if state_str == "OPEN":
+                return CircuitBreakerState.OPEN
+            elif state_str == "HALF_OPEN":
+                return CircuitBreakerState.HALF_OPEN
+            elif state_str == "CLOSED":
+                return CircuitBreakerState.CLOSED
+            else:
+                logger.error(f"[Fail-Closed] Unrecognized circuit breaker state '{state_str}'. State UNKNOWN.")
+                return CircuitBreakerState.UNKNOWN
         except Exception as e:
-            logger.debug(f"Failed to check offline circuit breaker: {e}")
-            return False
+            logger.error(f"[Fail-Closed] Error querying offline circuit breaker: {e}. State UNKNOWN.")
+            return CircuitBreakerState.UNKNOWN
         finally:
             if conn:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-    def _get_persisted_restart_count(self, container_name: str, window_seconds: float, db_path: str) -> int:
-        """Returns number of restarts recorded in SQLite within window_seconds."""
-        if not db_path:
-            return 0
+    def _get_persisted_restart_count(self, container_name: str, window_seconds: float, db_path: str) -> Optional[int]:
+        """
+        Returns number of restarts recorded in SQLite within window_seconds.
+        Returns None if DB is missing, corrupted, or query fails (Fail-Closed).
+        DO NOT auto-create empty DB file.
+        """
+        if not db_path or not os.path.isfile(db_path):
+            logger.error(f"[Fail-Closed] DB file missing at {db_path}. Persisted restart count UNKNOWN.")
+            return None
+        canonical = resolve_canonical_component(container_name)
         conn = None
         try:
-            parent_dir = os.path.dirname(os.path.abspath(db_path))
-            if parent_dir:
-                os.makedirs(parent_dir, exist_ok=True)
-            conn = sqlite3.connect(db_path)
-            with conn:
-                conn.execute("""
-                    CREATE TABLE IF NOT EXISTS offline_restart_history (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        container_name TEXT NOT NULL,
-                        restart_time REAL NOT NULL
-                    )
-                """)
-                cutoff = time.time() - window_seconds
-                cursor = conn.cursor()
-                cursor.execute(
-                    "SELECT COUNT(*) FROM offline_restart_history WHERE container_name = ? AND restart_time >= ?",
-                    (container_name, cutoff)
-                )
-                row = cursor.fetchone()
-                return row[0] if row else 0
+            conn = open_readonly_sqlite(db_path)
+            cursor = conn.cursor()
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_restart_history'")
+            if not cursor.fetchone():
+                return 0
+            cutoff = time.time() - window_seconds
+            cursor.execute(
+                "SELECT COUNT(*) FROM offline_restart_history WHERE (container_name = ? OR container_name = ?) AND restart_time >= ?",
+                (canonical, container_name, cutoff)
+            )
+            row = cursor.fetchone()
+            return row[0] if row else 0
         except Exception as e:
-            logger.debug(f"Failed to query offline_restart_history: {e}")
-            return 0
+            logger.error(f"[Fail-Closed] Failed to query offline_restart_history: {e}")
+            return None
         finally:
             if conn:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-    def _record_persisted_restart(self, container_name: str, db_path: str) -> None:
-        """Records restart timestamp into SQLite offline_restart_history."""
-        if not db_path:
-            return
+    def _record_persisted_restart(self, container_name: str, db_path: str) -> bool:
+        """
+        Records restart timestamp into SQLite offline_restart_history.
+        Returns True on success, False on failure.
+        DO NOT auto-create empty DB file if db_path does not exist.
+        """
+        if not db_path or not os.path.isfile(db_path):
+            logger.error(f"[Fail-Closed] Cannot record restart: DB file {db_path} does not exist.")
+            return False
+        canonical = resolve_canonical_component(container_name)
         conn = None
         try:
-            conn = sqlite3.connect(db_path)
+            conn = sqlite3.connect(db_path, timeout=5.0)
             with conn:
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS offline_restart_history (
@@ -634,20 +914,140 @@ class HomeOpsAgent:
                 """)
                 conn.execute(
                     "INSERT INTO offline_restart_history (container_name, restart_time) VALUES (?, ?)",
-                    (container_name, time.time())
+                    (canonical, time.time())
                 )
+            return True
         except Exception as e:
-            logger.debug(f"Failed to record offline restart timestamp: {e}")
+            logger.error(f"[Fail-Closed] Failed to record offline restart timestamp: {e}")
+            return False
         finally:
             if conn:
-                conn.close()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
-    async def _verify_container_health(self, container_name: str, sock_path: str) -> bool:
-        """Inspects container state via Docker socket to verify it is running and healthy."""
-        if not os.path.exists(sock_path):
-            return True
+    def _acquire_recovery_lease(self, component: str, db_path: str, lease_duration: float = 30.0) -> Tuple[bool, str]:
+        """
+        Attempts to atomically acquire an exclusive persistent recovery lease in SQLite.
+        Prevents dual-path race conditions between Go Core and Python Offline Emergency.
+        Returns (acquired: bool, lease_token: str).
+        """
+        if not db_path or not os.path.isfile(db_path):
+            return False, ""
+        canonical = resolve_canonical_component(component)
+        token = f"py-{uuid.uuid4()}"
+        now_epoch = time.time()
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch))
+        exp_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now_epoch + lease_duration))
+        conn = None
         try:
-            reader, writer = await asyncio.open_unix_connection(sock_path)
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            with conn:
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS ops_recovery_leases (
+                        component TEXT PRIMARY KEY,
+                        holder TEXT NOT NULL,
+                        lease_token TEXT NOT NULL,
+                        acquired_at DATETIME NOT NULL,
+                        expires_at DATETIME NOT NULL
+                    )
+                """)
+                cursor = conn.cursor()
+                cursor.execute("SELECT holder, expires_at FROM ops_recovery_leases WHERE component = ?", (canonical,))
+                row = cursor.fetchone()
+                if row:
+                    holder, exp_raw = row[0], row[1]
+                    exp_ts, valid = parse_sqlite_timestamp(exp_raw)
+                    if not valid or (exp_ts is not None and exp_ts > now_epoch and holder != "python-offline"):
+                        logger.warning(f"[Lease Conflict] Recovery lease for {canonical} held by '{holder}' until {exp_raw}.")
+                        return False, ""
+                    cursor.execute("""
+                        UPDATE ops_recovery_leases
+                        SET holder = 'python-offline', lease_token = ?, acquired_at = ?, expires_at = ?
+                        WHERE component = ? AND (holder = 'python-offline' OR expires_at = ?)
+                    """, (token, now_iso, exp_iso, canonical, exp_raw))
+                    if cursor.rowcount == 0:
+                        return False, ""
+                    return True, token
+                else:
+                    try:
+                        conn.execute("""
+                            INSERT INTO ops_recovery_leases (component, holder, lease_token, acquired_at, expires_at)
+                            VALUES (?, 'python-offline', ?, ?, ?)
+                        """, (canonical, token, now_iso, exp_iso))
+                        return True, token
+                    except sqlite3.IntegrityError:
+                        return False, ""
+        except Exception as e:
+            logger.error(f"[Fail-Closed] Failed to acquire recovery lease for {canonical}: {e}")
+            return False, ""
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _release_recovery_lease(self, component: str, lease_token: str, db_path: str) -> bool:
+        """Releases recovery lease held by this agent. Returns True if released, False otherwise."""
+        if not db_path or not lease_token or not os.path.isfile(db_path):
+            return False
+        canonical = resolve_canonical_component(component)
+        conn = None
+        try:
+            conn = sqlite3.connect(db_path, timeout=5.0)
+            with conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "DELETE FROM ops_recovery_leases WHERE component = ? AND lease_token = ?",
+                    (canonical, lease_token)
+                )
+                return cursor.rowcount > 0
+        except Exception as e:
+            logger.debug(f"Failed to release recovery lease for {canonical}: {e}")
+            return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    async def _connect_docker(self, sock_path: str) -> Tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """Connects to Docker socket via Unix domain socket or TCP endpoint."""
+        if not sock_path:
+            raise FileNotFoundError("Docker socket path is empty")
+        if sock_path.startswith("tcp://"):
+            host_port = sock_path[6:]
+            host, port = host_port.split(":")
+            return await asyncio.open_connection(host, int(port))
+        elif ":" in sock_path and not os.path.exists(sock_path):
+            parts = sock_path.split(":")
+            return await asyncio.open_connection(parts[0], int(parts[1]))
+        else:
+            if not os.path.exists(sock_path):
+                raise FileNotFoundError(f"Docker socket not found: {sock_path}")
+            if hasattr(asyncio, "open_unix_connection"):
+                return await asyncio.open_unix_connection(sock_path)
+            if hasattr(socket, "AF_UNIX"):
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                s.connect(sock_path)
+                return await asyncio.open_connection(sock=s)
+            raise OSError(f"Unix sockets unsupported on {sys.platform}")
+
+    async def _query_docker_inspect(self, container_name: str, sock_path: str) -> Tuple[DockerHealthState, Optional[Dict[str, Any]]]:
+        """Queries Docker /containers/{container_name}/json and returns (health_state, inspect_data)."""
+        try:
+            reader, writer = await self._connect_docker(sock_path)
+        except FileNotFoundError:
+            logger.error(f"[Fail-Closed] Docker socket not found: {sock_path}")
+            return DockerHealthState.UNKNOWN, None
+        except Exception as e:
+            logger.error(f"[Fail-Closed] Docker socket connection error: {e}")
+            return DockerHealthState.UNKNOWN, None
+
+        try:
             req = (
                 f"GET /containers/{container_name}/json HTTP/1.1\r\n"
                 f"Host: docker\r\n"
@@ -656,23 +1056,145 @@ class HomeOpsAgent:
             ).encode("utf-8")
             writer.write(req)
             await writer.drain()
-            resp = await reader.read(4096)
+
+            raw_chunks = []
+            while True:
+                chunk = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+                if not chunk:
+                    break
+                raw_chunks.append(chunk)
             writer.close()
             await writer.wait_closed()
-            if b"200 OK" not in resp:
-                return False
-            parts = resp.split(b"\r\n\r\n", 1)
-            if len(parts) > 1:
-                data = json.loads(parts[1].decode("utf-8", errors="ignore"))
-                state = data.get("State", {})
-                running = state.get("Running", False)
-                health = state.get("Health", {}).get("Status", "")
-                if running and health != "unhealthy":
-                    return True
-            return False
+            resp = b"".join(raw_chunks)
         except Exception as e:
-            logger.debug(f"Container health check error: {e}")
+            logger.error(f"[Fail-Closed] Error reading Docker inspect response: {e}")
+            return DockerHealthState.UNKNOWN, None
+
+        if not resp:
+            return DockerHealthState.UNKNOWN, None
+
+        parts = resp.split(b"\r\n\r\n", 1)
+        header_block = parts[0]
+        body = parts[1] if len(parts) > 1 else b""
+
+        status_line = header_block.split(b"\r\n", 1)[0].decode("utf-8", errors="ignore")
+        if not (status_line.startswith("HTTP/1.1 200") or status_line.startswith("HTTP/1.0 200")):
+            logger.error(f"[Fail-Closed] Docker inspect returned non-200 status: {status_line}")
+            if "404" in status_line:
+                return DockerHealthState.UNHEALTHY, None
+            return DockerHealthState.UNKNOWN, None
+
+        if not body:
+            logger.error("[Fail-Closed] Docker inspect returned empty body.")
+            return DockerHealthState.UNKNOWN, None
+
+        try:
+            data = json.loads(body.decode("utf-8", errors="ignore"))
+            return DockerHealthState.HEALTHY, data
+        except Exception as e:
+            logger.error(f"[Fail-Closed] Docker inspect JSON decode error: {e}")
+            return DockerHealthState.UNKNOWN, None
+
+    async def _check_service_readiness(self, canonical: str, container_name: str = "") -> bool:
+        """
+        Executes independent TCP/HTTP readiness probes for services without Docker HEALTHCHECK.
+        """
+        if hasattr(self, "_readiness_probe_override") and callable(self._readiness_probe_override):
+            return await self._readiness_probe_override(canonical)
+
+        probe_host = os.environ.get("PROBE_HOST", "127.0.0.1")
+
+        async def probe_tcp(host: str, port: int, timeout: float = 2.0) -> bool:
+            try:
+                _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except Exception:
+                return False
+
+        async def probe_http(host: str, port: int, path: str = "/", timeout: float = 2.0) -> bool:
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+                req = f"GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: home-ops-agent-probe\r\nConnection: close\r\n\r\n".encode("utf-8")
+                writer.write(req)
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.read(1024), timeout=timeout)
+                writer.close()
+                await writer.wait_closed()
+                return (
+                    b"200 OK" in resp or b"HTTP/1.1 200" in resp or b"HTTP/1.0 200" in resp or
+                    b"HTTP/1.1 204" in resp or b"HTTP/1.1 3" in resp
+                )
+            except Exception:
+                return False
+
+        if canonical == "mosquitto":
+            return await probe_tcp(probe_host, 1883)
+        elif canonical == "frigate":
+            ok = await probe_http(probe_host, 5000, "/")
+            if not ok:
+                ok = await probe_http(probe_host, 1984, "/")
+            return ok
+        elif canonical == "home-api":
+            return await probe_http(probe_host, 8080, "/health")
+        elif canonical == "home-web":
+            ok = await probe_http(probe_host, 80, "/")
+            if not ok:
+                ok = await probe_http(probe_host, 5173, "/")
+            return ok
+        elif canonical == "home-vision":
+            return await probe_http(probe_host, 8090, "/health")
+        elif canonical == "openresty":
+            return await probe_tcp(probe_host, 80)
+        else:
+            logger.warning(f"No independent readiness probe defined for component '{canonical}'.")
             return False
+
+    async def _verify_container_health(self, container_name: str, sock_path: str) -> DockerHealthState:
+        """
+        Inspects container state via Docker socket to verify it is running and healthy.
+        Distinguishes HEALTHY, UNHEALTHY, RUNNING_UNHEALTHCHECKED, and UNKNOWN.
+        For containers without HEALTHCHECK, executes independent service readiness probes.
+        """
+        if not sock_path or (not sock_path.startswith("tcp://") and ":" not in sock_path and not os.path.exists(sock_path)):
+            logger.error(f"[Fail-Closed] Docker socket missing at {sock_path}. Health state UNKNOWN.")
+            return DockerHealthState.UNKNOWN
+
+        inspect_status, data = await self._query_docker_inspect(container_name, sock_path)
+        if inspect_status != DockerHealthState.HEALTHY or not data:
+            return inspect_status
+
+        state = data.get("State", {})
+        if not state.get("Running", False):
+            logger.warning(f"Container {container_name} State.Running is False. State UNHEALTHY.")
+            return DockerHealthState.UNHEALTHY
+
+        health_obj = state.get("Health")
+        if health_obj is not None and isinstance(health_obj, dict):
+            status = str(health_obj.get("Status", "")).lower().strip()
+            if status == "healthy":
+                return DockerHealthState.HEALTHY
+            elif status == "unhealthy":
+                logger.warning(f"Container {container_name} Health.Status is unhealthy.")
+                return DockerHealthState.UNHEALTHY
+            elif status == "starting":
+                logger.warning(f"Container {container_name} Health.Status is starting. Not yet healthy.")
+                return DockerHealthState.UNHEALTHY
+            else:
+                logger.error(f"Container {container_name} Health.Status unrecognized: {status}.")
+                return DockerHealthState.UNKNOWN
+
+        # No HEALTHCHECK configured: classify as RUNNING_UNHEALTHCHECKED and run independent readiness probe
+        logger.info(f"Container {container_name} lacks Docker HEALTHCHECK (RUNNING_UNHEALTHCHECKED). Running readiness probe...")
+        canonical = resolve_canonical_component(container_name)
+        probe_ok = await self._check_service_readiness(canonical, container_name)
+        if probe_ok:
+            logger.info(f"Independent readiness probe for {canonical} passed. State HEALTHY.")
+            return DockerHealthState.HEALTHY
+        else:
+            logger.warning(f"Independent readiness probe for {canonical} failed. State UNHEALTHY.")
+            return DockerHealthState.UNHEALTHY
 
     def _record_offline_audit(self, container_name: str, action: str, exit_code: int, success: bool) -> str:
         """Persists offline emergency event into local SQLite offline_ops_audit table with unique UUID."""
@@ -837,14 +1359,15 @@ class HomeOpsAgent:
 
                     exec_status = str(resp_json.get("status", "")).upper()
                     decision = resp_json.get("decision", {})
-                    dec_action = str(decision.get("Action", "")).upper()
+                    dec_action = str(decision.get("Action") or decision.get("action") or "").upper()
+                    dec_reason = decision.get("Reason") or decision.get("reason") or resp_json.get("error") or ""
 
                     if exec_status == "RECOVERED":
                         return CoreReportingStatus.RECOVERED_BY_CORE, resp_json
                     elif exec_status in ("BLOCKED", "FAILED") or dec_action in ("BLOCKED", "IGNORE", "TRIPPED"):
                         logger.warning(
                             f"[Policy Guard] Go Core FSM evaluated {container_name}: "
-                            f"Status={exec_status}, Action={dec_action}, Reason={decision.get('Reason') or resp_json.get('error')}. Execution suppressed."
+                            f"Status={exec_status}, Action={dec_action}, Reason={dec_reason}. Execution suppressed."
                         )
                         return CoreReportingStatus.BLOCKED_BY_FSM, resp_json
                     elif dec_action == "RESTART":
@@ -925,7 +1448,7 @@ class HomeOpsAgent:
     async def _restart_docker_container(self, container_name: str, sock_path: str) -> bool:
         """Sends POST /containers/{name}/restart to Docker socket."""
         try:
-            reader, writer = await asyncio.open_unix_connection(sock_path)
+            reader, writer = await self._connect_docker(sock_path)
             req = (
                 f"POST /containers/{container_name}/restart?t=5 HTTP/1.1\r\n"
                 f"Host: docker\r\n"

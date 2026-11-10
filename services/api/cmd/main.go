@@ -587,12 +587,11 @@ func main() {
 		}
 	}))
 
-	// Trust Docker bridge and localhost only. LAN ranges (192.168.0.0/16, 10.0.0.0/8)
-	// are strictly NOT trusted as proxies to prevent clients from forging X-Forwarded-For to bypass IP guards.
-	if err := r.SetTrustedProxies([]string{
-		"127.0.0.1/32",  // Localhost (in-container proxy)
-		"172.16.0.0/12", // Docker bridge network
-	}); err != nil {
+	// Trust only controlled proxies (localhost and configured reverse proxy / Docker network).
+	// LAN ranges and broad Docker ranges (172.16.0.0/12) are strictly NOT trusted as proxies (R7.1)
+	// to prevent clients or unauthorized containers from forging X-Forwarded-For to bypass IP guards.
+	trustedProxies := GetConfiguredTrustedProxies()
+	if err := r.SetTrustedProxies(trustedProxies); err != nil {
 		log.Fatalf("failed to set trusted proxies: %v", err)
 	}
 
@@ -1241,4 +1240,25 @@ func pushRetentionWithRetry(days int, frigate *camera.FrigateClient) error {
 		}
 		return err
 	})
+}
+
+// GetConfiguredTrustedProxies resolves the tightened trusted proxy list (R7.1).
+func GetConfiguredTrustedProxies() []string {
+	if envProxies := os.Getenv("TRUSTED_PROXIES"); strings.TrimSpace(envProxies) != "" {
+		var res []string
+		for _, p := range strings.Split(envProxies, ",") {
+			clean := strings.TrimSpace(p)
+			if clean != "" {
+				res = append(res, clean)
+			}
+		}
+		if len(res) > 0 {
+			return res
+		}
+	}
+	return []string{
+		"127.0.0.1/32",
+		"::1/128",
+		"172.18.0.0/16", // Dedicated reverse proxy / compose bridge gateway, NOT broad 172.16.0.0/12
+	}
 }

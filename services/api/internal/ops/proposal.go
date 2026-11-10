@@ -24,6 +24,26 @@ type ApproveProposalRequest struct {
 	ScheduleTime string `json:"schedule_time"` // e.g. "03:00"
 }
 
+// ComputeApprovalDigest computes a deterministic SHA-256 digest over normalized canonical JSON of:
+// target_component, execution_action, canonical sorted parameters, baseline_hash, and version.
+func ComputeApprovalDigest(target string, action string, params interface{}, baseline string, version int) string {
+	var paramMap map[string]interface{}
+	switch v := params.(type) {
+	case map[string]interface{}:
+		paramMap = v
+	case string:
+		if strings.TrimSpace(v) != "" {
+			_ = json.Unmarshal([]byte(v), &paramMap)
+		}
+	}
+	return model.ComputeApprovalDigest(target, action, paramMap, baseline, version)
+}
+
+// ComputeProposalApprovalDigest extracts proposal attributes and generates the canonical approval digest.
+func ComputeProposalApprovalDigest(p *model.OpsProposal) (string, error) {
+	return model.ComputeProposalApprovalDigest(p)
+}
+
 // ListProposals lists pending system proposals.
 //
 //	Route: GET /api/v1/ops/proposals
@@ -101,9 +121,30 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 	if req.ProposalID == "" {
 		req.ProposalID = fmt.Sprintf("prop-%d", time.Now().UnixNano()/1e6)
 	}
-	if req.BaselineHash == "" && req.TargetComponent != "" {
-		req.BaselineHash = h.ComputeFingerprint(req.TargetComponent)
+	// BaselineHash Anti-Tampering (R5): Every proposal MUST have a valid non-empty baseline.
+	if req.TargetComponent != "" {
+		computed := h.ComputeFingerprint(req.TargetComponent)
+		if computed == "" {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   ErrEmptyBaseline.Error(),
+				"message": "failed to compute valid baseline state fingerprint; proposal creation rejected",
+			})
+			return
+		}
+		// Authoritative system baseline: overwrite any unverified caller baseline
+		req.BaselineHash = computed
 	}
+	if strings.TrimSpace(req.BaselineHash) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   ErrEmptyBaseline.Error(),
+			"message": "proposal requires a non-empty valid baseline hash",
+		})
+		return
+	}
+	if req.Version <= 0 {
+		req.Version = 1
+	}
+	req.ApprovalDigest = ""
 	req.CreatedAt = time.Now()
 
 	if err := h.db.Create(&req).Error; err != nil {
@@ -187,17 +228,22 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 	}
 
 	// Anti-TOCTOU BaselineHash Verification (Fail-Closed: calculation failure or drift strictly blocks approval)
-	if proposal.BaselineHash != "" {
-		currentHash := h.ComputeFingerprint(proposal.TargetComponent)
-		if currentHash == "" || currentHash != proposal.BaselineHash {
-			c.JSON(http.StatusConflict, gin.H{
-				"error":         "baseline hash mismatch: target state has drifted",
-				"message":       "目标资源状态在提案创建后已发生漂移或指纹提取失败 (TOCTOU)，请重新生成或确认提案",
-				"baseline_hash": proposal.BaselineHash,
-				"current_hash":  currentHash,
-			})
-			return
-		}
+	if strings.TrimSpace(proposal.BaselineHash) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   ErrEmptyBaseline.Error(),
+			"message": "提案未包含有效基线指纹 (BaselineHash)，无法审批",
+		})
+		return
+	}
+	currentHash := h.ComputeFingerprint(proposal.TargetComponent)
+	if currentHash == "" || currentHash != proposal.BaselineHash {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":         ErrBaselineMismatch.Error(),
+			"message":       "目标资源状态在提案创建后已发生漂移或指纹提取失败 (TOCTOU)，请重新生成或确认提案",
+			"baseline_hash": proposal.BaselineHash,
+			"current_hash":  currentHash,
+		})
+		return
 	}
 
 	var req ApproveProposalRequest
@@ -220,6 +266,19 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		proposal.ApprovedBy = operator
 		proposal.ApprovedAt = utils.NullTime{Time: now, Valid: true}
 	}
+
+	if proposal.Version <= 0 {
+		proposal.Version = 1
+	}
+
+	digest, err := ComputeProposalApprovalDigest(&proposal)
+	if err != nil || digest == "" {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Failed to compute proposal approval digest: " + err.Error(),
+		})
+		return
+	}
+	proposal.ApprovalDigest = digest
 
 	if err := h.db.Save(&proposal).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update proposal: " + err.Error()})
@@ -309,14 +368,15 @@ func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
 
 	res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
 	if err != nil {
-		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) {
+		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) || errors.Is(err, ErrEmptyBaseline) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":  err.Error(),
 				"status": proposal.Status,
 			})
 			return
 		}
-		if errors.Is(err, ErrProposalAlreadyRunning) || errors.Is(err, ErrProposalNotExecutable) {
+		if errors.Is(err, ErrProposalAlreadyRunning) || errors.Is(err, ErrProposalNotExecutable) ||
+			errors.Is(err, ErrApprovalDigestMismatch) || errors.Is(err, ErrBaselineMismatch) {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":  err.Error(),
 				"status": proposal.Status,
@@ -521,5 +581,89 @@ func (h *OpsHandler) ComputeFingerprint(component string) string {
 	}
 
 	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+}
+
+// InvalidateProposalApproval resets the approval status of a proposal when any bound field is modified.
+// It sets Status to PENDING, clears ApprovalDigest and approval metadata, and increments Version.
+func InvalidateProposalApproval(p *model.OpsProposal) {
+	if p == nil {
+		return
+	}
+	p.Status = model.ProposalStatusPending
+	p.ApprovalDigest = ""
+	p.ApprovedBy = ""
+	p.ApprovedAt = utils.NullTime{}
+	if p.Version <= 0 {
+		p.Version = 1
+	}
+	p.Version++
+}
+
+// UpdateProposal updates mutable proposal fields and invalidates previous approval if bound fields change.
+func (h *OpsHandler) UpdateProposal(c *gin.Context) {
+	id := strings.TrimSpace(c.Param("id"))
+	var proposal model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", id, id).First(&proposal).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	var updateReq struct {
+		Title           *string `json:"title"`
+		Description     *string `json:"description"`
+		TargetComponent *string `json:"target_component"`
+		ActionSpec      *string `json:"action_spec"`
+		ExecutionPlan   *string `json:"execution_plan"`
+		RollbackPlan    *string `json:"rollback_plan"`
+		RiskLevel       *string `json:"risk_level"`
+	}
+	if err := c.ShouldBindJSON(&updateReq); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request payload: " + err.Error()})
+		return
+	}
+
+	boundFieldChanged := false
+	if updateReq.TargetComponent != nil && *updateReq.TargetComponent != proposal.TargetComponent {
+		proposal.TargetComponent = *updateReq.TargetComponent
+		proposal.BaselineHash = h.ComputeFingerprint(proposal.TargetComponent)
+		boundFieldChanged = true
+	}
+	if updateReq.ActionSpec != nil && *updateReq.ActionSpec != proposal.ActionSpec {
+		proposal.ActionSpec = *updateReq.ActionSpec
+		boundFieldChanged = true
+	}
+	if updateReq.ExecutionPlan != nil && *updateReq.ExecutionPlan != proposal.ExecutionPlan {
+		proposal.ExecutionPlan = *updateReq.ExecutionPlan
+		boundFieldChanged = true
+	}
+	if updateReq.Title != nil {
+		proposal.Title = *updateReq.Title
+	}
+	if updateReq.Description != nil {
+		proposal.Description = *updateReq.Description
+	}
+	if updateReq.RollbackPlan != nil {
+		proposal.RollbackPlan = *updateReq.RollbackPlan
+	}
+	if updateReq.RiskLevel != nil {
+		proposal.RiskLevel = *updateReq.RiskLevel
+	}
+
+	if boundFieldChanged {
+		InvalidateProposalApproval(&proposal)
+	}
+
+	if err := h.db.Save(&proposal).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update proposal: " + err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, proposal)
 }
 

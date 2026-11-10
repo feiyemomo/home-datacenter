@@ -1,9 +1,14 @@
 package model
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
+
+	"gorm.io/gorm"
 
 	"home-datacenter-api/internal/utils"
 )
@@ -62,11 +67,174 @@ type OpsProposal struct {
 	ExecutionLog     string         `gorm:"type:text" json:"execution_log"`
 	BaselineHash     string         `gorm:"size:128" json:"baseline_hash"`
 	ActionSpec       string         `gorm:"type:text" json:"action_spec"`
+	ApprovalDigest   string         `gorm:"column:approval_digest;type:varchar(128)" json:"approval_digest,omitempty"`
+	Version          int            `gorm:"column:version;default:1" json:"version"`
 	CreatedAt        time.Time      `gorm:"not null" json:"created_at"`
 	UpdatedAt        time.Time      `json:"updated_at"`
 }
 
 func (OpsProposal) TableName() string { return "pending_proposals" }
+
+// CanonicalApprovalPayload is the normalized representation of proposal attributes
+// cryptographically bound upon administrator approval.
+type CanonicalApprovalPayload struct {
+	TargetComponent string                 `json:"target_component"`
+	ExecutionAction string                 `json:"execution_action"`
+	Parameters      map[string]interface{} `json:"parameters"`
+	BaselineHash    string                 `json:"baseline_hash"`
+	Version         int                    `json:"version"`
+}
+
+// CanonicalizeComponent normalizes component names and aliases.
+func CanonicalizeComponent(name string) string {
+	clean := strings.TrimSpace(name)
+	if idx := strings.Index(clean, "("); idx != -1 {
+		prefix := strings.TrimSpace(clean[:idx])
+		if prefix != "" {
+			clean = prefix
+		}
+	}
+	clean = strings.ToLower(clean)
+	switch clean {
+	case "home-frigate", "frigate", "nvr", "go2rtc":
+		return "frigate"
+	case "home-mosquitto", "mosquitto", "mqtt":
+		return "mosquitto"
+	case "home-api", "api", "backend", "go-api":
+		return "home-api"
+	case "home-web", "web", "frontend", "nginx":
+		return "home-web"
+	case "home-vision", "vision", "ai-vision":
+		return "home-vision"
+	case "openresty", "1panel-openresty", "nginx-proxy", "1panel-openresty-wudu":
+		return "openresty"
+	case "1pwaf", "waf", "openresty-waf":
+		return "1pwaf"
+	default:
+		return clean
+	}
+}
+
+// ComputeApprovalDigest computes a deterministic SHA-256 digest over normalized canonical JSON of:
+// target_component, execution_action, canonical sorted parameters, baseline_hash, and version.
+func ComputeApprovalDigest(target string, action string, params map[string]interface{}, baseline string, version int) string {
+	if params == nil {
+		params = make(map[string]interface{})
+	}
+	if version <= 0 {
+		version = 1
+	}
+	canonicalTarget := CanonicalizeComponent(target)
+	payload := CanonicalApprovalPayload{
+		TargetComponent: canonicalTarget,
+		ExecutionAction: strings.ToLower(strings.TrimSpace(action)),
+		Parameters:      params,
+		BaselineHash:    strings.TrimSpace(baseline),
+		Version:         version,
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("sha256:%x", sum)
+}
+
+// ComputeProposalApprovalDigest extracts proposal attributes and generates the canonical approval digest.
+func ComputeProposalApprovalDigest(p *OpsProposal) (string, error) {
+	if p == nil {
+		return "", errors.New("proposal is nil")
+	}
+	target := p.TargetComponent
+	action := ""
+	params := make(map[string]interface{})
+
+	if strings.TrimSpace(p.ActionSpec) != "" {
+		var spec struct {
+			Action       string                 `json:"action"`
+			Target       string                 `json:"target"`
+			Params       map[string]interface{} `json:"params"`
+			BaselineHash string                 `json:"baseline_hash"`
+		}
+		if err := json.Unmarshal([]byte(p.ActionSpec), &spec); err == nil {
+			if spec.Action != "" {
+				action = spec.Action
+			}
+			if target == "" && spec.Target != "" {
+				target = spec.Target
+			} else if target != "" && spec.Target != "" && CanonicalizeComponent(target) != CanonicalizeComponent(spec.Target) {
+				return "", fmt.Errorf("target component mismatch: proposal target '%s' does not match action_spec target '%s'", target, spec.Target)
+			}
+			if spec.Params != nil {
+				params = spec.Params
+			}
+		}
+	}
+
+	if action == "" {
+		planLower := strings.ToLower(p.ExecutionPlan)
+		switch {
+		case strings.Contains(planLower, "restart"):
+			action = "docker.restart"
+		case strings.Contains(planLower, "update") || strings.Contains(planLower, "recreate") || strings.Contains(planLower, "pull"):
+			action = "docker.recreate"
+		case strings.Contains(planLower, "create index"):
+			action = "db.create_index"
+		case strings.Contains(planLower, "drop index"):
+			action = "db.drop_index"
+		case strings.Contains(planLower, "reload"):
+			action = "waf.reload"
+		case strings.Contains(planLower, "cache") || strings.Contains(planLower, "purge"):
+			action = "cache.purge"
+		default:
+			action = strings.TrimSpace(p.ExecutionPlan)
+		}
+	}
+
+	version := p.Version
+	if version <= 0 {
+		version = 1
+	}
+
+	digest := ComputeApprovalDigest(target, action, params, p.BaselineHash, version)
+	if digest == "" {
+		return "", errors.New("failed to compute approval digest")
+	}
+	return digest, nil
+}
+
+// ComputeDefaultBaseline computes fallback baseline matching HostFallbackProvider.
+func ComputeDefaultBaseline(component string) string {
+	canonical := CanonicalizeComponent(component)
+	containerName := canonical
+	switch canonical {
+	case "frigate":
+		containerName = "home-frigate"
+	case "mosquitto":
+		containerName = "home-mosquitto"
+	}
+	hasher := sha256.New()
+	raw := fmt.Sprintf("%s:channels-tool/%s:latest:running:", canonical, containerName)
+	hasher.Write([]byte(raw))
+	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+}
+
+// BeforeCreate initializes version, fallback baseline, and approval digest for directly seeded proposals.
+func (p *OpsProposal) BeforeCreate(tx *gorm.DB) error {
+	if p.Version <= 0 {
+		p.Version = 1
+	}
+	if strings.TrimSpace(p.BaselineHash) == "" && strings.TrimSpace(p.TargetComponent) != "" {
+		p.BaselineHash = ComputeDefaultBaseline(p.TargetComponent)
+	}
+	if (p.Status == ProposalStatusApproved || p.Status == ProposalStatusScheduled) && strings.TrimSpace(p.ApprovalDigest) == "" {
+		if digest, err := ComputeProposalApprovalDigest(p); err == nil {
+			p.ApprovalDigest = digest
+		}
+	}
+	return nil
+}
+
 
 // MarshalJSON customizes JSON serialization so ID can map to proposal_id for frontend compatibility.
 func (p OpsProposal) MarshalJSON() ([]byte, error) {

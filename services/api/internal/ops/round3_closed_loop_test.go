@@ -209,7 +209,7 @@ func TestRound3_CircuitBreaker_PersistenceAndHalfOpen(t *testing.T) {
 	}
 
 	// Before cooldown: CanAttemptRecovery must return false
-	canRecover, err := cb2.CanAttemptRecovery("home-web")
+	canRecover, _, err := cb2.CanAttemptRecovery("home-web")
 	if canRecover || err == nil {
 		t.Fatalf("expected recovery to be blocked while circuit OPEN, got canRecover=%v, err=%v", canRecover, err)
 	}
@@ -218,13 +218,13 @@ func TestRound3_CircuitBreaker_PersistenceAndHalfOpen(t *testing.T) {
 	time.Sleep(120 * time.Millisecond)
 
 	// In HALF_OPEN: First probe allowed
-	canRecover, err = cb2.CanAttemptRecovery("home-web")
-	if !canRecover || err != nil {
-		t.Fatalf("expected first HALF_OPEN probe to be allowed, got canRecover=%v, err=%v", canRecover, err)
+	canRecover, ticket, err := cb2.CanAttemptRecovery("home-web")
+	if !canRecover || err != nil || ticket == nil {
+		t.Fatalf("expected first HALF_OPEN probe to be allowed with ticket, got canRecover=%v, err=%v", canRecover, err)
 	}
 
 	// Concurrency check: Second simultaneous probe must be BLOCKED (single in-flight probe token)
-	canRecover2, err2 := cb2.CanAttemptRecovery("home-web")
+	canRecover2, _, err2 := cb2.CanAttemptRecovery("home-web")
 	if canRecover2 || err2 == nil {
 		t.Fatalf("expected second simultaneous probe in HALF_OPEN to be blocked, got canRecover=%v", canRecover2)
 	}

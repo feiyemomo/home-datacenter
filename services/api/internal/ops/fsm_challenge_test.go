@@ -339,7 +339,7 @@ func TestChallenge_CircuitBreaker_ConcurrentStress(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				_ = cb.GetState(container)
 				_ = cb.GetCrashCount(container)
-				_, _ = cb.CanAttemptRecovery(container)
+				_, _, _ = cb.CanAttemptRecovery(container)
 			}
 		}()
 	}

@@ -3,6 +3,7 @@ package ops
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +32,8 @@ var (
 	ErrInvalidSpec               = errors.New("invalid operation spec")
 	ErrRollbackFailed            = errors.New("atomic rollback execution failed")
 	ErrBaselineMismatch          = errors.New("baseline hash mismatch: target state has drifted")
+	ErrEmptyBaseline             = errors.New("proposal baseline hash is empty or cannot be computed")
+	ErrApprovalDigestMismatch    = errors.New("approval digest mismatch: proposal was modified after approval")
 	ErrActionNotSupported        = errors.New("operation action not supported")
 	ErrShellMetacharacter        = errors.New("operation spec contains forbidden shell metacharacter")
 	ErrNotImplemented            = errors.New("operation not implemented or requires unsupported capabilities")
@@ -180,6 +183,7 @@ type DefaultOperationExecutor struct {
 	dockerRunner      func(ctx context.Context, action string, container string, params map[string]interface{}) (string, error)
 	baselineExtractor func(target string) string
 
+	leaseManager *RecoveryLeaseManager
 	componentLocks sync.Map // canonical string -> *sync.Mutex
 	mu             sync.RWMutex
 }
@@ -187,6 +191,20 @@ type DefaultOperationExecutor struct {
 func (e *DefaultOperationExecutor) getComponentLock(canonical string) *sync.Mutex {
 	val, _ := e.componentLocks.LoadOrStore(canonical, &sync.Mutex{})
 	return val.(*sync.Mutex)
+}
+
+// GetLeaseManager returns the persistent recovery lease manager.
+func (e *DefaultOperationExecutor) GetLeaseManager() *RecoveryLeaseManager {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.leaseManager
+}
+
+// SetLeaseManager sets the persistent recovery lease manager.
+func (e *DefaultOperationExecutor) SetLeaseManager(mgr *RecoveryLeaseManager) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.leaseManager = mgr
 }
 
 // ExecutorOption configures DefaultOperationExecutor behavior.
@@ -228,6 +246,12 @@ func WithBaselineExtractor(fn func(target string) string) ExecutorOption {
 	}
 }
 
+func WithLeaseManager(mgr *RecoveryLeaseManager) ExecutorOption {
+	return func(e *DefaultOperationExecutor) {
+		e.leaseManager = mgr
+	}
+}
+
 // NewOperationExecutor creates a new DefaultOperationExecutor.
 func NewOperationExecutor(
 	db *gorm.DB,
@@ -236,6 +260,9 @@ func NewOperationExecutor(
 	fallback *HostFallbackProvider,
 	opts ...ExecutorOption,
 ) *DefaultOperationExecutor {
+	if fallback == nil {
+		fallback = NewHostFallbackProvider("", "")
+	}
 	exec := &DefaultOperationExecutor{
 		db:            db,
 		bus:           bus,
@@ -245,8 +272,56 @@ func NewOperationExecutor(
 		probeTimeout:  15 * time.Second,
 		probeInterval: 1 * time.Second,
 	}
+	if db != nil {
+		exec.leaseManager = NewRecoveryLeaseManager(db)
+	}
 	for _, opt := range opts {
 		opt(exec)
+	}
+	if exec.baselineExtractor == nil {
+		exec.baselineExtractor = func(target string) string {
+			clean := strings.TrimSpace(target)
+			canonical, err := ResolveComponent(clean)
+			if err != nil {
+				canonical = strings.ToLower(clean)
+				if idx := strings.Index(canonical, "("); idx != -1 {
+					canonical = strings.TrimSpace(canonical[:idx])
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			var targetContainer *ContainerSummary
+			if exec.client != nil {
+				if containers, err := exec.client.ListContainers(ctx); err == nil {
+					for i := range containers {
+						cName := strings.TrimPrefix(containers[i].Name, "/")
+						if strings.EqualFold(cName, canonical) {
+							targetContainer = &containers[i]
+							break
+						}
+					}
+				}
+			}
+			if targetContainer == nil && exec.fallback != nil {
+				fallbackContainers := exec.fallback.GetHostContainers(ctx)
+				for i := range fallbackContainers {
+					cName := strings.TrimPrefix(fallbackContainers[i].Name, "/")
+					if strings.EqualFold(cName, canonical) {
+						targetContainer = &fallbackContainers[i]
+						break
+					}
+				}
+			}
+			hasher := sha256.New()
+			if targetContainer != nil {
+				raw := fmt.Sprintf("%s:%s:%s:%s", canonical, targetContainer.Image, targetContainer.State, targetContainer.CreatedAt)
+				hasher.Write([]byte(raw))
+			} else {
+				raw := fmt.Sprintf("%s:offline:none", canonical)
+				hasher.Write([]byte(raw))
+			}
+			return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+		}
 	}
 	return exec
 }
@@ -328,6 +403,23 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	lock := e.getComponentLock(canonical)
 	lock.Lock()
 	defer lock.Unlock()
+
+	// 2.2 Acquire persistent recovery lease (R13) if lease manager is configured and action is restart
+	if e.leaseManager != nil && spec.Action == ActionDockerRestart {
+		leaseToken, lErr := e.leaseManager.AcquireLease(canonical, "go-core", 30*time.Second)
+		if lErr != nil {
+			return &ExecutionResult{
+				Success:    false,
+				Action:     spec.Action,
+				Target:     canonical,
+				Error:      fmt.Sprintf("persistent recovery lease conflict: %v", lErr),
+				ExecutedAt: startTime,
+			}, fmt.Errorf("persistent recovery lease conflict for %s: %w", canonical, lErr)
+		}
+		defer func() {
+			_ = e.leaseManager.ReleaseLease(canonical, leaseToken)
+		}()
+	}
 
 	// 3. Anti-TOCTOU baseline hash verification (Fail-Closed: calculation failure or drift strictly blocks execution)
 	if spec.BaselineHash != "" {
@@ -533,6 +625,36 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, curr.Status)
 		}
 
+		// R5: BaselineHash anti-tampering check (Fail-Closed)
+		if strings.TrimSpace(curr.BaselineHash) == "" {
+			return nil, ErrEmptyBaseline
+		}
+
+		// R9: ApprovalDigest cryptographic binding verification against database state
+		if strings.TrimSpace(curr.ApprovalDigest) == "" {
+			return nil, fmt.Errorf("%w: proposal in database lacks approval digest", ErrApprovalDigestMismatch)
+		}
+		expectedDigestDB, err := ComputeProposalApprovalDigest(&curr)
+		if err != nil || expectedDigestDB != curr.ApprovalDigest {
+			return nil, fmt.Errorf("%w: database proposal record was tampered with post-approval (expected %s, computed %s)", ErrApprovalDigestMismatch, curr.ApprovalDigest, expectedDigestDB)
+		}
+
+		// Memory vs DB approval digest consistency
+		if proposal.ApprovalDigest != "" && proposal.ApprovalDigest != curr.ApprovalDigest {
+			return nil, fmt.Errorf("%w: memory proposal approval digest does not match database record", ErrApprovalDigestMismatch)
+		}
+
+		// R5: Pre-execution baseline re-validation against live component state (anti-TOCTOU)
+		if e.baselineExtractor != nil {
+			canonicalTarget, err := ResolveComponent(curr.TargetComponent)
+			if err == nil {
+				currentHash := e.baselineExtractor(canonicalTarget)
+				if currentHash == "" || currentHash != curr.BaselineHash {
+					return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, curr.BaselineHash, currentHash)
+				}
+			}
+		}
+
 		// If scheduled, verify schedule window has arrived
 		if err := validateScheduledWindow(&curr); err != nil {
 			return nil, err
@@ -561,6 +683,14 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			}
 			return nil, ErrProposalAlreadyRunning
 		}
+
+		// Synchronize authoritative DB fields to memory proposal
+		proposal.TargetComponent = curr.TargetComponent
+		proposal.ActionSpec = curr.ActionSpec
+		proposal.ExecutionPlan = curr.ExecutionPlan
+		proposal.BaselineHash = curr.BaselineHash
+		proposal.ApprovalDigest = curr.ApprovalDigest
+		proposal.Version = curr.Version
 	} else {
 		// Enforce state check for in-memory / mock executions without DB
 		if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending || proposal.Status == model.ProposalStatusApprovalRequired {
@@ -569,6 +699,32 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		if proposal.Status != model.ProposalStatusApproved && proposal.Status != model.ProposalStatusScheduled {
 			return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, proposal.Status)
 		}
+
+		// R5: Verify baseline is present
+		if strings.TrimSpace(proposal.BaselineHash) == "" {
+			return nil, ErrEmptyBaseline
+		}
+
+		// R9: Verify approval digest
+		if strings.TrimSpace(proposal.ApprovalDigest) == "" {
+			return nil, fmt.Errorf("%w: in-memory proposal lacks approval digest", ErrApprovalDigestMismatch)
+		}
+		expectedDigestMem, err := ComputeProposalApprovalDigest(proposal)
+		if err != nil || expectedDigestMem != proposal.ApprovalDigest {
+			return nil, fmt.Errorf("%w: in-memory proposal parameters do not match approval digest", ErrApprovalDigestMismatch)
+		}
+
+		// R5: Pre-execution baseline re-validation against live component state
+		if e.baselineExtractor != nil {
+			canonicalTarget, err := ResolveComponent(proposal.TargetComponent)
+			if err == nil {
+				currentHash := e.baselineExtractor(canonicalTarget)
+				if currentHash == "" || currentHash != proposal.BaselineHash {
+					return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, proposal.BaselineHash, currentHash)
+				}
+			}
+		}
+
 		if err := validateScheduledWindow(proposal); err != nil {
 			return nil, err
 		}
@@ -672,7 +828,11 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 		}
 		spec.Target = canonicalSpecTarget
 
-		if spec.BaselineHash == "" && proposal.BaselineHash != "" {
+		if spec.BaselineHash != "" && proposal.BaselineHash != "" && spec.BaselineHash != proposal.BaselineHash {
+			return OperationSpec{}, fmt.Errorf("%w: action spec baseline hash '%s' does not match approved proposal baseline '%s'", ErrBaselineMismatch, spec.BaselineHash, proposal.BaselineHash)
+		}
+		// ActionSpec MUST NOT override approved baseline; proposal baseline is strictly authoritative (R5.4)
+		if proposal.BaselineHash != "" {
 			spec.BaselineHash = proposal.BaselineHash
 		}
 
