@@ -32,6 +32,7 @@ import (
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/service"
+	"home-datacenter-api/internal/sso"
 	"home-datacenter-api/internal/utils"
 	"home-datacenter-api/internal/vision"
 	"home-datacenter-api/internal/ws"
@@ -89,8 +90,20 @@ func main() {
 		&model.OpsProposal{},
 		&model.OpsExecutionHistory{},
 		&model.SecurityAlertFilter{},
+		&model.SSOTicket{},
+		&model.Household{},
+		&model.StructuredOpsAuditLog{},
+		&model.OpsMaintenanceLock{},
+		&model.OpsCircuitBreakerState{},
 	); err != nil {
 		log.Fatalf("failed to auto-migrate ops models: %v", err)
+	}
+
+	// Seed default household (ID=1) if absent
+	var hhCount int64
+	database.DB.Model(&model.Household{}).Where("id = ?", 1).Count(&hhCount)
+	if hhCount == 0 {
+		database.DB.Create(&model.Household{ID: 1, Name: "默认家庭"})
 	}
 
 	deviceRepo := repository.NewDeviceRepository(database.DB)
@@ -254,6 +267,10 @@ func main() {
 		cfg.Maintenance.BackupStatePath,
 	)
 
+	ssoBroker := sso.NewBroker(database.DB)
+	ssoAdapter := sso.NewAdapterHandler(ssoBroker, onePanelClient, cfg.Server.SecureCookie)
+	internalSSOVerifier := sso.NewInternalVerifierHandler(ssoBroker)
+
 	systemHandler := handler.NewSystemHandler(mqttClient, hub, deviceMgr)
 	systemHandler.SetOpsTelemetry(onePanelClient, fallbackProvider)
 
@@ -266,10 +283,17 @@ func main() {
 	)
 	vulnScanner := ops.NewVulnScanner(database.DB, alertMgr)
 
-	// Startup orphan proposal sweeper to fail orphaned transient proposals
-	if err := ops.SweepOrphanProposals(database.DB); err != nil {
-		log.Printf("[ops] warning: failed to sweep orphan proposals: %v", err)
+	opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
+	opsHandler.SetVulnScanner(vulnScanner)
+
+	// Startup proposal reconciliation (replacing blind sweeper)
+	if err := ops.ReconcileStartupProposals(database.DB, opsHandler.GetExecutor()); err != nil {
+		log.Printf("[ops] warning: failed to reconcile startup proposals: %v", err)
 	}
+
+	// Go Core ProposalScheduler as sole background authority for SCHEDULED proposals
+	proposalScheduler := ops.NewProposalScheduler(database.DB, opsHandler.GetExecutor())
+	proposalScheduler.Start()
 
 	// Phase 11 / WO 5.4: 1Panel WAF log collector & bi-directional ipBlack.json firewall sync
 	wafCollector := ops.NewWAFCollector(
@@ -563,13 +587,11 @@ func main() {
 		}
 	}))
 
-	// Trust Docker bridge / LAN proxy ranges so c.ClientIP() resolves
-	// the real client IP from X-Forwarded-For for rate limiting.
+	// Trust Docker bridge and localhost only. LAN ranges (192.168.0.0/16, 10.0.0.0/8)
+	// are strictly NOT trusted as proxies to prevent clients from forging X-Forwarded-For to bypass IP guards.
 	if err := r.SetTrustedProxies([]string{
-		"172.16.0.0/12",  // Docker bridge
-		"192.168.0.0/16", // LAN
-		"10.0.0.0/8",     // LAN
-		"127.0.0.0/8",    // localhost (nginx same container)
+		"127.0.0.1/32",  // Localhost (in-container proxy)
+		"172.16.0.0/12", // Docker bridge network
 	}); err != nil {
 		log.Fatalf("failed to set trusted proxies: %v", err)
 	}
@@ -656,6 +678,7 @@ func main() {
 	netHandler := handler.NewNetworkHandler(netService, peerRegistry, prefixWatcher)
 
 	api := r.Group("/api/v1")
+	api.Use(middleware.TenantContext(database.DB))
 	{
 		// /auth/bind is gated by an IP-based rate limiter to
 		// slow down online brute-force attacks against the
@@ -993,13 +1016,12 @@ func main() {
 
 		// Phase 11: 1Panel OpenAPI BFF & Datacenter Operations
 		opsGroup := api.Group("/ops")
-		opsGroup.Use(middleware.JWTAuth(deviceRepo, userRepo))
+		opsGroup.Use(middleware.OpsFlexibleAuth(deviceRepo, userRepo))
 		{
-			opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
-			opsHandler.SetVulnScanner(vulnScanner)
 			opsHandler.RegisterRoutes(opsGroup)
 			opsHandler.RegisterProposalRoutes(opsGroup)
 			opsHandler.RegisterChatRoutes(opsGroup)
+			opsHandler.RegisterFSMRoutes(opsGroup)
 
 			// Autonomous FSM & Vuln Scanner Triggers
 			opsGroup.POST("/scan-vulns", func(c *gin.Context) {
@@ -1099,6 +1121,48 @@ func main() {
 				}
 			}
 		}()
+
+		// SSO Broker & 1Panel Single Sign-On
+		ssoGroup := api.Group("/sso")
+		{
+			// Ticket Issuance: strictly Admin JWT protected
+			adminSSO := ssoGroup.Group("")
+			adminSSO.Use(middleware.JWTAuth(deviceRepo, userRepo), middleware.RequireAdmin(database.DB))
+			{
+				adminSSO.POST("/ticket", func(c *gin.Context) {
+					userID := c.GetUint("user_id")
+					userName := c.GetString("user_name")
+					ticket, expiresAt, err := ssoBroker.IssueTicket(
+						c.Request.Context(),
+						userID,
+						userName,
+						true,
+						c.ClientIP(),
+						c.Request.UserAgent(),
+					)
+					if err != nil {
+						utils.Fail(c, http.StatusInternalServerError, err.Error())
+						return
+					}
+					utils.Success(c, gin.H{
+						"ticket":       ticket,
+						"exchange_url": "/api/v1/sso/exchange",
+						"redirect_to":  "/btpanel",
+						"expires_at":   expiresAt.Unix(),
+						"expires_in":   30,
+					})
+				})
+			}
+
+			// Exchange endpoint (Receives Form POST from browser, sets Cookies, 302 redirects)
+			ssoGroup.POST("/exchange", ssoAdapter.ExchangeTicket)
+		}
+
+		// Machine-to-machine internal verification endpoint
+		internalGroup := api.Group("/internal/sso")
+		{
+			internalGroup.POST("/verify", internalSSOVerifier.VerifyTicketInternal)
+		}
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
@@ -1143,6 +1207,7 @@ func main() {
 		if err := s.Shutdown(shutCtx); err != nil {
 			log.Printf("main: shutdown drain error: %v", err)
 		}
+		proposalScheduler.Stop()
 		wafCollector.Stop()
 		logSub.Stop()
 		bus.Close()

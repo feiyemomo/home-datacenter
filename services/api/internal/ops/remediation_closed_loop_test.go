@@ -337,7 +337,7 @@ func TestInternalSecretAuth_EnforcesDualTrack(t *testing.T) {
 
 	r := gin.New()
 	rg := r.Group("/api/v1/ops")
-	rg.Use(middleware.JWTAuth(deviceRepo, userRepo))
+	rg.Use(middleware.OpsFlexibleAuth(deviceRepo, userRepo))
 
 	handler := NewOpsHandler(nil, nil, db, eventbus.New(), nil)
 	handler.RegisterProposalRoutes(rg)
@@ -392,6 +392,11 @@ func TestProductionDeFaking_ZeroFakeSeedData(t *testing.T) {
 	handler := NewOpsHandler(nil, nil, db, eventbus.New(), nil)
 	r := gin.New()
 	rg := r.Group("/api/v1/ops")
+	rg.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(1))
+		c.Set("is_admin", true)
+		c.Next()
+	})
 	handler.RegisterRoutes(rg)
 	handler.RegisterProposalRoutes(rg)
 
@@ -673,7 +678,7 @@ func TestExecuteProposalEndpoint_DualTrackAndStateSafety(t *testing.T) {
 	handler.SetExecutor(executor)
 
 	r := gin.New()
-	r.Use(middleware.JWTAuth(devRepo, userRepo))
+	r.Use(middleware.OpsFlexibleAuth(devRepo, userRepo))
 	rg := r.Group("/api/v1/ops")
 	handler.RegisterProposalRoutes(rg)
 

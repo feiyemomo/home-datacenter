@@ -3,6 +3,7 @@ package ops
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -252,7 +253,9 @@ type ContainerCircuitBreaker struct {
 	crashTimestamps  map[string][]time.Time
 	states           map[string]CircuitState
 	openedAt         map[string]time.Time
+	halfOpenProbing  map[string]bool
 	onTrip           func(container string, crashCount int)
+	db               *gorm.DB
 }
 
 // NewContainerCircuitBreaker creates a default circuit breaker (3 crashes in 10 minutes).
@@ -264,6 +267,93 @@ func NewContainerCircuitBreaker() *ContainerCircuitBreaker {
 		crashTimestamps:  make(map[string][]time.Time),
 		states:           make(map[string]CircuitState),
 		openedAt:         make(map[string]time.Time),
+		halfOpenProbing:  make(map[string]bool),
+	}
+}
+
+// SetDB binds the database instance for persistent state recording.
+func (cb *ContainerCircuitBreaker) SetDB(db *gorm.DB) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.db = db
+}
+
+// LoadPersistedState restores circuit breaker states and crash windows from SQLite.
+func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
+	if db == nil {
+		return
+	}
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	cb.db = db
+
+	var rows []model.OpsCircuitBreakerState
+	if err := db.Find(&rows).Error; err != nil {
+		return
+	}
+
+	cutoff := time.Now().Add(-cb.windowDuration)
+	for _, r := range rows {
+		canonical := ResolveTopologyComponent(r.Container)
+		state := CircuitState(r.State)
+		if state == "" {
+			state = CircuitClosed
+		}
+		cb.states[canonical] = state
+		if !r.OpenedAt.IsZero() {
+			cb.openedAt[canonical] = r.OpenedAt
+		}
+
+		if r.CrashTimestamps != "" {
+			var tsStrings []string
+			if err := json.Unmarshal([]byte(r.CrashTimestamps), &tsStrings); err == nil {
+				var validTimes []time.Time
+				for _, s := range tsStrings {
+					if t, err := time.Parse(time.RFC3339Nano, s); err == nil && t.After(cutoff) {
+						validTimes = append(validTimes, t)
+					}
+				}
+				cb.crashTimestamps[canonical] = validTimes
+			}
+		}
+	}
+}
+
+// persistState saves a container's current state to the database. Must be called with lock held or copied.
+func (cb *ContainerCircuitBreaker) persistState(canonical string) {
+	if cb.db == nil {
+		return
+	}
+	state := cb.states[canonical]
+	if state == "" {
+		state = CircuitClosed
+	}
+	openedAt := cb.openedAt[canonical]
+	tsList := cb.crashTimestamps[canonical]
+	tsStrings := make([]string, 0, len(tsList))
+	for _, t := range tsList {
+		tsStrings = append(tsStrings, t.Format(time.RFC3339Nano))
+	}
+	rawJSON, _ := json.Marshal(tsStrings)
+
+	row := model.OpsCircuitBreakerState{
+		Container:       canonical,
+		State:           string(state),
+		OpenedAt:        openedAt,
+		CrashTimestamps: string(rawJSON),
+		UpdatedAt:       time.Now(),
+	}
+
+	var existing model.OpsCircuitBreakerState
+	if err := cb.db.Where("container = ?", row.Container).First(&existing).Error; err != nil {
+		_ = cb.db.Create(&row).Error
+	} else {
+		_ = cb.db.Model(&existing).Updates(map[string]interface{}{
+			"state":            row.State,
+			"opened_at":        row.OpenedAt,
+			"crash_timestamps": row.CrashTimestamps,
+			"updated_at":       row.UpdatedAt,
+		}).Error
 	}
 }
 
@@ -301,21 +391,37 @@ func (cb *ContainerCircuitBreaker) RecordCrash(container string) (CircuitState, 
 		currentState = CircuitClosed
 	}
 
+	// In HALF_OPEN: single failure immediately trips back to CircuitOpen!
+	if currentState == CircuitHalfOpen {
+		cb.states[canonical] = CircuitOpen
+		cb.openedAt[canonical] = now
+		cb.halfOpenProbing[canonical] = false
+		cb.persistState(canonical)
+		tripCallback := cb.onTrip
+		if tripCallback != nil {
+			go tripCallback(canonical, crashes)
+		}
+		return CircuitOpen, true
+	}
+
 	// Trip condition: >= 3 crashes in sliding window
 	if crashes >= cb.maxCrashes {
 		if currentState != CircuitOpen {
 			cb.states[canonical] = CircuitOpen
 			cb.openedAt[canonical] = now
+			cb.persistState(canonical)
 			tripCallback := cb.onTrip
 			if tripCallback != nil {
 				go tripCallback(canonical, crashes)
 			}
 			return CircuitOpen, true
 		}
+		cb.persistState(canonical)
 		return CircuitOpen, false
 	}
 
 	cb.states[canonical] = CircuitClosed
+	cb.persistState(canonical)
 	return CircuitClosed, false
 }
 
@@ -335,12 +441,23 @@ func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, e
 		// Check whether quiet cooldown period has passed to transition to HALF_OPEN
 		if hasOpened && time.Since(openTime) >= cb.cooldownDuration {
 			cb.states[canonical] = CircuitHalfOpen
+			cb.halfOpenProbing[canonical] = true
+			cb.persistState(canonical)
 			return true, nil
 		}
 		return false, ErrCircuitBreakerOpen
 	}
 
-	// CLOSED or HALF_OPEN: allow attempt
+	if state == CircuitHalfOpen {
+		// Only allow a single in-flight probe while in HALF_OPEN
+		if cb.halfOpenProbing[canonical] {
+			return false, ErrCircuitBreakerOpen
+		}
+		cb.halfOpenProbing[canonical] = true
+		return true, nil
+	}
+
+	// CLOSED: allow attempt
 	return true, nil
 }
 
@@ -353,6 +470,8 @@ func (cb *ContainerCircuitBreaker) RecordRecoverySuccess(container string) {
 	cb.states[canonical] = CircuitClosed
 	delete(cb.crashTimestamps, canonical)
 	delete(cb.openedAt, canonical)
+	delete(cb.halfOpenProbing, canonical)
+	cb.persistState(canonical)
 }
 
 // Reset manually resets a container's circuit breaker to CLOSED.
@@ -364,6 +483,8 @@ func (cb *ContainerCircuitBreaker) Reset(container string) {
 	cb.states[canonical] = CircuitClosed
 	delete(cb.crashTimestamps, canonical)
 	delete(cb.openedAt, canonical)
+	delete(cb.halfOpenProbing, canonical)
+	cb.persistState(canonical)
 }
 
 // ResetAll resets all tracked containers to CLOSED.
@@ -374,6 +495,7 @@ func (cb *ContainerCircuitBreaker) ResetAll() {
 	cb.states = make(map[string]CircuitState)
 	cb.crashTimestamps = make(map[string][]time.Time)
 	cb.openedAt = make(map[string]time.Time)
+	cb.halfOpenProbing = make(map[string]bool)
 }
 
 // GetState returns the current state of a container's circuit breaker.
@@ -427,6 +549,7 @@ type MaintenanceLock struct {
 	Reason    string    `json:"reason"`
 	LockedAt  time.Time `json:"locked_at"`
 	ExpiresAt time.Time `json:"expires_at"`
+	db        *gorm.DB
 }
 
 // MaintenanceStatus represents the serializable status of the maintenance lock.
@@ -442,6 +565,49 @@ type MaintenanceStatus struct {
 // NewMaintenanceLock creates an unlocked MaintenanceLock.
 func NewMaintenanceLock() *MaintenanceLock {
 	return &MaintenanceLock{}
+}
+
+// SetDB binds the database instance for persistent state recording.
+func (l *MaintenanceLock) SetDB(db *gorm.DB) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.db = db
+}
+
+// LoadPersistedState restores active maintenance lock from SQLite.
+func (l *MaintenanceLock) LoadPersistedState(db *gorm.DB) {
+	if db == nil {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.db = db
+
+	var lockRow model.OpsMaintenanceLock
+	if err := db.Order("id DESC").First(&lockRow).Error; err == nil {
+		if lockRow.Active && time.Now().Before(lockRow.ExpiresAt) {
+			l.Active = true
+			l.LockedBy = lockRow.LockedBy
+			l.Reason = lockRow.Reason
+			l.LockedAt = lockRow.LockedAt
+			l.ExpiresAt = lockRow.ExpiresAt
+		}
+	}
+}
+
+func (l *MaintenanceLock) persistState() {
+	if l.db == nil {
+		return
+	}
+	row := model.OpsMaintenanceLock{
+		Active:    l.Active,
+		LockedBy:  l.LockedBy,
+		Reason:    l.Reason,
+		LockedAt:  l.LockedAt,
+		ExpiresAt: l.ExpiresAt,
+		UpdatedAt: time.Now(),
+	}
+	_ = l.db.Create(&row).Error
 }
 
 // Acquire requests exclusive maintenance lock on the system.
@@ -467,6 +633,7 @@ func (l *MaintenanceLock) Acquire(lockedBy string, reason string, ttl time.Durat
 	l.Reason = reason
 	l.LockedAt = now
 	l.ExpiresAt = now.Add(ttl)
+	l.persistState()
 	return nil
 }
 
@@ -479,6 +646,7 @@ func (l *MaintenanceLock) Release(releasedBy string) error {
 	l.LockedBy = ""
 	l.Reason = ""
 	l.ExpiresAt = time.Time{}
+	l.persistState()
 	return nil
 }
 
@@ -595,6 +763,13 @@ func NewContainerRecoveryFSM(db *gorm.DB, bus *eventbus.Bus, executor OperationE
 	fsm.breaker.SetOnTrip(func(container string, crashCount int) {
 		fsm.createCircuitTripProposal(container, crashCount)
 	})
+
+	if db != nil {
+		fsm.lock.SetDB(db)
+		fsm.lock.LoadPersistedState(db)
+		fsm.breaker.SetDB(db)
+		fsm.breaker.LoadPersistedState(db)
+	}
 
 	return fsm
 }
@@ -784,6 +959,178 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 	}
 }
 
+// RecoveryExecutionStatus classifies the actual execution lifecycle stage of an FSM recovery.
+type RecoveryExecutionStatus string
+
+const (
+	StatusAccepted  RecoveryExecutionStatus = "ACCEPTED"  // Event recorded/ignored by policy, no action required
+	StatusExecuting RecoveryExecutionStatus = "EXECUTING" // Recovery operation currently dispatched to executor
+	StatusRecovered RecoveryExecutionStatus = "RECOVERED" // Recovery action executed and health probe verified
+	StatusBlocked   RecoveryExecutionStatus = "BLOCKED"   // Blocked by maintenance lock, circuit breaker, or topology
+	StatusFailed    RecoveryExecutionStatus = "FAILED"    // Execution attempted but failed or health check unverified
+)
+
+// ContainerRecoveryResult models the structured outcome of ProcessAndRecover.
+type ContainerRecoveryResult struct {
+	Decision       *RecoveryDecision       `json:"decision"`
+	Status         RecoveryExecutionStatus `json:"status"`
+	Executed       bool                    `json:"executed"`
+	Output         string                  `json:"output,omitempty"`
+	Error          string                  `json:"error,omitempty"`
+	HealthVerified bool                    `json:"health_verified"`
+}
+
+// SetExecutor updates the OperationExecutor bound to the recovery FSM.
+func (fsm *ContainerRecoveryFSM) SetExecutor(executor OperationExecutor) {
+	fsm.mu.Lock()
+	defer fsm.mu.Unlock()
+	fsm.executor = executor
+	if executor != nil {
+		fsm.topology.SetHealthChecker(func(ctx context.Context, component string) (bool, error) {
+			canonical := ResolveTopologyComponent(component)
+			if canonical == "app.db" {
+				if fsm.db != nil {
+					if sqlDB, err := fsm.db.DB(); err == nil {
+						if pingErr := sqlDB.PingContext(ctx); pingErr != nil {
+							return false, pingErr
+						}
+					}
+				}
+				return true, nil
+			}
+			if err := executor.CheckHealth(ctx, component); err != nil {
+				return false, err
+			}
+			return true, nil
+		})
+	}
+}
+
+// ProcessAndRecover performs closed-loop recovery: evaluates the container event via FSM,
+// and if RESTART is decided, invokes OperationExecutor to execute physical Docker recovery,
+// conducts health probe verification, records recovery success in the circuit breaker,
+// and returns a structured ContainerRecoveryResult.
+func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event ContainerEvent) (*ContainerRecoveryResult, error) {
+	decision, err := fsm.ProcessContainerEvent(ctx, event)
+	if err != nil || decision == nil {
+		status := StatusBlocked
+		if errors.Is(err, ErrMaintenanceLockActive) || errors.Is(err, ErrSystemInMaintenance) ||
+			errors.Is(err, ErrCircuitBreakerOpen) || errors.Is(err, ErrDependencyUnhealthy) {
+			status = StatusBlocked
+		} else {
+			status = StatusFailed
+		}
+		errMsg := ""
+		if err != nil {
+			errMsg = err.Error()
+		}
+		return &ContainerRecoveryResult{
+			Decision:       decision,
+			Status:         status,
+			Executed:       false,
+			Error:          errMsg,
+			HealthVerified: false,
+		}, err
+	}
+
+	switch decision.Action {
+	case ActionIgnore:
+		return &ContainerRecoveryResult{
+			Decision:       decision,
+			Status:         StatusAccepted,
+			Executed:       false,
+			Output:         "Event ignored per FSM policy (clean exit, update, or manual stop)",
+			HealthVerified: false,
+		}, nil
+
+	case ActionBlocked, ActionTripped:
+		return &ContainerRecoveryResult{
+			Decision:       decision,
+			Status:         StatusBlocked,
+			Executed:       false,
+			Error:          decision.Reason,
+			HealthVerified: false,
+		}, nil
+
+	case ActionRestart:
+		fsm.mu.RLock()
+		exec := fsm.executor
+		fsm.mu.RUnlock()
+
+		if exec == nil {
+			return &ContainerRecoveryResult{
+				Decision:       decision,
+				Status:         StatusFailed,
+				Executed:       false,
+				Error:          "operation executor is not configured on Go Active Core",
+				HealthVerified: false,
+			}, errors.New("operation executor not available")
+		}
+
+		if decision.BackoffSec > 0 {
+			select {
+			case <-time.After(time.Duration(decision.BackoffSec) * time.Second):
+			case <-ctx.Done():
+				return &ContainerRecoveryResult{
+					Decision:       decision,
+					Status:         StatusFailed,
+					Executed:       false,
+					Error:          ctx.Err().Error(),
+					HealthVerified: false,
+				}, ctx.Err()
+			}
+		}
+
+		canonical := ResolveTopologyComponent(decision.Container)
+		spec := OperationSpec{
+			Action: ActionDockerRestart,
+			Target: canonical,
+		}
+
+		execRes, execErr := exec.Execute(ctx, spec)
+		if execErr != nil || (execRes != nil && !execRes.Success) {
+			errStr := ""
+			if execErr != nil {
+				errStr = execErr.Error()
+			} else if execRes != nil {
+				errStr = execRes.Error
+			}
+			outStr := ""
+			if execRes != nil {
+				outStr = execRes.Output
+			}
+			return &ContainerRecoveryResult{
+				Decision:       decision,
+				Status:         StatusFailed,
+				Executed:       true,
+				Output:         outStr,
+				Error:          errStr,
+				HealthVerified: false,
+			}, execErr
+		}
+
+		// Recovery succeeded and health probe verified by executor -> update circuit breaker
+		fsm.breaker.RecordRecoverySuccess(canonical)
+
+		return &ContainerRecoveryResult{
+			Decision:       decision,
+			Status:         StatusRecovered,
+			Executed:       true,
+			Output:         execRes.Output,
+			HealthVerified: true,
+		}, nil
+
+	default:
+		return &ContainerRecoveryResult{
+			Decision:       decision,
+			Status:         StatusAccepted,
+			Executed:       false,
+			Output:         "Unrecognized action class treated as accepted",
+			HealthVerified: false,
+		}, nil
+	}
+}
+
 // ============================================================================
 // Global FSM Registration & Helpers
 // ============================================================================
@@ -806,3 +1153,47 @@ func GetGlobalRecoveryFSM() *ContainerRecoveryFSM {
 	defer globalRecoveryFSMMu.RUnlock()
 	return globalRecoveryFSM
 }
+
+// ============================================================================
+// 6. Proposal Lifecycle Finite State Machine (CAS Transitions)
+// ============================================================================
+
+// ProposalFSM manages atomic state transitions for OpsProposal.
+type ProposalFSM struct {
+	db *gorm.DB
+}
+
+// NewProposalFSM initializes a ProposalFSM.
+func NewProposalFSM(db *gorm.DB) *ProposalFSM {
+	return &ProposalFSM{db: db}
+}
+
+// TransitionCAS executes an atomic Compare-And-Swap state change for a proposal.
+// It matches by proposal ID or numeric ID, ensures the current status is in expectedStatuses,
+// and applies updates including the targetStatus atomically.
+func (fsm *ProposalFSM) TransitionCAS(
+	proposalID string,
+	expectedStatuses []string,
+	targetStatus string,
+	updates map[string]interface{},
+) (bool, error) {
+	if fsm.db == nil {
+		return true, nil
+	}
+
+	if updates == nil {
+		updates = make(map[string]interface{})
+	}
+	updates["status"] = targetStatus
+	updates["updated_at"] = time.Now()
+
+	res := fsm.db.Model(&model.OpsProposal{}).
+		Where("(id = ? OR proposal_id = ?) AND status IN (?)", proposalID, proposalID, expectedStatuses).
+		Updates(updates)
+
+	if res.Error != nil {
+		return false, res.Error
+	}
+	return res.RowsAffected > 0, nil
+}
+

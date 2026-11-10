@@ -40,6 +40,7 @@ func NewDeviceHandler(
 // the server over the API.
 type deviceResponse struct {
 	ID          uint           `json:"id"`
+	HouseholdID uint           `json:"household_id"`
 	UserID      uint           `json:"user_id"`
 	UserName    string         `json:"user_name"`
 	DeviceName  string         `json:"device_name"`
@@ -53,6 +54,7 @@ type deviceResponse struct {
 func toDeviceResponse(d model.Device, userName string) deviceResponse {
 	return deviceResponse{
 		ID:          d.ID,
+		HouseholdID: d.HouseholdID,
 		UserID:      d.UserID,
 		UserName:    userName,
 		DeviceName:  d.DeviceName,
@@ -101,6 +103,17 @@ func (h *DeviceHandler) List(c *gin.Context) {
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to list devices")
 		return
+	}
+
+	// Filter by tenant household if set
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 {
+		filtered := make([]model.Device, 0, len(devices))
+		for _, d := range devices {
+			if d.HouseholdID == 0 || d.HouseholdID == callerHouseholdID {
+				filtered = append(filtered, d)
+			}
+		}
+		devices = filtered
 	}
 
 	// Build a map of user_id -> user_name for the devices in this result.
@@ -215,6 +228,12 @@ func (h *DeviceHandler) Delete(c *gin.Context) {
 		return
 	}
 
+	// Anti-IDOR: Prevent cross-household access
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && device.HouseholdID != 0 && device.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "device not found")
+		return
+	}
+
 	// Ownership / admin check.
 	user, err := h.userService.GetByID(userID)
 	if err != nil {
@@ -288,6 +307,12 @@ func (h *DeviceHandler) RotateToken(c *gin.Context) {
 		return
 	}
 
+	// Anti-IDOR: Prevent cross-household access
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && device.HouseholdID != 0 && device.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "device not found")
+		return
+	}
+
 	// Admin-only check.
 	user, err := h.userService.GetByID(userID)
 	if err != nil {
@@ -354,6 +379,12 @@ func (h *DeviceHandler) HardDelete(c *gin.Context) {
 	// Load the device first so we can check ownership.
 	device, err := h.deviceService.GetDeviceByID(deviceID)
 	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "device not found")
+		return
+	}
+
+	// Anti-IDOR: Prevent cross-household access
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && device.HouseholdID != 0 && device.HouseholdID != callerHouseholdID {
 		utils.Fail(c, http.StatusNotFound, "device not found")
 		return
 	}

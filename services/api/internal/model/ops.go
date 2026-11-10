@@ -10,20 +10,24 @@ import (
 
 // Proposal status constants.
 const (
-	ProposalStatusPending          = "PENDING"
-	ProposalStatusAwaitingApproval = "AWAITING_APPROVAL" // Canonical / backward compatible
-	ProposalStatusApprovalRequired = "APPROVAL_REQUIRED"
-	ProposalStatusApproved         = "APPROVED"
-	ProposalStatusScheduled        = "SCHEDULED"
-	ProposalStatusExecuting        = "EXECUTING"
-	ProposalStatusExecuted         = "EXECUTED"
-	ProposalStatusRejected         = "REJECTED"
-	ProposalStatusCancelled        = "CANCELLED"
-	ProposalStatusFailed           = "FAILED"
-	ProposalStatusRollingBack      = "ROLLING_BACK"
-	ProposalStatusRolledBack       = "ROLLED_BACK"
-	ProposalStatusFailedRolledback = "FAILED_ROLLEDBACK" // Backward compatible alias for ROLLED_BACK
-	ProposalStatusRollbackFailed   = "ROLLBACK_FAILED"
+	ProposalStatusPending                = "PENDING"
+	ProposalStatusAwaitingApproval       = "AWAITING_APPROVAL" // Canonical / backward compatible
+	ProposalStatusApprovalRequired       = "APPROVAL_REQUIRED"
+	ProposalStatusApproved               = "APPROVED"
+	ProposalStatusScheduled              = "SCHEDULED"
+	ProposalStatusExecuting              = "EXECUTING"
+	ProposalStatusSuccess                = "SUCCESS"           // Canonical completed state
+	ProposalStatusExecuted               = "EXECUTED"          // Backward compatible alias for SUCCESS
+	ProposalStatusRejected               = "REJECTED"
+	ProposalStatusCancelled              = "CANCELLED"
+	ProposalStatusFailed                 = "FAILED"
+	ProposalStatusRollingBack            = "ROLLING_BACK"
+	ProposalStatusRolledBack             = "ROLLED_BACK"
+	ProposalStatusFailedRolledback       = "FAILED_ROLLEDBACK" // Backward compatible alias for ROLLED_BACK
+	ProposalStatusRollbackFailed         = "ROLLBACK_FAILED"
+	ProposalStatusExecutionUnknown       = "EXECUTION_UNKNOWN"       // Network timeout / unknown response
+	ProposalStatusReconciliationRequired = "RECONCILIATION_REQUIRED" // Process crash or ambiguous state
+	ProposalStatusExpired                = "EXPIRED"                 // Scheduled window missed
 )
 
 // Risk level constants.
@@ -39,6 +43,8 @@ const (
 type OpsProposal struct {
 	ID               uint           `gorm:"primaryKey" json:"id"`
 	ProposalID       string         `gorm:"size:64;uniqueIndex" json:"proposal_id"`
+	IdempotencyKey   string         `gorm:"size:128;index" json:"idempotency_key,omitempty"`
+	HouseholdID      uint           `gorm:"index;default:1" json:"household_id"`
 	Title            string         `gorm:"size:255;not null" json:"title"`
 	Description      string         `gorm:"type:text" json:"description"`
 	TargetComponent  string         `gorm:"size:128" json:"target_component"`
@@ -52,6 +58,7 @@ type OpsProposal struct {
 	ApprovedAt       utils.NullTime `json:"approved_at"`
 	ApprovedBy       string         `gorm:"size:64" json:"approved_by"`
 	ExecutedAt       utils.NullTime `json:"executed_at"`
+	ReconciledAt     utils.NullTime `json:"reconciled_at,omitempty"`
 	ExecutionLog     string         `gorm:"type:text" json:"execution_log"`
 	BaselineHash     string         `gorm:"size:128" json:"baseline_hash"`
 	ActionSpec       string         `gorm:"type:text" json:"action_spec"`
@@ -180,3 +187,29 @@ type OpsExecutionHistory struct {
 }
 
 func (OpsExecutionHistory) TableName() string { return "ops_execution_histories" }
+
+// OpsMaintenanceLock models the persistent system-wide maintenance lock.
+type OpsMaintenanceLock struct {
+	ID        uint      `gorm:"primaryKey" json:"id"`
+	Active    bool      `gorm:"not null;default:false" json:"active"`
+	LockedBy  string    `gorm:"size:64" json:"locked_by"`
+	Reason    string    `gorm:"type:text" json:"reason"`
+	LockedAt  time.Time `json:"locked_at"`
+	ExpiresAt time.Time `gorm:"index" json:"expires_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+func (OpsMaintenanceLock) TableName() string { return "ops_maintenance_locks" }
+
+// OpsCircuitBreakerState models the persistent container circuit breaker status and crash history.
+type OpsCircuitBreakerState struct {
+	ID              uint      `gorm:"primaryKey" json:"id"`
+	Container       string    `gorm:"size:64;uniqueIndex;not null" json:"container"`
+	State           string    `gorm:"size:32;not null;default:'CLOSED'" json:"state"` // CLOSED, OPEN, HALF_OPEN
+	OpenedAt        time.Time `json:"opened_at"`
+	CrashTimestamps string    `gorm:"type:text" json:"crash_timestamps"` // JSON array of RFC3339 timestamps
+	UpdatedAt       time.Time `json:"updated_at"`
+}
+
+func (OpsCircuitBreakerState) TableName() string { return "ops_circuit_breaker_states" }
+

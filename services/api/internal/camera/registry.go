@@ -159,7 +159,16 @@ func (r *Registry) Register(ctx context.Context, in RegisterInput) (*model.Camer
 		}
 	}
 
+	householdID := uint(1)
+	if in.OwnerID != 0 {
+		var u model.User
+		if err := r.DB.Select("household_id").First(&u, in.OwnerID).Error; err == nil && u.HouseholdID != 0 {
+			householdID = u.HouseholdID
+		}
+	}
+
 	cam := &model.Camera{
+		HouseholdID:       householdID,
 		Type:              "camera",
 		Name:              name,
 		Vendor:            in.Vendor,

@@ -19,6 +19,12 @@ import (
 // to check the latest admin status.
 func RequireAdmin(db *gorm.DB) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if isInternal, exists := c.Get("is_internal_service"); exists && isInternal.(bool) {
+			utils.Fail(c, http.StatusForbidden, "permission denied: internal daemon cannot approve proposals")
+			c.Abort()
+			return
+		}
+
 		if rawAdmin, exists := c.Get("is_admin"); exists {
 			if isAdmin, ok := rawAdmin.(bool); ok {
 				if !isAdmin {

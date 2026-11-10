@@ -30,6 +30,51 @@ import { useWebSocket } from "@/hooks/useWebSocket";
 import { getSecurityGuard, setSecurityGuard } from "@/api/security";
 import type { SecurityMode } from "@/types";
 import { Button } from "@/components/ui/button";
+import apiClient from "@/api/client";
+
+/**
+ * Open 1Panel via secure SSO Ticket exchange using an invisible Form POST.
+ * Strictly prevents ticket and session exposure in browser URL query parameters.
+ */
+export async function openOnePanelSSO(): Promise<void> {
+    try {
+        // 1. Request one-time 256-bit SSO ticket with Admin JWT
+        const res = await apiClient.post<any>("/sso/ticket");
+        const data = res.data?.data || res.data;
+        if (!data?.ticket) {
+            throw new Error("获取 1Panel 免密票据失败");
+        }
+
+        const ticket = data.ticket;
+        const exchangeUrl = data.exchange_url || "/api/v1/sso/exchange";
+        const redirectTo = data.redirect_to || "/btpanel";
+
+        // 2. Programmatically construct and submit invisible HTML Form POST
+        const form = document.createElement("form");
+        form.method = "POST";
+        form.action = exchangeUrl;
+        form.target = "_blank"; // Opens 1Panel in new tab, preserving Home Datacenter SPA session
+
+        const ticketInput = document.createElement("input");
+        ticketInput.type = "hidden";
+        ticketInput.name = "ticket";
+        ticketInput.value = ticket;
+        form.appendChild(ticketInput);
+
+        const redirectInput = document.createElement("input");
+        redirectInput.type = "hidden";
+        redirectInput.name = "redirect_url";
+        redirectInput.value = redirectTo;
+        form.appendChild(redirectInput);
+
+        document.body.appendChild(form);
+        form.submit();
+        document.body.removeChild(form);
+    } catch (err: any) {
+        console.error("1Panel SSO Error:", err);
+        alert(err.message || "无法建立 1Panel 单点登录");
+    }
+}
 
 interface NavItem {
     to: string;
@@ -42,6 +87,12 @@ const NAV_ITEMS: NavItem[] = [
     { to: "/dashboard", label: "仪表盘", icon: <LayoutDashboard size={18} /> },
     { to: "/cameras", label: "摄像头", icon: <CameraIcon size={18} /> },
     { to: "/network", label: "网络", icon: <NetworkIcon size={18} /> },
+    {
+        to: "/sso/1panel",
+        label: "1Panel 运维",
+        icon: <Server size={18} />,
+        adminOnly: true,
+    },
     {
         to: "/logs",
         label: "日志",
@@ -131,42 +182,51 @@ export function Sidebar({ open, onClose }: SidebarProps) {
 
                 {/* Nav links */}
                 <nav className="flex-1 space-y-1 overflow-y-auto p-3 stagger-children">
-                    {items.map((item) => (
-                        <NavLink
-                            key={item.to}
-                            to={item.to}
-                            onClick={onClose}
-                            className={({ isActive }) =>
-                                cn(
-                                    "group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all duration-300 ease-out",
-                                    isActive
-                                        ? "glass-subtle bg-[rgb(var(--accent-primary)/0.08)] text-[rgb(var(--accent-primary))] shadow-[0_0_12px_rgb(var(--accent-primary)/0.08)]"
-                                        : "text-fg-muted hover:bg-[rgb(var(--bg-subtle)/0.4)] hover:text-fg",
-                                )
-                            }
-                        >
-                            {({ isActive }) => (
-                                <>
-                                    {/* Active indicator glow */}
-                                    {isActive && (
-                                        <div className="absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r-full bg-gradient-to-b from-[rgb(var(--accent-warm))] to-[rgb(var(--accent-primary))] shadow-[0_0_8px_rgb(var(--accent-warm)/0.5)]" />
-                                    )}
-                                    <span className={cn(
-                                        "transition-transform duration-300",
-                                        isActive ? "scale-105" : "group-hover:scale-105"
-                                    )}>
-                                        {item.icon}
-                                    </span>
-                                    <span className="relative z-10">{item.label}</span>
-                                    {item.adminOnly && (
-                                        <span className="ml-auto text-[8px] text-fg-subtle/70">
-                                            管理员
+                    {items.map((item) => {
+                        const is1Panel = item.to === "/sso/1panel";
+                        return (
+                            <NavLink
+                                key={item.to}
+                                to={item.to}
+                                onClick={(e) => {
+                                    if (is1Panel) {
+                                        e.preventDefault();
+                                        openOnePanelSSO();
+                                    }
+                                    onClose();
+                                }}
+                                className={({ isActive }) =>
+                                    cn(
+                                        "group relative flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-all duration-300 ease-out",
+                                        isActive && !is1Panel
+                                            ? "glass-subtle bg-[rgb(var(--accent-primary)/0.08)] text-[rgb(var(--accent-primary))] shadow-[0_0_12px_rgb(var(--accent-primary)/0.08)]"
+                                            : "text-fg-muted hover:bg-[rgb(var(--bg-subtle)/0.4)] hover:text-fg",
+                                    )
+                                }
+                            >
+                                {({ isActive }) => (
+                                    <>
+                                        {/* Active indicator glow */}
+                                        {isActive && !is1Panel && (
+                                            <div className="absolute left-0 top-1/2 h-6 w-1 -translate-y-1/2 rounded-r-full bg-gradient-to-b from-[rgb(var(--accent-warm))] to-[rgb(var(--accent-primary))] shadow-[0_0_8px_rgb(var(--accent-warm)/0.5)]" />
+                                        )}
+                                        <span className={cn(
+                                            "transition-transform duration-300",
+                                            isActive && !is1Panel ? "scale-105" : "group-hover:scale-105"
+                                        )}>
+                                            {item.icon}
                                         </span>
-                                    )}
-                                </>
-                            )}
-                        </NavLink>
-                    ))}
+                                        <span className="relative z-10">{item.label}</span>
+                                        {item.adminOnly && (
+                                            <span className="ml-auto text-[8px] text-fg-subtle/70">
+                                                管理员
+                                            </span>
+                                        )}
+                                    </>
+                                )}
+                            </NavLink>
+                        );
+                    })}
                 </nav>
 
                 {/* Footer */}

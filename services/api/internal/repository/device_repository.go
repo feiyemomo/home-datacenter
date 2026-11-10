@@ -35,6 +35,14 @@ func (r *DeviceRepository) Create(device *model.Device) error {
 	if minID > 0 {
 		device.ID = minID
 	}
+	if device.HouseholdID == 0 && device.UserID != 0 {
+		var user model.User
+		if err := r.db.Select("household_id").First(&user, device.UserID).Error; err == nil && user.HouseholdID != 0 {
+			device.HouseholdID = user.HouseholdID
+		} else {
+			device.HouseholdID = 1
+		}
+	}
 	return r.db.Create(device).Error
 }
 

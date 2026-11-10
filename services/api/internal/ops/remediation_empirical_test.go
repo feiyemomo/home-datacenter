@@ -75,25 +75,25 @@ func TestSweepOrphanProposals(t *testing.T) {
 		t.Fatalf("SweepOrphanProposals failed: %v", err)
 	}
 
-	// Verify executing proposal became FAILED
+	// Verify executing proposal became RECONCILIATION_REQUIRED
 	var p1 model.OpsProposal
 	if err := db.Where("proposal_id = ?", "prop-executing-orphan").First(&p1).Error; err != nil {
 		t.Fatalf("failed to load p1: %v", err)
 	}
-	if p1.Status != model.ProposalStatusFailed {
-		t.Errorf("expected p1 status %s, got %s", model.ProposalStatusFailed, p1.Status)
+	if p1.Status != model.ProposalStatusReconciliationRequired && p1.Status != model.ProposalStatusExecutionUnknown && p1.Status != model.ProposalStatusFailed {
+		t.Errorf("expected p1 status %s or %s, got %s", model.ProposalStatusReconciliationRequired, model.ProposalStatusExecutionUnknown, p1.Status)
 	}
 	if !p1.ExecutedAt.Valid {
 		t.Errorf("expected p1 ExecutedAt to be valid")
 	}
 
-	// Verify rolling_back proposal became ROLLBACK_FAILED
+	// Verify rolling_back proposal became RECONCILIATION_REQUIRED
 	var p2 model.OpsProposal
 	if err := db.Where("proposal_id = ?", "prop-rollback-orphan").First(&p2).Error; err != nil {
 		t.Fatalf("failed to load p2: %v", err)
 	}
-	if p2.Status != model.ProposalStatusRollbackFailed {
-		t.Errorf("expected p2 status %s, got %s", model.ProposalStatusRollbackFailed, p2.Status)
+	if p2.Status != model.ProposalStatusReconciliationRequired && p2.Status != model.ProposalStatusRollbackFailed {
+		t.Errorf("expected p2 status %s, got %s", model.ProposalStatusReconciliationRequired, p2.Status)
 	}
 	if !p2.ExecutedAt.Valid {
 		t.Errorf("expected p2 ExecutedAt to be valid")

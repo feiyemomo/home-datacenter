@@ -35,6 +35,7 @@ var (
 	ErrShellMetacharacter        = errors.New("operation spec contains forbidden shell metacharacter")
 	ErrNotImplemented            = errors.New("operation not implemented or requires unsupported capabilities")
 	ErrProposalAlreadyRunning    = errors.New("proposal is already being executed")
+	ErrProposalNotExecutable     = errors.New("proposal is not in an executable state")
 	ErrProposalUnauthorized      = errors.New("proposal is not authorized for execution")
 	ErrScheduledWindowNotReached = errors.New("scheduled proposal execution window has not arrived")
 )
@@ -328,10 +329,20 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	lock.Lock()
 	defer lock.Unlock()
 
-	// 3. Anti-TOCTOU baseline hash verification
-	if spec.BaselineHash != "" && e.baselineExtractor != nil {
+	// 3. Anti-TOCTOU baseline hash verification (Fail-Closed: calculation failure or drift strictly blocks execution)
+	if spec.BaselineHash != "" {
+		if e.baselineExtractor == nil {
+			return &ExecutionResult{
+				Success:      false,
+				Action:       spec.Action,
+				Target:       canonical,
+				BaselineHash: spec.BaselineHash,
+				Error:        "baseline extractor not configured on executor",
+				ExecutedAt:   startTime,
+			}, ErrBaselineMismatch
+		}
 		currentHash := e.baselineExtractor(canonical)
-		if currentHash != "" && currentHash != spec.BaselineHash {
+		if currentHash == "" || currentHash != spec.BaselineHash {
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
@@ -498,7 +509,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 	}
 
 	// Gate check: forbid AWAITING_APPROVAL and unauthorized PENDING execution
-	if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending {
+	if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending || proposal.Status == model.ProposalStatusApprovalRequired {
 		return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, proposal.Status)
 	}
 
@@ -509,14 +520,17 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			return nil, fmt.Errorf("proposal %d not found: %w", proposal.ID, err)
 		}
 
-		if curr.Status == model.ProposalStatusExecuting {
+		if curr.Status == model.ProposalStatusExecuting || curr.Status == model.ProposalStatusRollingBack {
+			proposal.Status = curr.Status
 			return nil, ErrProposalAlreadyRunning
 		}
-		if curr.Status == model.ProposalStatusAwaitingApproval || curr.Status == model.ProposalStatusPending {
+		if curr.Status == model.ProposalStatusAwaitingApproval || curr.Status == model.ProposalStatusPending || curr.Status == model.ProposalStatusApprovalRequired {
+			proposal.Status = curr.Status
 			return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, curr.Status)
 		}
 		if curr.Status != model.ProposalStatusApproved && curr.Status != model.ProposalStatusScheduled {
-			return nil, fmt.Errorf("proposal %s is not in an executable state (status: %s)", proposal.ProposalID, curr.Status)
+			proposal.Status = curr.Status
+			return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, curr.Status)
 		}
 
 		// If scheduled, verify schedule window has arrived
@@ -538,12 +552,22 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			return nil, res.Error
 		}
 		if res.RowsAffected == 0 {
+			var latest model.OpsProposal
+			if err := e.db.First(&latest, proposal.ID).Error; err == nil {
+				proposal.Status = latest.Status
+				if latest.Status != model.ProposalStatusApproved && latest.Status != model.ProposalStatusScheduled {
+					return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, latest.Status)
+				}
+			}
 			return nil, ErrProposalAlreadyRunning
 		}
 	} else {
 		// Enforce state check for in-memory / mock executions without DB
+		if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending || proposal.Status == model.ProposalStatusApprovalRequired {
+			return nil, fmt.Errorf("%w: proposal %s requires approval before execution (status: %s)", ErrProposalUnauthorized, proposal.ProposalID, proposal.Status)
+		}
 		if proposal.Status != model.ProposalStatusApproved && proposal.Status != model.ProposalStatusScheduled {
-			return nil, fmt.Errorf("proposal %s is not in an executable state (status: %s)", proposal.ProposalID, proposal.Status)
+			return nil, fmt.Errorf("%w: proposal %s is not in an executable state (status: %s)", ErrProposalNotExecutable, proposal.ProposalID, proposal.Status)
 		}
 		if err := validateScheduledWindow(proposal); err != nil {
 			return nil, err
@@ -569,6 +593,19 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 	proposal.ExecutedAt = utils.NullTime{Time: now, Valid: true}
 
 	if execErr != nil || (res != nil && !res.Success) {
+		// If execution timed out or produced unknown HTTP/network state
+		if errors.Is(execErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+			(execErr != nil && strings.Contains(strings.ToLower(execErr.Error()), "deadline exceeded")) ||
+			(execErr != nil && strings.Contains(strings.ToLower(execErr.Error()), "timeout")) {
+			proposal.Status = model.ProposalStatusExecutionUnknown
+			proposal.ExecutionLog = fmt.Sprintf("execution timed out or produced unknown state (%v); manual reconciliation required", execErr)
+			if e.db != nil {
+				_ = e.db.Save(proposal)
+			}
+			e.publishEvent(eventbus.SeverityError, "ops.proposal.unknown", proposal)
+			return res, execErr
+		}
+
 		// If rollback spec was defined, transition to ROLLING_BACK first in DB
 		if spec.RollbackSpec != nil && e.db != nil && proposal.ID > 0 {
 			_ = e.db.Model(&model.OpsProposal{}).Where("id = ?", proposal.ID).Update("status", model.ProposalStatusRollingBack)
@@ -576,7 +613,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 
 		if spec.RollbackSpec != nil {
 			if res != nil && res.RolledBack {
-				proposal.Status = model.ProposalStatusFailedRolledback
+				proposal.Status = model.ProposalStatusRolledBack
 			} else {
 				proposal.Status = model.ProposalStatusRollbackFailed
 			}
@@ -609,15 +646,53 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 }
 
 // parseProposalSpec converts proposal fields into a typed OperationSpec.
+// Strictly enforces component consistency between ActionSpec and Proposal.TargetComponent,
+// validates rollback spec target consistency, and prevents ActionSpec tampering.
 func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal) (OperationSpec, error) {
+	canonicalProposalTarget, err := ResolveComponent(proposal.TargetComponent)
+	if err != nil {
+		return OperationSpec{}, fmt.Errorf("invalid proposal target component: %w", err)
+	}
+
 	if proposal.ActionSpec != "" {
 		var spec OperationSpec
-		if err := json.Unmarshal([]byte(proposal.ActionSpec), &spec); err == nil && spec.Action != "" {
-			if spec.BaselineHash == "" && proposal.BaselineHash != "" {
-				spec.BaselineHash = proposal.BaselineHash
-			}
-			return spec, nil
+		if err := json.Unmarshal([]byte(proposal.ActionSpec), &spec); err != nil {
+			return OperationSpec{}, fmt.Errorf("%w: failed to parse proposal action spec: %v", ErrInvalidSpec, err)
 		}
+		if spec.Action == "" {
+			return OperationSpec{}, fmt.Errorf("%w: action spec missing action field", ErrInvalidSpec)
+		}
+
+		canonicalSpecTarget, err := ResolveComponent(spec.Target)
+		if err != nil {
+			return OperationSpec{}, fmt.Errorf("action spec target invalid: %w", err)
+		}
+		if canonicalSpecTarget != canonicalProposalTarget {
+			return OperationSpec{}, fmt.Errorf("security violation: action spec target '%s' does not match proposal target '%s'", canonicalSpecTarget, canonicalProposalTarget)
+		}
+		spec.Target = canonicalSpecTarget
+
+		if spec.BaselineHash == "" && proposal.BaselineHash != "" {
+			spec.BaselineHash = proposal.BaselineHash
+		}
+
+		if spec.RollbackSpec != nil {
+			if spec.RollbackSpec.Target != "" {
+				rbTarget, err := ResolveComponent(spec.RollbackSpec.Target)
+				if err != nil || rbTarget != canonicalSpecTarget {
+					return OperationSpec{}, fmt.Errorf("security violation: rollback target '%s' does not match action target '%s'", spec.RollbackSpec.Target, canonicalSpecTarget)
+				}
+				spec.RollbackSpec.Target = rbTarget
+			} else {
+				spec.RollbackSpec.Target = canonicalSpecTarget
+			}
+		}
+
+		if err := ValidateSpecSafety(spec); err != nil {
+			return OperationSpec{}, err
+		}
+
+		return spec, nil
 	}
 
 	canonical, err := ResolveComponent(proposal.TargetComponent)
@@ -871,7 +946,26 @@ func (e *DefaultOperationExecutor) executeCachePurge(ctx context.Context, params
 	}
 }
 
+// allowedDockerExecCommands defines the strict whitelist of permissible non-shell exec commands per component.
+var allowedDockerExecCommands = map[string][][]string{
+	ComponentOpenResty: {
+		{"nginx", "-t"},
+		{"nginx", "-s", "reload"},
+		{"openresty", "-t"},
+		{"openresty", "-s", "reload"},
+		{"nginx", "-v"},
+	},
+	ComponentHomeWeb: {
+		{"nginx", "-t"},
+		{"nginx", "-s", "reload"},
+	},
+	ComponentFrigate: {
+		{"python3", "-m", "frigate", "--validate-config"},
+	},
+}
+
 // executeDockerExec executes a command inside a whitelisted container via Docker socket API without shell.
+// Strictly validates command against an approved per-component command whitelist to prevent arbitrary command injection.
 func (e *DefaultOperationExecutor) executeDockerExec(ctx context.Context, canonical string, params map[string]interface{}) (string, error) {
 	containerName := canonicalContainerNames[canonical]
 	if containerName == "" {
@@ -891,6 +985,33 @@ func (e *DefaultOperationExecutor) executeDockerExec(ctx context.Context, canoni
 
 	if len(cmd) == 0 {
 		return "", fmt.Errorf("%w: missing command in params", ErrInvalidSpec)
+	}
+
+	// Validate cmd against per-component whitelist
+	allowedList, hasList := allowedDockerExecCommands[canonical]
+	if !hasList {
+		return "", fmt.Errorf("%w: docker.exec is not permitted for component '%s'", ErrActionNotSupported, canonical)
+	}
+
+	matched := false
+	for _, allowedCmd := range allowedList {
+		if len(allowedCmd) == len(cmd) {
+			exactMatch := true
+			for i := range allowedCmd {
+				if allowedCmd[i] != cmd[i] {
+					exactMatch = false
+					break
+				}
+			}
+			if exactMatch {
+				matched = true
+				break
+			}
+		}
+	}
+
+	if !matched {
+		return "", fmt.Errorf("%w: command %v is not in the approved whitelist for %s", ErrActionNotSupported, cmd, canonical)
 	}
 
 	return executeDockerSocketExecOutput(ctx, e.dockerSocket, containerName, cmd)
@@ -1338,10 +1459,159 @@ func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName 
 	return string(outBytes), nil
 }
 
+// ContainerInspectSafetyConfig decodes ALL runtime and security parameters from docker inspect.
+type ContainerInspectSafetyConfig struct {
+	ID     string `json:"Id"`
+	Name   string `json:"Name"`
+	Config struct {
+		Image        string              `json:"Image"`
+		User         string              `json:"User"` // MUST NOT BE DROPPED! Preserves non-root user
+		Env          []string            `json:"Env"`
+		Cmd          []string            `json:"Cmd"`
+		Entrypoint   []string            `json:"Entrypoint"`
+		WorkingDir   string              `json:"WorkingDir"`
+		Labels       map[string]string   `json:"Labels"`
+		ExposedPorts map[string]struct{} `json:"ExposedPorts"`
+		StopSignal   string              `json:"StopSignal,omitempty"`
+	} `json:"Config"`
+	HostConfig struct {
+		Binds          []string                 `json:"Binds"`
+		Mounts         []map[string]interface{} `json:"Mounts"`
+		PortBindings   map[string]interface{}   `json:"PortBindings"`
+		RestartPolicy  map[string]interface{}   `json:"RestartPolicy"`
+		CapAdd         []string                 `json:"CapAdd"`
+		CapDrop        []string                 `json:"CapDrop"`
+		SecurityOpt    []string                 `json:"SecurityOpt"`
+		Devices        []map[string]interface{} `json:"Devices"`
+		DeviceRequests []map[string]interface{} `json:"DeviceRequests"`
+		NetworkMode    string                   `json:"NetworkMode"`
+		Privileged     bool                     `json:"Privileged"`
+		ReadonlyRootfs bool                     `json:"ReadonlyRootfs"`
+		Dns            []string                 `json:"Dns"`
+		ExtraHosts     []string                 `json:"ExtraHosts"`
+		Resources      map[string]interface{}   `json:"Resources"`
+	} `json:"HostConfig"`
+	NetworkSettings struct {
+		Networks map[string]interface{} `json:"Networks"`
+	} `json:"NetworkSettings"`
+}
+
+// executeVerifiedRollback performs the 5-stage real rollback and confirms container health:
+// Stage 1: Clean up failed candidate container if created (DELETE /containers/{containerName}?v=false&force=true).
+// Stage 2: Rename backup container back to original name (POST /containers/{backupName}/rename?name={containerName}).
+// Stage 3: Start original container (POST /containers/{containerName}/start).
+// Stage 4: Docker inspect verification (GET /containers/{containerName}/json, confirm Running == true).
+// Stage 5: Live health check probe.
+func executeVerifiedRollback(
+	ctx context.Context,
+	client *http.Client,
+	containerName, backupName string,
+	healthChecker func(ctx context.Context, target string) error,
+	canonical string,
+	triggerCause error,
+) error {
+	rbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Printf("[executor] initiating 5-stage verified rollback for %s (backup: %s, cause: %v)",
+		containerName, backupName, triggerCause)
+
+	// Stage 1: Clean up failed candidate container if present
+	delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", containerName)
+	delReq, _ := http.NewRequestWithContext(rbCtx, http.MethodDelete, delURL, nil)
+	if dResp, err := client.Do(delReq); err == nil {
+		_ = dResp.Body.Close()
+	}
+
+	// Stage 2: Rename backup container back to original name
+	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", backupName, containerName)
+	renameReq, err := http.NewRequestWithContext(rbCtx, http.MethodPost, renameURL, nil)
+	if err != nil {
+		return fmt.Errorf("rollback failed at rename request creation (%v); cause: %w", err, triggerCause)
+	}
+	renameResp, err := client.Do(renameReq)
+	if err != nil || (renameResp != nil && renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK) {
+		status := 0
+		if renameResp != nil {
+			status = renameResp.StatusCode
+			_ = renameResp.Body.Close()
+		}
+		return fmt.Errorf("rollback failed at rename (HTTP %d, err: %v); manual reconciliation required; cause: %w", status, err, triggerCause)
+	}
+	if renameResp != nil {
+		_ = renameResp.Body.Close()
+	}
+
+	// Stage 3: Start original container
+	startURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
+	startReq, err := http.NewRequestWithContext(rbCtx, http.MethodPost, startURL, nil)
+	if err != nil {
+		return fmt.Errorf("rollback failed at start request creation (%v); cause: %w", err, triggerCause)
+	}
+	startResp, err := client.Do(startReq)
+	if err != nil || (startResp != nil && startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK && startResp.StatusCode != http.StatusNotModified) {
+		status := 0
+		if startResp != nil {
+			status = startResp.StatusCode
+			_ = startResp.Body.Close()
+		}
+		return fmt.Errorf("rollback failed at start (HTTP %d, err: %v); manual reconciliation required; cause: %w", status, err, triggerCause)
+	}
+	if startResp != nil {
+		_ = startResp.Body.Close()
+	}
+
+	// Stage 4: Docker inspect verification
+	inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", containerName)
+	insReq, err := http.NewRequestWithContext(rbCtx, http.MethodGet, inspectURL, nil)
+	if err != nil {
+		return fmt.Errorf("rollback inspect request creation failed: %w", err)
+	}
+	insResp, err := client.Do(insReq)
+	if err != nil || insResp.StatusCode != http.StatusOK {
+		status := 0
+		if insResp != nil {
+			status = insResp.StatusCode
+			_ = insResp.Body.Close()
+		}
+		return fmt.Errorf("rollback inspect failed (HTTP %d, err: %v); manual reconciliation required; cause: %w", status, err, triggerCause)
+	}
+	defer insResp.Body.Close()
+	var stateCheck struct {
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(insResp.Body).Decode(&stateCheck); err != nil || !stateCheck.State.Running {
+		return fmt.Errorf("restored container is NOT running; manual reconciliation required; cause: %w", triggerCause)
+	}
+
+	// Stage 5: Live health check probe
+	if healthChecker != nil {
+		probeDeadline := time.Now().Add(10 * time.Second)
+		var probeErr error
+		for time.Now().Before(probeDeadline) {
+			pCtx, pCancel := context.WithTimeout(rbCtx, 2*time.Second)
+			probeErr = healthChecker(pCtx, canonical)
+			pCancel()
+			if probeErr == nil {
+				break
+			}
+			time.Sleep(1 * time.Second)
+		}
+		if probeErr != nil {
+			return fmt.Errorf("restored original container failed health probe (%v); manual reconciliation required; cause: %w", probeErr, triggerCause)
+		}
+	}
+
+	log.Printf("[executor] 5-stage verified rollback completed successfully for %s", containerName)
+	return nil
+}
+
 // executeDockerSocketRecreate inspects existing container, backs it up via rename,
 // creates & starts new container with new image, validates health probe, and only removes
 // the backup container if the new container is healthy. If anything fails, it automatically
-// restores the original container.
+// restores the original container via 5-stage verified rollback.
 func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, newImage string) (string, error) {
 	tr := &http.Transport{
 		DisableKeepAlives: true,
@@ -1368,20 +1638,7 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		return "", fmt.Errorf("inspect container %s returned %d: %s", containerName, inspectResp.StatusCode, string(b))
 	}
 
-	var inspectData struct {
-		Config struct {
-			Image      string            `json:"Image"`
-			Env        []string          `json:"Env"`
-			Cmd        []string          `json:"Cmd"`
-			Entrypoint []string          `json:"Entrypoint"`
-			WorkingDir string            `json:"WorkingDir"`
-			Labels     map[string]string `json:"Labels"`
-		} `json:"Config"`
-		HostConfig      map[string]interface{} `json:"HostConfig"`
-		NetworkSettings struct {
-			Networks map[string]interface{} `json:"Networks"`
-		} `json:"NetworkSettings"`
-	}
+	var inspectData ContainerInspectSafetyConfig
 	if err := json.NewDecoder(inspectResp.Body).Decode(&inspectData); err != nil {
 		return "", fmt.Errorf("failed to decode container inspect json: %w", err)
 	}
@@ -1425,42 +1682,30 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		_ = renameResp.Body.Close()
 	}
 
-	// Helper for atomic restoration of backup container with 15s timeout protection
+	// Helper for 5-stage verified atomic restoration of backup container
 	restoreOriginal := func(cause error) (string, error) {
 		log.Printf("[executor] recreate failed (%v), restoring original container %s from %s", cause, containerName, backupName)
-		rbCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-
-		// Delete candidate container if created
-		delCandidateURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", containerName)
-		delReq, _ := http.NewRequestWithContext(rbCtx, http.MethodDelete, delCandidateURL, nil)
-		if dResp, dErr := client.Do(delReq); dErr == nil {
-			_ = dResp.Body.Close()
+		rbErr := executeVerifiedRollback(ctx, client, containerName, backupName, nil, containerName, cause)
+		if rbErr != nil {
+			return "", fmt.Errorf("recreate container %s failed and 5-stage rollback failed (%v): %w", containerName, rbErr, cause)
 		}
-		// Rename backup back to original name
-		restoreRenameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", backupName, containerName)
-		rReq, _ := http.NewRequestWithContext(rbCtx, http.MethodPost, restoreRenameURL, nil)
-		if rResp, rErr := client.Do(rReq); rErr == nil {
-			_ = rResp.Body.Close()
-		}
-		// Start original container
-		origStartURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
-		oReq, _ := http.NewRequestWithContext(rbCtx, http.MethodPost, origStartURL, nil)
-		if oResp, oErr := client.Do(oReq); oErr == nil {
-			_ = oResp.Body.Close()
-		}
-		return "", fmt.Errorf("recreate container %s failed and original container was restored: %w", containerName, cause)
+		return "", fmt.Errorf("recreate container %s failed and original container was restored (5-stage verified rollback): %w", containerName, cause)
 	}
 
-	// 4. Create container with new image
+	// 4. Create container with new image preserving full security and runtime configurations
 	createPayload := map[string]interface{}{
-		"Image":      targetImage,
-		"Env":        inspectData.Config.Env,
-		"Cmd":        inspectData.Config.Cmd,
-		"Entrypoint": inspectData.Config.Entrypoint,
-		"WorkingDir": inspectData.Config.WorkingDir,
-		"Labels":     inspectData.Config.Labels,
-		"HostConfig": inspectData.HostConfig,
+		"Image":        targetImage,
+		"User":         inspectData.Config.User, // Non-root user strictly preserved!
+		"Env":          inspectData.Config.Env,
+		"Cmd":          inspectData.Config.Cmd,
+		"Entrypoint":   inspectData.Config.Entrypoint,
+		"WorkingDir":   inspectData.Config.WorkingDir,
+		"Labels":       inspectData.Config.Labels,
+		"ExposedPorts": inspectData.Config.ExposedPorts,
+		"HostConfig":   inspectData.HostConfig,
+	}
+	if inspectData.Config.StopSignal != "" {
+		createPayload["StopSignal"] = inspectData.Config.StopSignal
 	}
 	if len(inspectData.NetworkSettings.Networks) > 0 {
 		createPayload["NetworkingConfig"] = map[string]interface{}{
@@ -1525,32 +1770,60 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 	return fmt.Sprintf("container %s recreated successfully with image %s", containerName, targetImage), nil
 }
 
-// SweepOrphanProposals inspects proposals left in non-terminal transient states (EXECUTING, ROLLING_BACK)
-// after an unexpected process restart, and marks them appropriately to prevent lockup.
-func SweepOrphanProposals(db *gorm.DB) error {
+// ReconcileStartupProposals inspects proposals left in non-terminal transient states
+// (EXECUTING, ROLLING_BACK) on startup and marks them EXECUTION_UNKNOWN or RECONCILIATION_REQUIRED.
+func ReconcileStartupProposals(db *gorm.DB, executor OperationExecutor) error {
 	if db == nil {
 		return nil
 	}
 	now := time.Now()
-	// Sweep EXECUTING -> FAILED
-	err := db.Model(&model.OpsProposal{}).
-		Where("status = ?", model.ProposalStatusExecuting).
-		Updates(map[string]interface{}{
-			"status":        model.ProposalStatusFailed,
-			"execution_log": "process restarted during execution; marked as FAILED by startup orphan sweeper",
-			"executed_at":   utils.NullTime{Time: now, Valid: true},
-		}).Error
-	if err != nil {
-		return err
+
+	// 1. EXECUTING proposals on startup:
+	// If executor is available and can verify health, check target container state.
+	// Otherwise, mark as RECONCILIATION_REQUIRED / EXECUTION_UNKNOWN.
+	var executingProps []model.OpsProposal
+	if err := db.Where("status = ?", model.ProposalStatusExecuting).Find(&executingProps).Error; err == nil {
+		for _, prop := range executingProps {
+			targetStatus := model.ProposalStatusReconciliationRequired
+			execLog := "Service restarted while proposal was EXECUTING; marked RECONCILIATION_REQUIRED for human review"
+
+			if executor != nil && prop.TargetComponent != "" {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				if err := executor.CheckHealth(ctx, prop.TargetComponent); err == nil {
+					// Container is healthy, but we cannot confirm whether this proposal's exact mutation completed
+					targetStatus = model.ProposalStatusExecutionUnknown
+					execLog = "Service restarted while proposal was EXECUTING; target container is healthy, but mutation state requires verification (EXECUTION_UNKNOWN)"
+				}
+				cancel()
+			}
+
+			_ = db.Model(&model.OpsProposal{}).Where("id = ?", prop.ID).Updates(map[string]interface{}{
+				"status":        targetStatus,
+				"execution_log": execLog,
+				"executed_at":   utils.NullTime{Time: now, Valid: true},
+				"reconciled_at": utils.NullTime{Time: now, Valid: true},
+				"updated_at":    now,
+			})
+		}
 	}
 
-	// Sweep ROLLING_BACK -> ROLLBACK_FAILED
-	err = db.Model(&model.OpsProposal{}).
+	// 2. ROLLING_BACK proposals on startup:
+	// Rollback was interrupted by restart -> MUST flag RECONCILIATION_REQUIRED
+	_ = db.Model(&model.OpsProposal{}).
 		Where("status = ?", model.ProposalStatusRollingBack).
 		Updates(map[string]interface{}{
-			"status":        model.ProposalStatusRollbackFailed,
-			"execution_log": "process restarted during rollback; marked as ROLLBACK_FAILED by startup orphan sweeper",
+			"status":        model.ProposalStatusReconciliationRequired,
+			"execution_log": "Service restarted while proposal was ROLLING_BACK; container state is inconsistent (RECONCILIATION_REQUIRED)",
 			"executed_at":   utils.NullTime{Time: now, Valid: true},
-		}).Error
-	return err
+			"reconciled_at": utils.NullTime{Time: now, Valid: true},
+			"updated_at":    now,
+		})
+
+	return nil
 }
+
+// SweepOrphanProposals is a backward-compatible wrapper calling ReconcileStartupProposals.
+func SweepOrphanProposals(db *gorm.DB) error {
+	return ReconcileStartupProposals(db, nil)
+}
+

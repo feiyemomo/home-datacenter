@@ -1,0 +1,24 @@
+version: "3.8"
+
+services:
+  test-1panel:
+    image: moelin/1panel:v2
+    container_name: home-1panel-test
+    restart: unless-stopped
+    ports:
+      - "10000:10000"
+    environment:
+      - TZ=Asia/Shanghai
+      - PORT=10000
+      - ENTRANCE=btpanel
+      - USERNAME=admin
+      - PASSWORD=Admin@Home123456
+    volumes:
+      - ../../data/test-1panel:/opt
+    networks:
+      home-net:
+        ipv4_address: 172.18.0.25
+
+networks:
+  home-net:
+    external: true

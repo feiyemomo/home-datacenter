@@ -55,17 +55,18 @@ type OSVSeverity struct {
 
 // PackageTarget specifies an ecosystem package dependency to scan.
 type PackageTarget struct {
-	Component string
-	Ecosystem string
-	Package   string
-	Version   string
+	Component string `json:"component"`
+	Ecosystem string `json:"ecosystem"` // "Go", "PyPI"
+	Package   string `json:"package"`
+	Version   string `json:"version"`
+	Direct    bool   `json:"direct"` // true if direct dependency, false if indirect/transitive
 }
 
 // DefaultScanTargets lists baseline framework and server dependencies to monitor.
 var DefaultScanTargets = []PackageTarget{
-	{Component: "gin", Ecosystem: "Go", Package: "github.com/gin-gonic/gin", Version: "v1.9.1"},
-	{Component: "sqlite", Ecosystem: "Go", Package: "github.com/glebarez/sqlite", Version: "v1.11.0"},
-	{Component: "gorm", Ecosystem: "Go", Package: "gorm.io/gorm", Version: "v1.25.7"},
+	{Component: "gin", Ecosystem: "Go", Package: "github.com/gin-gonic/gin", Version: "v1.9.1", Direct: true},
+	{Component: "sqlite", Ecosystem: "Go", Package: "github.com/glebarez/sqlite", Version: "v1.11.0", Direct: true},
+	{Component: "gorm", Ecosystem: "Go", Package: "gorm.io/gorm", Version: "v1.25.7", Direct: true},
 }
 
 // Scan status outcomes
@@ -332,7 +333,8 @@ func EvaluateCVSS(v OSVVuln) (riskLevel string, isCritical bool) {
 	return "MEDIUM", false
 }
 
-// ParseGoMod parses go.mod content to dynamically extract dependency packages.
+// ParseGoMod parses go.mod content to dynamically extract dependency packages,
+// accurately distinguishing direct from indirect (// indirect) dependencies.
 func ParseGoMod(content string) ([]PackageTarget, error) {
 	var targets []PackageTarget
 	inRequireBlock := false
@@ -353,13 +355,16 @@ func ParseGoMod(content string) ([]PackageTarget, error) {
 		}
 
 		if inRequireBlock || strings.HasPrefix(trimmed, "require ") {
-			if strings.HasPrefix(trimmed, "require ") {
-				trimmed = strings.TrimSpace(strings.TrimPrefix(trimmed, "require "))
+			raw := trimmed
+			if strings.HasPrefix(raw, "require ") {
+				raw = strings.TrimSpace(strings.TrimPrefix(raw, "require "))
 			}
-			if idx := strings.Index(trimmed, "//"); idx != -1 {
-				trimmed = strings.TrimSpace(trimmed[:idx])
+			isIndirect := strings.Contains(raw, "// indirect")
+			clean := raw
+			if idx := strings.Index(clean, "//"); idx != -1 {
+				clean = strings.TrimSpace(clean[:idx])
 			}
-			fields := strings.Fields(trimmed)
+			fields := strings.Fields(clean)
 			if len(fields) >= 2 {
 				pkg := fields[0]
 				ver := fields[1]
@@ -370,6 +375,7 @@ func ParseGoMod(content string) ([]PackageTarget, error) {
 					Ecosystem: "Go",
 					Package:   pkg,
 					Version:   ver,
+					Direct:    !isIndirect,
 				})
 			}
 		}
@@ -378,6 +384,7 @@ func ParseGoMod(content string) ([]PackageTarget, error) {
 }
 
 // ParseRequirementsTxt parses Python requirements.txt to dynamically extract package dependencies.
+// It sanitizes inline comments (#), environment markers (;), and hash requirements.
 func ParseRequirementsTxt(content string) ([]PackageTarget, error) {
 	var targets []PackageTarget
 	lines := strings.Split(content, "\n")
@@ -387,6 +394,14 @@ func ParseRequirementsTxt(content string) ([]PackageTarget, error) {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, "-") {
 			continue
+		}
+		// Strip trailing inline comments
+		if idx := strings.Index(trimmed, "#"); idx != -1 {
+			trimmed = strings.TrimSpace(trimmed[:idx])
+		}
+		// Strip environment markers (e.g. '; python_version >= "3.8"')
+		if idx := strings.Index(trimmed, ";"); idx != -1 {
+			trimmed = strings.TrimSpace(trimmed[:idx])
 		}
 
 		pkg := trimmed
@@ -399,12 +414,18 @@ func ParseRequirementsTxt(content string) ([]PackageTarget, error) {
 			}
 		}
 
+		// Strip hash specifications if present
+		if idx := strings.Index(ver, "--hash"); idx != -1 {
+			ver = strings.TrimSpace(ver[:idx])
+		}
+
 		if pkg != "" {
 			targets = append(targets, PackageTarget{
 				Component: pkg,
 				Ecosystem: "PyPI",
 				Package:   pkg,
 				Version:   ver,
+				Direct:    true,
 			})
 		}
 	}
@@ -532,7 +553,12 @@ func (s *VulnScanner) ScanWorkspaceDependencies(ctx context.Context, workspaceRo
 	}
 
 	if len(targets) == 0 {
-		targets = DefaultScanTargets
+		s.mu.Lock()
+		s.lastScanAt = time.Now()
+		s.lastScanStatus = ScanStatusFailed
+		s.lastScanError = "no dependency files (go.mod / requirements.txt) found in workspace"
+		s.mu.Unlock()
+		return nil, errors.New("no dependency files (go.mod / requirements.txt) found in workspace")
 	}
 
 	var allVulns []OSVVuln

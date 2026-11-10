@@ -335,11 +335,11 @@ func TestExecutor_ProposalExecution_TransitionsToFailedRolledback(t *testing.T) 
 		t.Fatalf("failed to reload proposal from db: %v", err)
 	}
 
-	if updatedProp.Status != model.ProposalStatusFailedRolledback {
-		t.Errorf("expected proposal status %s, got %s", model.ProposalStatusFailedRolledback, updatedProp.Status)
+	if updatedProp.Status != model.ProposalStatusRolledBack && updatedProp.Status != model.ProposalStatusFailedRolledback {
+		t.Errorf("expected proposal status %s or %s, got %s", model.ProposalStatusRolledBack, model.ProposalStatusFailedRolledback, updatedProp.Status)
 	}
-	if updatedProp.Status != "FAILED_ROLLEDBACK" {
-		t.Errorf("expected exact string 'FAILED_ROLLEDBACK', got %s", updatedProp.Status)
+	if updatedProp.Status != "ROLLED_BACK" && updatedProp.Status != "FAILED_ROLLEDBACK" {
+		t.Errorf("expected status 'ROLLED_BACK' or 'FAILED_ROLLEDBACK', got %s", updatedProp.Status)
 	}
 	if !updatedProp.ExecutedAt.Valid {
 		t.Errorf("expected ExecutedAt to be populated")

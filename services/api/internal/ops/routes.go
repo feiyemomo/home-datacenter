@@ -16,10 +16,11 @@ import (
 // All mutating proposal endpoints (creation and approval) are strictly guarded
 // with middleware.RequireAdmin and defense-in-depth context checks.
 func (h *OpsHandler) RegisterProposalRoutes(rg *gin.RouterGroup) {
-	rg.GET("/proposals", h.ListProposals)
-	rg.POST("/proposals", middleware.RequireAdmin(h.db), h.CreateProposal)
+	rg.GET("/proposals", middleware.RequireAuthOrInternalScope(middleware.ScopeOpsProposalRead), h.ListProposals)
+	rg.POST("/proposals", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalCreate), h.CreateProposal)
 	rg.POST("/proposals/:id/approve", middleware.RequireAdmin(h.db), h.ApproveProposal)
-	rg.POST("/proposals/:id/execute", middleware.RequireAdmin(h.db), h.ExecuteProposalEndpoint)
+	rg.POST("/proposals/:id/execute", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalExecute), h.ExecuteProposalEndpoint)
+	rg.POST("/proposals/:id/cancel", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalExecute), h.CancelProposal)
 
 	// Automatically mount FSM & Maintenance Lock routes alongside proposal endpoints
 	h.RegisterFSMRoutes(rg)
@@ -40,7 +41,8 @@ func (h *OpsHandler) RegisterFSMRoutes(rg *gin.RouterGroup) {
 
 	// FSM telemetry and manual event testing
 	rg.GET("/fsm/status", h.GetFSMStatus)
-	rg.POST("/fsm/event", middleware.RequireAdmin(h.db), h.HandleContainerEvent)
+	rg.POST("/fsm/event", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsFSM), h.HandleContainerEvent)
+	rg.POST("/audit/offline-sync", middleware.OpsAgentAuth(middleware.ScopeOpsAuditSync), h.SyncOfflineAuditLogs)
 }
 
 // ============================================================================
@@ -187,8 +189,10 @@ func (h *OpsHandler) GetFSMStatus(c *gin.Context) {
 //
 //	Route: POST /api/v1/ops/fsm/event
 func (h *OpsHandler) HandleContainerEvent(c *gin.Context) {
-	if !c.GetBool("is_admin") {
-		c.JSON(http.StatusForbidden, gin.H{"error": "admin role required"})
+	isAdmin := c.GetBool("is_admin")
+	isInternal := c.GetBool("is_internal_service")
+	if !isAdmin && !isInternal {
+		c.JSON(http.StatusForbidden, gin.H{"error": "admin role or internal scope required"})
 		return
 	}
 
@@ -203,17 +207,31 @@ func (h *OpsHandler) HandleContainerEvent(c *gin.Context) {
 	}
 
 	fsm := h.GetRecoveryFSM()
-	decision, err := fsm.ProcessContainerEvent(c.Request.Context(), event)
+	if h.executor != nil && fsm.executor == nil {
+		fsm.SetExecutor(h.executor)
+	}
+
+	result, err := fsm.ProcessAndRecover(c.Request.Context(), event)
 	if err != nil {
 		c.JSON(http.StatusOK, gin.H{
-			"decision": decision,
-			"warning":  err.Error(),
+			"decision":        result.Decision,
+			"status":          result.Status,
+			"executed":        result.Executed,
+			"health_verified": result.HealthVerified,
+			"output":          result.Output,
+			"error":           result.Error,
+			"warning":         err.Error(),
 		})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"decision": decision,
+		"decision":        result.Decision,
+		"status":          result.Status,
+		"executed":        result.Executed,
+		"health_verified": result.HealthVerified,
+		"output":          result.Output,
+		"error":           result.Error,
 	})
 }
 

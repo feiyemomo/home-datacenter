@@ -31,6 +31,9 @@ func (h *OpsHandler) ListProposals(c *gin.Context) {
 	var proposals []model.OpsProposal
 
 	query := h.db.Model(&model.OpsProposal{})
+	if hid := c.GetUint("household_id"); hid != 0 {
+		query = query.Where("household_id = ?", hid)
+	}
 	if status := c.Query("status"); status != "" {
 		query = query.Where("status = ?", status)
 	}
@@ -56,11 +59,11 @@ func (h *OpsHandler) ListProposals(c *gin.Context) {
 //
 //	Route: POST /api/v1/ops/proposals
 func (h *OpsHandler) CreateProposal(c *gin.Context) {
-	// Guard against non-admin proposal creation (defense-in-depth)
-	if !c.GetBool("is_admin") {
+	// Guard against unauthorized proposal creation (admin or internal service daemon)
+	if !c.GetBool("is_admin") && !c.GetBool("is_internal_service") {
 		c.JSON(http.StatusForbidden, gin.H{
-			"error":   "Permission denied: admin role required",
-			"message": "管理员权限不足，无法创建系统提案",
+			"error":   "Permission denied: admin role or internal service required",
+			"message": "权限不足，无法创建系统提案",
 		})
 		return
 	}
@@ -74,6 +77,12 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 	if strings.TrimSpace(req.Title) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Title is required"})
 		return
+	}
+
+	if hid := c.GetUint("household_id"); hid != 0 {
+		req.HouseholdID = hid
+	} else {
+		req.HouseholdID = 1
 	}
 
 	if req.RiskLevel == "" {
@@ -158,6 +167,15 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		return
 	}
 
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+		c.JSON(http.StatusNotFound, gin.H{
+			"error":   "Proposal not found",
+			"message": fmt.Sprintf("未找到提案: %s", idParam),
+		})
+		return
+	}
+
 	// Only proposals in pending approval states can be approved
 	if proposal.Status != model.ProposalStatusAwaitingApproval &&
 		proposal.Status != model.ProposalStatusApprovalRequired &&
@@ -168,13 +186,13 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		return
 	}
 
-	// Anti-TOCTOU BaselineHash Verification
+	// Anti-TOCTOU BaselineHash Verification (Fail-Closed: calculation failure or drift strictly blocks approval)
 	if proposal.BaselineHash != "" {
 		currentHash := h.ComputeFingerprint(proposal.TargetComponent)
-		if currentHash != "" && currentHash != proposal.BaselineHash {
+		if currentHash == "" || currentHash != proposal.BaselineHash {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":         "baseline hash mismatch: target state has drifted",
-				"message":       "目标资源状态在提案创建后已发生漂移 (TOCTOU)，请重新生成或确认提案",
+				"message":       "目标资源状态在提案创建后已发生漂移或指纹提取失败 (TOCTOU)，请重新生成或确认提案",
 				"baseline_hash": proposal.BaselineHash,
 				"current_hash":  currentHash,
 			})
@@ -259,6 +277,30 @@ func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
 		return
 	}
 
+	callerHouseholdID := c.GetUint("household_id")
+	if !isInternal && callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	// 1. Unapproved proposal states strictly require approval first (HTTP 400 Bad Request)
+	if proposal.Status == model.ProposalStatusAwaitingApproval || proposal.Status == model.ProposalStatusPending || proposal.Status == model.ProposalStatusApprovalRequired {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":  fmt.Sprintf("proposal %s requires approval before execution (status: %s)", proposal.ProposalID, proposal.Status),
+			"status": proposal.Status,
+		})
+		return
+	}
+
+	// 2. Non-executable states (CANCELLED, EXECUTING, ROLLING_BACK, EXECUTED, SUCCESS, FAILED, ROLLED_BACK, etc.) return HTTP 409 Conflict
+	if proposal.Status != model.ProposalStatusApproved && proposal.Status != model.ProposalStatusScheduled {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  fmt.Sprintf("proposal %s is not in an executable state (status: %s)", proposal.ProposalID, proposal.Status),
+			"status": proposal.Status,
+		})
+		return
+	}
+
 	exec := h.GetExecutor()
 	if exec == nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Operation executor not configured"})
@@ -268,11 +310,17 @@ func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
 	res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
 	if err != nil {
 		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) {
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":  err.Error(),
+				"status": proposal.Status,
+			})
 			return
 		}
-		if errors.Is(err, ErrProposalAlreadyRunning) {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		if errors.Is(err, ErrProposalAlreadyRunning) || errors.Is(err, ErrProposalNotExecutable) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":  err.Error(),
+				"status": proposal.Status,
+			})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error(), "result": res})
@@ -298,6 +346,71 @@ func (h *OpsHandler) ExecuteProposal(ctx context.Context, proposalID string) (*E
 	}
 
 	return exec.ExecuteProposal(ctx, &proposal)
+}
+
+// CancelProposal handles POST /api/v1/ops/proposals/:id/cancel
+// Rejects cancellation if proposal is currently EXECUTING or ROLLING_BACK (HTTP 409).
+// Atomically transitions eligible proposals (PENDING, AWAITING_APPROVAL, APPROVED, SCHEDULED) to CANCELLED via CAS.
+func (h *OpsHandler) CancelProposal(c *gin.Context) {
+	idParam := strings.TrimSpace(c.Param("id"))
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
+		return
+	}
+
+	operator := getOperatorName(c)
+
+	var prop model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&prop).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	// Multi-tenant household anti-IDOR validation
+	callerHouseholdID := c.GetUint("household_id")
+	isInternal := c.GetBool("is_internal_service")
+	if !isInternal && callerHouseholdID != 0 && prop.HouseholdID != 0 && prop.HouseholdID != callerHouseholdID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	// Active execution cannot be cancelled
+	if prop.Status == model.ProposalStatusExecuting || prop.Status == model.ProposalStatusRollingBack {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":  "Cannot cancel proposal: execution is actively in progress",
+			"status": prop.Status,
+		})
+		return
+	}
+
+	// Allowed cancel statuses
+	allowedCancelStatuses := []string{
+		model.ProposalStatusPending,
+		model.ProposalStatusAwaitingApproval,
+		model.ProposalStatusApprovalRequired,
+		model.ProposalStatusApproved,
+		model.ProposalStatusScheduled,
+	}
+
+	fsm := NewProposalFSM(h.db)
+	won, err := fsm.TransitionCAS(idParam, allowedCancelStatuses, model.ProposalStatusCancelled, map[string]interface{}{
+		"execution_log": fmt.Sprintf("Cancelled by %s at %s", operator, time.Now().Format(time.RFC3339)),
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if !won {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": "Cancel race lost: proposal state changed concurrently",
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message": "Proposal cancelled successfully",
+		"status":  model.ProposalStatusCancelled,
+	})
 }
 
 // recordProposalAudit logs approval action to EventBus and system_logs.

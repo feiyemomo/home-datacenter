@@ -7,11 +7,13 @@ import (
 )
 
 type Device struct {
-	ID uint `gorm:"primaryKey"`
+	ID uint `gorm:"primaryKey" json:"id"`
 
-	UserID uint `gorm:"index"`
+	UserID uint `gorm:"index" json:"user_id"`
 
-	DeviceName string `gorm:"not null"`
+	HouseholdID uint `gorm:"index;default:1" json:"household_id"`
+
+	DeviceName string `gorm:"not null" json:"device_name"`
 
 	AccessKeyHash string `gorm:"not null"`
 

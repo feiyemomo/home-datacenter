@@ -79,6 +79,9 @@ type Camera struct {
 	// the caller's user id; admin sees all.
 	OwnerID uint `gorm:"index" json:"owner_id"`
 
+	// HouseholdID isolates camera devices to a specific household.
+	HouseholdID uint `gorm:"index;default:1" json:"household_id"`
+
 	Capabilities JSON `gorm:"type:text" json:"capabilities"`
 	Credentials  JSON `gorm:"type:text" json:"-"` // never serialize
 	Meta         JSON `gorm:"type:text" json:"meta"`

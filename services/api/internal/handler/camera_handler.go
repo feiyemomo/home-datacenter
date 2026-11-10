@@ -124,6 +124,10 @@ func (h *CameraHandler) requireCanRead(c *gin.Context) (*model.Camera, bool) {
 		utils.Fail(c, http.StatusNotFound, "camera not found")
 		return nil, false
 	}
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && cam.HouseholdID != 0 && cam.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "camera not found")
+		return nil, false
+	}
 	uid, isAdmin, ok := h.callerIsAdmin(c)
 	if !ok {
 		utils.Fail(c, http.StatusUnauthorized, "unauthenticated")
@@ -2330,8 +2334,12 @@ func (h *CameraHandler) Preheat(c *gin.Context) {
 func (h *CameraHandler) List(c *gin.Context) {
 	uid, isAdmin, ok := h.callerIsAdmin(c)
 	cams := h.Reg.List()
+	callerHouseholdID := c.GetUint("household_id")
 	views := make([]gin.H, 0, len(cams))
 	for i := range cams {
+		if callerHouseholdID != 0 && cams[i].HouseholdID != 0 && cams[i].HouseholdID != callerHouseholdID {
+			continue
+		}
 		if !isAdmin && !h.Reg.CanRead(&cams[i], uid, isAdmin) {
 			continue
 		}
@@ -2354,6 +2362,10 @@ func (h *CameraHandler) Get(c *gin.Context) {
 		utils.Fail(c, http.StatusNotFound, "camera not found")
 		return
 	}
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && cam.HouseholdID != 0 && cam.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "camera not found")
+		return
+	}
 	uid, isAdmin, ok := h.callerIsAdmin(c)
 	if !isAdmin && !h.Reg.CanRead(cam, uid, isAdmin) {
 		utils.Fail(c, http.StatusForbidden, "camera access forbidden")
@@ -2371,14 +2383,20 @@ func (h *CameraHandler) Delete(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "invalid id")
 		return
 	}
+	cam, gerr := h.Reg.Get(uint(id))
+	if gerr != nil {
+		utils.Fail(c, http.StatusNotFound, "camera not found")
+		return
+	}
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && cam.HouseholdID != 0 && cam.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "camera not found")
+		return
+	}
 	// v1.8.20: snapshot the camera name + caller identity BEFORE
 	// Unregister so the audit-log event carries a friendly label
 	// (the row is gone after Unregister).
 	adminID, _, _ := h.callerIsAdmin(c)
-	cameraName := ""
-	if cam, gerr := h.Reg.Get(uint(id)); gerr == nil {
-		cameraName = cam.Name
-	}
+	cameraName := cam.Name
 	if err := h.Reg.Unregister(c.Request.Context(), uint(id)); err != nil {
 		log.Printf("[handler] failed to unregister camera: %v", err)
 		utils.Fail(c, http.StatusInternalServerError, "failed to unregister camera")
@@ -2422,6 +2440,10 @@ func (h *CameraHandler) requireCanManageShares(c *gin.Context) (*model.Camera, b
 	}
 	cam, err := h.Reg.Get(uint(id))
 	if err != nil {
+		utils.Fail(c, http.StatusNotFound, "camera not found")
+		return nil, false
+	}
+	if callerHouseholdID := c.GetUint("household_id"); callerHouseholdID != 0 && cam.HouseholdID != 0 && cam.HouseholdID != callerHouseholdID {
 		utils.Fail(c, http.StatusNotFound, "camera not found")
 		return nil, false
 	}
@@ -2474,6 +2496,19 @@ func (h *CameraHandler) ShareCamera(c *gin.Context) {
 	if req.UserID == cam.OwnerID {
 		utils.Fail(c, http.StatusBadRequest, "cannot share with the camera owner (already has access)")
 		return
+	}
+
+	// Anti-IDOR: Check that target user exists and belongs to the same household
+	if h.Reg != nil && h.Reg.DB != nil {
+		var targetUser model.User
+		if err := h.Reg.DB.First(&targetUser, req.UserID).Error; err != nil {
+			utils.Fail(c, http.StatusNotFound, "user not found")
+			return
+		}
+		if cam.HouseholdID != 0 && targetUser.HouseholdID != 0 && targetUser.HouseholdID != cam.HouseholdID {
+			utils.Fail(c, http.StatusBadRequest, "禁止跨家庭共享摄像头设备")
+			return
+		}
 	}
 	if err := h.Reg.ShareCamera(cam.ID, req.UserID, req.CanPTZ); err != nil {
 		log.Printf("[handler] failed to share camera: %v", err)
@@ -2657,6 +2692,7 @@ func cameraView(cam *model.Camera, stream camera.StreamConfig, isPrivileged bool
 	}
 	return gin.H{
 		"id":           cam.ID,
+		"household_id": cam.HouseholdID,
 		"type":         cam.Type,
 		"name":         cam.Name,
 		"vendor":       cam.Vendor,

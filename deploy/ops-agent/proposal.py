@@ -310,6 +310,10 @@ class ProposalLifecycleManager:
     def _update_sqlite_status(self, prop: Dict[str, Any]) -> None:
         if not self.db_path:
             return
+        # Go Core is sole scheduling authority: do not write direct SQLite status updates for SCHEDULED proposals
+        if prop.get("status") == self.STATE_SCHEDULED:
+            logger.debug(f"Skipping direct SQLite status update for SCHEDULED proposal {prop.get('id')}; Go Core is sole scheduling authority")
+            return
         conn = None
         try:
             conn = sqlite3.connect(self.db_path)

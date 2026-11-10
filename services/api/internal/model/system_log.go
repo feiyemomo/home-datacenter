@@ -27,6 +27,9 @@ const (
 type SystemLog struct {
 	ID uint `gorm:"primaryKey" json:"id"`
 
+	// HouseholdID identifies the tenant household for the log entry.
+	HouseholdID uint `gorm:"index;default:1" json:"household_id"`
+
 	// Ts is the Unix timestamp the log entry refers to. Indexed so
 	// the REST list endpoint can ORDER BY ts DESC without a sort.
 	Ts int64 `gorm:"index" json:"ts"`

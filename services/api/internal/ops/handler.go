@@ -409,3 +409,87 @@ func contextWithTimeout(parent context.Context, timeout time.Duration) (context.
 	}
 	return context.WithTimeout(parent, timeout)
 }
+
+// OfflineSyncItem represents a single offline audit log event.
+type OfflineSyncItem struct {
+	EventUUID     string `json:"event_uuid"`
+	ContainerName string `json:"container_name"`
+	Action        string `json:"action"`
+	ExitCode      int    `json:"exit_code"`
+	Success       int    `json:"success"`
+	ExecutedAt    string `json:"executed_at"`
+}
+
+// OfflineSyncRequest represents the batch of offline emergency audit events.
+type OfflineSyncRequest struct {
+	Events []OfflineSyncItem `json:"events"`
+}
+
+// SyncOfflineAuditLogs handles POST /api/v1/ops/audit/offline-sync.
+// Atomically ingests buffered offline events with idempotency deduplication by EventUUID.
+func (h *OpsHandler) SyncOfflineAuditLogs(c *gin.Context) {
+	var req OfflineSyncRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		utils.Fail(c, http.StatusBadRequest, "invalid payload: "+err.Error())
+		return
+	}
+
+	syncedCount := 0
+	for _, ev := range req.Events {
+		eventUUID := strings.TrimSpace(ev.EventUUID)
+		if eventUUID == "" {
+			continue
+		}
+
+		// Idempotency check: if event_uuid already exists, skip insertion
+		var existing model.StructuredOpsAuditLog
+		if err := h.db.Where("event_uuid = ?", eventUUID).First(&existing).Error; err == nil {
+			continue
+		}
+
+		createdAt := time.Now()
+		if ev.ExecutedAt != "" {
+			if t, err := time.Parse(time.RFC3339, ev.ExecutedAt); err == nil {
+				createdAt = t
+			}
+		}
+
+		auditRow := model.StructuredOpsAuditLog{
+			EventUUID:       eventUUID,
+			HouseholdID:     1,
+			RequestID:       c.GetString("request_id"),
+			ActorType:       "offline_agent",
+			ActorID:         0,
+			ActorName:       "home-ops-agent",
+			ClientIP:        c.ClientIP(),
+			TargetType:      "container",
+			TargetID:        ev.ContainerName,
+			Action:          "container.emergency_restart",
+			ExecutionResult: fmt.Sprintf(`{"success":%v,"exit_code":%d}`, ev.Success == 1, ev.ExitCode),
+			IsOfflineAction: true,
+			CreatedAt:       createdAt,
+		}
+
+		// Also mirror into existing system_logs for UI dashboard visibility
+		sysLog := model.SystemLog{
+			HouseholdID: 1,
+			Ts:          createdAt.Unix(),
+			EventType:   "ops.container.offline_restart",
+			Level:       model.LevelWarning,
+			Source:      "ops_agent_offline",
+			Context:     ev.ContainerName,
+			Message:     security.RedactSensitiveInfo(fmt.Sprintf("【离线应急自愈】容器 %s 在 Go Core 离线期间执行了受控紧急重启 (状态: %v)", ev.ContainerName, ev.Success == 1)),
+			Payload:     fmt.Sprintf(`{"event_uuid":"%s","exit_code":%d}`, eventUUID, ev.ExitCode),
+		}
+
+		if err := h.db.Create(&auditRow).Error; err == nil {
+			_ = h.db.Create(&sysLog)
+			syncedCount++
+		}
+	}
+
+	utils.Success(c, gin.H{
+		"synced_count": syncedCount,
+		"message":      fmt.Sprintf("成功同步 %d 条离线应急自愈审计日志", syncedCount),
+	})
+}

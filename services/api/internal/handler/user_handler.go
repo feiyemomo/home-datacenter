@@ -86,6 +86,7 @@ type userWithCount struct {
 	ID          uint
 	Name        string
 	IsAdmin     bool
+	HouseholdID uint
 	CreatedAt   string
 	UpdatedAt   string
 	DeviceCount int64
@@ -96,6 +97,7 @@ func toUserWithCount(s service.UserSummary) userWithCount {
 		ID:          s.User.ID,
 		Name:        s.User.Name,
 		IsAdmin:     s.User.IsAdmin,
+		HouseholdID: s.User.HouseholdID,
 		CreatedAt:   s.User.CreatedAt.Format("2006-01-02 15:04:05"),
 		UpdatedAt:   s.User.UpdatedAt.Format("2006-01-02 15:04:05"),
 		DeviceCount: s.DeviceCount,
@@ -116,9 +118,10 @@ func (h *UserHandler) Me(c *gin.Context) {
 	}
 
 	utils.Success(c, gin.H{
-		"id":       user.ID,
-		"name":     user.Name,
-		"is_admin": user.IsAdmin,
+		"id":           user.ID,
+		"name":         user.Name,
+		"is_admin":     user.IsAdmin,
+		"household_id": user.HouseholdID,
 	})
 }
 
@@ -131,6 +134,18 @@ func (h *UserHandler) List(c *gin.Context) {
 	if err != nil {
 		utils.Fail(c, http.StatusInternalServerError, "failed to list users")
 		return
+	}
+
+	// Filter rows by household if caller has household_id
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 {
+		var filtered []service.UserSummary
+		for _, r := range rows {
+			if r.User.HouseholdID == 0 || r.User.HouseholdID == callerHouseholdID {
+				filtered = append(filtered, r)
+			}
+		}
+		rows = filtered
 	}
 
 	// Build a set of online device IDs for O(1) lookup.
@@ -159,6 +174,7 @@ func (h *UserHandler) List(c *gin.Context) {
 			"id":           uc.ID,
 			"name":         uc.Name,
 			"is_admin":     uc.IsAdmin,
+			"household_id": uc.HouseholdID,
 			"created_at":   uc.CreatedAt,
 			"updated_at":   uc.UpdatedAt,
 			"device_count": uc.DeviceCount,
@@ -260,12 +276,20 @@ func (h *UserHandler) Get(c *gin.Context) {
 		utils.Fail(c, http.StatusInternalServerError, "failed to fetch user")
 		return
 	}
+
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && u.HouseholdID != 0 && u.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
+
 	utils.Success(c, gin.H{
-		"id":         u.ID,
-		"name":       u.Name,
-		"is_admin":   u.IsAdmin,
-		"created_at": u.CreatedAt.Format("2006-01-02 15:04:05"),
-		"updated_at": u.UpdatedAt.Format("2006-01-02 15:04:05"),
+		"id":           u.ID,
+		"name":         u.Name,
+		"is_admin":     u.IsAdmin,
+		"household_id": u.HouseholdID,
+		"created_at":   u.CreatedAt.Format("2006-01-02 15:04:05"),
+		"updated_at":   u.UpdatedAt.Format("2006-01-02 15:04:05"),
 	})
 }
 
@@ -293,6 +317,21 @@ func (h *UserHandler) Update(c *gin.Context) {
 		return
 	}
 	callerID := c.GetUint("user_id")
+
+	targetUser, err := h.userService.GetByID(id)
+	if err != nil {
+		if errors.Is(err, service.ErrUserNotFound) {
+			utils.Fail(c, http.StatusNotFound, "user not found")
+			return
+		}
+		utils.Fail(c, http.StatusInternalServerError, "failed to fetch user")
+		return
+	}
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && targetUser.HouseholdID != 0 && targetUser.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
 
 	var req updateUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -323,11 +362,12 @@ func (h *UserHandler) Update(c *gin.Context) {
 	detailStr := strings.Join(details, "，")
 	h.publishUserManageEvent(callerID, u.ID, u.Name, "update", u.IsAdmin, detailStr)
 	utils.Success(c, gin.H{
-		"id":         u.ID,
-		"name":       u.Name,
-		"is_admin":   u.IsAdmin,
-		"created_at": u.CreatedAt.Format("2006-01-02 15:04:05"),
-		"updated_at": u.UpdatedAt.Format("2006-01-02 15:04:05"),
+		"id":           u.ID,
+		"name":         u.Name,
+		"is_admin":     u.IsAdmin,
+		"household_id": u.HouseholdID,
+		"created_at":   u.CreatedAt.Format("2006-01-02 15:04:05"),
+		"updated_at":   u.UpdatedAt.Format("2006-01-02 15:04:05"),
 	})
 }
 
@@ -344,15 +384,24 @@ func (h *UserHandler) Delete(c *gin.Context) {
 		return
 	}
 	callerID := c.GetUint("user_id")
-	// v1.8.20: snapshot the target user's name BEFORE the row is
-	// deleted so the audit-log event carries a friendly label
-	// instead of just "#<id>".
-	targetName := ""
-	targetIsAdmin := false
-	if u, err := h.userService.GetByID(id); err == nil {
-		targetName = u.Name
-		targetIsAdmin = u.IsAdmin
+
+	targetUser, err := h.userService.GetByID(id)
+	if err != nil {
+		if errors.Is(err, service.ErrUserNotFound) {
+			utils.Fail(c, http.StatusNotFound, "user not found")
+			return
+		}
+		utils.Fail(c, http.StatusInternalServerError, "failed to fetch user")
+		return
 	}
+	callerHouseholdID := c.GetUint("household_id")
+	if callerHouseholdID != 0 && targetUser.HouseholdID != 0 && targetUser.HouseholdID != callerHouseholdID {
+		utils.Fail(c, http.StatusNotFound, "user not found")
+		return
+	}
+
+	targetName := targetUser.Name
+	targetIsAdmin := targetUser.IsAdmin
 	deletedDevices, err := h.userService.Delete(id, callerID)
 	if err != nil {
 		writeUserServiceError(c, err)
