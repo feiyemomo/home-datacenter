@@ -293,12 +293,60 @@ func TestIngestOfflineEvents_StrictProof_Gap_Fork_AndCrossDevice(t *testing.T) {
 		t.Fatalf("expected DUPLICATE_SEQ_CONFLICT, got %+v", forkRes)
 	}
 
-	// 4. Tampered replay with same EventUUID but different EntryHash -> DUPLICATE_ID_CONFLICT
+	// 4. Tampered replay with same EventUUID MUST fail cryptographic entry_hash check BEFORE idempotency!
 	tamperedReplay := evA1
 	tamperedReplay.EntryHash = strings.Repeat("f", 64)
 	repRes, err := ae.IngestOfflineEvents(context.Background(), []OfflineSyncEvent{tamperedReplay}, "req-4", "127.0.0.1", 1)
-	if err != nil || len(repRes.Rejected) != 1 || repRes.Rejected[0].ErrorCode != "DUPLICATE_ID_CONFLICT" {
-		t.Fatalf("expected DUPLICATE_ID_CONFLICT on tampered replay, got %+v err=%v", repRes, err)
+	if err != nil || len(repRes.Rejected) != 1 || repRes.Rejected[0].ErrorCode != "HASH_MISMATCH" {
+		t.Fatalf("expected HASH_MISMATCH on tampered replay before idempotency, got %+v err=%v", repRes, err)
+	}
+
+	// 4b. Unsigned / seq=0 replay sharing an existing EventUUID MUST fail MISSING_CRYPTO_PROOF (never blindly idempotent!)
+	unsignedExisting := OfflineSyncEvent{
+		EventUUID:     evA1.EventUUID,
+		AuditID:       evA1.AuditID,
+		ContainerName: "frigate",
+		Action:        "container.emergency_restart",
+		Success:       1,
+	}
+	unRes, err := ae.IngestOfflineEvents(context.Background(), []OfflineSyncEvent{unsignedExisting}, "req-4b", "127.0.0.1", 1)
+	if err != nil || len(unRes.Rejected) != 1 || unRes.Rejected[0].ErrorCode != "MISSING_CRYPTO_PROOF" {
+		t.Fatalf("expected MISSING_CRYPTO_PROOF on unsigned existing-UUID replay, got %+v err=%v", unRes, err)
+	}
+
+	// 4c. Validly re-signed different event reusing existing EventUUID on another stream -> passes hash+HMAC+chain, then rejected by DUPLICATE_ID_CONFLICT
+	resignedConflict := makeSignedOfflineEvent(t, kid, secret, "edge-node-c", 1, evA1.EventUUID, model.AuditGenesisHash, baseMs+50, `{"conflicting":"payload"}`)
+	confRes, err := ae.IngestOfflineEvents(context.Background(), []OfflineSyncEvent{resignedConflict}, "req-4c", "127.0.0.1", 1)
+	if err != nil || len(confRes.Rejected) != 1 || confRes.Rejected[0].ErrorCode != "DUPLICATE_ID_CONFLICT" {
+		t.Fatalf("expected DUPLICATE_ID_CONFLICT on validly signed conflicting existing UUID, got %+v err=%v", confRes, err)
+	}
+
+	// 4d. Exact duplicate retry with valid hash+HMAC+chain and matching (origin_stream_id, origin_seq, origin_entry_hash) -> accepted idempotently
+	exactRetry, err := ae.IngestOfflineEvents(context.Background(), []OfflineSyncEvent{evA1}, "req-4d", "127.0.0.1", 1)
+	if err != nil || len(exactRetry.Rejected) != 0 || len(exactRetry.AcceptedUUIDs) != 1 || exactRetry.AcceptedUUIDs[0] != evA1.EventUUID || exactRetry.SyncedCount != 0 {
+		t.Fatalf("expected idempotent acceptance on exact signed retry, got %+v err=%v", exactRetry, err)
+	}
+
+	// 4e. Invalid origin_stream_id -> rejected with INVALID_ORIGIN_STREAM before crypto hashing
+	badStreamEv := evA1
+	badStreamEv.OriginStreamID = "edge/bad stream"
+	badStreamRes, err := ae.IngestOfflineEvents(context.Background(), []OfflineSyncEvent{badStreamEv}, "req-4e", "127.0.0.1", 1)
+	if err != nil || len(badStreamRes.Rejected) != 1 || badStreamRes.Rejected[0].ErrorCode != "INVALID_ORIGIN_STREAM" {
+		t.Fatalf("expected INVALID_ORIGIN_STREAM rejection, got %+v err=%v", badStreamRes, err)
+	}
+
+	// 4f. Legacy record without origin_entry_hash (e.g. only in structured_ops_audit_logs) MUST NOT be blindly accepted
+	if execErr := db.Exec(`
+		INSERT INTO structured_ops_audit_logs (
+			event_uuid, household_id, request_id, actor_type, actor_id, actor_name,
+			client_ip, target_type, target_id, action, execution_result, is_offline_action, created_at
+		) VALUES ('off-legacy-no-hash', 1, 'req-leg', 'offline_agent', 0, 'legacy', '127.0.0.1', 'container', 'frigate', 'restart', '{}', 1, CURRENT_TIMESTAMP)`).Error; execErr != nil {
+		t.Fatalf("insert legacy structured log failed: %v", execErr)
+	}
+	legacyDup := makeSignedOfflineEvent(t, kid, secret, "edge-node-legacy", 1, "off-legacy-no-hash", model.AuditGenesisHash, baseMs+60, `{"legacy":true}`)
+	legRes, err := ae.IngestOfflineEvents(context.Background(), []OfflineSyncEvent{legacyDup}, "req-4f", "127.0.0.1", 1)
+	if err != nil || len(legRes.Rejected) != 1 || legRes.Rejected[0].ErrorCode != "DUPLICATE_ID_CONFLICT" {
+		t.Fatalf("expected DUPLICATE_ID_CONFLICT (no blind acceptance of legacy row), got %+v err=%v", legRes, err)
 	}
 
 	// 5. Verify full Core chain & persisted metadata (ProposalID, ApprovalID, OriginStreamID, KeyID)

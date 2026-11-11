@@ -1154,6 +1154,13 @@ class HomeOpsAgent:
                     return False, DockerHealthState.UNKNOWN, False, f"exit_code={exit_code}"
 
                 if not guard.verify_before_stage("health_check", min_remaining_ms=3000):
+                    self._ambiguous_operations[canonical] = {
+                        "operation_id": op_id,
+                        "run_id": run_id,
+                        "fencing_generation": fencing_gen,
+                        "recorded_at": time.time(),
+                    }
+                    self.metrics.inc("recovery_execution_unknown")
                     return False, DockerHealthState.UNKNOWN, True, "fencing_lost_before_health_check"
 
                 h_state = await self._verify_container_health(docker_container, sock_path)
@@ -1200,6 +1207,19 @@ class HomeOpsAgent:
                             pass
                     raise
 
+            if guard.lost and not execution_unknown:
+                final_ok = False
+                health_state = DockerHealthState.UNKNOWN
+                execution_unknown = True
+                err_detail = err_detail or "lease_lost_during_execution"
+                self._ambiguous_operations[canonical] = {
+                    "operation_id": op_id,
+                    "run_id": run_id,
+                    "fencing_generation": fencing_gen,
+                    "recorded_at": time.time(),
+                }
+                self.metrics.inc("recovery_execution_unknown")
+
             if has_v5 and not execution_unknown and health_state != DockerHealthState.UNKNOWN:
                 st_hc, ev_hc_id = self._record_offline_audit_strict(
                     audit_container_name,
@@ -1226,7 +1246,16 @@ class HomeOpsAgent:
             if not guard.lost and not execution_unknown:
                 if not guard.verify_before_stage("final_audit", min_remaining_ms=1000):
                     final_ok = False
+                    health_state = DockerHealthState.UNKNOWN
+                    execution_unknown = True
                     err_detail = "fencing_lost_before_final_audit"
+                    self._ambiguous_operations[canonical] = {
+                        "operation_id": op_id,
+                        "run_id": run_id,
+                        "fencing_generation": fencing_gen,
+                        "recorded_at": time.time(),
+                    }
+                    self.metrics.inc("recovery_execution_unknown")
 
             term_event_type = (
                 EXECUTION_UNKNOWN if execution_unknown else (EXECUTION_COMPLETED if final_ok else EXECUTION_FAILED)
@@ -2289,6 +2318,13 @@ class HomeOpsAgent:
                         break
                     raw_chunks.append(chunk)
                 resp = b"".join(raw_chunks)
+            except asyncio.CancelledError:
+                if writer is not None and getattr(writer, "transport", None) is not None:
+                    try:
+                        writer.transport.abort()
+                    except Exception:
+                        pass
+                raise
             except Exception as e:
                 logger.error(f"[Fail-Closed] Error reading Docker HTTP response for {path}: {e}")
                 return 0, None
@@ -2296,7 +2332,7 @@ class HomeOpsAgent:
                 if writer is not None:
                     try:
                         writer.close()
-                        await writer.wait_closed()
+                        await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
                     except Exception:
                         pass
 
@@ -2434,7 +2470,9 @@ class HomeOpsAgent:
             return ""
 
         inspected_name = str(inspect_data.get("Name") or "").strip().lstrip("/")
-        if inspected_name and inspected_name.lower() != docker_name.lower():
+        if (list_status == "ok" and inspected_name.lower() != docker_name.lower()) or (
+            inspected_name and inspected_name.lower() != docker_name.lower()
+        ):
             logger.critical(
                 f"[R8 Name Mismatch] Docker inspect Name '{inspected_name}' != expected '{docker_name}' for '{canonical}'. Failing closed."
             )
@@ -3022,7 +3060,7 @@ class HomeOpsAgent:
         # 2. Query unsynced events ordered by offline_seq ASC, id ASC (never auto-create DB)
         def read_unsynced():
             if not db_path or not os.path.isfile(db_path):
-                return [], set()
+                return [], set(), []
             conn = None
             try:
                 conn = open_readonly_sqlite(db_path)
@@ -3030,23 +3068,36 @@ class HomeOpsAgent:
                 cursor = conn.cursor()
                 cursor.execute("PRAGMA table_info(offline_ops_audit)")
                 cols = {str(c[1]).lower() for c in cursor.fetchall()}
+                prior_rows: List[Dict[str, Any]] = []
                 if "offline_seq" in cols:
                     cursor.execute(
                         "SELECT * FROM offline_ops_audit WHERE synced = 0 ORDER BY COALESCE(offline_seq, 0) ASC, id ASC LIMIT 50"
                     )
+                    rows = cursor.fetchall()
+                    if rows and {"entry_hash", "payload_json"}.issubset(cols):
+                        cursor.execute(
+                            "SELECT offline_seq, entry_hash, payload_json, synced FROM offline_ops_audit "
+                            "WHERE offline_seq > 0 AND synced IN (1, -1) ORDER BY offline_seq ASC, id ASC"
+                        )
+                        prior_rows = [dict(r) for r in cursor.fetchall()]
                 else:
                     cursor.execute("SELECT * FROM offline_ops_audit WHERE synced = 0 ORDER BY id ASC LIMIT 50")
-                rows = cursor.fetchall()
-                return [dict(r) for r in rows], cols
+                    rows = cursor.fetchall()
+                return [dict(r) for r in rows], cols, prior_rows
             except sqlite3.OperationalError:
-                return [], set()
+                return [], set(), []
             finally:
                 if conn:
                     conn.close()
 
-        records, audit_cols = await loop.run_in_executor(None, read_unsynced)
+        records, audit_cols, prior_tip_rows = await loop.run_in_executor(None, read_unsynced)
         if not records:
             return 0
+
+        has_v5_cols = {
+            "run_id", "correlation_id", "event_type", "payload_json",
+            "offline_seq", "local_prev_hash", "entry_hash", "hmac_signature",
+        }.issubset(audit_cols)
 
         # Enrich records with unpacked payload_json metadata for Go Core AgentAuditEngine verification
         enriched_records = []
@@ -3075,32 +3126,92 @@ class HomeOpsAgent:
                 out["key_id"] = extract_hmac_key_id(str(out.get("hmac_signature") or ""))
             enriched_records.append(out)
 
+        # Build confirmed stream tips preceding the earliest unsynced record per stream
+        min_unsynced_seq_by_stream: Dict[str, int] = {}
+        for rec in enriched_records:
+            sid = str(rec.get("origin_stream_id") or "offline-agent").strip() or "offline-agent"
+            seq_val = int(rec.get("offline_seq") or 0)
+            if seq_val > 0:
+                if sid not in min_unsynced_seq_by_stream or seq_val < min_unsynced_seq_by_stream[sid]:
+                    min_unsynced_seq_by_stream[sid] = seq_val
+
+        confirmed_tips: Dict[str, Tuple[int, str]] = {}
+        for prow in prior_tip_rows:
+            p_seq = int(prow.get("offline_seq") or 0)
+            p_hash = str(prow.get("entry_hash") or "").strip().lower()
+            if p_seq <= 0 or len(p_hash) != 64:
+                continue
+            p_sid = "offline-agent"
+            raw_pmeta = str(prow.get("payload_json") or "").strip()
+            if raw_pmeta.startswith("{"):
+                try:
+                    pmeta = json.loads(raw_pmeta)
+                    if pmeta.get("origin_stream_id"):
+                        p_sid = str(pmeta["origin_stream_id"]).strip() or "offline-agent"
+                except Exception:
+                    pass
+            min_u = min_unsynced_seq_by_stream.get(p_sid)
+            if min_u is None or p_seq < min_u:
+                prev_t = confirmed_tips.get(p_sid)
+                if prev_t is None or p_seq > prev_t[0]:
+                    confirmed_tips[p_sid] = (p_seq, p_hash)
+
         # Pre-verify local cryptographic hash chain before pushing to Go Core (R7)
         _, hmac_ring = resolve_audit_hmac_keyring()
         valid_records: List[Dict[str, Any]] = []
         tampered_ids: List[int] = []
-        chain_ok, chain_reason = verify_offline_audit_chain(enriched_records, ring=hmac_ring or None)
-        if not chain_ok:
-            self.metrics.inc("recovery_audit_failed")
-            logger.critical(f"[Offline Audit Tamper Detected] Local chain check failed before sync: {chain_reason}")
-            prev_valid_seq = None
-            prev_valid_hash = ""
-            for rec in enriched_records:
-                single_ok, _ = verify_offline_audit_chain([rec], ring=hmac_ring or None)
-                seq_val = int(rec.get("offline_seq") or 0)
-                if single_ok and seq_val > 0 and prev_valid_seq is not None:
-                    if seq_val <= prev_valid_seq or str(rec.get("local_prev_hash") or "") != prev_valid_hash:
-                        single_ok = False
-                if single_ok:
-                    valid_records.append(rec)
-                    if seq_val > 0:
-                        prev_valid_seq = seq_val
-                        prev_valid_hash = str(rec.get("entry_hash") or "")
-                else:
-                    if "id" in rec:
-                        tampered_ids.append(rec["id"])
-        else:
+        all_unsigned_legacy = all(
+            int(r.get("offline_seq") or 0) == 0
+            and not str(r.get("entry_hash") or "").strip()
+            and not str(r.get("hmac_signature") or "").strip()
+            for r in enriched_records
+        )
+        if not has_v5_cols or (not hmac_ring and all_unsigned_legacy):
+            if is_production() or os.environ.get("OPS_AUDIT_REQUIRE_HMAC", "") == "1":
+                self.metrics.inc("recovery_audit_failed")
+                logger.critical("[Offline Audit Sync Blocked] v5 cryptographic audit proof and HMAC key required in production; failing closed.")
+                return 0
             valid_records = enriched_records
+        elif not hmac_ring:
+            self.metrics.inc("recovery_audit_failed")
+            logger.critical("[Offline Audit Sync Blocked] External OPS_AUDIT_HMAC_KEY unavailable to verify v5 offline chain; failing closed.")
+            return 0
+        else:
+            chain_ok, chain_reason = verify_offline_audit_chain(
+                enriched_records,
+                ring=hmac_ring,
+                stream_tips=confirmed_tips,
+            )
+            if not chain_ok:
+                self.metrics.inc("recovery_audit_failed")
+                logger.critical(f"[Offline Audit Tamper Detected] Local chain check failed before sync: {chain_reason}")
+                cur_tips: Dict[str, Tuple[int, str]] = dict(confirmed_tips)
+                for rec in enriched_records:
+                    sid = str(rec.get("origin_stream_id") or "offline-agent").strip() or "offline-agent"
+                    single_ok, _ = verify_offline_audit_chain(
+                        [rec],
+                        ring=hmac_ring,
+                        stream_tips=cur_tips,
+                    )
+                    seq_val = int(rec.get("offline_seq") or 0)
+                    rec_hash = str(rec.get("entry_hash") or "").strip().lower()
+                    rec_prev = str(rec.get("local_prev_hash") or "").strip().lower()
+                    if single_ok:
+                        valid_records.append(rec)
+                        if seq_val > 0 and len(rec_hash) == 64:
+                            cur_tips[sid] = (seq_val, rec_hash)
+                    else:
+                        if "id" in rec:
+                            tampered_ids.append(rec["id"])
+                        tip_seq, tip_hash = cur_tips.get(sid, (0, AUDIT_GENESIS_HASH))
+                        if (
+                            seq_val == tip_seq + 1
+                            and rec_prev == tip_hash
+                            and len(rec_hash) == 64
+                        ):
+                            cur_tips[sid] = (seq_val, rec_hash)
+            else:
+                valid_records = enriched_records
 
         if tampered_ids:
             def mark_tampered():
@@ -3162,16 +3273,17 @@ class HomeOpsAgent:
                         if not isinstance(parsed, dict):
                             return False, None, []
                         data_obj = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-                        if not isinstance(data_obj, dict) or "accepted_uuids" not in data_obj:
-                            logger.error("[Offline Audit Sync] Response missing required 'accepted_uuids'; failing closed.")
+                        if not isinstance(data_obj, dict) or not isinstance(data_obj.get("accepted_uuids"), list):
+                            logger.error("[Offline Audit Sync] Response missing required 'accepted_uuids' list; failing closed.")
                             return False, None, []
                         acc = data_obj.get("accepted_uuids") or []
                         rej_uuids: List[str] = []
+                        transient_codes = {"RATE_LIMITED", "TEMPORARY_UNAVAILABLE", "RETRY_LATER", "SERVICE_UNAVAILABLE"}
                         for item in (data_obj.get("rejected") or []):
                             if isinstance(item, dict):
                                 r_uuid = str(item.get("event_uuid") or item.get("audit_id") or "").strip()
-                                r_code = str(item.get("code") or "").strip().upper()
-                                if r_uuid and r_code not in ("RATE_LIMITED", "TEMPORARY_UNAVAILABLE", "RETRY_LATER"):
+                                r_code = str(item.get("error_code") or item.get("code") or "").strip().upper()
+                                if r_uuid and r_code not in transient_codes:
                                     rej_uuids.append(r_uuid)
                         return True, [str(u) for u in acc if u], rej_uuids
                     # Fallback for unconfigured unittest MagicMocks with no JSON body
@@ -3187,8 +3299,14 @@ class HomeOpsAgent:
         if accepted_uuids is not None:
             accepted_set = set(accepted_uuids)
             rejected_set = set(rejected_uuids) - accepted_set
-            records_to_ack = [r for r in valid_records if r.get("event_uuid") in accepted_set]
-            records_to_reject = [r for r in valid_records if r.get("event_uuid") in rejected_set]
+            records_to_ack = [
+                r for r in valid_records
+                if (r.get("event_uuid") in accepted_set or r.get("audit_id") in accepted_set)
+            ]
+            records_to_reject = [
+                r for r in valid_records
+                if (r.get("event_uuid") in rejected_set or r.get("audit_id") in rejected_set)
+            ]
         else:
             records_to_ack = valid_records
             records_to_reject = []
@@ -3440,6 +3558,19 @@ class HomeOpsAgent:
                 return False
             logger.info(f"[Tier 1] Issued restart for container {container_name}")
             return b"204 No Content" in resp or b"200 OK" in resp
+        except asyncio.CancelledError:
+            if request_sent:
+                self._last_restart_ambiguous = True
+                self.metrics.inc("recovery_execution_unknown")
+                logger.critical(
+                    f"[EXECUTION_UNKNOWN] Docker restart cancelled after request dispatch for {container_name}."
+                )
+            if writer is not None and getattr(writer, "transport", None) is not None:
+                try:
+                    writer.transport.abort()
+                except Exception:
+                    pass
+            raise
         except (asyncio.TimeoutError, TimeoutError, ConnectionError, EOFError, OSError) as e:
             if request_sent:
                 self._last_restart_ambiguous = True
@@ -3457,7 +3588,7 @@ class HomeOpsAgent:
             if writer is not None:
                 try:
                     writer.close()
-                    await writer.wait_closed()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
                 except Exception:
                     pass
 

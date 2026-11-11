@@ -74,6 +74,7 @@ func (e *AgentAuditEngine) IngestOfflineEvents(ctx context.Context, events []Off
 		}
 
 		for _, item := range events {
+			// 1. Event identity check
 			rawUUID := strings.TrimSpace(item.EventUUID)
 			rawAuditID := strings.TrimSpace(item.AuditID)
 			uuid := defaultStr(rawUUID, rawAuditID)
@@ -83,40 +84,22 @@ func (e *AgentAuditEngine) IngestOfflineEvents(ctx context.Context, events []Off
 				continue
 			}
 
-			// Idempotency lookup across both primary audit table and legacy structured log table.
-			var existingOriginHash string
-			idErr := conn.QueryRowContext(ctx,
-				`SELECT origin_entry_hash FROM agent_audit_events WHERE audit_id = ? OR audit_id = ? LIMIT 1`,
-				auditID, uuid,
-			).Scan(&existingOriginHash)
-			if idErr == nil {
-				incomingHash := strings.TrimSpace(item.EntryHash)
-				if incomingHash != "" && existingOriginHash != "" && incomingHash != existingOriginHash {
-					recordReject(uuid, "DUPLICATE_ID_CONFLICT", "audit_id already exists with different origin_entry_hash (possible replay tamper)")
-					continue
-				}
-				result.AcceptedUUIDs = append(result.AcceptedUUIDs, uuid)
-				continue
-			} else if idErr != sql.ErrNoRows {
-				return idErr
-			}
-
-			var legacyCount int64
-			if err := conn.QueryRowContext(ctx,
-				`SELECT COUNT(*) FROM structured_ops_audit_logs WHERE event_uuid = ? OR event_uuid = ?`,
-				uuid, auditID,
-			).Scan(&legacyCount); err != nil {
-				return err
-			}
-			if legacyCount > 0 {
-				result.AcceptedUUIDs = append(result.AcceptedUUIDs, uuid)
+			// 2. Monotonic origin sequence floor check (offline_seq >= 1)
+			if item.OfflineSeq == 0 {
+				recordReject(uuid, "MISSING_CRYPTO_PROOF", "offline audit event offline_seq must be >= 1")
 				continue
 			}
 
-			// Fail-closed cryptographic proof requirement: never ingest unsigned/unchained offline events.
+			// 3. Origin stream identity validation
+			originStream := defaultStr(strings.TrimSpace(item.OriginStreamID), "offline-agent")
+			if len(originStream) > 64 || strings.ContainsAny(originStream, "\r\n\t\x00/\\ ") {
+				recordReject(uuid, "INVALID_ORIGIN_STREAM", fmt.Sprintf("invalid origin_stream_id %q", originStream))
+				continue
+			}
+
 			originHash := strings.TrimSpace(item.EntryHash)
-			if item.OfflineSeq == 0 || originHash == "" || strings.TrimSpace(item.HMACSignature) == "" {
-				recordReject(uuid, "MISSING_CRYPTO_PROOF", "offline audit event missing required offline_seq, entry_hash, or hmac_signature")
+			if originHash == "" || strings.TrimSpace(item.HMACSignature) == "" {
+				recordReject(uuid, "MISSING_CRYPTO_PROOF", "offline audit event missing required entry_hash or hmac_signature")
 				continue
 			}
 
@@ -131,7 +114,6 @@ func (e *AgentAuditEngine) IngestOfflineEvents(ctx context.Context, events []Off
 			if itemHouseholdID == 0 {
 				itemHouseholdID = householdID
 			}
-			originStream := defaultStr(strings.TrimSpace(item.OriginStreamID), "offline-agent")
 			policyVer := defaultStr(strings.TrimSpace(item.PolicyVersion), PolicyVersion)
 
 			rawTarget := defaultStr(strings.TrimSpace(item.Target), strings.TrimSpace(item.ContainerName))
@@ -153,7 +135,7 @@ func (e *AgentAuditEngine) IngestOfflineEvents(ctx context.Context, events []Off
 				resLabel = "FAILED"
 			}
 
-			// Verify origin entry_hash and HMAC against exact incoming signed payload before Core re-redaction.
+			// 4. Canonical entry_hash verification BEFORE any idempotency shortcut
 			localPrevHash := defaultStr(strings.TrimSpace(item.LocalPrevHash), model.AuditGenesisHash)
 			verifyCopy := model.AgentAuditEvent{
 				StreamID:           originStream,
@@ -195,24 +177,14 @@ func (e *AgentAuditEngine) IngestOfflineEvents(ctx context.Context, events []Off
 				recordReject(uuid, "HASH_MISMATCH", fmt.Sprintf("offline entry_hash mismatch (got %s, expected %s)", originHash, expectedOriginHash))
 				continue
 			}
+
+			// 5. Cryptographic HMAC signature and key_id verification
 			if _, mErr := VerifyOfflineOriginHMACWithKID(item, ring); mErr != nil {
 				recordReject(uuid, "HMAC_INVALID", fmt.Sprintf("offline HMAC verification failed: %v", mErr))
 				continue
 			}
 
-			// Cross-device / fork duplicate sequence detection on (origin_stream_id, origin_seq).
-			var existingSeqAuditID string
-			seqDupErr := conn.QueryRowContext(ctx,
-				`SELECT audit_id FROM agent_audit_events WHERE origin_stream_id = ? AND origin_seq = ? LIMIT 1`,
-				originStream, item.OfflineSeq,
-			).Scan(&existingSeqAuditID)
-			if seqDupErr == nil {
-				recordReject(uuid, "DUPLICATE_SEQ_CONFLICT", fmt.Sprintf("origin_stream_id=%s origin_seq=%d already occupied by %s", originStream, item.OfflineSeq, existingSeqAuditID))
-				continue
-			} else if seqDupErr != sql.ErrNoRows {
-				return seqDupErr
-			}
-
+			// 6. Monotonic origin_seq continuity & local_prev_hash chain linkage verification
 			tip, loaded := streamTips[originStream]
 			if !loaded {
 				var dbTipSeq uint64
@@ -228,28 +200,103 @@ func (e *AgentAuditEngine) IngestOfflineEvents(ctx context.Context, events []Off
 				streamTips[originStream] = tip
 			}
 
-			if tip.lastSeq == 0 {
-				if item.OfflineSeq != 1 {
-					recordReject(uuid, "SEQ_GAP", fmt.Sprintf("expected initial offline_seq=1 for stream %s, got %d (missing preceding offline events)", originStream, item.OfflineSeq))
-					continue
-				}
-				if localPrevHash != model.AuditGenesisHash {
-					recordReject(uuid, "CHAIN_FORK", fmt.Sprintf("initial offline event for stream %s must link to genesis hash", originStream))
-					continue
+			if item.OfflineSeq > tip.lastSeq {
+				if tip.lastSeq == 0 {
+					if item.OfflineSeq != 1 {
+						recordReject(uuid, "SEQ_GAP", fmt.Sprintf("expected initial offline_seq=1 for stream %s, got %d (missing preceding offline events)", originStream, item.OfflineSeq))
+						continue
+					}
+					if localPrevHash != model.AuditGenesisHash {
+						recordReject(uuid, "CHAIN_FORK", fmt.Sprintf("initial offline event for stream %s must link to genesis hash", originStream))
+						continue
+					}
+				} else {
+					if item.OfflineSeq > tip.lastSeq+1 {
+						recordReject(uuid, "SEQ_GAP", fmt.Sprintf("missing offline event(s) on stream %s: expected offline_seq=%d, got %d", originStream, tip.lastSeq+1, item.OfflineSeq))
+						continue
+					}
+					if localPrevHash != tip.lastHash {
+						recordReject(uuid, "CHAIN_FORK", fmt.Sprintf("local_prev_hash mismatch on stream %s at offline_seq=%d", originStream, item.OfflineSeq))
+						continue
+					}
 				}
 			} else {
-				if item.OfflineSeq <= tip.lastSeq {
-					recordReject(uuid, "DUPLICATE_SEQ_CONFLICT", fmt.Sprintf("non-monotonic offline_seq=%d <= tip=%d on stream %s", item.OfflineSeq, tip.lastSeq, originStream))
+				if item.OfflineSeq == 1 {
+					if localPrevHash != model.AuditGenesisHash {
+						recordReject(uuid, "CHAIN_FORK", fmt.Sprintf("initial offline event for stream %s must link to genesis hash", originStream))
+						continue
+					}
+				} else {
+					var predHash string
+					predErr := conn.QueryRowContext(ctx,
+						`SELECT origin_entry_hash FROM agent_audit_events WHERE origin_stream_id = ? AND origin_seq = ? LIMIT 1`,
+						originStream, item.OfflineSeq-1,
+					).Scan(&predHash)
+					if predErr == sql.ErrNoRows {
+						recordReject(uuid, "SEQ_GAP", fmt.Sprintf("missing predecessor offline_seq=%d on stream %s", item.OfflineSeq-1, originStream))
+						continue
+					} else if predErr != nil {
+						return predErr
+					}
+					if predHash == "" || localPrevHash != predHash {
+						recordReject(uuid, "CHAIN_FORK", fmt.Sprintf("local_prev_hash mismatch on stream %s at offline_seq=%d", originStream, item.OfflineSeq))
+						continue
+					}
+				}
+			}
+
+			// 7. LAST: Idempotency verification & sequence occupancy guard.
+			// Existing events may ONLY be accepted idempotently after cryptographic proof and chain continuity pass,
+			// and ONLY when origin_entry_hash, origin_stream_id, and origin_seq all strictly match.
+			var existingOriginStream string
+			var existingOriginSeq uint64
+			var existingOriginHash string
+			idErr := conn.QueryRowContext(ctx,
+				`SELECT origin_stream_id, origin_seq, origin_entry_hash FROM agent_audit_events WHERE audit_id = ? OR audit_id = ? LIMIT 1`,
+				auditID, uuid,
+			).Scan(&existingOriginStream, &existingOriginSeq, &existingOriginHash)
+			if idErr == nil {
+				if existingOriginHash == "" || existingOriginStream == "" || existingOriginSeq == 0 {
+					recordReject(uuid, "DUPLICATE_ID_CONFLICT", "existing audit_id lacks origin_entry_hash provenance; refusing blind idempotent acceptance")
 					continue
 				}
-				if item.OfflineSeq > tip.lastSeq+1 {
-					recordReject(uuid, "SEQ_GAP", fmt.Sprintf("missing offline event(s) on stream %s: expected offline_seq=%d, got %d", originStream, tip.lastSeq+1, item.OfflineSeq))
+				if existingOriginHash != originHash || existingOriginStream != originStream || existingOriginSeq != item.OfflineSeq {
+					recordReject(uuid, "DUPLICATE_ID_CONFLICT", "audit_id already exists with conflicting origin_entry_hash/origin_stream_id/origin_seq")
 					continue
 				}
-				if localPrevHash != tip.lastHash {
-					recordReject(uuid, "CHAIN_FORK", fmt.Sprintf("local_prev_hash mismatch on stream %s at offline_seq=%d", originStream, item.OfflineSeq))
-					continue
-				}
+				result.AcceptedUUIDs = append(result.AcceptedUUIDs, uuid)
+				continue
+			} else if idErr != sql.ErrNoRows {
+				return idErr
+			}
+
+			var legacyCount int64
+			if err := conn.QueryRowContext(ctx,
+				`SELECT COUNT(*) FROM structured_ops_audit_logs WHERE event_uuid = ? OR event_uuid = ?`,
+				uuid, auditID,
+			).Scan(&legacyCount); err != nil {
+				return err
+			}
+			if legacyCount > 0 {
+				recordReject(uuid, "DUPLICATE_ID_CONFLICT", "legacy structured_ops_audit_logs entry lacks origin_entry_hash; refusing blind idempotent acceptance")
+				continue
+			}
+
+			// Cross-device / fork duplicate sequence detection on (origin_stream_id, origin_seq) for new audit_id.
+			var existingSeqAuditID string
+			seqDupErr := conn.QueryRowContext(ctx,
+				`SELECT audit_id FROM agent_audit_events WHERE origin_stream_id = ? AND origin_seq = ? LIMIT 1`,
+				originStream, item.OfflineSeq,
+			).Scan(&existingSeqAuditID)
+			if seqDupErr == nil {
+				recordReject(uuid, "DUPLICATE_SEQ_CONFLICT", fmt.Sprintf("origin_stream_id=%s origin_seq=%d already occupied by %s", originStream, item.OfflineSeq, existingSeqAuditID))
+				continue
+			} else if seqDupErr != sql.ErrNoRows {
+				return seqDupErr
+			}
+			if item.OfflineSeq <= tip.lastSeq {
+				recordReject(uuid, "DUPLICATE_SEQ_CONFLICT", fmt.Sprintf("non-monotonic offline_seq=%d <= tip=%d on stream %s", item.OfflineSeq, tip.lastSeq, originStream))
+				continue
 			}
 
 			target := redact.SensitiveString(rawTarget)
