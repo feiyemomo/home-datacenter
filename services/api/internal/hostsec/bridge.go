@@ -411,6 +411,8 @@ func computeBridgeRequestSignature(key []byte, method, path, ts, nonce string, b
 type HostBridgeServerConfig struct {
 	HostRoot       string
 	SnapshotRoot   string
+	NonceDir       string
+	FencingDir     string
 	KeyID          string
 	HMACKey        []byte
 	Runner         HostExecRunner
@@ -438,9 +440,48 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 	if cfg.ReplayWindow <= 0 {
 		cfg.ReplayWindow = defaultBridgeReplayWindow
 	}
+	if cfg.NonceDir == "" && cfg.SnapshotRoot != "" {
+		cfg.NonceDir = filepath.Join(cfg.SnapshotRoot, "bridge-nonces")
+	}
+	if cfg.FencingDir == "" && cfg.SnapshotRoot != "" {
+		cfg.FencingDir = filepath.Join(cfg.SnapshotRoot, "bridge-fencing")
+	}
+
 	detector := NewPlatformDetector(cfg.HostRoot)
 	var nonceMu sync.Mutex
 	seenNonces := make(map[string]int64)
+
+	// Pre-populate seenNonces from persistent disk storage if configured
+	if cfg.NonceDir != "" {
+		_ = os.MkdirAll(cfg.NonceDir, 0700)
+		if entries, err := os.ReadDir(cfg.NonceDir); err == nil {
+			nowMs := time.Now().UTC().UnixMilli()
+			skewMs := cfg.ReplayWindow.Milliseconds()
+			for _, ent := range entries {
+				if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".ts") {
+					continue
+				}
+				p := filepath.Join(cfg.NonceDir, ent.Name())
+				data, rErr := os.ReadFile(p)
+				if rErr != nil {
+					continue
+				}
+				tsMs, pErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64)
+				if pErr != nil || tsMs < nowMs-skewMs {
+					_ = os.Remove(p)
+					continue
+				}
+				nonceKey := strings.TrimSuffix(ent.Name(), ".ts")
+				seenNonces[nonceKey] = tsMs
+			}
+		}
+	}
+
+	var fencingMu sync.Mutex
+	lastFencingGen := make(map[string]int64)
+	if cfg.FencingDir != "" {
+		_ = os.MkdirAll(cfg.FencingDir, 0700)
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON := func(code int, v any) {
@@ -493,14 +534,31 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 		for k, exp := range seenNonces {
 			if exp < nowMs-skewMs {
 				delete(seenNonces, k)
+				if cfg.NonceDir != "" {
+					_ = os.Remove(filepath.Join(cfg.NonceDir, k+".ts"))
+				}
 			}
 		}
-		if _, dup := seenNonces[reqNonce]; dup || len(seenNonces) >= maxBridgeNonceCacheEntries {
+		nonceSum := sha256.Sum256([]byte(reqNonce))
+		nonceKey := hex.EncodeToString(nonceSum[:])
+		if _, dup := seenNonces[nonceKey]; dup || len(seenNonces) >= maxBridgeNonceCacheEntries {
 			nonceMu.Unlock()
 			writeJSON(http.StatusUnauthorized, map[string]string{"error": "bridge nonce replayed or cache saturated"})
 			return
 		}
-		seenNonces[reqNonce] = tsMs
+		if cfg.NonceDir != "" {
+			noncePath := filepath.Join(cfg.NonceDir, nonceKey+".ts")
+			if _, statErr := os.Stat(noncePath); statErr == nil {
+				nonceMu.Unlock()
+				writeJSON(http.StatusUnauthorized, map[string]string{"error": "bridge nonce replayed"})
+				return
+			}
+			tmpPath := noncePath + ".tmp"
+			if wErr := os.WriteFile(tmpPath, []byte(strconv.FormatInt(tsMs, 10)), 0600); wErr == nil {
+				_ = os.Rename(tmpPath, noncePath)
+			}
+		}
+		seenNonces[nonceKey] = tsMs
 		nonceMu.Unlock()
 
 		// 2. Decode strictly without unknown fields (prevent arbitrary shell/command/args injection)
@@ -514,6 +572,38 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 		if err := ValidateHostActionRequest(req, cfg.AllowedPkgs, cfg.RequireFencing); err != nil {
 			writeJSON(http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
+		}
+
+		// Enforce monotonic fencing generation per proposal across the bridge
+		if req.Binding.ProposalID != "" && req.Binding.FencingGeneration > 0 {
+			fencingMu.Lock()
+			propSum := sha256.Sum256([]byte(req.Binding.ProposalID))
+			proposalKey := hex.EncodeToString(propSum[:])
+			lastGen, exists := lastFencingGen[proposalKey]
+			if !exists && cfg.FencingDir != "" {
+				genPath := filepath.Join(cfg.FencingDir, proposalKey+".gen")
+				if data, rErr := os.ReadFile(genPath); rErr == nil {
+					if parsed, pErr := strconv.ParseInt(strings.TrimSpace(string(data)), 10, 64); pErr == nil {
+						lastGen = parsed
+					}
+				}
+			}
+			if req.Binding.FencingGeneration < lastGen {
+				fencingMu.Unlock()
+				writeJSON(http.StatusBadRequest, map[string]string{
+					"error": fmt.Sprintf("stale or non-monotonic fencing generation %d < %d for proposal %s", req.Binding.FencingGeneration, lastGen, req.Binding.ProposalID),
+				})
+				return
+			}
+			lastFencingGen[proposalKey] = req.Binding.FencingGeneration
+			if cfg.FencingDir != "" {
+				genPath := filepath.Join(cfg.FencingDir, proposalKey+".gen")
+				tmpGen := genPath + ".tmp"
+				if wErr := os.WriteFile(tmpGen, []byte(strconv.FormatInt(req.Binding.FencingGeneration, 10)), 0600); wErr == nil {
+					_ = os.Rename(tmpGen, genPath)
+				}
+			}
+			fencingMu.Unlock()
 		}
 
 		// 3. Independent local host platform policy enforcement (fnOS strictly read-only, no bypass)

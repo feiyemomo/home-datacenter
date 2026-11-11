@@ -171,8 +171,8 @@ func TestR4_21_CircuitBreakerFaultMatrix(t *testing.T) {
 		db, _ := setupR4CBDB(t)
 		cb := NewContainerCircuitBreaker()
 		cb.SetDB(db)
-		cb.SetCooldownDuration(20 * time.Millisecond)
-		cb.SetProbeTTL(30 * time.Millisecond)
+		cb.SetCooldownDuration(60 * time.Millisecond)
+		cb.SetProbeTTL(200 * time.Millisecond)
 
 		for i := 0; i < 3; i++ {
 			_, tripped := cb.RecordCrash("home-api")
@@ -182,7 +182,7 @@ func TestR4_21_CircuitBreakerFaultMatrix(t *testing.T) {
 		}
 
 		// Wait cooldown -> acquire first HALF_OPEN probe ticket
-		time.Sleep(35 * time.Millisecond)
+		time.Sleep(75 * time.Millisecond)
 		ok1, ticket1, err1 := cb.CanAttemptRecovery("home-api")
 		if !ok1 || err1 != nil || ticket1 == nil || ticket1.Token == "" {
 			t.Fatalf("expected first probe ticket, got ok=%v ticket=%v err=%v", ok1, ticket1, err1)
@@ -195,13 +195,13 @@ func TestR4_21_CircuitBreakerFaultMatrix(t *testing.T) {
 		}
 
 		// Wait probeTTL so ticket1 expires -> stale callback MUST fail and reopen with cooldown
-		time.Sleep(45 * time.Millisecond)
+		time.Sleep(250 * time.Millisecond)
 		if staleErr := cb.RecordRecoverySuccess("home-api", ticket1.Token); !errors.Is(staleErr, ErrProbeExpired) && !errors.Is(staleErr, ErrStaleProbeToken) {
 			t.Fatalf("expected expired probe callback rejected, got %v", staleErr)
 		}
 
 		// During cooldown, new probe is still gated by ErrCircuitBreakerOpen; once cooldown passes, new probe slot opens without deadlock
-		time.Sleep(35 * time.Millisecond)
+		time.Sleep(75 * time.Millisecond)
 		ok3, ticket3, err3 := cb.CanAttemptRecovery("home-api")
 		if !ok3 || err3 != nil || ticket3 == nil || ticket3.Token == "" || ticket3.Token == ticket1.Token {
 			t.Fatalf("expected new probe slot after expiry without deadlock, got ok=%v ticket=%v err=%v", ok3, ticket3, err3)

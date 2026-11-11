@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -479,8 +480,12 @@ func TestR11_FI_06_ConcurrentHostUpdateAndFencingRejection(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
+			wProp := makeSignedHostUpdateProposal(t, []string{"openssh-server"})
+			wProp.ProposalID = fmt.Sprintf("prop-hostupd-race-%d", idx)
+			wProp.BaselineHash = baseHash
+			wProp.ApprovalDigest, _ = model.ComputeProposalApprovalDigest(wProp)
 			res, execErr := exec.Execute(context.Background(), HostUpdateRequest{
-				Proposal:             prop,
+				Proposal:             wProp,
 				FencingGeneration:    int64(idx + 1),
 				Packages:             []string{"openssh-server"},
 				ExpectedBaselineHash: baseHash,
