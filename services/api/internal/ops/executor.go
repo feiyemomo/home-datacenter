@@ -1063,7 +1063,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				ExecutedAt: startTime,
 			}, err
 		}
-	} else if e.leaseManager != nil && isMutatingContainerAction(spec.Action) {
+	} else if e.leaseManager != nil && (isMutatingContainerAction(spec.Action) || strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade)) {
 		leaseCtx, guard, lErr := AcquireLeaseGuard(ctx, e.leaseManager, canonical, opID, 30*time.Second, e.db, e.bus)
 		if lErr != nil {
 			emitPreExecBlock(lErr, 0)
@@ -2612,8 +2612,15 @@ func (e *DefaultOperationExecutor) executeHostPackageUpgrade(ctx context.Context
 		timeout = time.Duration(spec.TimeoutSec) * time.Second
 	}
 
+	var fencingGen int64
+	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+		fencingGen = guard.Grant.FencingGeneration
+	}
+
 	res, err := hue.Execute(ctx, hostsec.HostUpdateRequest{
 		Proposal:             proposal,
+		ApprovalID:           proposal.ApprovalDigest,
+		FencingGeneration:    fencingGen,
 		Packages:             pkgs,
 		TargetVersions:       targetVersions,
 		ExpectedBaselineHash: expectedBaseline,
