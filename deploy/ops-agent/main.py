@@ -7,7 +7,9 @@ import asyncio
 import json
 import logging
 import enum
+import math
 import os
+import secrets
 import shutil
 import signal
 import socket
@@ -131,96 +133,17 @@ class SecurityMetricsCollector:
     def snapshot(self) -> Dict[str, int]:
         return dict(self.counters)
 
-# Canonical Component Resolution (1-to-1 with Go Core ResolveTopologyComponent)
-CANONICAL_COMPONENT_MAP = {
-    "home-mosquitto": "mosquitto",
-    "mosquitto": "mosquitto",
-    "mqtt": "mosquitto",
-    "broker": "mosquitto",
-    "mosquitto-broker": "mosquitto",
-    "home-datacenter-mosquitto": "mosquitto",
-
-    "home-frigate": "frigate",
-    "nvr": "frigate",
-    "frigate": "frigate",
-    "go2rtc": "frigate",
-    "home-datacenter-frigate": "frigate",
-
-    "app.db": "app.db",
-    "database": "app.db",
-    "sqlite": "app.db",
-    "db": "app.db",
-
-    "home-api": "home-api",
-    "api": "home-api",
-    "backend": "home-api",
-    "go-api": "home-api",
-    "home-datacenter-api": "home-api",
-
-    "home-web": "home-web",
-    "web": "home-web",
-    "frontend": "home-web",
-    "nginx": "home-web",
-    "home-datacenter-web": "home-web",
-
-    "home-vision": "home-vision",
-    "vision": "home-vision",
-    "ai-vision": "home-vision",
-    "home-datacenter-vision": "home-vision",
-
-    "home-cloudflared": "home-cloudflared",
-    "cloudflared": "home-cloudflared",
-    "home-datacenter-cloudflared": "home-cloudflared",
-
-    "home-h3c-keepalive": "home-h3c-keepalive",
-    "h3c": "home-h3c-keepalive",
-    "home-datacenter-h3c-keepalive": "home-h3c-keepalive",
-
-    "home-ops-agent": "home-ops-agent",
-    "ops-agent": "home-ops-agent",
-    "home-datacenter-ops-agent": "home-ops-agent",
-
-    "1panel-openresty-wudu": "openresty",
-    "1panel-openresty": "openresty",
-    "openresty": "openresty",
-    "nginx-proxy": "openresty",
-    "1pwaf": "openresty",
-    "waf": "openresty",
-    "openresty-waf": "openresty",
-    "home-gateway": "openresty",
-    "gateway": "openresty",
-    "home-datacenter-gateway": "openresty",
-}
-
-CANONICAL_TO_DOCKER_CONTAINER = {
-    "frigate": "home-frigate",
-    "mosquitto": "home-mosquitto",
-    "home-api": "home-api",
-    "home-web": "home-web",
-    "home-vision": "home-vision",
-    "openresty": "1Panel-openresty-WuDU",
-    "home-cloudflared": "home-cloudflared",
-    "home-h3c-keepalive": "home-h3c-keepalive",
-    "home-ops-agent": "home-ops-agent",
-}
-
-def resolve_canonical_component(name: str) -> str:
-    """Normalizes known component names and aliases; returns '' (Fail-Closed) on unknown (R4-17)."""
-    cleaned = (name or "").strip().lower().lstrip("/")
-    if "(" in cleaned:
-        prefix = cleaned.split("(")[0].strip()
-        if prefix:
-            cleaned = prefix
-    if not cleaned:
-        return ""
-    return CANONICAL_COMPONENT_MAP.get(cleaned, "")
-
-def resolve_docker_container_name(canonical: str) -> str:
-    """Resolves canonical component name to Docker container name; returns '' on unknown (R4-17)."""
-    cleaned = resolve_canonical_component(canonical)
-    if not cleaned:
-        return ""
-    return CANONICAL_TO_DOCKER_CONTAINER.get(cleaned, "")
+from config import (
+    CANONICAL_COMPONENT_MAP,
+    CANONICAL_TO_DOCKER_CONTAINER,
+    OpsAgentConfig,
+    compute_container_baseline_from_inspect,
+    compute_offline_placeholder_baseline,
+    is_placeholder_baseline_hash,
+    is_real_baseline_hash,
+    resolve_canonical_component,
+    resolve_docker_container_name,
+)
 
 def open_readonly_sqlite(db_path: str) -> sqlite3.Connection:
     """
@@ -313,7 +236,6 @@ OFFLINE_FORBIDDEN_COMPONENTS = frozenset({
     "app.db", "mosquitto", "home-mosquitto", "database", "sqlite", "db", "mqtt"
 })
 
-from config import OpsAgentConfig
 from proposal import ProposalLifecycleManager
 from rule_engine import TwoTierRuleEngine, sanitize_log
 
@@ -449,6 +371,7 @@ class HomeOpsAgent:
         self.metrics = SecurityMetricsCollector()
         self._last_audit_status: AuditStatus = AuditStatus.AUDIT_UNKNOWN
         self._active_lease_generations: dict[str, int] = {}
+        self._executor_id: str = f"py-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
     def _create_paho_client(self, loop: asyncio.AbstractEventLoop) -> Optional[Any]:
         """Creates and configures standard paho-mqtt client with auth, TLS, LWT, and QoS 1."""
@@ -698,6 +621,30 @@ class HomeOpsAgent:
                                         f"[Security Block] Refusing Go Core AUTHORIZED restart for non-whitelisted container '{container_name}'."
                                     )
                                     continue
+                                docker_name = resolve_docker_container_name(canonical_auth)
+                                if not docker_name:
+                                    logger.critical(f"[Security Block] Cannot resolve docker container for {canonical_auth}.")
+                                    continue
+
+                                expected_bh = str(
+                                    resp_data.get("baseline_hash")
+                                    or (resp_data.get("proposal") or {}).get("baseline_hash")
+                                    or ""
+                                ).strip()
+                                if expected_bh:
+                                    if not is_real_baseline_hash(expected_bh, canonical_auth):
+                                        logger.critical(
+                                            f"[R5 Security Block] Rejecting AUTHORIZED restart for {canonical_auth}: invalid/placeholder baseline_hash."
+                                        )
+                                        continue
+                                    live_bh = await self._compute_container_baseline_hash(canonical_auth, sock_path)
+                                    if not live_bh or live_bh != expected_bh:
+                                        logger.critical(
+                                            f"[R5 Security Block] BaselineHash verification failed or drifted for {canonical_auth} "
+                                            f"(expected={expected_bh}, live={live_bh})."
+                                        )
+                                        continue
+
                                 db_path_auth = getattr(self.config, "db_path", "/data/sqlite/app.db")
                                 auth_run_id = f"run-pyauth-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
                                 auth_corr_id = f"corr-{uuid.uuid4().hex[:8]}"
@@ -709,7 +656,9 @@ class HomeOpsAgent:
                                     )
                                     continue
                                 try:
-                                    if not self._verify_recovery_lease(canonical_auth, lease_tok, fencing_gen, db_path_auth):
+                                    if not self._verify_recovery_lease(
+                                        canonical_auth, lease_tok, fencing_gen, db_path_auth, min_remaining_ms=5000
+                                    ):
                                         self.metrics.inc("recovery_fencing_rejected")
                                         logger.critical(f"[Fencing Block] Lease invalid before Docker restart for {canonical_auth}.")
                                         continue
@@ -733,10 +682,6 @@ class HomeOpsAgent:
                                     logger.info(
                                         f"[Authoritative] Go Core approved restart for {canonical_auth} (gen={fencing_gen}). Executing guarded restart."
                                     )
-                                    docker_name = resolve_docker_container_name(canonical_auth)
-                                    if not docker_name:
-                                        logger.critical(f"[Security Block] Cannot resolve docker container for {canonical_auth}.")
-                                        continue
                                     restarted = await self._restart_docker_container(docker_name, sock_path)
                                     health_ok = False
                                     h_state = DockerHealthState.UNKNOWN
@@ -762,7 +707,14 @@ class HomeOpsAgent:
                                         evidence={"health_state": h_state.value, "restarted": restarted},
                                     )
                                 finally:
-                                    self._release_recovery_lease(canonical_auth, lease_tok, db_path_auth, fencing_gen=fencing_gen)
+                                    released_auth = self._release_recovery_lease(
+                                        canonical_auth, lease_tok, db_path_auth, fencing_gen=fencing_gen
+                                    )
+                                    if not released_auth:
+                                        self.metrics.inc("recovery_database_error")
+                                        logger.critical(
+                                            f"[Lease Release Failed] Failed to release AUTHORIZED lease for {canonical_auth} (gen={fencing_gen})."
+                                        )
                                 continue
 
                             if status in (CoreReportingStatus.POLICY_REJECTED, CoreReportingStatus.BLOCKED_BY_FSM):
@@ -799,7 +751,13 @@ class HomeOpsAgent:
             except Exception as e:
                 logger.debug(f"Docker event processing error: {e}")
 
-    async def _handle_offline_emergency_restart(self, container_name: str, exit_code: int, sock_path: str) -> bool:
+    async def _handle_offline_emergency_restart(
+        self,
+        container_name: str,
+        exit_code: int,
+        sock_path: str,
+        expected_baseline_hash: Optional[str] = None,
+    ) -> bool:
         """
         Controlled 5-guard offline emergency recovery mode with fail-closed semantics.
         All safety checks must be explicitly confirmed safe. Any UNKNOWN or failure halts restart.
@@ -819,6 +777,26 @@ class HomeOpsAgent:
                 f"[Emergency Autonomy Blocked] Unknown or non-whitelisted component '{container_name}' (R4-17). Refusing offline restart."
             )
             return False
+
+        docker_container = resolve_docker_container_name(canonical)
+        if not docker_container:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Cannot resolve Docker container for '{canonical}' (R5). Refusing offline restart."
+            )
+            return False
+
+        if expected_baseline_hash is not None:
+            if not is_real_baseline_hash(expected_baseline_hash, canonical):
+                logger.critical(
+                    f"[Emergency Autonomy Blocked] Invalid or placeholder baseline_hash rejected for {canonical} (R5)."
+                )
+                return False
+            live_bh = await self._compute_container_baseline_hash(canonical, sock_path)
+            if not live_bh or live_bh != expected_baseline_hash:
+                logger.critical(
+                    f"[Emergency Autonomy Blocked] Live container baseline_hash failed or drifted for {canonical} (R5)."
+                )
+                return False
 
         # Guard 2a: Forbidden component check (core storage / database forbidden from offline autonomous restart)
         if container_name in OFFLINE_FORBIDDEN_COMPONENTS or canonical in OFFLINE_FORBIDDEN_COMPONENTS:
@@ -908,13 +886,13 @@ class HomeOpsAgent:
         try:
             # Guard 4: Persistent cooldown and circuit breaker (<= 2 restarts in 60s, <= 3 crashes in 10m)
             now = time.time()
-            timestamps = self._local_restarts.setdefault(container_name, [])
+            timestamps = self._local_restarts.setdefault(canonical, [])
             timestamps = [t for t in timestamps if now - t < 600.0]  # 10 minute window
-            self._local_restarts[container_name] = timestamps
+            self._local_restarts[canonical] = timestamps
 
             short_window = [t for t in timestamps if now - t < 60.0]  # 60 second window
-            persisted_short = self._get_persisted_restart_count(container_name, 60.0, db_path)
-            persisted_long = self._get_persisted_restart_count(container_name, 600.0, db_path)
+            persisted_short = self._get_persisted_restart_count(canonical, 60.0, db_path)
+            persisted_long = self._get_persisted_restart_count(canonical, 600.0, db_path)
 
             if persisted_short is None or persisted_long is None:
                 logger.critical(
@@ -924,26 +902,26 @@ class HomeOpsAgent:
 
             if len(short_window) >= 2 or persisted_short >= 2:
                 logger.error(
-                    f"[Emergency Autonomy Breaker] Tripped for {container_name}: {max(len(short_window), persisted_short)} restarts in 60s. Halted."
+                    f"[Emergency Autonomy Breaker] Tripped for {canonical}: {max(len(short_window), persisted_short)} restarts in 60s. Halted."
                 )
                 return False
 
             if len(timestamps) >= 3 or persisted_long >= 3:
                 logger.critical(
-                    f"[Emergency Autonomy Breaker] 10-minute circuit tripped for {container_name}: {max(len(timestamps), persisted_long)} crashes. Halted."
+                    f"[Emergency Autonomy Breaker] 10-minute circuit tripped for {canonical}: {max(len(timestamps), persisted_long)} crashes. Halted."
                 )
                 return False
 
-            # Guard 5: Local SQLite persistence in offline_restart_history
-            rec_ok = self._record_persisted_restart(container_name, db_path)
+            # Guard 5: Local SQLite persistence in offline_restart_history (atomic check-and-insert under BEGIN IMMEDIATE)
+            rec_ok = self._record_persisted_restart(canonical, db_path)
             if not rec_ok:
                 logger.critical(
-                    f"[Emergency Autonomy Blocked] Failed to write persisted restart record for {container_name}. Halting restart."
+                    f"[Emergency Autonomy Blocked] Failed to write persisted restart record for {canonical}. Halting restart."
                 )
                 return False
 
             # R4-06: Pre-mutation lease & fencing gate right before Docker socket dispatch
-            if not self._verify_recovery_lease(canonical, lease_token, fencing_gen, db_path):
+            if not self._verify_recovery_lease(canonical, lease_token, fencing_gen, db_path, min_remaining_ms=5000):
                 self.metrics.inc("recovery_fencing_rejected")
                 logger.critical(
                     f"[Fencing Gate] Lease token or fencing generation ({fencing_gen}) became invalid right before Docker restart for {canonical}. Aborting."
@@ -977,10 +955,6 @@ class HomeOpsAgent:
                 f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
                 f"(attempt {len(timestamps)} in 10m window, gen={fencing_gen}, op={op_id})"
             )
-            docker_container = resolve_docker_container_name(canonical)
-            if not docker_container:
-                logger.critical(f"[Emergency Autonomy Blocked] Cannot map canonical '{canonical}' to Docker container.")
-                return False
             success = await self._restart_docker_container(docker_container, sock_path)
             health_detail = "NOT_CHECKED"
             if success:
@@ -1267,10 +1241,19 @@ class HomeOpsAgent:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _is_valid_restart_timestamp(rt_val: Any) -> bool:
+        """Validates restart_time numeric sanity; rejects bool, None, str, NaN, Inf, and non-positive values."""
+        if isinstance(rt_val, bool) or not isinstance(rt_val, (int, float)):
+            return False
+        val = float(rt_val)
+        return math.isfinite(val) and val > 0.0
+
     def _get_persisted_restart_count(self, container_name: str, window_seconds: float, db_path: str) -> Optional[int]:
         """
-        Returns number of restarts recorded in SQLite within window_seconds.
-        Returns None if DB is missing, corrupted, table missing, or component invalid (Fail-Closed: NEVER 0 on missing table) (R4-14).
+        Returns number of restarts recorded in SQLite within window_seconds using an explicit read transaction.
+        Returns None if DB is missing, corrupted, table/columns missing, unbootstrapped anomaly,
+        corrupt timestamp rows, or component invalid (Fail-Closed: NEVER 0 on missing table) (R4-14).
         """
         if not db_path or not os.path.isfile(db_path):
             logger.error(f"[Fail-Closed] DB file missing at {db_path}. Persisted restart count UNKNOWN.")
@@ -1280,13 +1263,34 @@ class HomeOpsAgent:
             logger.error(f"[Fail-Closed] Unknown component '{container_name}'. Persisted restart count UNKNOWN.")
             return None
         conn = None
+        cursor = None
         try:
             conn = open_readonly_sqlite(db_path)
             cursor = conn.cursor()
+            cursor.execute("BEGIN")
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_schema_meta'")
+            if cursor.fetchone():
+                cursor.execute("SELECT value FROM ops_schema_meta WHERE key='bootstrapped'")
+                meta_row = cursor.fetchone()
+                if not meta_row or str(meta_row[0]) != "1":
+                    cursor.execute("ROLLBACK")
+                    logger.critical(f"[Fail-Closed] Schema meta bootstrapped sentinel missing in {db_path}. Restart count UNKNOWN.")
+                    return None
+
             cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_restart_history'")
             if not cursor.fetchone():
+                cursor.execute("ROLLBACK")
                 logger.critical(f"[Fail-Closed] Table offline_restart_history missing in {db_path}. Persisted restart count UNKNOWN.")
                 return None
+
+            cursor.execute("PRAGMA table_info(offline_restart_history)")
+            cols = {str(c[1]).lower() for c in cursor.fetchall()}
+            if not {"container_name", "restart_time"}.issubset(cols):
+                cursor.execute("ROLLBACK")
+                logger.critical(f"[Fail-Closed] Table offline_restart_history missing required columns in {db_path}.")
+                return None
+
             # Reject corrupt/non-numeric restart_time values in history table
             cursor.execute(
                 "SELECT restart_time FROM offline_restart_history WHERE container_name = ? OR container_name = ?",
@@ -1295,13 +1299,20 @@ class HomeOpsAgent:
             cutoff = time.time() - window_seconds
             count = 0
             for (rt_val,) in cursor.fetchall():
-                if not isinstance(rt_val, (int, float)):
+                if not self._is_valid_restart_timestamp(rt_val):
+                    cursor.execute("ROLLBACK")
                     logger.critical(f"[Fail-Closed] Corrupt restart_time value '{rt_val}' in offline_restart_history.")
                     return None
                 if float(rt_val) >= cutoff:
                     count += 1
+            cursor.execute("COMMIT")
             return count
         except Exception as e:
+            if cursor is not None:
+                try:
+                    cursor.execute("ROLLBACK")
+                except Exception:
+                    pass
             self.metrics.inc("recovery_database_error")
             logger.error(f"[Fail-Closed] Failed to query offline_restart_history: {e}")
             return None
@@ -1312,9 +1323,18 @@ class HomeOpsAgent:
                 except Exception:
                     pass
 
-    def _record_persisted_restart(self, container_name: str, db_path: str) -> bool:
+    def _record_persisted_restart(
+        self,
+        container_name: str,
+        db_path: str,
+        short_window: float = 60.0,
+        short_limit: int = 2,
+        long_window: float = 600.0,
+        long_limit: int = 3,
+    ) -> bool:
         """
-        Records restart timestamp into EXISTING SQLite offline_restart_history table using BEGIN IMMEDIATE.
+        Atomically verifies history schema/limits and records restart timestamp into EXISTING
+        SQLite offline_restart_history table using BEGIN IMMEDIATE (unified transaction & locking).
         NEVER auto-creates database files or tables at runtime (R4-14).
         """
         if not db_path or not os.path.isfile(db_path):
@@ -1336,7 +1356,40 @@ class HomeOpsAgent:
                 return False
             cur.execute("PRAGMA table_info(offline_restart_history)")
             cols = {str(c[1]).lower() for c in cur.fetchall()}
+            if not {"container_name", "restart_time"}.issubset(cols):
+                cur.execute("ROLLBACK")
+                logger.critical(f"[Fail-Closed] Table offline_restart_history missing required columns in {db_path}.")
+                return False
+
+            cur.execute(
+                "SELECT restart_time FROM offline_restart_history WHERE container_name = ? OR container_name = ?",
+                (canonical, container_name),
+            )
             now_sec = time.time()
+            short_cutoff = now_sec - short_window
+            long_cutoff = now_sec - long_window
+            short_cnt = 0
+            long_cnt = 0
+            for (rt_val,) in cur.fetchall():
+                if not self._is_valid_restart_timestamp(rt_val):
+                    cur.execute("ROLLBACK")
+                    self.metrics.inc("recovery_database_error")
+                    logger.critical(f"[Fail-Closed] Corrupt restart_time '{rt_val}' detected under write lock; aborting restart.")
+                    return False
+                rt_f = float(rt_val)
+                if rt_f >= short_cutoff:
+                    short_cnt += 1
+                if rt_f >= long_cutoff:
+                    long_cnt += 1
+
+            if short_cnt >= short_limit or long_cnt >= long_limit:
+                cur.execute("ROLLBACK")
+                logger.error(
+                    f"[Emergency Autonomy Breaker] Atomic write-lock rate check tripped for {canonical}: "
+                    f"short={short_cnt}/{short_limit}, long={long_cnt}/{long_limit}."
+                )
+                return False
+
             now_ms = int(now_sec * 1000)
             if "restart_time_ms" in cols:
                 cur.execute(
@@ -1381,7 +1434,7 @@ class HomeOpsAgent:
         if not canonical:
             logger.error(f"[Fail-Closed] Cannot acquire lease for unknown component '{component}'.")
             return False, "", 0
-        token = f"py-{uuid.uuid4()}"
+        token = f"py-{self._executor_id}-{secrets.token_hex(16)}"
         now_epoch = time.time()
         now_ms = int(now_epoch * 1000)
         exp_ms = now_ms + int(lease_duration * 1000)
@@ -1493,10 +1546,13 @@ class HomeOpsAgent:
                     UPDATE ops_recovery_leases
                     SET holder = 'python-offline', lease_token = ?, fencing_generation = ?,
                         acquired_at = ?, expires_at = ?, acquired_at_ms = ?, expires_at_ms = ?, state = 'ACTIVE'
-                    WHERE component = ?
+                    WHERE component = ? AND (state != 'ACTIVE' OR expires_at_ms <= ?)
                     """,
-                    (token, next_gen, now_iso, exp_iso, now_ms, exp_ms, canonical),
+                    (token, next_gen, now_iso, exp_iso, now_ms, exp_ms, canonical, now_ms),
                 )
+                if cur.rowcount != 1:
+                    cur.execute("ROLLBACK")
+                    return False, "", 0
             else:
                 cur.execute(
                     """
@@ -1559,6 +1615,7 @@ class HomeOpsAgent:
                 SET expires_at = ?, expires_at_ms = ?
                 WHERE component = ? AND lease_token = ? AND fencing_generation = ?
                   AND state = 'ACTIVE' AND expires_at_ms > ?
+                  AND acquired_at_ms > 0 AND expires_at_ms > acquired_at_ms
                 """,
                 (new_exp_iso, new_exp_ms, canonical, lease_token, fencing_gen, now_ms),
             )
@@ -1584,7 +1641,9 @@ class HomeOpsAgent:
                 except Exception:
                     pass
 
-    def _verify_recovery_lease(self, component: str, lease_token: str, fencing_gen: int, db_path: str) -> bool:
+    def _verify_recovery_lease(
+        self, component: str, lease_token: str, fencing_gen: int, db_path: str, min_remaining_ms: int = 0
+    ) -> bool:
         """Verifies right before external Docker mutation that this token & fencing generation still own the lease (R4-06)."""
         if not db_path or not lease_token or fencing_gen <= 0 or not os.path.isfile(db_path):
             return False
@@ -1592,21 +1651,26 @@ class HomeOpsAgent:
         if not canonical:
             return False
         now_ms = int(time.time() * 1000)
+        guard_ms = max(0, int(min_remaining_ms))
         conn = None
         try:
             conn = open_readonly_sqlite(db_path)
             cur = conn.cursor()
             cur.execute(
-                "SELECT lease_token, fencing_generation, expires_at_ms, state FROM ops_recovery_leases WHERE component = ?",
+                "SELECT lease_token, fencing_generation, acquired_at_ms, expires_at_ms, state FROM ops_recovery_leases WHERE component = ?",
                 (canonical,),
             )
             row = cur.fetchone()
             if not row:
                 return False
-            db_tok, db_gen, db_exp_ms, db_state = row
+            db_tok, db_gen, db_acq_ms, db_exp_ms, db_state = row
+            acq_ms = int(db_acq_ms or 0)
+            exp_ms = int(db_exp_ms or 0)
+            if acq_ms <= 0 or exp_ms <= acq_ms:
+                return False
             if str(db_tok) != lease_token or int(db_gen or 0) != fencing_gen:
                 return False
-            if str(db_state or "").upper() != "ACTIVE" or int(db_exp_ms or 0) <= now_ms:
+            if str(db_state or "").upper() != "ACTIVE" or (exp_ms - now_ms) <= guard_ms:
                 return False
             return True
         except Exception as e:
@@ -1670,11 +1734,12 @@ class HomeOpsAgent:
         """Connects to Docker socket via Unix domain socket or TCP endpoint."""
         if not sock_path:
             raise FileNotFoundError("Docker socket path is empty")
+        is_win_drive = len(sock_path) >= 2 and sock_path[1] == ":" and sock_path[0].isalpha()
         if sock_path.startswith("tcp://"):
             host_port = sock_path[6:]
             host, port = host_port.split(":")
             return await asyncio.open_connection(host, int(port))
-        elif ":" in sock_path and not os.path.exists(sock_path):
+        elif ":" in sock_path and not is_win_drive and not os.path.exists(sock_path):
             parts = sock_path.split(":")
             return await asyncio.open_connection(parts[0], int(parts[1]))
         else:
@@ -1690,37 +1755,69 @@ class HomeOpsAgent:
 
     async def _query_docker_inspect(self, container_name: str, sock_path: str) -> Tuple[DockerHealthState, Optional[Dict[str, Any]]]:
         """Queries Docker /containers/{container_name}/json and returns (health_state, inspect_data)."""
-        try:
-            reader, writer = await self._connect_docker(sock_path)
-        except FileNotFoundError:
-            logger.error(f"[Fail-Closed] Docker socket not found: {sock_path}")
-            return DockerHealthState.UNKNOWN, None
-        except Exception as e:
-            logger.error(f"[Fail-Closed] Docker socket connection error: {e}")
-            return DockerHealthState.UNKNOWN, None
+        req_bytes = (
+            f"GET /containers/{container_name}/json HTTP/1.1\r\n"
+            f"Host: docker\r\n"
+            f"User-Agent: home-ops-agent\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("utf-8")
 
-        try:
-            req = (
-                f"GET /containers/{container_name}/json HTTP/1.1\r\n"
-                f"Host: docker\r\n"
-                f"User-Agent: home-ops-agent\r\n"
-                f"Connection: close\r\n\r\n"
-            ).encode("utf-8")
-            writer.write(req)
-            await writer.drain()
+        resp = b""
+        if sock_path and (sock_path.startswith("npipe://") or sock_path.startswith("\\\\.\\pipe\\")):
+            pipe_path = sock_path[len("npipe://"):].replace("/", "\\") if sock_path.startswith("npipe://") else sock_path
 
-            raw_chunks = []
-            while True:
-                chunk = await asyncio.wait_for(reader.read(4096), timeout=5.0)
-                if not chunk:
-                    break
-                raw_chunks.append(chunk)
-            writer.close()
-            await writer.wait_closed()
-            resp = b"".join(raw_chunks)
-        except Exception as e:
-            logger.error(f"[Fail-Closed] Error reading Docker inspect response: {e}")
-            return DockerHealthState.UNKNOWN, None
+            def _read_npipe() -> bytes:
+                chunks = []
+                with open(pipe_path, "r+b", buffering=0) as pf:
+                    pf.write(req_bytes)
+                    while True:
+                        chunk = pf.read(4096)
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                return b"".join(chunks)
+
+            try:
+                loop = asyncio.get_running_loop()
+                resp = await asyncio.wait_for(loop.run_in_executor(None, _read_npipe), timeout=5.0)
+            except FileNotFoundError:
+                logger.error(f"[Fail-Closed] Docker named pipe not found: {pipe_path}")
+                return DockerHealthState.UNKNOWN, None
+            except Exception as e:
+                logger.error(f"[Fail-Closed] Docker named pipe error: {e}")
+                return DockerHealthState.UNKNOWN, None
+        else:
+            writer = None
+            try:
+                reader, writer = await asyncio.wait_for(self._connect_docker(sock_path), timeout=5.0)
+            except FileNotFoundError:
+                logger.error(f"[Fail-Closed] Docker socket not found: {sock_path}")
+                return DockerHealthState.UNKNOWN, None
+            except Exception as e:
+                logger.error(f"[Fail-Closed] Docker socket connection error: {e}")
+                return DockerHealthState.UNKNOWN, None
+
+            try:
+                writer.write(req_bytes)
+                await asyncio.wait_for(writer.drain(), timeout=5.0)
+
+                raw_chunks = []
+                while True:
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+                    if not chunk:
+                        break
+                    raw_chunks.append(chunk)
+                resp = b"".join(raw_chunks)
+            except Exception as e:
+                logger.error(f"[Fail-Closed] Error reading Docker inspect response: {e}")
+                return DockerHealthState.UNKNOWN, None
+            finally:
+                if writer is not None:
+                    try:
+                        writer.close()
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
 
         if not resp:
             return DockerHealthState.UNKNOWN, None
@@ -1736,6 +1833,25 @@ class HomeOpsAgent:
                 return DockerHealthState.UNHEALTHY, None
             return DockerHealthState.UNKNOWN, None
 
+        if b"transfer-encoding: chunked" in header_block.lower():
+            decoded_chunks = []
+            pos = 0
+            while pos < len(body):
+                crlf = body.find(b"\r\n", pos)
+                if crlf == -1:
+                    break
+                size_hex = body[pos:crlf].split(b";", 1)[0].strip()
+                try:
+                    csize = int(size_hex, 16)
+                except ValueError:
+                    break
+                if csize == 0:
+                    break
+                start = crlf + 2
+                decoded_chunks.append(body[start:start + csize])
+                pos = start + csize + 2
+            body = b"".join(decoded_chunks)
+
         if not body:
             logger.error("[Fail-Closed] Docker inspect returned empty body.")
             return DockerHealthState.UNKNOWN, None
@@ -1746,6 +1862,33 @@ class HomeOpsAgent:
         except Exception as e:
             logger.error(f"[Fail-Closed] Docker inspect JSON decode error: {e}")
             return DockerHealthState.UNKNOWN, None
+
+    async def _compute_container_baseline_hash(self, component: str, sock_path: Optional[str] = None) -> str:
+        """
+        Computes a live real resource BaselineHash from Docker inspect (R5).
+        Returns '' (Fail-Closed, NEVER a placeholder) on component resolution failure,
+        non-existent container, Docker API timeout/error, or unknown container state.
+        """
+        canonical = resolve_canonical_component(component)
+        if not canonical:
+            logger.error(f"[R5 Fail-Closed] Component resolution failed for '{component}'.")
+            return ""
+        docker_name = resolve_docker_container_name(canonical)
+        if not docker_name:
+            logger.error(f"[R5 Fail-Closed] No Docker container mapping for canonical '{canonical}'.")
+            return ""
+        target_sock = sock_path or getattr(self.config, "docker_socket", "/var/run/docker.sock")
+        inspect_status, inspect_data = await self._query_docker_inspect(docker_name, target_sock)
+        if inspect_status != DockerHealthState.HEALTHY or not isinstance(inspect_data, dict):
+            logger.warning(
+                f"[R5 Fail-Closed] Cannot compute real baseline_hash for '{canonical}' ({docker_name}): "
+                f"inspect_status={inspect_status.value}."
+            )
+            return ""
+        bh = compute_container_baseline_from_inspect(canonical, inspect_data)
+        if not bh:
+            logger.warning(f"[R5 Fail-Closed] Incomplete or unknown inspect metadata for '{canonical}' ({docker_name}).")
+        return bh
 
     async def _check_service_readiness(self, canonical: str, container_name: str = "") -> bool:
         """
@@ -2451,6 +2594,20 @@ class HomeOpsAgent:
 
     async def _submit_proposal_to_go_core(self, prop_id: str, title: str, risk_level: str, action: str, rollback_cmd: str, target_component: str, estimated_seconds: int) -> bool:
         """Submits high-risk diagnostic proposal to Go Core for human review."""
+        canonical = resolve_canonical_component(target_component)
+        if not canonical:
+            logger.critical(
+                f"[R5 Fail-Closed] Refusing proposal {prop_id}: component resolution failed for '{target_component}'."
+            )
+            return False
+
+        live_baseline = await self._compute_container_baseline_hash(canonical, getattr(self.config, "docker_socket", None))
+        if is_production() and not is_real_baseline_hash(live_baseline, canonical):
+            logger.critical(
+                f"[R5 Fail-Closed] Refusing proposal {prop_id} in production: real resource baseline_hash unavailable for '{canonical}'."
+            )
+            return False
+
         api_url = f"{self.config.api_base_url.rstrip('/')}/api/v1/ops/proposals"
         payload = {
             "proposal_id": prop_id,
@@ -2458,9 +2615,11 @@ class HomeOpsAgent:
             "risk_level": risk_level,
             "execution_plan": action,
             "rollback_plan": rollback_cmd,
-            "target_component": target_component,
+            "target_component": canonical,
             "estimated_seconds": estimated_seconds
         }
+        if is_real_baseline_hash(live_baseline, canonical):
+            payload["baseline_hash"] = live_baseline
         headers = {"Content-Type": "application/json"}
         if getattr(self.config, "internal_token", None):
             headers["X-Internal-Secret"] = self.config.internal_token
@@ -2478,22 +2637,30 @@ class HomeOpsAgent:
         except Exception as e:
             logger.debug(f"Submit proposal to Go Core failed ({api_url}): {e}")
 
-        # Local tracking fallback
+        if not is_real_baseline_hash(live_baseline, canonical):
+            logger.warning(
+                f"[R5 Fail-Closed] Skipping local fallback proposal {prop_id} for '{canonical}': real baseline_hash unavailable."
+            )
+            return False
+
+        # Local tracking fallback (only with verified real resource baseline)
         self.proposal_manager.create_proposal(
             prop_id=prop_id,
             title=title,
             risk_level=risk_level,
             action=action,
             rollback_cmd=rollback_cmd,
-            target_component=target_component,
-            estimated_seconds=estimated_seconds
+            target_component=canonical,
+            estimated_seconds=estimated_seconds,
+            baseline_hash=live_baseline,
         )
         return False
 
     async def _restart_docker_container(self, container_name: str, sock_path: str) -> bool:
         """Sends POST /containers/{name}/restart to Docker socket."""
+        writer = None
         try:
-            reader, writer = await self._connect_docker(sock_path)
+            reader, writer = await asyncio.wait_for(self._connect_docker(sock_path), timeout=5.0)
             req = (
                 f"POST /containers/{container_name}/restart?t=5 HTTP/1.1\r\n"
                 f"Host: docker\r\n"
@@ -2502,15 +2669,20 @@ class HomeOpsAgent:
                 f"Connection: close\r\n\r\n"
             ).encode("utf-8")
             writer.write(req)
-            await writer.drain()
-            resp = await reader.read(256)
-            writer.close()
-            await writer.wait_closed()
+            await asyncio.wait_for(writer.drain(), timeout=5.0)
+            resp = await asyncio.wait_for(reader.read(256), timeout=15.0)
             logger.info(f"[Tier 1] Issued restart for container {container_name}")
             return b"204 No Content" in resp or b"200 OK" in resp
         except Exception as e:
             logger.error(f"Failed to restart container {container_name} via Docker socket: {e}")
             return False
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
 
     async def _mqtt_listener(self) -> None:
         """

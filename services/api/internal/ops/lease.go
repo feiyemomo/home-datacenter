@@ -110,10 +110,12 @@ func (m *RecoveryLeaseManager) AutoMigrate() error {
 	return EnsureOpsSchema(m.db)
 }
 
-func generateLeaseToken(holder string) string {
+func generateLeaseToken(holder string) (string, error) {
 	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return fmt.Sprintf("lease-%s-%s", holder, hex.EncodeToString(b))
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("failed to generate cryptographic lease token: %w", err)
+	}
+	return fmt.Sprintf("lease-%s-%s", holder, hex.EncodeToString(b)), nil
 }
 
 func resolveLeaseCanonical(component string) (string, error) {
@@ -196,11 +198,14 @@ func (m *RecoveryLeaseManager) AcquireLeaseGrant(component string, holder string
 		return nil, fmt.Errorf("%w: invalid clock parameters nowMs=%d expiresMs=%d", ErrTimestampInvalid, nowMs, expiresMs)
 	}
 
-	token := generateLeaseToken(cleanHolder)
+	token, tokErr := generateLeaseToken(cleanHolder)
+	if tokErr != nil {
+		return nil, tokErr
+	}
 	var grant *LeaseGrant
 
 	txErr := m.runImmediate(func(ctx context.Context, conn *sql.Conn) error {
-		// 1. Inspect existing row if present (fail closed on malformed timestamps or active lease)
+		// 1. Inspect existing row if present (fail closed on malformed timestamps, invalid state, or active lease)
 		var existHolder, existToken, existState string
 		var existGen, existAcqMs, existExpMs int64
 		row := conn.QueryRowContext(ctx,
@@ -209,13 +214,18 @@ func (m *RecoveryLeaseManager) AcquireLeaseGrant(component string, holder string
 		)
 		scanErr := row.Scan(&existHolder, &existToken, &existGen, &existAcqMs, &existExpMs, &existState)
 		if scanErr == nil {
+			existStateUpper := strings.ToUpper(strings.TrimSpace(existState))
+			if existStateUpper != "ACTIVE" && existStateUpper != "RELEASED" && existStateUpper != "EXPIRED" {
+				GlobalSecurityMetrics.IncDatabaseError()
+				return fmt.Errorf("%w: invalid lease state %q for %s", ErrRecordInconsistent, existState, canonical)
+			}
 			// Validate timestamp sanity (R4-20 #12: malformed/zero/inverted timestamps NEVER treated as expired)
 			if existAcqMs <= 0 || existExpMs <= existAcqMs {
 				GlobalSecurityMetrics.IncDatabaseError()
 				return fmt.Errorf("%w: corrupt lease timestamps (acq=%d exp=%d) for %s", ErrTimestampInvalid, existAcqMs, existExpMs, canonical)
 			}
 			// Fail-closed if lease is still active (EVEN IF same holder — R4-04!)
-			if existState == "ACTIVE" && existExpMs > nowMs {
+			if existStateUpper == "ACTIVE" && existExpMs > nowMs {
 				return ErrLeaseHeld
 			}
 			// Expired lease: record expiration metric
@@ -265,14 +275,19 @@ func (m *RecoveryLeaseManager) AcquireLeaseGrant(component string, holder string
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ACTIVE')`,
 				canonical, cleanHolder, token, nextGen, now, expiresAt, nowMs, expiresMs,
 			); err != nil {
-				return ErrLeaseHeld
+				msg := strings.ToLower(err.Error())
+				if strings.Contains(msg, "unique") || strings.Contains(msg, "constraint") {
+					return ErrLeaseHeld
+				}
+				GlobalSecurityMetrics.IncDatabaseError()
+				return err
 			}
 		} else {
 			res, err := conn.ExecContext(ctx,
 				`UPDATE ops_recovery_leases
 				 SET holder = ?, lease_token = ?, fencing_generation = ?,
 				     acquired_at = ?, expires_at = ?, acquired_at_ms = ?, expires_at_ms = ?, state = 'ACTIVE'
-				 WHERE component = ? AND (state != 'ACTIVE' OR expires_at_ms <= ?)`,
+				 WHERE component = ? AND (UPPER(state) != 'ACTIVE' OR expires_at_ms <= ?)`,
 				cleanHolder, token, nextGen, now, expiresAt, nowMs, expiresMs, canonical, nowMs,
 			)
 			if err != nil {
@@ -341,7 +356,7 @@ func (m *RecoveryLeaseManager) RenewLease(component string, leaseToken string, t
 		res, err := conn.ExecContext(ctx,
 			`UPDATE ops_recovery_leases
 			 SET expires_at = ?, expires_at_ms = ?
-			 WHERE component = ? AND lease_token = ? AND state = 'ACTIVE' AND expires_at_ms > ? AND acquired_at_ms > 0 AND expires_at_ms > acquired_at_ms`,
+			 WHERE component = ? AND lease_token = ? AND UPPER(state) = 'ACTIVE' AND expires_at_ms > ? AND acquired_at_ms > 0 AND expires_at_ms > acquired_at_ms`,
 			newExp, newExpMs, canonical, leaseToken, nowMs,
 		)
 		if err != nil {
@@ -389,7 +404,7 @@ func (m *RecoveryLeaseManager) VerifyLeaseFencing(component string, leaseToken s
 		GlobalSecurityMetrics.IncFencingRejected()
 		return ErrTimestampInvalid
 	}
-	if lease.State != "ACTIVE" || lease.LeaseToken != leaseToken || lease.FencingGeneration != fencingGen {
+	if strings.ToUpper(strings.TrimSpace(lease.State)) != "ACTIVE" || lease.LeaseToken != leaseToken || lease.FencingGeneration != fencingGen {
 		GlobalSecurityMetrics.IncFencingRejected()
 		return fmt.Errorf("%w: token or generation mismatch (held gen=%d, claimed gen=%d)", ErrFencingTokenStale, lease.FencingGeneration, fencingGen)
 	}
@@ -475,7 +490,7 @@ func (m *RecoveryLeaseManager) IsLeaseActive(component string) (bool, string, er
 		return false, lease.Holder, ErrTimestampInvalid
 	}
 	nowMs := m.nowUTC().UnixMilli()
-	if lease.State == "ACTIVE" && lease.ExpiresAtMs > nowMs {
+	if strings.ToUpper(strings.TrimSpace(lease.State)) == "ACTIVE" && lease.ExpiresAtMs > nowMs {
 		return true, lease.Holder, nil
 	}
 	return false, lease.Holder, nil

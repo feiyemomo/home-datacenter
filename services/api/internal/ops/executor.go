@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"testing"
 	"time"
 
 	"gorm.io/gorm"
@@ -347,6 +348,194 @@ func WithLeaseManager(mgr *RecoveryLeaseManager) ExecutorOption {
 	}
 }
 
+// BaselineInfo describes an extracted resource baseline fingerprint and its provenance (R5).
+type BaselineInfo struct {
+	Hash          string `json:"hash"`
+	Canonical     string `json:"canonical"`
+	Image         string `json:"image,omitempty"`
+	State         string `json:"state,omitempty"`
+	CreatedAt     string `json:"created_at,omitempty"`
+	Source        string `json:"source"` // "1panel", "docker_socket", "offline_catalog", ""
+	IsPlaceholder bool   `json:"is_placeholder"`
+	Error         string `json:"error,omitempty"`
+}
+
+// IsProductionRuntime reports whether the process is running in production/strict baseline mode.
+func IsProductionRuntime() bool {
+	if v := strings.ToLower(strings.TrimSpace(os.Getenv("OPS_STRICT_BASELINE"))); v != "" {
+		if v == "1" || v == "true" {
+			return true
+		}
+		if v == "0" || v == "false" {
+			return false
+		}
+	}
+	for _, k := range []string{"APP_ENV", "ENVIRONMENT", "ENV"} {
+		if v := strings.ToLower(strings.TrimSpace(os.Getenv(k))); v != "" {
+			switch v {
+			case "development", "dev", "test", "testing":
+				return false
+			case "production", "prod":
+				return true
+			}
+		}
+	}
+	if !testing.Testing() {
+		if _, err := os.Stat("/.dockerenv"); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+// ComputeOfflinePlaceholderBaseline computes the deterministic offline placeholder fingerprint for a component.
+func ComputeOfflinePlaceholderBaseline(component string) string {
+	canonical, err := ResolveComponent(component)
+	if err != nil {
+		return ""
+	}
+	hasher := sha256.New()
+	raw := fmt.Sprintf("%s:offline:none", canonical)
+	hasher.Write([]byte(raw))
+	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+}
+
+// IsOfflinePlaceholderBaseline reports whether baselineHash matches any offline/static placeholder fingerprint (R5).
+func IsOfflinePlaceholderBaseline(component string, baselineHash string) bool {
+	trimmed := strings.TrimSpace(baselineHash)
+	if trimmed == "" {
+		return false
+	}
+	if strings.HasPrefix(trimmed, "offline-placeholder:") || strings.HasPrefix(trimmed, "placeholder:") {
+		return true
+	}
+	canonical, err := ResolveComponent(component)
+	if err != nil {
+		canonical = model.CanonicalizeComponent(component)
+	}
+	if canonical == "" {
+		return false
+	}
+	if offHash := ComputeOfflinePlaceholderBaseline(canonical); offHash != "" && trimmed == offHash {
+		return true
+	}
+	if defHash := model.ComputeDefaultBaseline(canonical); defHash != "" && trimmed == defHash {
+		return true
+	}
+	return false
+}
+
+// ExtractBaseline extracts the container baseline fingerprint and distinguishes real runtime
+// fingerprints from offline placeholders. Unknown components, unknown states, API timeouts,
+// and missing containers fail closed with empty Hash (R5).
+func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
+	clean := strings.TrimSpace(target)
+	canonical, err := ResolveComponent(clean)
+	if err != nil {
+		return BaselineInfo{Error: err.Error()}
+	}
+	expectedDockerName := canonicalContainerNames[canonical]
+
+	matchContainer := func(containers []ContainerSummary) *ContainerSummary {
+		for i := range containers {
+			cName := strings.TrimPrefix(strings.TrimSpace(containers[i].Name), "/")
+			if strings.EqualFold(cName, canonical) ||
+				(expectedDockerName != "" && strings.EqualFold(cName, expectedDockerName)) ||
+				ResolveTopologyComponent(cName) == canonical {
+				return &containers[i]
+			}
+		}
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	var targetContainer *ContainerSummary
+	var source string
+	var isPlaceholder bool
+	var clientSucceeded bool
+	var clientTimedOut bool
+
+	if e.client != nil && strings.TrimSpace(e.client.baseURL) != "" {
+		containers, lErr := e.client.ListContainers(ctx)
+		if lErr == nil {
+			clientSucceeded = true
+			if matched := matchContainer(containers); matched != nil {
+				targetContainer = matched
+				source = "1panel"
+			}
+		} else if errors.Is(lErr, context.DeadlineExceeded) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+			strings.Contains(strings.ToLower(lErr.Error()), "deadline exceeded") ||
+			strings.Contains(strings.ToLower(lErr.Error()), "timeout") {
+			clientTimedOut = true
+		}
+	}
+
+	if targetContainer == nil && e.fallback != nil {
+		sockPath := e.dockerSocket
+		if sockPath == "" {
+			sockPath = e.fallback.dockerSocket
+		}
+		if sockPath != "" {
+			if _, statErr := os.Stat(sockPath); statErr == nil {
+				fb := &HostFallbackProvider{dockerSocket: sockPath}
+				containers, dErr := fb.queryDockerSocket(ctx)
+				if dErr != nil {
+					return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("docker socket query failed: %v", dErr)}
+				}
+				if matched := matchContainer(containers); matched != nil {
+					targetContainer = matched
+					source = "docker_socket"
+				} else {
+					return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not found in docker", canonical)}
+				}
+			}
+		}
+
+		if targetContainer == nil {
+			if clientTimedOut {
+				return BaselineInfo{Canonical: canonical, Error: "1panel container query timed out"}
+			}
+			if clientSucceeded {
+				return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not found in 1panel", canonical)}
+			}
+			if IsProductionRuntime() {
+				return BaselineInfo{Canonical: canonical, Error: "live container runtime unavailable in production"}
+			}
+			fallbackContainers := e.fallback.GetHostContainers(ctx)
+			if matched := matchContainer(fallbackContainers); matched != nil {
+				targetContainer = matched
+				source = "offline_catalog"
+				isPlaceholder = true
+			}
+		}
+	}
+
+	if targetContainer == nil {
+		return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not resolved", canonical)}
+	}
+
+	stateLower := strings.ToLower(strings.TrimSpace(targetContainer.State))
+	if stateLower == "" || stateLower == "unknown" || strings.TrimSpace(targetContainer.Image) == "" {
+		return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s has invalid state %q or empty image", canonical, targetContainer.State)}
+	}
+
+	hasher := sha256.New()
+	raw := fmt.Sprintf("%s:%s:%s:%s", canonical, targetContainer.Image, targetContainer.State, targetContainer.CreatedAt)
+	hasher.Write([]byte(raw))
+	return BaselineInfo{
+		Hash:          fmt.Sprintf("sha256:%x", hasher.Sum(nil)),
+		Canonical:     canonical,
+		Image:         targetContainer.Image,
+		State:         targetContainer.State,
+		CreatedAt:     targetContainer.CreatedAt,
+		Source:        source,
+		IsPlaceholder: isPlaceholder,
+	}
+}
+
 // NewOperationExecutor creates a new DefaultOperationExecutor.
 func NewOperationExecutor(
 	db *gorm.DB,
@@ -378,47 +567,7 @@ func NewOperationExecutor(
 	}
 	if exec.baselineExtractor == nil {
 		exec.baselineExtractor = func(target string) string {
-			clean := strings.TrimSpace(target)
-			canonical, err := ResolveComponent(clean)
-			if err != nil {
-				canonical = strings.ToLower(clean)
-				if idx := strings.Index(canonical, "("); idx != -1 {
-					canonical = strings.TrimSpace(canonical[:idx])
-				}
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			var targetContainer *ContainerSummary
-			if exec.client != nil {
-				if containers, err := exec.client.ListContainers(ctx); err == nil {
-					for i := range containers {
-						cName := strings.TrimPrefix(containers[i].Name, "/")
-						if strings.EqualFold(cName, canonical) {
-							targetContainer = &containers[i]
-							break
-						}
-					}
-				}
-			}
-			if targetContainer == nil && exec.fallback != nil {
-				fallbackContainers := exec.fallback.GetHostContainers(ctx)
-				for i := range fallbackContainers {
-					cName := strings.TrimPrefix(fallbackContainers[i].Name, "/")
-					if strings.EqualFold(cName, canonical) {
-						targetContainer = &fallbackContainers[i]
-						break
-					}
-				}
-			}
-			hasher := sha256.New()
-			if targetContainer != nil {
-				raw := fmt.Sprintf("%s:%s:%s:%s", canonical, targetContainer.Image, targetContainer.State, targetContainer.CreatedAt)
-				hasher.Write([]byte(raw))
-			} else {
-				raw := fmt.Sprintf("%s:offline:none", canonical)
-				hasher.Write([]byte(raw))
-			}
-			return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+			return exec.ExtractBaseline(target).Hash
 		}
 	}
 	return exec
@@ -673,8 +822,19 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		return ownGuard.Release(e.db, e.bus)
 	}
 
-	// 3. Anti-TOCTOU baseline hash verification (Fail-Closed: calculation failure or drift strictly blocks execution)
+	// 3. Anti-TOCTOU baseline hash verification (Fail-Closed: calculation failure, placeholder in prod, or drift strictly blocks execution)
 	if spec.BaselineHash != "" {
+		if IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonical, spec.BaselineHash) {
+			_ = releaseOwnLease()
+			return &ExecutionResult{
+				Success:      false,
+				Action:       spec.Action,
+				Target:       canonical,
+				BaselineHash: spec.BaselineHash,
+				Error:        "offline placeholder baseline hash rejected in production",
+				ExecutedAt:   startTime,
+			}, ErrBaselineMismatch
+		}
 		if e.baselineExtractor == nil {
 			_ = releaseOwnLease()
 			return &ExecutionResult{
@@ -687,7 +847,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			}, ErrBaselineMismatch
 		}
 		currentHash := e.baselineExtractor(canonical)
-		if currentHash == "" || currentHash != spec.BaselineHash {
+		if currentHash == "" || currentHash != spec.BaselineHash || (IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonical, currentHash)) {
 			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
@@ -1362,7 +1522,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			return abortPreClaimed(fmt.Errorf("%w: %v", ErrApprovalDigestMismatch, err))
 		}
 
-		// Memory vs DB integrity consistency checks
+		// Memory vs DB integrity consistency checks (R2.4: reject if in-memory object disagrees with DB record)
 		if proposal.ApprovalDigest != "" && proposal.ApprovalDigest != curr.ApprovalDigest {
 			GlobalSecurityMetrics.IncProposalDigestMismatch()
 			return abortPreClaimed(fmt.Errorf("%w: memory proposal approval digest does not match database record", ErrApprovalDigestMismatch))
@@ -1374,6 +1534,30 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		if proposal.TargetComponent != "" && model.CanonicalizeComponent(proposal.TargetComponent) != model.CanonicalizeComponent(curr.TargetComponent) {
 			GlobalSecurityMetrics.IncProposalDigestMismatch()
 			return abortPreClaimed(fmt.Errorf("%w: memory target_component differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.BaselineHash != "" && strings.TrimSpace(proposal.BaselineHash) != strings.TrimSpace(curr.BaselineHash) {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory baseline_hash differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.RiskLevel != "" && !strings.EqualFold(strings.TrimSpace(proposal.RiskLevel), strings.TrimSpace(curr.RiskLevel)) {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory risk_level differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.RollbackPlan != "" && strings.TrimSpace(proposal.RollbackPlan) != strings.TrimSpace(curr.RollbackPlan) {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory rollback_plan differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.ExecutionPlan != "" && strings.TrimSpace(proposal.ExecutionPlan) != strings.TrimSpace(curr.ExecutionPlan) {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory execution_plan differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.ExecutionPolicy != "" && strings.TrimSpace(proposal.ExecutionPolicy) != strings.TrimSpace(curr.ExecutionPolicy) {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory execution_policy differs from database record", ErrApprovalDigestMismatch))
+		}
+		if proposal.Version > 0 && curr.Version > 0 && proposal.Version != curr.Version {
+			GlobalSecurityMetrics.IncProposalDigestMismatch()
+			return abortPreClaimed(fmt.Errorf("%w: memory version (%d) differs from database record (%d)", ErrApprovalDigestMismatch, proposal.Version, curr.Version))
 		}
 
 		// Validate strict spec, params, whitelist, and rollback spec before acquiring execution token
@@ -1387,10 +1571,13 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		}
 		_ = specPreview
 
-		// R5: Pre-execution baseline re-validation against live component state (anti-TOCTOU)
+		// R5: Pre-execution baseline re-validation against live component state (anti-TOCTOU & anti-placeholder)
+		if IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, curr.BaselineHash) {
+			return abortPreClaimed(fmt.Errorf("%w: offline placeholder baseline rejected in production for %s", ErrBaselineMismatch, canonicalTarget))
+		}
 		if e.baselineExtractor != nil {
 			currentHash := e.baselineExtractor(canonicalTarget)
-			if currentHash == "" || currentHash != curr.BaselineHash {
+			if currentHash == "" || currentHash != curr.BaselineHash || (IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, currentHash)) {
 				return abortPreClaimed(fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, curr.BaselineHash, currentHash))
 			}
 		}
@@ -1482,23 +1669,24 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 			GlobalSecurityMetrics.IncProposalDigestMismatch()
 			return nil, fmt.Errorf("%w: %v", ErrApprovalDigestMismatch, err)
 		}
+		canonicalTarget, err := ResolveComponent(proposal.TargetComponent)
+		if err != nil {
+			return nil, err
+		}
+		if IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, proposal.BaselineHash) {
+			return nil, fmt.Errorf("%w: offline placeholder baseline rejected in production for %s", ErrBaselineMismatch, canonicalTarget)
+		}
 		if e.baselineExtractor != nil {
-			canonicalTarget, err := ResolveComponent(proposal.TargetComponent)
-			if err != nil {
-				return nil, err
-			}
 			currentHash := e.baselineExtractor(canonicalTarget)
-			if currentHash == "" || currentHash != proposal.BaselineHash {
+			if currentHash == "" || currentHash != proposal.BaselineHash || (IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, currentHash)) {
 				return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, proposal.BaselineHash, currentHash)
 			}
 		}
 		if err := validateScheduledWindow(proposal); err != nil {
 			return nil, err
 		}
-		if canonicalTarget, err := ResolveComponent(proposal.TargetComponent); err == nil {
-			if sErr := e.checkProposalSafetyPreconditions(ctx, canonicalTarget); sErr != nil {
-				return nil, sErr
-			}
+		if sErr := e.checkProposalSafetyPreconditions(ctx, canonicalTarget); sErr != nil {
+			return nil, sErr
 		}
 		proposal.Status = model.ProposalStatusExecuting
 	}
@@ -1693,7 +1881,7 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 		}
 		spec.Target = canonicalSpecTarget
 
-		if spec.BaselineHash != "" && proposal.BaselineHash != "" && spec.BaselineHash != proposal.BaselineHash {
+		if spec.BaselineHash != "" && (proposal.BaselineHash == "" || spec.BaselineHash != proposal.BaselineHash) {
 			return OperationSpec{}, fmt.Errorf("%w: action spec baseline hash '%s' does not match approved proposal baseline '%s'", ErrBaselineMismatch, spec.BaselineHash, proposal.BaselineHash)
 		}
 		// ActionSpec MUST NOT override approved baseline; proposal baseline is strictly authoritative (R5.4)
@@ -2210,8 +2398,10 @@ func inDockerEnv() bool {
 	if os.Getenv("IN_DOCKER") == "true" {
 		return true
 	}
-	if _, err := os.Stat("/.dockerenv"); err == nil {
-		return true
+	if !testing.Testing() {
+		if _, err := os.Stat("/.dockerenv"); err == nil {
+			return true
+		}
 	}
 	return false
 }

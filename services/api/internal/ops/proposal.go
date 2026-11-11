@@ -121,8 +121,16 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 		req.HouseholdID = 1
 	}
 
+	req.RiskLevel = strings.ToUpper(strings.TrimSpace(req.RiskLevel))
 	if req.RiskLevel == "" {
 		req.RiskLevel = model.RiskLevelLow
+	}
+	if !isValidRiskLevel(req.RiskLevel) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   fmt.Sprintf("invalid risk_level %q: must be LOW, MEDIUM, HIGH, or CRITICAL", req.RiskLevel),
+			"message": "风险等级无效",
+		})
+		return
 	}
 	// Proposal status hardening: strictly enforce initial state as AWAITING_APPROVAL
 	// and clear any forged approval/execution metadata from caller.
@@ -136,36 +144,36 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 		req.EstimatedSeconds = 30
 	}
 	if req.ProposalID == "" {
-		req.ProposalID = fmt.Sprintf("prop-%d", time.Now().UnixNano()/1e6)
+		req.ProposalID = GenerateOperationID("prop")
 	}
 	// Canonical component and BaselineHash Anti-Tampering (R4-17, R5)
-	if req.TargetComponent != "" {
-		canonicalTarget := model.CanonicalizeComponent(req.TargetComponent)
-		if canonicalTarget == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   ErrComponentNotWhitelisted.Error(),
-				"message": "target component is unknown or not permitted",
-			})
-			return
-		}
-		computed := h.ComputeFingerprint(req.TargetComponent)
-		if computed == "" {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   ErrEmptyBaseline.Error(),
-				"message": "failed to compute valid baseline state fingerprint; proposal creation rejected",
-			})
-			return
-		}
-		// Authoritative system baseline: overwrite any unverified caller baseline
-		req.BaselineHash = computed
-	}
-	if strings.TrimSpace(req.BaselineHash) == "" {
+	// Never trust caller-supplied baseline_hash or allow empty target_component to bypass baseline extraction.
+	req.BaselineHash = ""
+	if strings.TrimSpace(req.TargetComponent) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   ErrEmptyBaseline.Error(),
-			"message": "proposal requires a non-empty valid baseline hash",
+			"message": "proposal requires a valid whitelisted target_component and baseline hash",
 		})
 		return
 	}
+	canonicalTarget := model.CanonicalizeComponent(req.TargetComponent)
+	if canonicalTarget == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   ErrComponentNotWhitelisted.Error(),
+			"message": "target component is unknown or not permitted",
+		})
+		return
+	}
+	computed := h.ComputeFingerprint(req.TargetComponent)
+	if computed == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   ErrEmptyBaseline.Error(),
+			"message": "failed to compute valid baseline state fingerprint; proposal creation rejected",
+		})
+		return
+	}
+	// Authoritative system baseline: overwrite any unverified caller baseline
+	req.BaselineHash = computed
 	req.Version = 1
 	req.Revision = 1
 	req.ApprovalDigest = ""
@@ -173,8 +181,7 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 
 	// Validate action_spec structure strictly at creation time if provided
 	if strings.TrimSpace(req.ActionSpec) != "" {
-		exec := &DefaultOperationExecutor{}
-		if _, err := exec.parseProposalSpec(&req); err != nil {
+		if _, err := h.validateProposalSpec(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   err.Error(),
 				"message": "invalid or mismatched action_spec payload",
@@ -290,7 +297,7 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 	}
 
 	callerHouseholdID := c.GetUint("household_id")
-	if callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+	if !sameHouseholdAccess(callerHouseholdID, proposal.HouseholdID) {
 		c.JSON(http.StatusNotFound, gin.H{
 			"error":   "Proposal not found",
 			"message": fmt.Sprintf("未找到提案: %s", idParam),
@@ -316,6 +323,14 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		})
 		return
 	}
+	if IsProductionRuntime() && IsOfflinePlaceholderBaseline(proposal.TargetComponent, proposal.BaselineHash) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":         ErrBaselineMismatch.Error(),
+			"message":       "生产/严格模式下禁止使用离线占位基线指纹通过审批",
+			"baseline_hash": proposal.BaselineHash,
+		})
+		return
+	}
 	currentHash := h.ComputeFingerprint(proposal.TargetComponent)
 	if currentHash == "" || currentHash != proposal.BaselineHash {
 		c.JSON(http.StatusConflict, gin.H{
@@ -325,6 +340,22 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 			"current_hash":  currentHash,
 		})
 		return
+	}
+
+	// Pre-approval ActionSpec validation (R5): forbid ActionSpec from overriding authoritative baseline,
+	// spoofing target, injecting unknown fields, or mismatching execution_policy.
+	if strings.TrimSpace(proposal.ActionSpec) != "" {
+		if _, specErr := h.validateProposalSpec(&proposal); specErr != nil {
+			statusCode := http.StatusBadRequest
+			if errors.Is(specErr, ErrBaselineMismatch) {
+				statusCode = http.StatusConflict
+			}
+			c.JSON(statusCode, gin.H{
+				"error":   specErr.Error(),
+				"message": "提案 action_spec 校验失败，拒绝审批",
+			})
+			return
+		}
 	}
 
 	var req ApproveProposalRequest
@@ -468,14 +499,7 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 // Allows authorized callers (admin or internal service) to trigger execution of an already
 // APPROVED or SCHEDULED proposal. Strictly rejects execution of unapproved proposals.
 func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
-	id := c.Param("id")
-	var proposal model.OpsProposal
-	if err := h.db.Where("id = ? OR proposal_id = ?", id, id).First(&proposal).Error; err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
-		return
-	}
-
-	// Require either admin or internal service
+	// Require either admin or internal service before revealing proposal existence
 	isAdmin := c.GetBool("is_admin")
 	isInternal := c.GetBool("is_internal_service")
 	if !isAdmin && !isInternal {
@@ -483,8 +507,19 @@ func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
 		return
 	}
 
+	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
+		return
+	}
+	var proposal model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", id, id).First(&proposal).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
 	callerHouseholdID := c.GetUint("household_id")
-	if !isInternal && callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+	if !isInternal && !sameHouseholdAccess(callerHouseholdID, proposal.HouseholdID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
 		return
 	}
@@ -515,7 +550,8 @@ func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
 
 	res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
 	if err != nil {
-		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) || errors.Is(err, ErrEmptyBaseline) {
+		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) || errors.Is(err, ErrEmptyBaseline) ||
+			errors.Is(err, ErrInvalidSpec) || errors.Is(err, model.ErrApprovalUnknownField) || errors.Is(err, ErrComponentNotWhitelisted) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":  err.Error(),
 				"status": proposal.Status,
@@ -559,6 +595,13 @@ func (h *OpsHandler) ExecuteProposal(ctx context.Context, proposalID string) (*E
 // Rejects cancellation if proposal is currently EXECUTING or ROLLING_BACK (HTTP 409).
 // Atomically transitions eligible proposals (PENDING, AWAITING_APPROVAL, APPROVED, SCHEDULED) to CANCELLED via CAS.
 func (h *OpsHandler) CancelProposal(c *gin.Context) {
+	isAdmin := c.GetBool("is_admin")
+	isInternal := c.GetBool("is_internal_service")
+	if !isAdmin && !isInternal {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: admin or internal service required"})
+		return
+	}
+
 	idParam := strings.TrimSpace(c.Param("id"))
 	if idParam == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
@@ -575,8 +618,7 @@ func (h *OpsHandler) CancelProposal(c *gin.Context) {
 
 	// Multi-tenant household anti-IDOR validation
 	callerHouseholdID := c.GetUint("household_id")
-	isInternal := c.GetBool("is_internal_service")
-	if !isInternal && callerHouseholdID != 0 && prop.HouseholdID != 0 && prop.HouseholdID != callerHouseholdID {
+	if !isInternal && !sameHouseholdAccess(callerHouseholdID, prop.HouseholdID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
 		return
 	}
@@ -668,7 +710,7 @@ func (h *OpsHandler) ReconcileProposalEndpoint(c *gin.Context) {
 		return
 	}
 	callerHouseholdID := c.GetUint("household_id")
-	if callerHouseholdID != 0 && prop.HouseholdID != 0 && prop.HouseholdID != callerHouseholdID {
+	if !sameHouseholdAccess(callerHouseholdID, prop.HouseholdID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
 		return
 	}
@@ -776,42 +818,68 @@ func (h *OpsHandler) ComputeFingerprint(component string) string {
 	defer cancel()
 
 	var targetContainer *ContainerSummary
+	matchContainer := func(rawName string) bool {
+		cName := strings.TrimPrefix(strings.TrimSpace(rawName), "/")
+		if cName == "" {
+			return false
+		}
+		if strings.EqualFold(cName, canonical) {
+			return true
+		}
+		if expectedName, ok := canonicalContainerNames[canonical]; ok && strings.EqualFold(cName, expectedName) {
+			return true
+		}
+		return model.CanonicalizeComponent(cName) == canonical
+	}
 
 	// 1. Try querying via 1PanelClient if available
-	if h.client != nil {
+	clientSucceeded := false
+	if h.client != nil && strings.TrimSpace(h.client.baseURL) != "" {
 		if containers, err := h.client.ListContainers(ctx); err == nil {
+			clientSucceeded = true
 			for i := range containers {
-				cName := strings.TrimPrefix(containers[i].Name, "/")
-				if strings.EqualFold(cName, canonical) {
+				if matchContainer(containers[i].Name) {
 					targetContainer = &containers[i]
 					break
 				}
 			}
+		} else if IsProductionRuntime() && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") || strings.Contains(strings.ToLower(err.Error()), "timeout")) {
+			return ""
 		}
 	}
 
-	// 2. Fallback to host Docker inspection via HostFallbackProvider
-	if targetContainer == nil && h.fallback != nil {
+	// 2. Fallback to host Docker inspection via HostFallbackProvider (only if 1Panel did not authoritatively respond)
+	if targetContainer == nil && !clientSucceeded && h.fallback != nil {
 		fallbackContainers := h.fallback.GetHostContainers(ctx)
 		for i := range fallbackContainers {
-			cName := strings.TrimPrefix(fallbackContainers[i].Name, "/")
-			if strings.EqualFold(cName, canonical) {
+			if matchContainer(fallbackContainers[i].Name) {
 				targetContainer = &fallbackContainers[i]
 				break
 			}
 		}
 	}
 
-	hasher := sha256.New()
 	if targetContainer != nil {
+		state := strings.ToLower(strings.TrimSpace(targetContainer.State))
+		if state == "" || state == "unknown" || strings.TrimSpace(targetContainer.Image) == "" {
+			return ""
+		}
+		if IsProductionRuntime() && targetContainer.Status == "Up (host monitored)" && targetContainer.CreatedAt == "" {
+			return ""
+		}
+		hasher := sha256.New()
 		raw := fmt.Sprintf("%s:%s:%s:%s", canonical, targetContainer.Image, targetContainer.State, targetContainer.CreatedAt)
 		hasher.Write([]byte(raw))
-	} else {
-		// Deterministic baseline for offline, uncreated, or test components
-		raw := fmt.Sprintf("%s:offline:none", canonical)
-		hasher.Write([]byte(raw))
+		return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
 	}
 
+	if IsProductionRuntime() {
+		return ""
+	}
+	// Deterministic baseline for offline, uncreated, or test components
+	hasher := sha256.New()
+	raw := fmt.Sprintf("%s:offline:none", canonical)
+	hasher.Write([]byte(raw))
 	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
 }
 
@@ -833,12 +901,16 @@ func InvalidateProposalApproval(p *model.OpsProposal) {
 
 // UpdateProposal updates mutable proposal fields using CAS and invalidates previous approval if any bound field changes.
 func (h *OpsHandler) UpdateProposal(c *gin.Context) {
-	if !c.GetBool("is_admin") && !c.GetBool("is_internal_service") {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: admin role or internal service required"})
+	if c.GetBool("is_internal_service") || !c.GetBool("is_admin") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: human administrator role required"})
 		return
 	}
 
 	id := strings.TrimSpace(c.Param("id"))
+	if id == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
+		return
+	}
 	var proposal model.OpsProposal
 	if err := h.db.Where("id = ? OR proposal_id = ?", id, id).First(&proposal).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
@@ -846,7 +918,7 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 	}
 
 	callerHouseholdID := c.GetUint("household_id")
-	if !c.GetBool("is_internal_service") && callerHouseholdID != 0 && proposal.HouseholdID != 0 && proposal.HouseholdID != callerHouseholdID {
+	if !sameHouseholdAccess(callerHouseholdID, proposal.HouseholdID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
 		return
 	}
@@ -892,6 +964,7 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 
 	updates := make(map[string]interface{})
 	boundFieldChanged := false
+	specNeedsRevalidation := false
 	if updateReq.TargetComponent != nil && *updateReq.TargetComponent != proposal.TargetComponent {
 		if model.CanonicalizeComponent(*updateReq.TargetComponent) == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": ErrComponentNotWhitelisted.Error()})
@@ -907,25 +980,29 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 		updates["target_component"] = proposal.TargetComponent
 		updates["baseline_hash"] = proposal.BaselineHash
 		boundFieldChanged = true
+		specNeedsRevalidation = true
+	}
+	if updateReq.ExecutionPolicy != nil && *updateReq.ExecutionPolicy != proposal.ExecutionPolicy {
+		proposal.ExecutionPolicy = *updateReq.ExecutionPolicy
+		updates["execution_policy"] = proposal.ExecutionPolicy
+		boundFieldChanged = true
+		specNeedsRevalidation = true
 	}
 	if updateReq.ActionSpec != nil && *updateReq.ActionSpec != proposal.ActionSpec {
-		tmpProp := proposal
-		tmpProp.ActionSpec = *updateReq.ActionSpec
-		if exec, ok := h.GetExecutor().(*DefaultOperationExecutor); ok && exec != nil {
-			if _, err := exec.parseProposalSpec(&tmpProp); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action_spec: " + err.Error()})
-				return
-			}
-		} else {
-			defExec := &DefaultOperationExecutor{}
-			if _, err := defExec.parseProposalSpec(&tmpProp); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid action_spec: " + err.Error()})
-				return
-			}
-		}
 		proposal.ActionSpec = *updateReq.ActionSpec
 		updates["action_spec"] = proposal.ActionSpec
 		boundFieldChanged = true
+		specNeedsRevalidation = true
+	}
+	if specNeedsRevalidation && strings.TrimSpace(proposal.ActionSpec) != "" {
+		if _, err := h.validateProposalSpec(&proposal); err != nil {
+			statusCode := http.StatusBadRequest
+			if errors.Is(err, ErrBaselineMismatch) {
+				statusCode = http.StatusConflict
+			}
+			c.JSON(statusCode, gin.H{"error": "invalid action_spec: " + err.Error()})
+			return
+		}
 	}
 	if updateReq.ExecutionPlan != nil && *updateReq.ExecutionPlan != proposal.ExecutionPlan {
 		proposal.ExecutionPlan = *updateReq.ExecutionPlan
@@ -937,27 +1014,32 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 		updates["rollback_plan"] = proposal.RollbackPlan
 		boundFieldChanged = true
 	}
-	if updateReq.ExecutionPolicy != nil && *updateReq.ExecutionPolicy != proposal.ExecutionPolicy {
-		proposal.ExecutionPolicy = *updateReq.ExecutionPolicy
-		updates["execution_policy"] = proposal.ExecutionPolicy
-		boundFieldChanged = true
-	}
 	if updateReq.ScheduledAt != nil {
-		proposal.ScheduledAt = updateReq.ScheduledAt
-		updates["scheduled_at"] = *updateReq.ScheduledAt
-		boundFieldChanged = true
+		if proposal.ScheduledAt == nil || *proposal.ScheduledAt != *updateReq.ScheduledAt {
+			proposal.ScheduledAt = updateReq.ScheduledAt
+			updates["scheduled_at"] = *updateReq.ScheduledAt
+			boundFieldChanged = true
+		}
 	}
-	if updateReq.Title != nil {
+	if updateReq.RiskLevel != nil {
+		normalizedRisk := strings.ToUpper(strings.TrimSpace(*updateReq.RiskLevel))
+		if !isValidRiskLevel(normalizedRisk) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid risk_level %q: must be LOW, MEDIUM, HIGH, or CRITICAL", *updateReq.RiskLevel)})
+			return
+		}
+		if normalizedRisk != strings.ToUpper(strings.TrimSpace(proposal.RiskLevel)) {
+			proposal.RiskLevel = normalizedRisk
+			updates["risk_level"] = proposal.RiskLevel
+			boundFieldChanged = true
+		}
+	}
+	if updateReq.Title != nil && *updateReq.Title != proposal.Title {
 		proposal.Title = *updateReq.Title
 		updates["title"] = proposal.Title
 	}
-	if updateReq.Description != nil {
+	if updateReq.Description != nil && *updateReq.Description != proposal.Description {
 		proposal.Description = *updateReq.Description
 		updates["description"] = proposal.Description
-	}
-	if updateReq.RiskLevel != nil {
-		proposal.RiskLevel = *updateReq.RiskLevel
-		updates["risk_level"] = proposal.RiskLevel
 	}
 
 	if boundFieldChanged {
@@ -1047,7 +1129,7 @@ func (h *OpsHandler) RejectProposal(c *gin.Context) {
 	}
 
 	callerHouseholdID := c.GetUint("household_id")
-	if callerHouseholdID != 0 && prop.HouseholdID != 0 && prop.HouseholdID != callerHouseholdID {
+	if !sameHouseholdAccess(callerHouseholdID, prop.HouseholdID) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
 		return
 	}
@@ -1099,5 +1181,32 @@ func auditDecisionForRisk(risk string) string {
 	default:
 		return model.AuditDecisionRequireApproval
 	}
+}
+
+func isValidRiskLevel(risk string) bool {
+	switch strings.ToUpper(strings.TrimSpace(risk)) {
+	case model.RiskLevelLow, model.RiskLevelMedium, model.RiskLevelHigh, model.RiskLevelCritical:
+		return true
+	default:
+		return false
+	}
+}
+
+func sameHouseholdAccess(callerHouseholdID, propHouseholdID uint) bool {
+	if callerHouseholdID == 0 {
+		return true
+	}
+	if propHouseholdID == 0 {
+		propHouseholdID = 1
+	}
+	return propHouseholdID == callerHouseholdID
+}
+
+func (h *OpsHandler) validateProposalSpec(p *model.OpsProposal) (OperationSpec, error) {
+	if exec, ok := h.GetExecutor().(*DefaultOperationExecutor); ok && exec != nil {
+		return exec.parseProposalSpec(p)
+	}
+	defExec := &DefaultOperationExecutor{}
+	return defExec.parseProposalSpec(p)
 }
 

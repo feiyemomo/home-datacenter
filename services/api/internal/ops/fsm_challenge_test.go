@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -215,9 +216,9 @@ func TestChallenge_CircuitBreaker_EdgeCases(t *testing.T) {
 	ctx := context.Background()
 	container := "home-web"
 
-	tripCount := 0
+	var tripCount atomic.Int32
 	fsm.breaker.SetOnTrip(func(c string, count int) {
-		tripCount++
+		tripCount.Add(1)
 	})
 
 	crashEvent := ContainerEvent{
@@ -249,8 +250,8 @@ func TestChallenge_CircuitBreaker_EdgeCases(t *testing.T) {
 	if fsm.breaker.GetState(container) != CircuitClosed {
 		t.Fatalf("expected breaker state CLOSED after 2 crashes, got %s", fsm.breaker.GetState(container))
 	}
-	if tripCount != 0 {
-		t.Fatalf("expected 0 trips after 2 crashes, got %d", tripCount)
+	if tripCount.Load() != 0 {
+		t.Fatalf("expected 0 trips after 2 crashes, got %d", tripCount.Load())
 	}
 
 	// 3. Third Crash -> Must TRIP breaker (crashes: 3 in window)
@@ -267,8 +268,8 @@ func TestChallenge_CircuitBreaker_EdgeCases(t *testing.T) {
 
 	// Give async trip callback goroutine a moment to increment counter
 	time.Sleep(50 * time.Millisecond)
-	if tripCount != 1 {
-		t.Fatalf("expected exactly 1 trip invocation, got %d", tripCount)
+	if tripCount.Load() != 1 {
+		t.Fatalf("expected exactly 1 trip invocation, got %d", tripCount.Load())
 	}
 
 	// 4. Fourth Crash -> Must be BLOCKED (circuit is already OPEN)

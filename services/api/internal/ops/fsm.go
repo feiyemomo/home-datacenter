@@ -2,6 +2,7 @@ package ops
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -475,6 +476,7 @@ func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
 	}
 
 	cutoff := cb.now().Add(-cb.windowDuration)
+	var halfOpenResetContainers []string
 	for _, r := range rows {
 		canonical := ResolveTopologyComponent(r.Container)
 		if canonical == "" {
@@ -496,7 +498,7 @@ func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
 		}
 
 		if state == CircuitHalfOpen || strings.TrimSpace(r.ActiveProbeToken) != "" {
-			// R4-10: Any interrupted HALF_OPEN or active probe across process restart resets to OPEN
+			// R4-10 / R3: Any interrupted HALF_OPEN or active probe across process restart resets to OPEN
 			state = CircuitOpen
 			if !r.OpenedAt.IsZero() {
 				cb.openedAt[canonical] = r.OpenedAt.UTC()
@@ -506,6 +508,7 @@ func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
 				cb.openedAt[canonical] = cb.now()
 			}
 			delete(cb.activeProbes, canonical)
+			halfOpenResetContainers = append(halfOpenResetContainers, canonical)
 		} else if !r.OpenedAt.IsZero() {
 			cb.openedAt[canonical] = r.OpenedAt.UTC()
 		} else if r.OpenedAtMs > 0 {
@@ -543,6 +546,15 @@ func (cb *ContainerCircuitBreaker) LoadPersistedState(db *gorm.DB) {
 			}
 			if validTimes != nil {
 				cb.crashTimestamps[canonical] = validTimes
+			}
+		}
+	}
+
+	if !cb.isDegraded {
+		for _, canonical := range halfOpenResetContainers {
+			if err := cb.persistState(canonical); err != nil {
+				cb.markDegraded(fmt.Sprintf("persistState failed resetting interrupted HALF_OPEN for %s: %v", canonical, err))
+				break
 			}
 		}
 	}
@@ -593,27 +605,193 @@ func (cb *ContainerCircuitBreaker) persistState(canonical string) error {
 		UpdatedAtMs:          now.UnixMilli(),
 	}
 
-	return cb.db.Transaction(func(tx *gorm.DB) error {
-		var existing model.OpsCircuitBreakerState
-		if err := tx.Where("container = ?", row.Container).First(&existing).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				return tx.Create(&row).Error
-			}
+	sqlDB, err := cb.db.DB()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	conn, err := sqlDB.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		}
+	}()
+
+	var existingID uint
+	scanErr := conn.QueryRowContext(ctx,
+		"SELECT id FROM ops_circuit_breaker_states WHERE container = ? LIMIT 1",
+		row.Container,
+	).Scan(&existingID)
+	if scanErr != nil && !errors.Is(scanErr, sql.ErrNoRows) {
+		return scanErr
+	}
+
+	if errors.Is(scanErr, sql.ErrNoRows) {
+		if _, err := conn.ExecContext(ctx,
+			`INSERT INTO ops_circuit_breaker_states
+			 (container, state, opened_at, opened_at_ms, crash_timestamps, active_probe_token, active_probe_issued_ms, active_probe_expires_ms, degraded, updated_at, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			row.Container, row.State, row.OpenedAt, row.OpenedAtMs, row.CrashTimestamps,
+			row.ActiveProbeToken, row.ActiveProbeIssuedMs, row.ActiveProbeExpiresMs,
+			row.Degraded, row.UpdatedAt, row.UpdatedAtMs,
+		); err != nil {
 			return err
 		}
-		return tx.Model(&existing).Updates(map[string]interface{}{
-			"state":                   row.State,
-			"opened_at":               row.OpenedAt,
-			"opened_at_ms":            row.OpenedAtMs,
-			"crash_timestamps":        row.CrashTimestamps,
-			"active_probe_token":      row.ActiveProbeToken,
-			"active_probe_issued_ms":  row.ActiveProbeIssuedMs,
-			"active_probe_expires_ms": row.ActiveProbeExpiresMs,
-			"degraded":                row.Degraded,
-			"updated_at":              row.UpdatedAt,
-			"updated_at_ms":           row.UpdatedAtMs,
-		}).Error
-	})
+	} else {
+		if _, err := conn.ExecContext(ctx,
+			`UPDATE ops_circuit_breaker_states
+			 SET state = ?, opened_at = ?, opened_at_ms = ?, crash_timestamps = ?,
+			     active_probe_token = ?, active_probe_issued_ms = ?, active_probe_expires_ms = ?,
+			     degraded = ?, updated_at = ?, updated_at_ms = ?
+			 WHERE id = ?`,
+			row.State, row.OpenedAt, row.OpenedAtMs, row.CrashTimestamps,
+			row.ActiveProbeToken, row.ActiveProbeIssuedMs, row.ActiveProbeExpiresMs,
+			row.Degraded, row.UpdatedAt, row.UpdatedAtMs, existingID,
+		); err != nil {
+			return err
+		}
+	}
+
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// syncContainerFromDBLocked reconciles a container's persisted DB row into memory while caller holds cb.mu.Lock().
+// Prevents memory=CLOSED / DB=OPEN (or DB=degraded) split-brain from being treated as normal operation (R3).
+func (cb *ContainerCircuitBreaker) syncContainerFromDBLocked(canonical string) error {
+	if cb.db == nil || canonical == "" {
+		return nil
+	}
+	var r model.OpsCircuitBreakerState
+	err := cb.db.Where("container = ?", canonical).First(&r).Error
+	if err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil
+		}
+		cb.states[canonical] = CircuitOpen
+		if cb.openedAt[canonical].IsZero() {
+			cb.openedAt[canonical] = cb.now()
+		}
+		cb.markDegraded("failed querying circuit breaker state from DB: " + err.Error())
+		return ErrFailClosedMode
+	}
+
+	if r.Degraded {
+		cb.states[canonical] = CircuitOpen
+		if cb.openedAt[canonical].IsZero() {
+			cb.openedAt[canonical] = cb.now()
+		}
+		cb.markDegraded(fmt.Sprintf("persisted degraded flag set on container %s", canonical))
+		return ErrFailClosedMode
+	}
+
+	dbState := CircuitState(strings.ToUpper(strings.TrimSpace(r.State)))
+	if !isValidCircuitState(dbState) {
+		cb.states[canonical] = CircuitOpen
+		cb.openedAt[canonical] = cb.now()
+		cb.markDegraded(fmt.Sprintf("unrecognized persisted circuit state %q for container %s", r.State, canonical))
+		return ErrFailClosedMode
+	}
+
+	var parsedCrashes []time.Time
+	if strings.TrimSpace(r.CrashTimestamps) != "" {
+		var tsStrings []string
+		if jsonErr := json.Unmarshal([]byte(r.CrashTimestamps), &tsStrings); jsonErr != nil {
+			cb.states[canonical] = CircuitOpen
+			cb.openedAt[canonical] = cb.now()
+			cb.markDegraded(fmt.Sprintf("corrupt crash_timestamps JSON for %s: %v", canonical, jsonErr))
+			return ErrFailClosedMode
+		}
+		cutoff := cb.now().Add(-cb.windowDuration)
+		for _, s := range tsStrings {
+			t, parseErr := time.Parse(time.RFC3339Nano, s)
+			if parseErr != nil {
+				t, parseErr = time.Parse(time.RFC3339, s)
+			}
+			if parseErr != nil {
+				cb.states[canonical] = CircuitOpen
+				cb.openedAt[canonical] = cb.now()
+				cb.markDegraded(fmt.Sprintf("invalid timestamp %q in crash_timestamps for %s", s, canonical))
+				return ErrFailClosedMode
+			}
+			if t.After(cutoff) {
+				parsedCrashes = append(parsedCrashes, t)
+			}
+		}
+	}
+
+	memState := cb.states[canonical]
+	if memState == "" {
+		memState = CircuitClosed
+	}
+
+	if memState == CircuitClosed && dbState == CircuitOpen {
+		if !r.OpenedAt.IsZero() {
+			cb.openedAt[canonical] = r.OpenedAt.UTC()
+		} else if r.OpenedAtMs > 0 {
+			cb.openedAt[canonical] = time.UnixMilli(r.OpenedAtMs).UTC()
+		} else {
+			cb.states[canonical] = CircuitOpen
+			cb.openedAt[canonical] = cb.now()
+			cb.markDegraded(fmt.Sprintf("OPEN circuit in DB for %s missing valid opened_at timestamp", canonical))
+			return ErrFailClosedMode
+		}
+		cb.states[canonical] = CircuitOpen
+		cb.crashTimestamps[canonical] = parsedCrashes
+		delete(cb.activeProbes, canonical)
+		RecordSecurityEvent(nil, cb.bus, OpsSecurityEvent{
+			OperationID: GenerateOperationID("cb-sync"),
+			EventType:   "ops.circuit_breaker.split_brain_resolved",
+			Severity:    "warning",
+			Component:   canonical,
+			Actor:       "circuit-breaker",
+			Message:     fmt.Sprintf("resolved memory=CLOSED / DB=OPEN split-brain for %s", canonical),
+		})
+		return nil
+	}
+
+	if memState == CircuitClosed && dbState == CircuitHalfOpen {
+		if !r.OpenedAt.IsZero() {
+			cb.openedAt[canonical] = r.OpenedAt.UTC()
+		} else if r.OpenedAtMs > 0 {
+			cb.openedAt[canonical] = time.UnixMilli(r.OpenedAtMs).UTC()
+		} else {
+			cb.openedAt[canonical] = cb.now()
+		}
+		if strings.TrimSpace(r.ActiveProbeToken) != "" && r.ActiveProbeExpiresMs > cb.now().UnixMilli() {
+			cb.states[canonical] = CircuitHalfOpen
+			cb.activeProbes[canonical] = ProbeTicket{
+				Token:     r.ActiveProbeToken,
+				Container: canonical,
+				IssuedAt:  time.UnixMilli(r.ActiveProbeIssuedMs).UTC(),
+				ExpiresAt: time.UnixMilli(r.ActiveProbeExpiresMs).UTC(),
+			}
+		} else {
+			cb.states[canonical] = CircuitOpen
+			delete(cb.activeProbes, canonical)
+		}
+		cb.crashTimestamps[canonical] = parsedCrashes
+		return nil
+	}
+
+	if memState == CircuitClosed && dbState == CircuitClosed && len(parsedCrashes) > len(cb.crashTimestamps[canonical]) {
+		cb.crashTimestamps[canonical] = parsedCrashes
+	}
+	return nil
 }
 
 // SetOnTrip sets the callback invoked when a container circuit breaker trips to OPEN.
@@ -632,6 +810,12 @@ func (cb *ContainerCircuitBreaker) RecordCrash(container string) (CircuitState, 
 	canonical := ResolveTopologyComponent(container)
 	if canonical == "" {
 		return CircuitOpen, false
+	}
+
+	if !cb.isDegraded {
+		if syncErr := cb.syncContainerFromDBLocked(canonical); syncErr != nil {
+			return CircuitOpen, false
+		}
 	}
 
 	now := cb.now()
@@ -719,6 +903,9 @@ func (cb *ContainerCircuitBreaker) CanAttemptRecovery(container string) (bool, *
 	canonical := ResolveTopologyComponent(container)
 	if canonical == "" {
 		return false, nil, ErrComponentNotWhitelisted
+	}
+	if syncErr := cb.syncContainerFromDBLocked(canonical); syncErr != nil {
+		return false, nil, syncErr
 	}
 	state := cb.states[canonical]
 	if state == "" {
@@ -811,6 +998,9 @@ func (cb *ContainerCircuitBreaker) RecordRecoverySuccess(container string, token
 	canonical := ResolveTopologyComponent(container)
 	if canonical == "" {
 		return ErrComponentNotWhitelisted
+	}
+	if syncErr := cb.syncContainerFromDBLocked(canonical); syncErr != nil {
+		return syncErr
 	}
 	currentState := cb.states[canonical]
 	if currentState == "" {
@@ -954,6 +1144,7 @@ func (cb *ContainerCircuitBreaker) ReconcileFromDB() error {
 	newStates := make(map[string]CircuitState)
 	newOpened := make(map[string]time.Time)
 	newCrashes := make(map[string][]time.Time)
+	var resetHalfOpen []string
 	cutoff := cb.now().Add(-cb.windowDuration)
 
 	for _, r := range rows {
@@ -965,8 +1156,9 @@ func (cb *ContainerCircuitBreaker) ReconcileFromDB() error {
 		if !isValidCircuitState(st) {
 			return fmt.Errorf("%w: invalid state %q for %s", ErrRecordInconsistent, r.State, canonical)
 		}
-		if st == CircuitHalfOpen {
+		if st == CircuitHalfOpen || strings.TrimSpace(r.ActiveProbeToken) != "" {
 			st = CircuitOpen
+			resetHalfOpen = append(resetHalfOpen, canonical)
 		}
 		newStates[canonical] = st
 		if !r.OpenedAt.IsZero() {
@@ -993,6 +1185,18 @@ func (cb *ContainerCircuitBreaker) ReconcileFromDB() error {
 				}
 			}
 			newCrashes[canonical] = parsed
+		}
+	}
+
+	if len(resetHalfOpen) > 0 {
+		if err := cb.db.Model(&model.OpsCircuitBreakerState{}).Where("container IN ?", resetHalfOpen).Updates(map[string]interface{}{
+			"state":                   string(CircuitOpen),
+			"active_probe_token":      "",
+			"active_probe_issued_ms":  0,
+			"active_probe_expires_ms": 0,
+		}).Error; err != nil {
+			cb.markDegraded("failed resetting interrupted HALF_OPEN during reconcile: " + err.Error())
+			return err
 		}
 	}
 
@@ -1036,6 +1240,9 @@ func (cb *ContainerCircuitBreaker) GetState(container string) CircuitState {
 
 	canonical := ResolveTopologyComponent(container)
 	if canonical == "" {
+		return CircuitOpen
+	}
+	if syncErr := cb.syncContainerFromDBLocked(canonical); syncErr != nil {
 		return CircuitOpen
 	}
 	state := cb.states[canonical]
@@ -1815,8 +2022,20 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 	if defExec, ok := curExec.(*DefaultOperationExecutor); ok && defExec != nil && defExec.baselineExtractor != nil {
 		baselineHash = defExec.baselineExtractor(canonical)
 	}
-	if baselineHash == "" {
+	if baselineHash == "" && !IsProductionRuntime() {
 		baselineHash = model.ComputeDefaultBaseline(canonical)
+	}
+	if baselineHash == "" {
+		GlobalSecurityMetrics.IncHealthUnknown()
+		RecordSecurityEvent(fsm.db, fsm.bus, OpsSecurityEvent{
+			OperationID: propID,
+			EventType:   "ops.proposal.baseline_unavailable",
+			Severity:    "critical",
+			Component:   canonical,
+			Actor:       "container-recovery-fsm",
+			Message:     fmt.Sprintf("cannot create circuit trip proposal for %s in production: real baseline fingerprint unavailable", canonical),
+		})
+		return
 	}
 
 	actionSpec, _ := json.Marshal(OperationSpec{
@@ -2292,7 +2511,7 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		}
 
 		if ae != nil {
-			_, _ = ae.EmitEvent(workCtx, audit.EmitEventInput{
+			_, _ = ae.EmitEvent(context.WithoutCancel(workCtx), audit.EmitEventInput{
 				EventType:      model.AuditEventRecoveryVerified,
 				Action:         "container.recovery.verified",
 				Target:         canonical,

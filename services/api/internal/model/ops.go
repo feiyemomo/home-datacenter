@@ -248,6 +248,7 @@ type CanonicalApprovalPayload struct {
 	TargetComponent string                 `json:"target_component"`
 	ExecutionAction string                 `json:"execution_action"`
 	Parameters      interface{}            `json:"parameters"`
+	RiskLevel       string                 `json:"risk_level"`
 	ExecutionPlan   string                 `json:"execution_plan"`
 	RollbackPlan    string                 `json:"rollback_plan"`
 	RollbackSpec    *CanonicalRollbackSpec `json:"rollback_spec,omitempty"`
@@ -372,8 +373,16 @@ func CanonicalizeComponent(name string) string {
 		return "home-cloudflared"
 	case "home-h3c-keepalive", "h3c", "home-datacenter-h3c-keepalive":
 		return "home-h3c-keepalive"
+	case "home-new-api", "new-api", "home-datacenter-new-api":
+		return "home-new-api"
 	case "home-ops-agent", "ops-agent", "home-datacenter-ops-agent":
 		return "home-ops-agent"
+	case "home-backup", "backup", "home-datacenter-backup":
+		return "home-backup"
+	case "mihomo":
+		return "mihomo"
+	case "tailscale":
+		return "tailscale"
 	default:
 		return ""
 	}
@@ -514,12 +523,18 @@ func buildCanonicalPayloadFromProposal(p *OpsProposal) ([]byte, error) {
 		householdID = 1
 	}
 
+	riskLevel := strings.ToUpper(strings.TrimSpace(p.RiskLevel))
+	if riskLevel == "" {
+		riskLevel = RiskLevelLow
+	}
+
 	payload := CanonicalApprovalPayload{
 		ProposalID:      strings.TrimSpace(p.ProposalID),
 		HouseholdID:     householdID,
 		TargetComponent: target,
 		ExecutionAction: strings.ToLower(strings.TrimSpace(action)),
 		Parameters:      CanonicalizeJSONValue(params),
+		RiskLevel:       riskLevel,
 		ExecutionPlan:   strings.TrimSpace(p.ExecutionPlan),
 		RollbackPlan:    strings.TrimSpace(p.RollbackPlan),
 		RollbackSpec:    rbSpec,

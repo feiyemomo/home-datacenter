@@ -13,7 +13,14 @@ import pathlib
 import socket
 import sqlite3
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from config import (
+    is_placeholder_baseline_hash,
+    is_production_env,
+    is_real_baseline_hash,
+    resolve_canonical_component,
+)
 
 logger = logging.getLogger("home-ops-agent.proposal")
 
@@ -46,14 +53,47 @@ class ProposalLifecycleManager:
         self,
         db_path: Optional[str] = None,
         go_api_url: Optional[str] = None,
-        internal_token: Optional[str] = None
+        internal_token: Optional[str] = None,
+        baseline_verifier: Optional[Callable[[str], str]] = None,
     ):
         self.db_path = db_path
         self.go_api_url = go_api_url
         self.internal_token = internal_token
+        self.baseline_verifier = baseline_verifier
         self.proposals: Dict[str, Dict[str, Any]] = {}
         if self.db_path and os.path.isfile(self.db_path):
             self._load_from_sqlite()
+
+    def _validate_proposal_baseline(self, proposal: Dict[str, Any], phase: str) -> Tuple[bool, str]:
+        """
+        Validates component resolution and real BaselineHash integrity (R5).
+        Rejects unknown components, placeholder fingerprints, and live drift.
+        """
+        target = str(proposal.get("target_component") or "").strip()
+        if target:
+            canonical = resolve_canonical_component(target)
+            if not canonical:
+                return False, f"Component resolution failed during {phase}: unknown component '{target}'"
+            target = canonical
+
+        bh = str(proposal.get("baseline_hash") or "").strip()
+        if bh and is_placeholder_baseline_hash(bh, target):
+            return False, f"Placeholder or invalid baseline_hash rejected during {phase}"
+
+        if is_production_env():
+            if not target:
+                return False, f"Target component resolution required during {phase} in production"
+            if not is_real_baseline_hash(bh, target):
+                return False, f"Real resource baseline_hash required during {phase} in production"
+
+        if self.baseline_verifier and target:
+            live_bh = (self.baseline_verifier(target) or "").strip()
+            if not is_real_baseline_hash(live_bh, target):
+                return False, f"Live baseline_hash resolution failed during {phase} for '{target}'"
+            if not bh or live_bh != bh:
+                return False, f"Baseline hash mismatch during {phase} for '{target}'"
+
+        return True, "ok"
 
     def create_proposal(
         self,
@@ -64,9 +104,27 @@ class ProposalLifecycleManager:
         rollback_cmd: str,
         target_component: str = "",
         estimated_seconds: int = 30,
-        downtime_seconds: int = 0
+        downtime_seconds: int = 0,
+        baseline_hash: str = "",
+        action_spec: str = "",
+        approval_digest: str = "",
+        version: int = 1,
     ) -> Dict[str, Any]:
         """Creates a pending proposal with status AWAITING_APPROVAL."""
+        clean_target = str(target_component or "").strip()
+        if clean_target:
+            canonical = resolve_canonical_component(clean_target)
+            if not canonical:
+                raise ValueError(f"Component resolution failed: unknown component '{target_component}'")
+            clean_target = canonical
+
+        clean_bh = str(baseline_hash or "").strip()
+        if clean_bh and is_placeholder_baseline_hash(clean_bh, clean_target):
+            if is_production_env():
+                raise ValueError("Placeholder baseline_hash rejected in production")
+        if is_production_env() and (not clean_target or not is_real_baseline_hash(clean_bh, clean_target)):
+            raise ValueError("Valid target_component and real baseline_hash required in production")
+
         now = time.time()
         proposal = {
             "id": prop_id,
@@ -74,9 +132,13 @@ class ProposalLifecycleManager:
             "risk_level": risk_level,
             "action": action,
             "rollback_cmd": rollback_cmd,
-            "target_component": target_component,
+            "target_component": clean_target,
             "estimated_seconds": estimated_seconds,
             "downtime_seconds": downtime_seconds,
+            "baseline_hash": clean_bh,
+            "action_spec": action_spec,
+            "approval_digest": approval_digest,
+            "version": int(version or 1),
             "status": self.STATE_AWAITING,
             "created_at": now,
             "approved_at": None,
@@ -111,6 +173,11 @@ class ProposalLifecycleManager:
 
         if proposal["status"] != self.STATE_AWAITING:
             return False, f"Invalid state transition from {proposal['status']}: must be AWAITING_APPROVAL first"
+
+        ok_base, base_msg = self._validate_proposal_baseline(proposal, "approval")
+        if not ok_base:
+            logger.warning(f"Rejecting approval for proposal {prop_id}: {base_msg}")
+            return False, base_msg
 
         now = time.time()
         proposal["approved_at"] = now
@@ -148,6 +215,11 @@ class ProposalLifecycleManager:
 
         if proposal["status"] not in (self.STATE_APPROVED, self.STATE_SCHEDULED):
             return False, f"Cannot execute proposal in state {proposal['status']}: must be APPROVED first"
+
+        ok_base, base_msg = self._validate_proposal_baseline(proposal, "execution")
+        if not ok_base:
+            logger.error(f"Rejecting execution for proposal {prop_id}: {base_msg}")
+            return False, base_msg
 
         target_go_url = go_api_url or self.go_api_url
         target_token = internal_token or self.internal_token
@@ -270,6 +342,7 @@ class ProposalLifecycleManager:
                 return
             cur.execute("SELECT * FROM pending_proposals")
             for row in cur.fetchall():
+                row_keys = set(row.keys())
                 prop_id = row["proposal_id"] or f"prop-{row['id']}"
                 self.proposals[prop_id] = {
                     "id": prop_id,
@@ -280,6 +353,10 @@ class ProposalLifecycleManager:
                     "target_component": row["target_component"] or "",
                     "estimated_seconds": row["estimated_seconds"] or 30,
                     "downtime_seconds": row["downtime_seconds"] or 0,
+                    "baseline_hash": row["baseline_hash"] if "baseline_hash" in row_keys else "",
+                    "action_spec": row["action_spec"] if "action_spec" in row_keys else "",
+                    "approval_digest": row["approval_digest"] if "approval_digest" in row_keys else "",
+                    "version": int(row["version"] or 1) if "version" in row_keys else 1,
                     "status": row["status"],
                     "created_at": time.time(),
                     "approved_at": None,
@@ -301,22 +378,42 @@ class ProposalLifecycleManager:
         try:
             conn = _open_existing_sqlite(self.db_path, readonly=False)
             with conn:
-                conn.execute("""
-                    INSERT INTO pending_proposals
-                    (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, status, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                    ON CONFLICT(proposal_id) DO NOTHING
-                """, (
-                    prop["id"],
-                    prop["title"],
-                    prop["risk_level"],
-                    prop["action"],
-                    prop["rollback_cmd"],
-                    prop["target_component"],
-                    prop["estimated_seconds"],
-                    prop["downtime_seconds"],
-                    prop["status"]
-                ))
+                cols = {str(c[1]).lower() for c in conn.execute("PRAGMA table_info(pending_proposals)").fetchall()}
+                if "baseline_hash" in cols:
+                    conn.execute("""
+                        INSERT INTO pending_proposals
+                        (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, baseline_hash, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(proposal_id) DO NOTHING
+                    """, (
+                        prop["id"],
+                        prop["title"],
+                        prop["risk_level"],
+                        prop["action"],
+                        prop["rollback_cmd"],
+                        prop["target_component"],
+                        prop["estimated_seconds"],
+                        prop["downtime_seconds"],
+                        prop.get("baseline_hash", ""),
+                        prop["status"]
+                    ))
+                else:
+                    conn.execute("""
+                        INSERT INTO pending_proposals
+                        (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, status, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                        ON CONFLICT(proposal_id) DO NOTHING
+                    """, (
+                        prop["id"],
+                        prop["title"],
+                        prop["risk_level"],
+                        prop["action"],
+                        prop["rollback_cmd"],
+                        prop["target_component"],
+                        prop["estimated_seconds"],
+                        prop["downtime_seconds"],
+                        prop["status"]
+                    ))
         except Exception as e:
             logger.debug(f"SQLite persist note: {e}")
         finally:
