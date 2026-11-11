@@ -1,0 +1,133 @@
+name: Security & Parity Verification
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "services/api/**"
+      - "deploy/ops-agent/**"
+      - "web/**"
+      - "testdata/**"
+      - ".github/workflows/security.yml"
+  pull_request:
+    branches: [main, master]
+    paths:
+      - "services/api/**"
+      - "deploy/ops-agent/**"
+      - "web/**"
+      - "testdata/**"
+      - ".github/workflows/security.yml"
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repo-hygiene-and-guards:
+    name: Line Endings & Forbidden Driver Guards
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enforce pure LF line endings on code and config files
+        run: |
+          python3 - <<'EOF'
+          import pathlib, sys
+          roots = ["services/api", "deploy/ops-agent", "web/src", "testdata", ".github/workflows"]
+          exts = {".go", ".py", ".ts", ".tsx", ".json", ".yml", ".yaml"}
+          bad = []
+          for r in roots:
+              p = pathlib.Path(r)
+              if not p.exists():
+                  continue
+              for f in p.rglob("*"):
+                  if f.is_file() and f.suffix in exts:
+                      if b"\r\n" in f.read_bytes():
+                          bad.append(str(f))
+          if bad:
+              print("CRLF detected in:", bad)
+              sys.exit(1)
+          print("All checked files use pure LF.")
+          EOF
+
+      - name: Forbid CGO sqlite driver (must use pure-Go glebarez/sqlite)
+        run: |
+          if grep -rn "gorm.io/driver/sqlite" services/api/; then
+            echo "ERROR: gorm.io/driver/sqlite requires CGO and is forbidden."
+            exit 1
+          fi
+
+  golden-vector-parity:
+    name: Cross-Language Golden Vector & Protocol Parity
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/api/go.mod
+          cache-dependency-path: services/api/go.sum
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: deploy/ops-agent/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install -r deploy/ops-agent/requirements.txt
+
+      - name: Verify Go golden vectors and audit parity
+        working-directory: services/api
+        run: |
+          go test -v -count=1 -run "TestBaselineV1GoldenVectors|TestAuditR5_GoldenVectorsParity" ./internal/ops/...
+
+      - name: Verify Python golden vectors and component map parity
+        working-directory: deploy/ops-agent
+        run: |
+          python -m unittest -v \
+            tests.test_audit_protocol_r5.TestAuditProtocolR5.test_golden_vectors_parity_with_go \
+            tests.test_phase2_r5_r8_hardening.TestPhase2BaselineAndDockerR5R8.test_baseline_protocol_v1_golden_vectors_exact_parity \
+            tests.test_r1_r4_r5_hardening.TestR1LeaseProtocolParity.test_component_map_parity_with_go_core
+
+  vuln-checks:
+    name: Vulnerability & Dependency Audit
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: services/api/go.mod
+          cache-dependency-path: services/api/go.sum
+
+      - name: Run govulncheck
+        working-directory: services/api
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./internal/... ./cmd/...
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Run npm production dependency audit
+        working-directory: web
+        continue-on-error: true
+        run: npm audit --omit=dev --audit-level=high
