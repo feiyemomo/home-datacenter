@@ -30,7 +30,7 @@ const (
 )
 
 const (
-	RequiredOpsSchemaVersion = 5
+	RequiredOpsSchemaVersion = 7
 )
 
 var (
@@ -173,6 +173,9 @@ func EnsureOpsSchema(db *gorm.DB) error {
 				"agent_audit_events",
 				"agent_audit_checkpoints",
 			)
+		}
+		if bootVer >= 7 {
+			criticalTables = append(criticalTables, "agent_audit_remote_sync_states")
 		}
 		for _, tbl := range criticalTables {
 			exists, tErr := tableExists(db, tbl)
@@ -411,6 +414,55 @@ func EnsureOpsSchema(db *gorm.DB) error {
 		}
 	}
 
+	// Migration V6: Audit key_id, origin_stream_id provenance, and cross-device unique sequence indexes
+	if currentVersion < 6 {
+		for _, col := range []struct{ tbl, col, ddl string }{
+			{"agent_audit_events", "origin_stream_id", "TEXT NOT NULL DEFAULT ''"},
+			{"agent_audit_events", "key_id", "TEXT NOT NULL DEFAULT ''"},
+			{"offline_ops_audit", "origin_stream_id", "TEXT NOT NULL DEFAULT 'offline-agent'"},
+			{"offline_ops_audit", "key_id", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := addColumnIfMissing(db, col.tbl, col.col, col.ddl); err != nil {
+				GlobalSecurityMetrics.IncDatabaseError()
+				return err
+			}
+		}
+		if err := db.Exec(`
+			CREATE INDEX IF NOT EXISTS idx_audit_events_operation_id ON agent_audit_events (operation_id);
+			CREATE INDEX IF NOT EXISTS idx_audit_runs_operation_id ON agent_audit_runs (operation_id);
+			CREATE INDEX IF NOT EXISTS idx_audit_events_key_id ON agent_audit_events (key_id);
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_origin_stream_seq ON agent_audit_events (origin_stream_id, origin_seq) WHERE origin_stream_id <> '' AND origin_seq > 0;
+			CREATE UNIQUE INDEX IF NOT EXISTS idx_offline_ops_audit_stream_seq ON offline_ops_audit (origin_stream_id, offline_seq) WHERE offline_seq > 0;
+		`).Error; err != nil {
+			GlobalSecurityMetrics.IncDatabaseError()
+			return fmt.Errorf("migration v6 audit indexes failed: %w", err)
+		}
+		if err := recordMigration(db, 6, "audit_v6_origin_stream_and_key_id", nowMs, "v6"); err != nil {
+			return err
+		}
+	}
+
+	// Migration V7: External asymmetric checkpoint signatures & mutable remote replication cursor table
+	if currentVersion < 7 {
+		for _, col := range []struct{ tbl, col, ddl string }{
+			{"agent_audit_checkpoints", "external_sig", "TEXT NOT NULL DEFAULT ''"},
+			{"agent_audit_checkpoints", "external_sig_alg", "TEXT NOT NULL DEFAULT ''"},
+			{"agent_audit_checkpoints", "external_key_id", "TEXT NOT NULL DEFAULT ''"},
+		} {
+			if err := addColumnIfMissing(db, col.tbl, col.col, col.ddl); err != nil {
+				GlobalSecurityMetrics.IncDatabaseError()
+				return err
+			}
+		}
+		if err := db.AutoMigrate(&model.AgentAuditRemoteSyncState{}); err != nil {
+			GlobalSecurityMetrics.IncDatabaseError()
+			return fmt.Errorf("migration v7 remote sync table failed: %w", err)
+		}
+		if err := recordMigration(db, 7, "audit_v7_remote_store_and_external_sigs", nowMs, "v7"); err != nil {
+			return err
+		}
+	}
+
 	// Anchor boot sentinel once schema is healthy
 	if err := db.Exec(`
 		INSERT INTO ops_schema_meta (key, value, updated_at_ms)
@@ -501,10 +553,11 @@ func VerifyOpsSchemaIntegrity(db *gorm.DB) error {
 		"ops_maintenance_locks":          {"active", "locked_by", "expires_at"},
 		"pending_proposals":              {"proposal_id", "status", "version", "revision", "baseline_hash", "approval_digest", "execution_token"},
 		"offline_restart_history":        {"container_name", "restart_time", "restart_time_ms"},
-		"offline_ops_audit":              {"event_uuid", "operation_id", "container_name", "audit_status", "fencing_generation", "run_id", "entry_hash", "hmac_signature"},
+		"offline_ops_audit":              {"event_uuid", "operation_id", "container_name", "audit_status", "fencing_generation", "run_id", "entry_hash", "hmac_signature", "origin_stream_id", "key_id"},
 		"agent_audit_runs":               {"run_id", "correlation_id", "household_id", "trigger_source", "action", "status", "started_at_ms", "last_entry_hash"},
-		"agent_audit_events":             {"stream_id", "seq", "audit_id", "run_id", "correlation_id", "event_type", "action", "created_at_ms", "previous_hash", "entry_hash", "hmac_signature"},
-		"agent_audit_checkpoints":        {"checkpoint_id", "stream_id", "from_seq", "to_seq", "tail_entry_hash", "chain_digest", "hmac_signature"},
+		"agent_audit_events":             {"stream_id", "seq", "audit_id", "run_id", "correlation_id", "event_type", "action", "created_at_ms", "origin_stream_id", "key_id", "previous_hash", "entry_hash", "hmac_signature"},
+		"agent_audit_checkpoints":        {"checkpoint_id", "stream_id", "from_seq", "to_seq", "tail_entry_hash", "chain_digest", "hmac_signature", "external_sig", "external_sig_alg", "external_key_id"},
+		"agent_audit_remote_sync_states": {"stream_id", "remote_store_type", "last_synced_seq", "sync_status"},
 	}
 
 	for tbl, cols := range requiredColumns {
@@ -523,6 +576,25 @@ func VerifyOpsSchemaIntegrity(db *gorm.DB) error {
 			if !colMap[reqCol] {
 				return fmt.Errorf("%w: table %s missing column %s", ErrSchemaColumnMissing, tbl, reqCol)
 			}
+		}
+	}
+
+	var trigNames []string
+	if err := db.Raw("SELECT name FROM sqlite_master WHERE type='trigger'").Scan(&trigNames).Error; err != nil {
+		return err
+	}
+	trigSet := make(map[string]bool, len(trigNames))
+	for _, n := range trigNames {
+		trigSet[n] = true
+	}
+	for _, reqTrig := range []string{
+		"trg_agent_audit_events_no_update",
+		"trg_agent_audit_events_no_delete",
+		"trg_agent_audit_checkpoints_no_update",
+		"trg_agent_audit_checkpoints_no_delete",
+	} {
+		if !trigSet[reqTrig] {
+			return fmt.Errorf("%w: missing required append-only trigger %s", ErrSchemaIntegrityFailed, reqTrig)
 		}
 	}
 

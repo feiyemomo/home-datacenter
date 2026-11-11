@@ -1,0 +1,292 @@
+package hostsec
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+// OSFamily identifies normalized host operating system families.
+type OSFamily string
+
+const (
+	OSFamilyFnOS    OSFamily = "fnos"
+	OSFamilyDebian  OSFamily = "debian"
+	OSFamilyUbuntu  OSFamily = "ubuntu"
+	OSFamilyAlpine  OSFamily = "alpine"
+	OSFamilyUnknown OSFamily = "unknown"
+)
+
+// PackageManagerKind identifies the host package management subsystem.
+type PackageManagerKind string
+
+const (
+	PkgManagerAptDpkg     PackageManagerKind = "apt-dpkg"
+	PkgManagerTrimManaged PackageManagerKind = "trim-managed"
+	PkgManagerApk         PackageManagerKind = "apk"
+	PkgManagerUnknown     PackageManagerKind = "unknown"
+)
+
+var (
+	// ErrFnOSUpdateUnsupported is returned fail-closed when a mutating host package/OS
+	// update is attempted on fnOS (trim), whose base OS packages are OTA-managed.
+	ErrFnOSUpdateUnsupported = errors.New("host package mutation blocked on fnOS (trim): read-only security inspection only; apply OS patches via fnOS official OTA")
+
+	// ErrUnsupportedHostOS is returned fail-closed when the host OS is not a verified
+	// Debian/Ubuntu apt-dpkg environment (e.g., unknown or container Alpine rootfs).
+	ErrUnsupportedHostOS = errors.New("host package mutation blocked: unsupported or unverified host OS platform")
+)
+
+// PlatformInfo captures host OS identity, fnOS compatibility status, and update eligibility.
+type PlatformInfo struct {
+	OSFamily            OSFamily           `json:"os_family"`
+	DistroID            string             `json:"distro_id"`
+	DistroIDLike        string             `json:"distro_id_like,omitempty"`
+	DistroName          string             `json:"distro_name"`
+	PrettyName          string             `json:"pretty_name"`
+	VersionID           string             `json:"version_id"`
+	Codename            string             `json:"codename,omitempty"`
+	KernelVersion       string             `json:"kernel_version"`
+	KernelArch          string             `json:"kernel_arch"`
+	IsFnOS              bool               `json:"is_fnos"`
+	FnOSVersion         string             `json:"fnos_version,omitempty"`
+	PackageManager      PackageManagerKind `json:"package_manager"`
+	HostUpdateSupported bool               `json:"host_update_supported"`
+	UnsupportedReason   string             `json:"unsupported_reason,omitempty"`
+	Markers             []string           `json:"markers,omitempty"`
+	HostRoot            string             `json:"host_root"`
+}
+
+// HostUpdatePolicyError returns a fail-closed error if mutating host package/system
+// updates are not permitted on this platform. Read-only inspection remains allowed.
+func (p PlatformInfo) HostUpdatePolicyError() error {
+	if p.IsFnOS || p.OSFamily == OSFamilyFnOS {
+		return fmt.Errorf("%w (distro=%q, markers=%v)", ErrFnOSUpdateUnsupported, p.PrettyName, p.Markers)
+	}
+	if !p.HostUpdateSupported || p.PackageManager != PkgManagerAptDpkg {
+		reason := strings.TrimSpace(p.UnsupportedReason)
+		if reason == "" {
+			reason = fmt.Sprintf("os_family=%s pkg_manager=%s", p.OSFamily, p.PackageManager)
+		}
+		return fmt.Errorf("%w: %s", ErrUnsupportedHostOS, reason)
+	}
+	return nil
+}
+
+// Digest returns a deterministic SHA-256 baseline hash of the platform identity.
+func (p PlatformInfo) Digest() string {
+	b, _ := json.Marshal(struct {
+		OSFamily       OSFamily           `json:"os_family"`
+		DistroID       string             `json:"distro_id"`
+		VersionID      string             `json:"version_id"`
+		KernelVersion  string             `json:"kernel_version"`
+		KernelArch     string             `json:"kernel_arch"`
+		IsFnOS         bool               `json:"is_fnos"`
+		PackageManager PackageManagerKind `json:"package_manager"`
+	}{
+		OSFamily:       p.OSFamily,
+		DistroID:       p.DistroID,
+		VersionID:      p.VersionID,
+		KernelVersion:  p.KernelVersion,
+		KernelArch:     p.KernelArch,
+		IsFnOS:         p.IsFnOS,
+		PackageManager: p.PackageManager,
+	})
+	sum := sha256.Sum256(b)
+	return fmt.Sprintf("sha256:%x", sum[:])
+}
+
+// PlatformDetector inspects the host filesystem to identify Linux distro vs fnOS.
+type PlatformDetector struct {
+	HostRoot string
+	InDocker bool
+}
+
+// NewPlatformDetector constructs a detector, defaulting HostRoot to "/host" when mounted,
+// otherwise "/".
+func NewPlatformDetector(hostRoot string) *PlatformDetector {
+	root := strings.TrimSpace(hostRoot)
+	if root == "" {
+		if envRoot := strings.TrimSpace(os.Getenv("HOST_ROOT_PATH")); envRoot != "" {
+			root = envRoot
+		} else if _, err := os.Stat("/host/etc/os-release"); err == nil {
+			root = "/host"
+		} else {
+			root = "/"
+		}
+	}
+	_, dockerErr := os.Stat("/.dockerenv")
+	return &PlatformDetector{
+		HostRoot: filepath.Clean(root),
+		InDocker: dockerErr == nil,
+	}
+}
+
+func (d *PlatformDetector) resolvePath(rel string) string {
+	cleanRel := strings.TrimPrefix(filepath.Clean(rel), string(filepath.Separator))
+	if d.HostRoot == "/" || d.HostRoot == "" {
+		return "/" + filepath.ToSlash(cleanRel)
+	}
+	return filepath.Join(d.HostRoot, cleanRel)
+}
+
+// Detect inspects os-release, procfs, and fnOS trim markers to classify the host OS.
+func (d *PlatformDetector) Detect(ctx context.Context) PlatformInfo {
+	if ctx != nil && ctx.Err() != nil {
+		return PlatformInfo{
+			OSFamily:          OSFamilyUnknown,
+			PackageManager:    PkgManagerUnknown,
+			UnsupportedReason: ctx.Err().Error(),
+			HostRoot:          d.HostRoot,
+		}
+	}
+
+	info := PlatformInfo{
+		OSFamily:       OSFamilyUnknown,
+		KernelArch:     runtime.GOARCH,
+		PackageManager: PkgManagerUnknown,
+		HostRoot:       d.HostRoot,
+	}
+
+	if k, err := os.ReadFile(d.resolvePath("proc/sys/kernel/osrelease")); err == nil {
+		info.KernelVersion = strings.TrimSpace(string(k))
+	} else if k, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
+		info.KernelVersion = strings.TrimSpace(string(k))
+	}
+
+	if arch, err := os.ReadFile(d.resolvePath("proc/sys/kernel/arch")); err == nil {
+		if trimmed := strings.TrimSpace(string(arch)); trimmed != "" {
+			info.KernelArch = trimmed
+		}
+	}
+
+	osRelMap := map[string]string{}
+	if osRelBytes, err := os.ReadFile(d.resolvePath("etc/os-release")); err == nil {
+		osRelMap = parseOSRelease(string(osRelBytes))
+	} else if osRelBytes, err := os.ReadFile(d.resolvePath("usr/lib/os-release")); err == nil {
+		osRelMap = parseOSRelease(string(osRelBytes))
+	}
+
+	info.DistroID = strings.ToLower(strings.TrimSpace(osRelMap["ID"]))
+	info.DistroIDLike = strings.ToLower(strings.TrimSpace(osRelMap["ID_LIKE"]))
+	info.DistroName = strings.TrimSpace(osRelMap["NAME"])
+	info.PrettyName = strings.TrimSpace(osRelMap["PRETTY_NAME"])
+	info.VersionID = strings.TrimSpace(osRelMap["VERSION_ID"])
+	info.Codename = strings.ToLower(strings.TrimSpace(osRelMap["VERSION_CODENAME"]))
+
+	// Detect fnOS ("trim" / "fnOS") markers on host root
+	fnosMarkers := []struct {
+		rel  string
+		note string
+	}{
+		{"etc/trim-release", "file:/etc/trim-release"},
+		{"etc/fnos-release", "file:/etc/fnos-release"},
+		{"usr/trim", "dir:/usr/trim"},
+		{"usr/trim/bin", "dir:/usr/trim/bin"},
+		{"var/lib/trim", "dir:/var/lib/trim"},
+		{"etc/systemd/system/trim_srv.service", "unit:trim_srv.service"},
+		{"lib/systemd/system/trim_srv.service", "unit:trim_srv.service"},
+	}
+
+	for _, m := range fnosMarkers {
+		if _, err := os.Stat(d.resolvePath(m.rel)); err == nil {
+			info.Markers = append(info.Markers, m.note)
+			info.IsFnOS = true
+			if strings.HasSuffix(m.rel, "-release") && info.FnOSVersion == "" {
+				if raw, rErr := os.ReadFile(d.resolvePath(m.rel)); rErr == nil {
+					info.FnOSVersion = strings.TrimSpace(string(raw))
+				}
+			}
+		}
+	}
+
+	lowerPretty := strings.ToLower(info.PrettyName + " " + info.DistroName + " " + info.KernelVersion)
+	if info.DistroID == "trim" || info.DistroID == "fnos" ||
+		strings.Contains(lowerPretty, "fnos") ||
+		strings.Contains(lowerPretty, "fnnas") ||
+		strings.Contains(lowerPretty, "-trim") {
+		info.IsFnOS = true
+		info.Markers = append(info.Markers, "os-release:fnos")
+	}
+
+	if info.IsFnOS {
+		info.OSFamily = OSFamilyFnOS
+		info.PackageManager = PkgManagerTrimManaged
+		info.HostUpdateSupported = false
+		info.UnsupportedReason = "fnOS (trim) detected: host OS updates must be performed via fnOS official OTA; automated apt/dpkg mutation is fail-closed"
+		return info
+	}
+
+	// Containerized API without host /host mount reading its own Alpine rootfs must fail-closed
+	if d.InDocker && d.HostRoot == "/" && info.DistroID == "alpine" {
+		info.OSFamily = OSFamilyAlpine
+		info.PackageManager = PkgManagerApk
+		info.HostUpdateSupported = false
+		info.UnsupportedReason = "running inside Alpine container without host rootfs mount (/host); refusing container-local OS update"
+		return info
+	}
+
+	switch {
+	case info.DistroID == "debian" || strings.Contains(info.DistroIDLike, "debian"):
+		if info.DistroID == "ubuntu" {
+			info.OSFamily = OSFamilyUbuntu
+		} else {
+			info.OSFamily = OSFamilyDebian
+		}
+		if _, err := os.Stat(d.resolvePath("var/lib/dpkg/status")); err == nil {
+			info.PackageManager = PkgManagerAptDpkg
+			info.HostUpdateSupported = true
+		} else {
+			info.PackageManager = PkgManagerUnknown
+			info.HostUpdateSupported = false
+			info.UnsupportedReason = "Debian-like OS detected but /var/lib/dpkg/status is absent or unmounted"
+		}
+	case info.DistroID == "ubuntu":
+		info.OSFamily = OSFamilyUbuntu
+		if _, err := os.Stat(d.resolvePath("var/lib/dpkg/status")); err == nil {
+			info.PackageManager = PkgManagerAptDpkg
+			info.HostUpdateSupported = true
+		} else {
+			info.PackageManager = PkgManagerUnknown
+			info.HostUpdateSupported = false
+			info.UnsupportedReason = "Ubuntu detected but /var/lib/dpkg/status is absent or unmounted"
+		}
+	case info.DistroID == "alpine":
+		info.OSFamily = OSFamilyAlpine
+		info.PackageManager = PkgManagerApk
+		info.HostUpdateSupported = false
+		info.UnsupportedReason = "Alpine Linux is not supported for host apt/dpkg updates"
+	default:
+		info.OSFamily = OSFamilyUnknown
+		info.PackageManager = PkgManagerUnknown
+		info.HostUpdateSupported = false
+		info.UnsupportedReason = fmt.Sprintf("unrecognized host distribution (id=%q, pretty=%q)", info.DistroID, info.PrettyName)
+	}
+
+	return info
+}
+
+func parseOSRelease(content string) map[string]string {
+	out := make(map[string]string)
+	for _, rawLine := range strings.Split(content, "\n") {
+		line := strings.TrimSpace(rawLine)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		idx := strings.IndexByte(line, '=')
+		if idx <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:idx])
+		v := strings.TrimSpace(line[idx+1:])
+		v = strings.Trim(v, `"'`)
+		out[k] = v
+	}
+	return out
+}

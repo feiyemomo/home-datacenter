@@ -38,6 +38,7 @@ const (
 	AuditEventExecutionUnknown     = "EXECUTION_UNKNOWN"
 	AuditEventAuditCommitFailed    = "AUDIT_COMMIT_FAILED"
 	AuditEventExecutionCancelled   = "EXECUTION_CANCELLED"
+	AuditEventAuditKeyRotated      = "AUDIT_KEY_ROTATED"
 )
 
 // AuditDecision values returned by policy/authorization checks.
@@ -165,9 +166,10 @@ type AgentAuditEvent struct {
 	CreatedAtMs        int64     `gorm:"not null;index" json:"created_at_ms"`
 	IsOffline          bool      `gorm:"not null;default:false;index" json:"is_offline"`
 	Synced             bool      `gorm:"not null;default:true;index" json:"synced"`
-	OriginStreamID     string    `gorm:"size:64" json:"origin_stream_id,omitempty"`
+	OriginStreamID     string    `gorm:"size:64;index" json:"origin_stream_id,omitempty"`
 	OriginSeq          uint64    `gorm:"not null;default:0" json:"origin_seq,omitempty"`
 	OriginEntryHash    string    `gorm:"size:64" json:"origin_entry_hash,omitempty"`
+	KeyID              string    `gorm:"size:32;index" json:"key_id,omitempty"`
 	PreviousHash       string    `gorm:"size:64;not null" json:"previous_hash"`
 	EntryHash          string    `gorm:"size:64;uniqueIndex;not null" json:"entry_hash"`
 	HMACSignature      string    `gorm:"size:160;not null" json:"hmac_signature"`
@@ -189,9 +191,31 @@ type AgentAuditCheckpoint struct {
 	PrevChainDigest string    `gorm:"size:64;not null" json:"prev_chain_digest"`
 	KeyID           string    `gorm:"size:32;not null" json:"key_id"`
 	HMACSignature   string    `gorm:"size:160;not null" json:"hmac_signature"`
+	ExternalSig     string    `gorm:"type:text" json:"external_sig,omitempty"`
+	ExternalSigAlg  string    `gorm:"size:32" json:"external_sig_alg,omitempty"`
+	ExternalKeyID   string    `gorm:"size:64" json:"external_key_id,omitempty"`
 	ArchiveFile     string    `gorm:"size:255" json:"archive_file,omitempty"`
 	CreatedAt       time.Time `gorm:"not null;index" json:"created_at"`
 	CreatedAtMs     int64     `gorm:"not null" json:"created_at_ms"`
 }
 
 func (AgentAuditCheckpoint) TableName() string { return "agent_audit_checkpoints" }
+
+// AgentAuditRemoteSyncState tracks mutable replication progress and divergence status against
+// an external append-only/WORM remote audit replica without altering append-only audit tables.
+type AgentAuditRemoteSyncState struct {
+	StreamID                string `gorm:"primaryKey;size:64" json:"stream_id"`
+	RemoteStoreType         string `gorm:"size:32;not null;default:'none'" json:"remote_store_type"`
+	RemoteEndpoint          string `gorm:"size:255" json:"remote_endpoint,omitempty"`
+	LastSyncedSeq           uint64 `gorm:"not null;default:0" json:"last_synced_seq"`
+	LastSyncedEntryHash     string `gorm:"size:64" json:"last_synced_entry_hash,omitempty"`
+	LastSyncedCheckpointID  string `gorm:"size:64" json:"last_synced_checkpoint_id,omitempty"`
+	LastSyncedCheckpointSeq uint64 `gorm:"not null;default:0" json:"last_synced_checkpoint_seq"`
+	LastSyncAtMs            int64  `gorm:"not null;default:0" json:"last_sync_at_ms"`
+	LastError               string `gorm:"type:text" json:"last_error,omitempty"`
+	ConsecutiveFailures     int    `gorm:"not null;default:0" json:"consecutive_failures"`
+	SyncStatus              string `gorm:"size:32;not null;default:'DISABLED'" json:"sync_status"`
+	UpdatedAtMs             int64  `gorm:"not null;default:0" json:"updated_at_ms"`
+}
+
+func (AgentAuditRemoteSyncState) TableName() string { return "agent_audit_remote_sync_states" }

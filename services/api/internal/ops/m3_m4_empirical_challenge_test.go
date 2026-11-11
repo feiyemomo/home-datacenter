@@ -2,7 +2,6 @@ package ops
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -113,26 +112,25 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 	bus := eventbus.New()
 
 	t.Run("Offline and Uncreated Determinism Across Aliases", func(t *testing.T) {
-		// Handler without 1Panel client or HostFallbackProvider: tests pure offline calculation
+		// Handler without 1Panel client or HostFallbackProvider: tests explicit non-prod offline placeholder
 		handler := &OpsHandler{
 			db:  db,
 			bus: bus,
 		}
 
-		// 1. Deterministic across offline calls
+		// 1. Deterministic across offline calls and strictly marked as offline placeholder
 		hash1 := handler.ComputeFingerprint("home-web")
 		hash2 := handler.ComputeFingerprint("home-web")
-		if hash1 == "" || !strings.HasPrefix(hash1, "sha256:") {
-			t.Fatalf("expected non-empty sha256 prefix, got: %s", hash1)
+		expectedOffline := ComputeOfflinePlaceholderBaseline("home-web")
+		if hash1 == "" || !IsOfflinePlaceholderBaseline("home-web", hash1) {
+			t.Fatalf("expected non-empty offline placeholder, got: %s", hash1)
+		}
+		if IsRealBaselineHash("home-web", hash1) {
+			t.Fatalf("offline placeholder must NOT satisfy IsRealBaselineHash: %s", hash1)
 		}
 		if hash1 != hash2 {
 			t.Fatalf("expected deterministic hash across calls, got %s vs %s", hash1, hash2)
 		}
-
-		// Expected offline baseline calculation: canonical:offline:none
-		hasher := sha256.New()
-		hasher.Write([]byte("home-web:offline:none"))
-		expectedOffline := fmt.Sprintf("sha256:%x", hasher.Sum(nil))
 		if hash1 != expectedOffline {
 			t.Fatalf("expected %s, got %s", expectedOffline, hash1)
 		}
@@ -162,7 +160,8 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 	})
 
 	t.Run("Host Fallback Provider Mode Determinism", func(t *testing.T) {
-		// Test behavior when HostFallbackProvider is active (static catalog when docker socket unmounted)
+		// Without live Docker socket or 1Panel, ExtractBaseline MUST NOT fabricate static catalog hashes;
+		// in non-production it emits an explicit offline placeholder so real vs placeholder stays distinct.
 		fallback := NewHostFallbackProvider("", "")
 		handler := &OpsHandler{
 			fallback: fallback,
@@ -170,18 +169,13 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 			bus:      bus,
 		}
 
-		// Core container in fallback static catalog
 		hashFallback := handler.ComputeFingerprint("home-web")
-		if !strings.HasPrefix(hashFallback, "sha256:") {
-			t.Fatalf("expected sha256 prefix for fallback, got: %s", hashFallback)
+		expectedOffline := ComputeOfflinePlaceholderBaseline("home-web")
+		if hashFallback != expectedOffline {
+			t.Fatalf("expected explicit offline placeholder %s, got: %s", expectedOffline, hashFallback)
 		}
-
-		// Verify deterministic hash for fallback catalog (canonical:channels-tool/home-web:latest:running:)
-		h := sha256.New()
-		h.Write([]byte("home-web:channels-tool/home-web:latest:running:"))
-		expectedFallbackHash := fmt.Sprintf("sha256:%x", h.Sum(nil))
-		if hashFallback != expectedFallbackHash {
-			t.Fatalf("expected fallback hash %s, got %s", expectedFallbackHash, hashFallback)
+		if IsRealBaselineHash("home-web", hashFallback) {
+			t.Fatalf("offline placeholder must not pass IsRealBaselineHash: %s", hashFallback)
 		}
 
 		// Unknown / non-whitelisted component MUST Fail-Closed to empty string (R4-17)
@@ -241,18 +235,24 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 			bus:    bus,
 		}
 
-		// 1. Initial baseline hash
+		// 1. Initial Baseline Protocol v1 hash
 		hashBase := handler.ComputeFingerprint("home-web")
-		if !strings.HasPrefix(hashBase, "sha256:") {
+		if !IsRealBaselineHashV1(hashBase, "home-web") {
 			t.Fatalf("invalid initial baseline hash: %s", hashBase)
 		}
 
-		// Verify calculation matches canonical:image:state:created_at
-		h := sha256.New()
-		h.Write([]byte(fmt.Sprintf("home-web:%s:%s:%s", containerData.Image, containerData.State, containerData.Created)))
-		expectedBase := fmt.Sprintf("sha256:%x", h.Sum(nil))
-		if hashBase != expectedBase {
-			t.Fatalf("expected baseline hash %s, got %s", expectedBase, hashBase)
+		comp, compErr := ComputeContainerBaselineFromInspect("home-web", map[string]interface{}{
+			"Id":      containerData.ContainerID,
+			"Name":    containerData.Name,
+			"Created": containerData.Created,
+			"Config":  map[string]interface{}{"Image": containerData.Image},
+			"State":   map[string]interface{}{"Status": containerData.State},
+		})
+		if compErr != nil {
+			t.Fatalf("ComputeContainerBaselineFromInspect failed: %v", compErr)
+		}
+		if hashBase != comp.Hash {
+			t.Fatalf("expected baseline hash %s, got %s", comp.Hash, hashBase)
 		}
 
 		// Re-verification of determinism
@@ -293,20 +293,17 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 			t.Fatalf("fingerprint FAILED to detect container recreation drift! Both hashes: %s", hashBase)
 		}
 
-		// 5. Container destroyed / goes offline
+		// 5. Container destroyed / omitted by live 1Panel -> MUST FAIL CLOSED (empty hash, no offline fallback)
 		mu.Lock()
 		returnEmptyList = true
 		mu.Unlock()
 
-		hashDriftOffline := handler.ComputeFingerprint("home-web")
-		if hashDriftOffline == hashBase {
-			t.Fatalf("fingerprint FAILED to detect container destruction/offline drift! Both hashes: %s", hashBase)
+		hashDriftMissing := handler.ComputeFingerprint("home-web")
+		if hashDriftMissing == hashBase {
+			t.Fatalf("fingerprint FAILED to detect container destruction! Both hashes: %s", hashBase)
 		}
-		hasherOffline := sha256.New()
-		hasherOffline.Write([]byte("home-web:offline:none"))
-		expectedOffline := fmt.Sprintf("sha256:%x", hasherOffline.Sum(nil))
-		if hashDriftOffline != expectedOffline {
-			t.Fatalf("expected fallback to offline hash %s, got: %s", expectedOffline, hashDriftOffline)
+		if hashDriftMissing != "" {
+			t.Fatalf("expected fail-closed empty hash when live 1Panel omits container, got: %s", hashDriftMissing)
 		}
 	})
 }
@@ -505,15 +502,19 @@ func TestChallengeEmpirical_ProposalStatusForgeryAttack(t *testing.T) {
 	db, adminUser, _ := setupEmpiricalChallengeDB(t)
 	bus := eventbus.New()
 
-	// Fast mock client responding in 0ms to eliminate network timeouts during ComputeFingerprint
+	// Fast mock client returning valid live containers in 0ms (live 1Panel returning empty items now fails closed per R5)
 	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		items := []onePanelContainerItem{
+			{ContainerID: "cid-web", Name: "/home-web", State: "running", Status: "Up", Image: "home-web:v1.0.0", Created: "2026-11-01T00:00:00Z"},
+			{ContainerID: "cid-api", Name: "/home-api", State: "running", Status: "Up", Image: "home-api:v1.0.0", Created: "2026-11-01T00:00:00Z"},
+		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code":    200,
 			"message": "OK",
 			"data": map[string]interface{}{
-				"items": []onePanelContainerItem{},
-				"total": 0,
+				"items": items,
+				"total": len(items),
 			},
 		})
 	}))

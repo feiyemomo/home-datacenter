@@ -22,6 +22,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
 from audit_protocol import (
+    AUDIT_COMMIT_FAILED,
     AUDIT_GENESIS_HASH,
     AUDIT_POLICY_VERSION,
     DECISION_ALLOW,
@@ -30,15 +31,20 @@ from audit_protocol import (
     EXECUTION_COMPLETED,
     EXECUTION_FAILED,
     EXECUTION_STARTED,
+    EXECUTION_UNKNOWN,
     HEALTH_CHECK_COMPLETED,
+    HEALTH_CHECK_STARTED,
     RECOVERY_LEASE_ACQUIRED,
     append_jsonl_audit_stub,
     compute_event_entry_hash,
     compute_event_hmac,
+    extract_hmac_key_id,
     format_rfc3339_ms,
+    redact_sensitive_string,
     resolve_audit_hmac_keyring,
     serialize_evidence,
     serialize_params,
+    verify_offline_audit_chain,
 )
 
 class CoreReportingStatus(enum.Enum):
@@ -83,6 +89,7 @@ class AuditStatus(str, enum.Enum):
     AUDIT_COMMITTED = "AUDIT_COMMITTED"
     AUDIT_PENDING = "AUDIT_PENDING"
     AUDIT_FAILED = "AUDIT_FAILED"
+    AUDIT_REJECTED = "AUDIT_REJECTED"
     AUDIT_UNKNOWN = "AUDIT_UNKNOWN"
 
 REQUIRED_OPS_SCHEMA_VERSION = 4
@@ -140,7 +147,9 @@ from config import (
     compute_container_baseline_from_inspect,
     compute_offline_placeholder_baseline,
     is_placeholder_baseline_hash,
+    is_production_env,
     is_real_baseline_hash,
+    is_real_baseline_hash_v1,
     resolve_canonical_component,
     resolve_docker_container_name,
 )
@@ -272,14 +281,7 @@ WEAK_SECRETS_BLACKLIST = {
 }
 
 
-def is_production() -> bool:
-    """Returns True if running in production mode (explicit env or Docker container without dev override)."""
-    env = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", os.environ.get("ENV", ""))).lower().strip()
-    if env in ("development", "dev", "test", "testing"):
-        return False
-    if env in ("production", "prod"):
-        return True
-    return os.path.exists("/.dockerenv")
+is_production = is_production_env
 
 
 def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
@@ -345,6 +347,124 @@ def validate_boot_guard(config: Optional[OpsAgentConfig] = None) -> None:
         raise RuntimeError(msg)
 
 
+class AsyncLeaseGuard:
+    """
+    Background lease renewal & fencing watchdog for recovery mutations (R6).
+    Renews active recovery leases every ttl/3, cancels guarded execution immediately
+    on renewal loss or fencing drift, and verifies lease validity before critical stages.
+    """
+
+    def __init__(
+        self,
+        agent: "HomeOpsAgent",
+        component: str,
+        lease_token: str,
+        fencing_gen: int,
+        db_path: str,
+        ttl_sec: float = 30.0,
+        renew_interval_sec: Optional[float] = None,
+        guarded_task: Optional[asyncio.Task] = None,
+    ):
+        self.agent = agent
+        self.component = component
+        self.lease_token = lease_token
+        self.fencing_gen = fencing_gen
+        self.db_path = db_path
+        self.ttl_sec = max(1.0, float(ttl_sec))
+        self.renew_interval_sec = (
+            max(0.05, float(renew_interval_sec))
+            if renew_interval_sec is not None
+            else max(1.0, self.ttl_sec / 3.0)
+        )
+        self._guarded_task = guarded_task
+        self._stop_event = asyncio.Event()
+        self._renew_task: Optional[asyncio.Task] = None
+        self.lost: bool = False
+        self.loss_reason: str = ""
+        self.renewal_count: int = 0
+        self.last_expires_at_ms: int = 0
+
+    def attach_task(self, task: Optional[asyncio.Task]) -> None:
+        self._guarded_task = task
+
+    async def start(self) -> None:
+        if self._renew_task is None:
+            self._renew_task = asyncio.create_task(self._renew_loop())
+
+    async def _renew_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.renew_interval_sec)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self._stop_event.is_set():
+                break
+            ok, new_exp_ms = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: self.agent._renew_recovery_lease(
+                    self.component,
+                    self.lease_token,
+                    self.fencing_gen,
+                    self.db_path,
+                    lease_duration=self.ttl_sec,
+                ),
+            )
+            if ok:
+                self.renewal_count += 1
+                self.last_expires_at_ms = new_exp_ms
+                continue
+
+            self.lost = True
+            self.loss_reason = (
+                f"lease renewal lost for {self.component} (gen={self.fencing_gen})"
+            )
+            self.agent.metrics.inc("recovery_fencing_rejected")
+            logger.critical(f"[AsyncLeaseGuard] {self.loss_reason}; cancelling guarded operation.")
+            if self._guarded_task and not self._guarded_task.done():
+                self._guarded_task.cancel()
+            break
+
+    def verify_before_stage(self, stage: str, min_remaining_ms: int = 5000) -> bool:
+        if self.lost:
+            self.agent.metrics.inc("recovery_fencing_rejected")
+            logger.critical(
+                f"[AsyncLeaseGuard] Stage '{stage}' aborted for {self.component}: {self.loss_reason}"
+            )
+            return False
+        ok = self.agent._verify_recovery_lease(
+            self.component,
+            self.lease_token,
+            self.fencing_gen,
+            self.db_path,
+            min_remaining_ms=min_remaining_ms,
+        )
+        if not ok:
+            self.lost = True
+            self.loss_reason = (
+                f"fencing verification failed before '{stage}' for {self.component} (gen={self.fencing_gen})"
+            )
+            self.agent.metrics.inc("recovery_fencing_rejected")
+            logger.critical(f"[AsyncLeaseGuard] {self.loss_reason}")
+            return False
+        return True
+
+    async def stop_and_release(self) -> bool:
+        self._stop_event.set()
+        if self._renew_task and not self._renew_task.done():
+            self._renew_task.cancel()
+            try:
+                await self._renew_task
+            except asyncio.CancelledError:
+                pass
+        return self.agent._release_recovery_lease(
+            self.component,
+            self.lease_token,
+            self.db_path,
+            fencing_gen=self.fencing_gen,
+        )
+
+
 class HomeOpsAgent:
     """
     Main asynchronous daemon orchestrating Docker socket events, MQTT security alerts,
@@ -372,6 +492,9 @@ class HomeOpsAgent:
         self._last_audit_status: AuditStatus = AuditStatus.AUDIT_UNKNOWN
         self._active_lease_generations: dict[str, int] = {}
         self._executor_id: str = f"py-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        self._inflight_operations: Dict[str, Dict[str, Any]] = {}
+        self._ambiguous_operations: Dict[str, Dict[str, Any]] = {}
+        self._last_restart_ambiguous: bool = False
 
     def _create_paho_client(self, loop: asyncio.AbstractEventLoop) -> Optional[Any]:
         """Creates and configures standard paho-mqtt client with auth, TLS, LWT, and QoS 1."""
@@ -493,14 +616,15 @@ class HomeOpsAgent:
         """
         sock_path = self.config.docker_socket
         while self.running:
-            if not os.path.exists(sock_path):
+            is_tcp = bool(sock_path and (sock_path.startswith("tcp://") or (":" in sock_path and not (len(sock_path) >= 2 and sock_path[1] == ":" and sock_path[0].isalpha()) and not os.path.exists(sock_path))))
+            if not is_tcp and not os.path.exists(sock_path):
                 logger.debug(f"Docker socket {sock_path} not found. Retrying in 10s...")
                 await asyncio.sleep(10)
                 continue
 
             writer = None
             try:
-                reader, writer = await asyncio.open_unix_connection(sock_path)
+                reader, writer = await self._connect_docker(sock_path)
                 since_time = self._last_docker_event_time
                 req = (
                     f"GET /events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D&since={since_time} HTTP/1.1\r\n"
@@ -588,7 +712,14 @@ class HomeOpsAgent:
                 status = event.get("status", "")
                 actor = event.get("Actor", {})
                 attributes = actor.get("Attributes", {})
-                container_name = attributes.get("name", actor.get("ID", "")[:12])
+                container_name = attributes.get("name", "")
+                actor_id_raw = str(actor.get("ID", "") or "")
+                if not container_name and actor_id_raw:
+                    _st_evt, _ins_evt = await self._query_docker_inspect(actor_id_raw, sock_path)
+                    if isinstance(_ins_evt, dict):
+                        container_name = str(_ins_evt.get("Name") or "").strip().lstrip("/")
+                if not container_name:
+                    container_name = actor_id_raw[:12]
 
                 if action in ("die", "kill", "oom") or status in ("die", "kill"):
                     exit_code = int(attributes.get("exitCode", 1))
@@ -626,95 +757,68 @@ class HomeOpsAgent:
                                     logger.critical(f"[Security Block] Cannot resolve docker container for {canonical_auth}.")
                                     continue
 
+                                db_path_auth = getattr(self.config, "db_path", "/data/sqlite/app.db")
                                 expected_bh = str(
                                     resp_data.get("baseline_hash")
                                     or (resp_data.get("proposal") or {}).get("baseline_hash")
                                     or ""
                                 ).strip()
-                                if expected_bh:
-                                    if not is_real_baseline_hash(expected_bh, canonical_auth):
-                                        logger.critical(
-                                            f"[R5 Security Block] Rejecting AUTHORIZED restart for {canonical_auth}: invalid/placeholder baseline_hash."
-                                        )
-                                        continue
-                                    live_bh = await self._compute_container_baseline_hash(canonical_auth, sock_path)
-                                    if not live_bh or live_bh != expected_bh:
-                                        logger.critical(
-                                            f"[R5 Security Block] BaselineHash verification failed or drifted for {canonical_auth} "
-                                            f"(expected={expected_bh}, live={live_bh})."
-                                        )
-                                        continue
+                                bh_ok, verified_bh, bh_reason = await self._verify_trusted_baseline(
+                                    canonical_auth,
+                                    expected_bh,
+                                    db_path_auth,
+                                    sock_path,
+                                    require_live_without_expected=(
+                                        is_production() or os.environ.get("OPS_REQUIRE_LIVE_BASELINE", "") == "1"
+                                    ),
+                                )
+                                if not bh_ok:
+                                    logger.critical(
+                                        f"[R5 Security Block] AUTHORIZED baseline verification failed for {canonical_auth}: {bh_reason}."
+                                    )
+                                    continue
 
-                                db_path_auth = getattr(self.config, "db_path", "/data/sqlite/app.db")
                                 auth_run_id = f"run-pyauth-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
                                 auth_corr_id = f"corr-{uuid.uuid4().hex[:8]}"
-                                auth_op_id = f"pyauth-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+                                auth_op_id = str(resp_data.get("operation_id") or "").strip() or (
+                                    f"pyauth-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
+                                )
+                                proposal_id_auth = str(
+                                    resp_data.get("proposal_id")
+                                    or (resp_data.get("proposal") or {}).get("proposal_id")
+                                    or ""
+                                ).strip()
+                                approval_id_auth = str(
+                                    resp_data.get("approval_id")
+                                    or (resp_data.get("proposal") or {}).get("approval_id")
+                                    or ""
+                                ).strip()
                                 lease_ok, lease_tok, fencing_gen = self._acquire_recovery_lease_grant(canonical_auth, db_path_auth)
                                 if not lease_ok:
                                     logger.critical(
                                         f"[Lease Block] Failed to acquire recovery lease for AUTHORIZED container {canonical_auth}. Halting restart."
                                     )
                                     continue
-                                try:
-                                    if not self._verify_recovery_lease(
-                                        canonical_auth, lease_tok, fencing_gen, db_path_auth, min_remaining_ms=5000
-                                    ):
-                                        self.metrics.inc("recovery_fencing_rejected")
-                                        logger.critical(f"[Fencing Block] Lease invalid before Docker restart for {canonical_auth}.")
-                                        continue
-                                    if not self._can_write_offline_audit_table(db_path_auth):
-                                        logger.critical(
-                                            f"[Audit Block] Pre-execution offline audit check failed for AUTHORIZED restart of {canonical_auth}; halting."
-                                        )
-                                        continue
-                                    pre_archive = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
-                                    if pre_archive:
-                                        append_jsonl_audit_stub(pre_archive, "python-offline-audit.jsonl", {
-                                            "event_type": EXECUTION_STARTED,
-                                            "run_id": auth_run_id,
-                                            "correlation_id": auth_corr_id,
-                                            "operation_id": auth_op_id,
-                                            "container_name": canonical_auth,
-                                            "action": "authorized_restart",
-                                            "fencing_generation": fencing_gen,
-                                            "executed_at": format_rfc3339_ms(),
-                                        })
-                                    logger.info(
-                                        f"[Authoritative] Go Core approved restart for {canonical_auth} (gen={fencing_gen}). Executing guarded restart."
-                                    )
-                                    restarted = await self._restart_docker_container(docker_name, sock_path)
-                                    health_ok = False
-                                    h_state = DockerHealthState.UNKNOWN
-                                    if restarted:
-                                        h_state = await self._verify_container_health(docker_name, sock_path)
-                                        health_ok = (h_state == DockerHealthState.HEALTHY)
-                                        if not health_ok:
-                                            logger.error(f"[Post-Restart Failed] Health check returned {h_state} for {canonical_auth}.")
-                                    final_ok = bool(restarted and health_ok)
-                                    self._record_offline_audit_strict(
-                                        canonical_auth,
-                                        "authorized_restart",
-                                        exit_code,
-                                        final_ok,
-                                        operation_id=auth_op_id,
-                                        fencing_generation=fencing_gen,
-                                        run_id=auth_run_id,
-                                        correlation_id=auth_corr_id,
-                                        event_type=EXECUTION_COMPLETED if final_ok else EXECUTION_FAILED,
-                                        trigger_source="go_core_authorized",
-                                        actor_type="internal_service",
-                                        actor_id="home-ops-agent",
-                                        evidence={"health_state": h_state.value, "restarted": restarted},
-                                    )
-                                finally:
-                                    released_auth = self._release_recovery_lease(
-                                        canonical_auth, lease_tok, db_path_auth, fencing_gen=fencing_gen
-                                    )
-                                    if not released_auth:
-                                        self.metrics.inc("recovery_database_error")
-                                        logger.critical(
-                                            f"[Lease Release Failed] Failed to release AUTHORIZED lease for {canonical_auth} (gen={fencing_gen})."
-                                        )
+                                await self._execute_guarded_restart(
+                                    canonical=canonical_auth,
+                                    audit_container_name=canonical_auth,
+                                    docker_container=docker_name,
+                                    sock_path=sock_path,
+                                    db_path=db_path_auth,
+                                    action_name="authorized_restart",
+                                    exit_code=exit_code,
+                                    lease_token=lease_tok,
+                                    fencing_gen=fencing_gen,
+                                    run_id=auth_run_id,
+                                    corr_id=auth_corr_id,
+                                    op_id=auth_op_id,
+                                    trigger_source="go_core_authorized",
+                                    actor_type="internal_service",
+                                    actor_id="home-ops-agent",
+                                    baseline_hash=verified_bh or expected_bh,
+                                    proposal_id=proposal_id_auth,
+                                    approval_id=approval_id_auth,
+                                )
                                 continue
 
                             if status in (CoreReportingStatus.POLICY_REJECTED, CoreReportingStatus.BLOCKED_BY_FSM):
@@ -736,7 +840,8 @@ class HomeOpsAgent:
                                 await self._handle_offline_emergency_restart(container_name, exit_code, sock_path)
 
                         elif result.get("action") == "request_diagnostic":
-                            prop_id = f"prop-crash-{container_name}-{int(time.time())}"
+                            canon_diag = resolve_canonical_component(container_name) or container_name
+                            prop_id = f"prop-crash-{canon_diag}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}"
                             await self._submit_proposal_to_go_core(
                                 prop_id=prop_id,
                                 title=f"【高危告警】{container_name} 连续崩溃自愈推演方案",
@@ -750,6 +855,422 @@ class HomeOpsAgent:
                 break
             except Exception as e:
                 logger.debug(f"Docker event processing error: {e}")
+
+    def _has_v5_audit_schema(self, db_path: str) -> bool:
+        """Checks whether offline_ops_audit contains v5 hash-chained lifecycle columns."""
+        if not db_path or not os.path.isfile(db_path):
+            return False
+        conn = None
+        try:
+            conn = open_readonly_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("PRAGMA table_info(offline_ops_audit)")
+            cols = {str(c[1]).lower() for c in cur.fetchall()}
+            return {
+                "run_id", "correlation_id", "event_type", "payload_json",
+                "offline_seq", "local_prev_hash", "entry_hash", "hmac_signature",
+            }.issubset(cols)
+        except Exception:
+            return False
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _lookup_trusted_db_baseline(self, canonical: str, db_path: str) -> str:
+        """Reads latest approved/active non-placeholder baseline_hash from SQLite proposals if present."""
+        if not canonical or not db_path or not os.path.isfile(db_path):
+            return ""
+        conn = None
+        try:
+            conn = open_readonly_sqlite(db_path)
+            cur = conn.cursor()
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_proposals'")
+            if not cur.fetchone():
+                return ""
+            cur.execute("PRAGMA table_info(pending_proposals)")
+            cols = {str(c[1]).lower() for c in cur.fetchall()}
+            if "baseline_hash" not in cols or "target_component" not in cols:
+                return ""
+            cur.execute(
+                """
+                SELECT baseline_hash FROM pending_proposals
+                WHERE target_component = ? AND baseline_hash != '' AND status IN ('APPROVED', 'EXECUTING', 'COMPLETED')
+                ORDER BY updated_at DESC LIMIT 1
+                """,
+                (canonical,),
+            )
+            row = cur.fetchone()
+            return str(row[0]).strip() if row and row[0] else ""
+        except Exception:
+            return ""
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    async def _verify_trusted_baseline(
+        self,
+        canonical: str,
+        expected_bh: str,
+        db_path: str,
+        sock_path: str,
+        require_live_without_expected: bool = False,
+    ) -> Tuple[bool, str, str]:
+        """Verifies live container baseline against expected/DB baselines (R5/R8 Fail-Closed)."""
+        expected_clean = (expected_bh or "").strip()
+        if expected_clean:
+            if not is_real_baseline_hash(expected_clean, canonical):
+                return False, "", f"invalid or placeholder baseline_hash ({expected_clean!r})"
+            db_bh = self._lookup_trusted_db_baseline(canonical, db_path)
+            if db_bh and is_real_baseline_hash(db_bh, canonical) and db_bh != expected_clean:
+                return False, "", f"expected baseline {expected_clean} conflicts with trusted DB baseline {db_bh}"
+            live_bh = await self._compute_container_baseline_hash(canonical, sock_path)
+            if not live_bh or live_bh != expected_clean:
+                return False, live_bh, f"live baseline mismatch/unavailable (expected={expected_clean}, live={live_bh})"
+            return True, live_bh, "ok"
+
+        if require_live_without_expected:
+            live_bh = await self._compute_container_baseline_hash(canonical, sock_path)
+            if not is_real_baseline_hash(live_bh, canonical):
+                return False, "", "live baseline unavailable in strict/production mode"
+            db_bh = self._lookup_trusted_db_baseline(canonical, db_path)
+            if db_bh and is_real_baseline_hash(db_bh, canonical) and db_bh != live_bh:
+                return False, live_bh, f"live baseline {live_bh} drifted from trusted DB baseline {db_bh}"
+            return True, live_bh, "ok"
+
+        return True, "", "skipped_non_strict_without_expected"
+
+    async def _dispatch_restart_with_fencing(
+        self,
+        docker_container: str,
+        sock_path: str,
+        fencing_gen: int,
+        op_id: str,
+    ) -> bool:
+        """Invokes _restart_docker_container while remaining compatible with 2-arg test mocks."""
+        import inspect
+
+        self._last_restart_ambiguous = False
+        fn = self._restart_docker_container
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+            accepts_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()) or (
+                "fencing_generation" in params and "operation_id" in params
+            )
+        except (ValueError, TypeError):
+            accepts_kw = False
+
+        if accepts_kw:
+            return await fn(
+                docker_container,
+                sock_path,
+                fencing_generation=fencing_gen,
+                operation_id=op_id,
+            )
+        return await fn(docker_container, sock_path)
+
+    async def _execute_guarded_restart(
+        self,
+        *,
+        canonical: str,
+        audit_container_name: str,
+        docker_container: str,
+        sock_path: str,
+        db_path: str,
+        action_name: str,
+        exit_code: int,
+        lease_token: str,
+        fencing_gen: int,
+        run_id: str,
+        corr_id: str,
+        op_id: str,
+        trigger_source: str,
+        actor_type: str,
+        actor_id: str,
+        baseline_hash: str = "",
+        proposal_id: str = "",
+        approval_id: str = "",
+    ) -> bool:
+        """
+        Executes a lease-guarded, lifecycle-audited Docker container restart with
+        background AsyncLeaseGuard renewal, mid-flight cancellation, and EXECUTION_UNKNOWN tracking.
+        """
+        started_wall = time.monotonic()
+        ttl_sec = float(os.environ.get("OPS_LEASE_TTL_SEC", "30.0") or "30.0")
+        renew_env = os.environ.get("OPS_LEASE_RENEW_INTERVAL_SEC", "").strip()
+        renew_interval = float(renew_env) if renew_env else None
+        guard = AsyncLeaseGuard(
+            self,
+            canonical,
+            lease_token,
+            fencing_gen,
+            db_path,
+            ttl_sec=ttl_sec,
+            renew_interval_sec=renew_interval,
+        )
+        released = False
+        try:
+            if canonical in self._ambiguous_operations:
+                self.metrics.inc("recovery_execution_unknown")
+                logger.critical(
+                    f"[EXECUTION_UNKNOWN Block] Container {canonical} has unresolved ambiguous execution "
+                    f"{self._ambiguous_operations[canonical].get('operation_id')}; refusing duplicate restart."
+                )
+                return False
+
+            if not guard.verify_before_stage("pre_audit", min_remaining_ms=5000):
+                return False
+
+            if not self._can_write_offline_audit_table(db_path):
+                logger.critical(
+                    f"[Audit Fail-Closed] Pre-execution offline audit table check failed for op={op_id}. Aborting Docker restart."
+                )
+                return False
+
+            has_v5 = self._has_v5_audit_schema(db_path)
+            before_meta = {"canonical": canonical}
+            if baseline_hash:
+                before_meta["baseline_hash"] = baseline_hash
+            parent_ev_id = ""
+            if has_v5:
+                st_rec, ev_recv_id = self._record_offline_audit_strict(
+                    audit_container_name,
+                    action_name,
+                    exit_code,
+                    True,
+                    operation_id=op_id,
+                    fencing_generation=fencing_gen,
+                    run_id=run_id,
+                    correlation_id=corr_id,
+                    event_type=EVENT_RECEIVED,
+                    trigger_source=trigger_source,
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    proposal_id=proposal_id,
+                    approval_id=approval_id,
+                    before_state=before_meta,
+                )
+                if st_rec != AuditStatus.AUDIT_COMMITTED:
+                    return False
+
+                st_lease, ev_lease_id = self._record_offline_audit_strict(
+                    audit_container_name,
+                    action_name,
+                    exit_code,
+                    True,
+                    operation_id=op_id,
+                    fencing_generation=fencing_gen,
+                    run_id=run_id,
+                    correlation_id=corr_id,
+                    parent_event_id=ev_recv_id,
+                    event_type=RECOVERY_LEASE_ACQUIRED,
+                    trigger_source=trigger_source,
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    proposal_id=proposal_id,
+                    approval_id=approval_id,
+                    evidence={"lease_generation": fencing_gen},
+                )
+                if st_lease != AuditStatus.AUDIT_COMMITTED:
+                    return False
+
+                st_start, ev_start_id = self._record_offline_audit_strict(
+                    audit_container_name,
+                    action_name,
+                    exit_code,
+                    True,
+                    operation_id=op_id,
+                    fencing_generation=fencing_gen,
+                    run_id=run_id,
+                    correlation_id=corr_id,
+                    parent_event_id=ev_lease_id,
+                    event_type=EXECUTION_STARTED,
+                    trigger_source=trigger_source,
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    proposal_id=proposal_id,
+                    approval_id=approval_id,
+                    before_state=before_meta,
+                )
+                if st_start != AuditStatus.AUDIT_COMMITTED:
+                    return False
+                parent_ev_id = ev_start_id
+            else:
+                pre_archive = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+                if pre_archive:
+                    append_jsonl_audit_stub(pre_archive, "python-offline-audit.jsonl", {
+                        "event_type": EXECUTION_STARTED,
+                        "run_id": run_id,
+                        "correlation_id": corr_id,
+                        "operation_id": op_id,
+                        "container_name": audit_container_name,
+                        "action": action_name,
+                        "fencing_generation": fencing_gen,
+                        "executed_at": format_rfc3339_ms(),
+                    })
+
+            self._inflight_operations[canonical] = {
+                "operation_id": op_id,
+                "run_id": run_id,
+                "fencing_generation": fencing_gen,
+                "started_at": time.time(),
+            }
+            await guard.start()
+
+            async def _guarded_exec() -> Tuple[bool, DockerHealthState, bool, str]:
+                if not guard.verify_before_stage("docker_restart", min_remaining_ms=5000):
+                    return False, DockerHealthState.UNKNOWN, False, "fencing_rejected_before_restart"
+                ambiguous = False
+                restarted = False
+                try:
+                    restarted = await self._dispatch_restart_with_fencing(
+                        docker_container, sock_path, fencing_gen, op_id
+                    )
+                    if not restarted and self._last_restart_ambiguous:
+                        ambiguous = True
+                except (asyncio.TimeoutError, TimeoutError, ConnectionError, EOFError, OSError) as exc:
+                    ambiguous = True
+                    self.metrics.inc("recovery_execution_unknown")
+                    logger.critical(
+                        f"[EXECUTION_UNKNOWN] Docker restart outcome ambiguous for {canonical} (op={op_id}): {exc}"
+                    )
+
+                if ambiguous:
+                    self._ambiguous_operations[canonical] = {
+                        "operation_id": op_id,
+                        "run_id": run_id,
+                        "fencing_generation": fencing_gen,
+                        "recorded_at": time.time(),
+                    }
+                    return False, DockerHealthState.UNKNOWN, True, "docker_outcome_ambiguous"
+
+                if not restarted:
+                    return False, DockerHealthState.UNKNOWN, False, f"exit_code={exit_code}"
+
+                if not guard.verify_before_stage("health_check", min_remaining_ms=3000):
+                    return False, DockerHealthState.UNKNOWN, True, "fencing_lost_before_health_check"
+
+                h_state = await self._verify_container_health(docker_container, sock_path)
+                if h_state == DockerHealthState.UNKNOWN:
+                    self.metrics.inc("recovery_health_unknown")
+                h_ok = (h_state == DockerHealthState.HEALTHY)
+                if not h_ok:
+                    logger.error(
+                        f"[Post-Restart Failed] Health check returned {h_state} for {audit_container_name}."
+                    )
+                return h_ok, h_state, False, ("" if h_ok else f"health_state={h_state.value}")
+
+            exec_task = asyncio.create_task(_guarded_exec())
+            guard.attach_task(exec_task)
+
+            final_ok = False
+            health_state = DockerHealthState.UNKNOWN
+            execution_unknown = False
+            err_detail = ""
+            try:
+                final_ok, health_state, execution_unknown, err_detail = await exec_task
+            except asyncio.CancelledError:
+                if guard.lost:
+                    final_ok = False
+                    health_state = DockerHealthState.UNKNOWN
+                    execution_unknown = True
+                    err_detail = "lease_lost_mid_execution"
+                    self._ambiguous_operations[canonical] = {
+                        "operation_id": op_id,
+                        "run_id": run_id,
+                        "fencing_generation": fencing_gen,
+                        "recorded_at": time.time(),
+                    }
+                    self.metrics.inc("recovery_execution_unknown")
+                    logger.critical(
+                        f"[EXECUTION_UNKNOWN] Operation {op_id} for {canonical} aborted due to AsyncLeaseGuard lease loss."
+                    )
+                else:
+                    if not exec_task.done():
+                        exec_task.cancel()
+                        try:
+                            await exec_task
+                        except asyncio.CancelledError:
+                            pass
+                    raise
+
+            if has_v5 and not execution_unknown and health_state != DockerHealthState.UNKNOWN:
+                st_hc, ev_hc_id = self._record_offline_audit_strict(
+                    audit_container_name,
+                    action_name,
+                    exit_code,
+                    health_state == DockerHealthState.HEALTHY,
+                    operation_id=op_id,
+                    fencing_generation=fencing_gen,
+                    run_id=run_id,
+                    correlation_id=corr_id,
+                    parent_event_id=parent_ev_id,
+                    event_type=HEALTH_CHECK_COMPLETED,
+                    trigger_source=trigger_source,
+                    actor_type=actor_type,
+                    actor_id=actor_id,
+                    proposal_id=proposal_id,
+                    approval_id=approval_id,
+                    evidence={"health_state": health_state.value, "canonical": canonical},
+                )
+                if st_hc != AuditStatus.AUDIT_COMMITTED:
+                    return False
+                parent_ev_id = ev_hc_id
+
+            if not guard.lost and not execution_unknown:
+                if not guard.verify_before_stage("final_audit", min_remaining_ms=1000):
+                    final_ok = False
+                    err_detail = "fencing_lost_before_final_audit"
+
+            term_event_type = (
+                EXECUTION_UNKNOWN if execution_unknown else (EXECUTION_COMPLETED if final_ok else EXECUTION_FAILED)
+            )
+            dur_ms = max(0, int((time.monotonic() - started_wall) * 1000))
+            audit_status, _ = self._record_offline_audit_strict(
+                audit_container_name,
+                action_name,
+                exit_code,
+                final_ok,
+                operation_id=op_id,
+                fencing_generation=fencing_gen,
+                run_id=run_id,
+                correlation_id=corr_id,
+                parent_event_id=parent_ev_id,
+                event_type=term_event_type,
+                trigger_source=trigger_source,
+                actor_type=actor_type,
+                actor_id=actor_id,
+                proposal_id=proposal_id,
+                approval_id=approval_id,
+                duration_ms=dur_ms,
+                error_code=err_detail,
+                before_state=before_meta,
+                after_state={"health_state": health_state.value, "execution_unknown": execution_unknown},
+                evidence={
+                    "health_state": health_state.value,
+                    "canonical": canonical,
+                    "execution_unknown": execution_unknown,
+                    "lease_renewals": guard.renewal_count,
+                },
+            )
+            if audit_status != AuditStatus.AUDIT_COMMITTED:
+                logger.critical(
+                    f"[Audit Integrity Failure] Offline audit persistence returned {audit_status} for op={op_id}. Cannot report recovery success."
+                )
+                return False
+            return final_ok
+        finally:
+            self._inflight_operations.pop(canonical, None)
+            released = await guard.stop_and_release()
+            if not released and not guard.lost:
+                self.metrics.inc("recovery_database_error")
+                logger.critical(f"[Lease Release Failed] Failed to cleanly release recovery lease for {canonical} (gen={fencing_gen}).")
 
     async def _handle_offline_emergency_restart(
         self,
@@ -785,18 +1306,23 @@ class HomeOpsAgent:
             )
             return False
 
-        if expected_baseline_hash is not None:
-            if not is_real_baseline_hash(expected_baseline_hash, canonical):
-                logger.critical(
-                    f"[Emergency Autonomy Blocked] Invalid or placeholder baseline_hash rejected for {canonical} (R5)."
-                )
-                return False
-            live_bh = await self._compute_container_baseline_hash(canonical, sock_path)
-            if not live_bh or live_bh != expected_baseline_hash:
-                logger.critical(
-                    f"[Emergency Autonomy Blocked] Live container baseline_hash failed or drifted for {canonical} (R5)."
-                )
-                return False
+        db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
+        bh_ok, verified_bh, bh_reason = await self._verify_trusted_baseline(
+            canonical,
+            expected_baseline_hash or "",
+            db_path,
+            sock_path,
+            require_live_without_expected=(
+                expected_baseline_hash is not None
+                or is_production()
+                or os.environ.get("OPS_REQUIRE_LIVE_BASELINE", "") == "1"
+            ),
+        )
+        if not bh_ok:
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Baseline verification failed for {canonical} (R5): {bh_reason}."
+            )
+            return False
 
         # Guard 2a: Forbidden component check (core storage / database forbidden from offline autonomous restart)
         if container_name in OFFLINE_FORBIDDEN_COMPONENTS or canonical in OFFLINE_FORBIDDEN_COMPONENTS:
@@ -811,8 +1337,6 @@ class HomeOpsAgent:
                 f"[Emergency Autonomy Blocked] Container {container_name} ({canonical}) is NOT in EMERGENCY_RESTART_WHITELIST. Refusing restart."
             )
             return False
-
-        db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
 
         # Guard 2b-pre: Pre-flight schema & storage integrity check (R4-14, R4-18)
         schema_ok, fault_cls, schema_reason = self._verify_ops_schema(db_path)
@@ -883,115 +1407,72 @@ class HomeOpsAgent:
             )
             return False
 
-        try:
-            # Guard 4: Persistent cooldown and circuit breaker (<= 2 restarts in 60s, <= 3 crashes in 10m)
-            now = time.time()
-            timestamps = self._local_restarts.setdefault(canonical, [])
-            timestamps = [t for t in timestamps if now - t < 600.0]  # 10 minute window
-            self._local_restarts[canonical] = timestamps
+        # Guard 4: Persistent cooldown and circuit breaker (<= 2 restarts in 60s, <= 3 crashes in 10m)
+        now = time.time()
+        timestamps = self._local_restarts.setdefault(canonical, [])
+        timestamps = [t for t in timestamps if now - t < 600.0]  # 10 minute window
+        self._local_restarts[canonical] = timestamps
 
-            short_window = [t for t in timestamps if now - t < 60.0]  # 60 second window
-            persisted_short = self._get_persisted_restart_count(canonical, 60.0, db_path)
-            persisted_long = self._get_persisted_restart_count(canonical, 600.0, db_path)
+        short_window = [t for t in timestamps if now - t < 60.0]  # 60 second window
+        persisted_short = self._get_persisted_restart_count(canonical, 60.0, db_path)
+        persisted_long = self._get_persisted_restart_count(canonical, 600.0, db_path)
 
-            if persisted_short is None or persisted_long is None:
-                logger.critical(
-                    f"[Emergency Autonomy Blocked] Persisted restart count is UNKNOWN (query error or missing table). Halting restart."
-                )
-                return False
-
-            if len(short_window) >= 2 or persisted_short >= 2:
-                logger.error(
-                    f"[Emergency Autonomy Breaker] Tripped for {canonical}: {max(len(short_window), persisted_short)} restarts in 60s. Halted."
-                )
-                return False
-
-            if len(timestamps) >= 3 or persisted_long >= 3:
-                logger.critical(
-                    f"[Emergency Autonomy Breaker] 10-minute circuit tripped for {canonical}: {max(len(timestamps), persisted_long)} crashes. Halted."
-                )
-                return False
-
-            # Guard 5: Local SQLite persistence in offline_restart_history (atomic check-and-insert under BEGIN IMMEDIATE)
-            rec_ok = self._record_persisted_restart(canonical, db_path)
-            if not rec_ok:
-                logger.critical(
-                    f"[Emergency Autonomy Blocked] Failed to write persisted restart record for {canonical}. Halting restart."
-                )
-                return False
-
-            # R4-06: Pre-mutation lease & fencing gate right before Docker socket dispatch
-            if not self._verify_recovery_lease(canonical, lease_token, fencing_gen, db_path, min_remaining_ms=5000):
-                self.metrics.inc("recovery_fencing_rejected")
-                logger.critical(
-                    f"[Fencing Gate] Lease token or fencing generation ({fencing_gen}) became invalid right before Docker restart for {canonical}. Aborting."
-                )
-                return False
-
-            timestamps.append(now)
-            op_id = f"pyop-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
-            run_id = f"run-offline-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
-            corr_id = f"corr-{uuid.uuid4().hex[:8]}"
-
-            if not self._can_write_offline_audit_table(db_path):
-                logger.critical(
-                    f"[Audit Fail-Closed] Pre-execution offline audit table check failed for op={op_id}. Aborting Docker restart."
-                )
-                return False
-            pre_archive = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
-            if pre_archive:
-                append_jsonl_audit_stub(pre_archive, "python-offline-audit.jsonl", {
-                    "event_type": EXECUTION_STARTED,
-                    "run_id": run_id,
-                    "correlation_id": corr_id,
-                    "operation_id": op_id,
-                    "container_name": container_name,
-                    "action": "emergency_restart",
-                    "fencing_generation": fencing_gen,
-                    "executed_at": format_rfc3339_ms(),
-                })
-
-            logger.warning(
-                f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
-                f"(attempt {len(timestamps)} in 10m window, gen={fencing_gen}, op={op_id})"
+        if persisted_short is None or persisted_long is None:
+            self._release_recovery_lease(canonical, lease_token, db_path, fencing_gen=fencing_gen)
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Persisted restart count is UNKNOWN (query error or missing table). Halting restart."
             )
-            success = await self._restart_docker_container(docker_container, sock_path)
-            health_detail = "NOT_CHECKED"
-            if success:
-                health_state = await self._verify_container_health(docker_container, sock_path)
-                health_detail = health_state.value
-                if health_state == DockerHealthState.UNKNOWN:
-                    self.metrics.inc("recovery_health_unknown")
-                if health_state != DockerHealthState.HEALTHY:
-                    logger.error(f"[Emergency Recovery Failed] Post-restart health check returned {health_state} for {container_name}.")
-                    success = False
+            return False
 
-            audit_status, _ = self._record_offline_audit_strict(
-                container_name,
-                "emergency_restart",
-                exit_code,
-                success,
-                operation_id=op_id,
-                fencing_generation=fencing_gen,
-                run_id=run_id,
-                correlation_id=corr_id,
-                event_type=EXECUTION_COMPLETED if success else EXECUTION_FAILED,
-                trigger_source="python_offline",
-                actor_type="offline_agent",
-                actor_id="home-ops-agent",
-                evidence={"health_state": health_detail, "canonical": canonical},
+        if len(short_window) >= 2 or persisted_short >= 2:
+            self._release_recovery_lease(canonical, lease_token, db_path, fencing_gen=fencing_gen)
+            logger.error(
+                f"[Emergency Autonomy Breaker] Tripped for {canonical}: {max(len(short_window), persisted_short)} restarts in 60s. Halted."
             )
-            if audit_status != AuditStatus.AUDIT_COMMITTED:
-                logger.critical(
-                    f"[Audit Integrity Failure] Offline audit persistence returned {audit_status} for op={op_id}. Cannot report recovery success."
-                )
-                return False
-            return success
-        finally:
-            released = self._release_recovery_lease(canonical, lease_token, db_path, fencing_gen=fencing_gen)
-            if not released:
-                self.metrics.inc("recovery_database_error")
-                logger.critical(f"[Lease Release Failed] Failed to cleanly release recovery lease for {canonical} (gen={fencing_gen}).")
+            return False
+
+        if len(timestamps) >= 3 or persisted_long >= 3:
+            self._release_recovery_lease(canonical, lease_token, db_path, fencing_gen=fencing_gen)
+            logger.critical(
+                f"[Emergency Autonomy Breaker] 10-minute circuit tripped for {canonical}: {max(len(timestamps), persisted_long)} crashes. Halted."
+            )
+            return False
+
+        # Guard 5: Local SQLite persistence in offline_restart_history (atomic check-and-insert under BEGIN IMMEDIATE)
+        rec_ok = self._record_persisted_restart(canonical, db_path)
+        if not rec_ok:
+            self._release_recovery_lease(canonical, lease_token, db_path, fencing_gen=fencing_gen)
+            logger.critical(
+                f"[Emergency Autonomy Blocked] Failed to write persisted restart record for {canonical}. Halting restart."
+            )
+            return False
+
+        timestamps.append(now)
+        op_id = f"pyop-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+        run_id = f"run-offline-{int(now * 1000)}-{uuid.uuid4().hex[:8]}"
+        corr_id = f"corr-{uuid.uuid4().hex[:8]}"
+        logger.warning(
+            f"[Emergency Autonomy Triggered] Go Core OFFLINE. Executing offline emergency restart for {container_name} "
+            f"(attempt {len(timestamps)} in 10m window, gen={fencing_gen}, op={op_id})"
+        )
+        return await self._execute_guarded_restart(
+            canonical=canonical,
+            audit_container_name=container_name,
+            docker_container=docker_container,
+            sock_path=sock_path,
+            db_path=db_path,
+            action_name="emergency_restart",
+            exit_code=exit_code,
+            lease_token=lease_token,
+            fencing_gen=fencing_gen,
+            run_id=run_id,
+            corr_id=corr_id,
+            op_id=op_id,
+            trigger_source="python_offline",
+            actor_type="offline_agent",
+            actor_id="home-ops-agent",
+            baseline_hash=verified_bh or (expected_baseline_hash or ""),
+        )
 
     def _verify_ops_schema(self, db_path: str) -> Tuple[bool, str, str]:
         """
@@ -1753,10 +2234,10 @@ class HomeOpsAgent:
                 return await asyncio.open_connection(sock=s)
             raise OSError(f"Unix sockets unsupported on {sys.platform}")
 
-    async def _query_docker_inspect(self, container_name: str, sock_path: str) -> Tuple[DockerHealthState, Optional[Dict[str, Any]]]:
-        """Queries Docker /containers/{container_name}/json and returns (health_state, inspect_data)."""
+    async def _docker_http_get_json(self, path: str, sock_path: str, timeout: float = 5.0) -> Tuple[int, Any]:
+        """Executes a GET request against Docker Engine API (npipe/unix/tcp) and decodes HTTP status + JSON body."""
         req_bytes = (
-            f"GET /containers/{container_name}/json HTTP/1.1\r\n"
+            f"GET {path} HTTP/1.1\r\n"
             f"Host: docker\r\n"
             f"User-Agent: home-ops-agent\r\n"
             f"Connection: close\r\n\r\n"
@@ -1779,38 +2260,38 @@ class HomeOpsAgent:
 
             try:
                 loop = asyncio.get_running_loop()
-                resp = await asyncio.wait_for(loop.run_in_executor(None, _read_npipe), timeout=5.0)
+                resp = await asyncio.wait_for(loop.run_in_executor(None, _read_npipe), timeout=timeout)
             except FileNotFoundError:
                 logger.error(f"[Fail-Closed] Docker named pipe not found: {pipe_path}")
-                return DockerHealthState.UNKNOWN, None
+                return 0, None
             except Exception as e:
                 logger.error(f"[Fail-Closed] Docker named pipe error: {e}")
-                return DockerHealthState.UNKNOWN, None
+                return 0, None
         else:
             writer = None
             try:
-                reader, writer = await asyncio.wait_for(self._connect_docker(sock_path), timeout=5.0)
+                reader, writer = await asyncio.wait_for(self._connect_docker(sock_path), timeout=timeout)
             except FileNotFoundError:
                 logger.error(f"[Fail-Closed] Docker socket not found: {sock_path}")
-                return DockerHealthState.UNKNOWN, None
+                return 0, None
             except Exception as e:
                 logger.error(f"[Fail-Closed] Docker socket connection error: {e}")
-                return DockerHealthState.UNKNOWN, None
+                return 0, None
 
             try:
                 writer.write(req_bytes)
-                await asyncio.wait_for(writer.drain(), timeout=5.0)
+                await asyncio.wait_for(writer.drain(), timeout=timeout)
 
                 raw_chunks = []
                 while True:
-                    chunk = await asyncio.wait_for(reader.read(4096), timeout=5.0)
+                    chunk = await asyncio.wait_for(reader.read(4096), timeout=timeout)
                     if not chunk:
                         break
                     raw_chunks.append(chunk)
                 resp = b"".join(raw_chunks)
             except Exception as e:
-                logger.error(f"[Fail-Closed] Error reading Docker inspect response: {e}")
-                return DockerHealthState.UNKNOWN, None
+                logger.error(f"[Fail-Closed] Error reading Docker HTTP response for {path}: {e}")
+                return 0, None
             finally:
                 if writer is not None:
                     try:
@@ -1820,18 +2301,17 @@ class HomeOpsAgent:
                         pass
 
         if not resp:
-            return DockerHealthState.UNKNOWN, None
+            return 0, None
 
         parts = resp.split(b"\r\n\r\n", 1)
         header_block = parts[0]
         body = parts[1] if len(parts) > 1 else b""
 
         status_line = header_block.split(b"\r\n", 1)[0].decode("utf-8", errors="ignore")
-        if not (status_line.startswith("HTTP/1.1 200") or status_line.startswith("HTTP/1.0 200")):
-            logger.error(f"[Fail-Closed] Docker inspect returned non-200 status: {status_line}")
-            if "404" in status_line:
-                return DockerHealthState.UNHEALTHY, None
-            return DockerHealthState.UNKNOWN, None
+        status_code = 0
+        status_parts = status_line.split()
+        if len(status_parts) >= 2 and status_parts[1].isdigit():
+            status_code = int(status_parts[1])
 
         if b"transfer-encoding: chunked" in header_block.lower():
             decoded_chunks = []
@@ -1853,22 +2333,51 @@ class HomeOpsAgent:
             body = b"".join(decoded_chunks)
 
         if not body:
-            logger.error("[Fail-Closed] Docker inspect returned empty body.")
-            return DockerHealthState.UNKNOWN, None
+            return status_code, None
 
         try:
-            data = json.loads(body.decode("utf-8", errors="ignore"))
-            return DockerHealthState.HEALTHY, data
+            return status_code, json.loads(body.decode("utf-8", errors="ignore"))
         except Exception as e:
-            logger.error(f"[Fail-Closed] Docker inspect JSON decode error: {e}")
+            logger.error(f"[Fail-Closed] Docker JSON decode error for {path}: {e}")
+            return status_code, None
+
+    async def _list_docker_containers(self, sock_path: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        """Lists all containers via /containers/json?all=1 for unambiguous canonical matching (R8)."""
+        status_code, data = await self._docker_http_get_json("/containers/json?all=1", sock_path)
+        if status_code != 200 or data is None:
+            return "error", None
+        if isinstance(data, list):
+            return "ok", [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict) and "Id" in data:
+            return "not_implemented", None
+        return "error", None
+
+    async def _query_docker_inspect(self, container_name: str, sock_path: str) -> Tuple[DockerHealthState, Optional[Dict[str, Any]]]:
+        """Queries Docker /containers/{container_name}/json and returns (health_state, inspect_data)."""
+        import urllib.parse
+
+        quoted_name = urllib.parse.quote(str(container_name), safe="")
+        status_code, data = await self._docker_http_get_json(f"/containers/{quoted_name}/json", sock_path)
+        if status_code == 404:
+            logger.error(f"[Fail-Closed] Docker inspect returned 404 for {container_name}")
+            return DockerHealthState.UNHEALTHY, None
+        if status_code != 200:
+            if status_code:
+                logger.error(f"[Fail-Closed] Docker inspect returned HTTP {status_code}")
             return DockerHealthState.UNKNOWN, None
+        if not isinstance(data, dict) or not data:
+            logger.error("[Fail-Closed] Docker inspect returned empty or non-object JSON body.")
+            return DockerHealthState.UNKNOWN, None
+        return DockerHealthState.HEALTHY, data
 
     async def _compute_container_baseline_hash(self, component: str, sock_path: Optional[str] = None) -> str:
         """
-        Computes a live real resource BaselineHash from Docker inspect (R5).
-        Returns '' (Fail-Closed, NEVER a placeholder) on component resolution failure,
-        non-existent container, Docker API timeout/error, or unknown container state.
+        Computes a live real resource BaselineHash (Protocol v1) from Docker inspect (R5/R8).
+        Detects duplicate/ambiguous containers via /containers/json?all=1, verifies inspected Name,
+        enriches RepoDigests from /images/{Image}/json when missing, and strictly fails closed.
         """
+        import urllib.parse
+
         canonical = resolve_canonical_component(component)
         if not canonical:
             logger.error(f"[R5 Fail-Closed] Component resolution failed for '{component}'.")
@@ -1878,16 +2387,71 @@ class HomeOpsAgent:
             logger.error(f"[R5 Fail-Closed] No Docker container mapping for canonical '{canonical}'.")
             return ""
         target_sock = sock_path or getattr(self.config, "docker_socket", "/var/run/docker.sock")
-        inspect_status, inspect_data = await self._query_docker_inspect(docker_name, target_sock)
+
+        query_name = docker_name
+        list_status, container_list = await self._list_docker_containers(target_sock)
+        if list_status == "error":
+            logger.warning(f"[R5/R8 Fail-Closed] Failed to list Docker containers for '{canonical}'.")
+            return ""
+        if list_status == "ok" and container_list is not None:
+            matched_names: List[str] = []
+            exact_match = ""
+            for item in container_list:
+                raw_names = item.get("Names")
+                if not isinstance(raw_names, list):
+                    continue
+                item_matched = False
+                cleaned_list: List[str] = []
+                for raw_n in raw_names:
+                    clean_n = str(raw_n or "").strip().lstrip("/")
+                    if not clean_n:
+                        continue
+                    cleaned_list.append(clean_n)
+                    if clean_n.lower() == docker_name.lower() or resolve_canonical_component(clean_n) == canonical:
+                        item_matched = True
+                        if clean_n.lower() == docker_name.lower():
+                            exact_match = clean_n
+                if item_matched and cleaned_list:
+                    matched_names.append(cleaned_list[0])
+            if len(matched_names) > 1:
+                logger.critical(
+                    f"[R8 Ambiguity Block] Multiple Docker containers matched canonical '{canonical}': {matched_names}. Failing closed."
+                )
+                return ""
+            if len(matched_names) == 0:
+                logger.warning(
+                    f"[R5 Fail-Closed] Container '{canonical}' ({docker_name}) not found in Docker container list."
+                )
+                return ""
+            query_name = exact_match or matched_names[0]
+
+        inspect_status, inspect_data = await self._query_docker_inspect(query_name, target_sock)
         if inspect_status != DockerHealthState.HEALTHY or not isinstance(inspect_data, dict):
             logger.warning(
-                f"[R5 Fail-Closed] Cannot compute real baseline_hash for '{canonical}' ({docker_name}): "
+                f"[R5 Fail-Closed] Cannot compute real baseline_hash for '{canonical}' ({query_name}): "
                 f"inspect_status={inspect_status.value}."
             )
             return ""
+
+        inspected_name = str(inspect_data.get("Name") or "").strip().lstrip("/")
+        if inspected_name and inspected_name.lower() != docker_name.lower():
+            logger.critical(
+                f"[R8 Name Mismatch] Docker inspect Name '{inspected_name}' != expected '{docker_name}' for '{canonical}'. Failing closed."
+            )
+            return ""
+
+        if not inspect_data.get("RepoDigests") and inspect_data.get("Image"):
+            img_id = str(inspect_data.get("Image") or "").strip()
+            if img_id:
+                quoted_img = urllib.parse.quote(img_id, safe="")
+                img_status, img_data = await self._docker_http_get_json(f"/images/{quoted_img}/json", target_sock)
+                if img_status == 200 and isinstance(img_data, dict) and isinstance(img_data.get("RepoDigests"), list) and img_data["RepoDigests"]:
+                    inspect_data = dict(inspect_data)
+                    inspect_data["RepoDigests"] = img_data["RepoDigests"]
+
         bh = compute_container_baseline_from_inspect(canonical, inspect_data)
         if not bh:
-            logger.warning(f"[R5 Fail-Closed] Incomplete or unknown inspect metadata for '{canonical}' ({docker_name}).")
+            logger.warning(f"[R5 Fail-Closed] Incomplete or unknown inspect metadata for '{canonical}' ({query_name}).")
         return bh
 
     async def _check_service_readiness(self, canonical: str, container_name: str = "") -> bool:
@@ -2044,10 +2608,31 @@ class HomeOpsAgent:
             return DockerHealthState.UNHEALTHY
 
     def _can_write_offline_audit_table(self, db_path: str) -> bool:
-        """Verifies offline_ops_audit exists and is writable under BEGIN IMMEDIATE before Docker mutations."""
+        """
+        Verifies offline_ops_audit exists, is writable under BEGIN IMMEDIATE, satisfies v5 schema
+        (in schema>=5 or production), has valid HMAC keyring when required, and has writable archive dir.
+        """
         if not db_path or not os.path.isfile(db_path):
             self.metrics.inc("recovery_audit_failed")
             return False
+        if is_production() or os.environ.get("OPS_AUDIT_REQUIRE_HMAC", "") == "1":
+            kid, ring = resolve_audit_hmac_keyring()
+            if not (kid and kid in ring):
+                self.metrics.inc("recovery_audit_failed")
+                logger.critical("[Offline Audit Precheck] Missing external OPS_AUDIT_HMAC_KEY in strict/production mode.")
+                return False
+        archive_dir = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+        if archive_dir:
+            try:
+                if os.path.exists(archive_dir):
+                    if not os.path.isdir(archive_dir) or not os.access(archive_dir, os.W_OK):
+                        self.metrics.inc("recovery_audit_failed")
+                        return False
+                else:
+                    os.makedirs(archive_dir, exist_ok=True)
+            except Exception:
+                self.metrics.inc("recovery_audit_failed")
+                return False
         conn = None
         try:
             conn = open_readwrite_sqlite(db_path)
@@ -2055,10 +2640,30 @@ class HomeOpsAgent:
             cur.execute("BEGIN IMMEDIATE")
             cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='offline_ops_audit'")
             exists = cur.fetchone() is not None
-            cur.execute("ROLLBACK")
             if not exists:
+                cur.execute("ROLLBACK")
                 self.metrics.inc("recovery_audit_failed")
-            return exists
+                return False
+            cur.execute("PRAGMA table_info(offline_ops_audit)")
+            cols = {str(c[1]).lower() for c in cur.fetchall()}
+            schema_ver = 0
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ops_schema_migrations'")
+            if cur.fetchone():
+                cur.execute("SELECT COALESCE(MAX(version), 0) FROM ops_schema_migrations")
+                vr = cur.fetchone()
+                schema_ver = int(vr[0]) if vr and vr[0] is not None else 0
+            if schema_ver >= 5 or is_production():
+                req_v5 = {
+                    "run_id", "correlation_id", "event_type", "payload_json",
+                    "offline_seq", "local_prev_hash", "entry_hash", "hmac_signature",
+                }
+                if not req_v5.issubset(cols):
+                    cur.execute("ROLLBACK")
+                    self.metrics.inc("recovery_audit_failed")
+                    logger.critical("[Offline Audit Precheck] offline_ops_audit missing required v5 columns.")
+                    return False
+            cur.execute("ROLLBACK")
+            return True
         except Exception:
             self.metrics.inc("recovery_audit_failed")
             return False
@@ -2079,10 +2684,19 @@ class HomeOpsAgent:
         fencing_generation: int = 0,
         run_id: str = "",
         correlation_id: str = "",
+        parent_event_id: str = "",
         event_type: str = EXECUTION_COMPLETED,
         trigger_source: str = "python_offline",
         actor_type: str = "offline_agent",
         actor_id: str = "home-ops-agent",
+        proposal_id: str = "",
+        approval_id: str = "",
+        duration_ms: int = 0,
+        household_id: int = 1,
+        risk_level: str = "HIGH",
+        decision: str = DECISION_ALLOW,
+        origin_stream_id: str = "offline-agent",
+        error_code: str = "",
         evidence: Any = None,
         before_state: Any = None,
         after_state: Any = None,
@@ -2099,6 +2713,7 @@ class HomeOpsAgent:
         op_id = operation_id or event_uuid
         run_id_val = run_id or f"run-offline-{event_uuid}"
         corr_id_val = correlation_id or f"corr-{event_uuid}"
+        safe_target = redact_sensitive_string(str(container_name or ""))
         db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
         if not db_path or not os.path.isfile(db_path):
             self.metrics.inc("recovery_audit_failed")
@@ -2111,7 +2726,7 @@ class HomeOpsAgent:
         before_str = serialize_evidence(before_state)
         after_str = serialize_evidence(after_state)
         params_digest, params_redacted = serialize_params({
-            "container_name": container_name,
+            "container_name": safe_target,
             "action": action,
             "exit_code": exit_code,
             "fencing_generation": fencing_generation,
@@ -2121,6 +2736,7 @@ class HomeOpsAgent:
         entry_hash = ""
         hmac_sig = ""
         offline_seq = 0
+        key_id_used = ""
         try:
             conn = open_readwrite_sqlite(db_path)
             cur = conn.cursor()
@@ -2153,7 +2769,9 @@ class HomeOpsAgent:
                 offline_seq = prev_seq + 1
 
                 res_label = "SUCCESS" if success else "FAILED"
-                err_msg = "" if success else f"exit_code={exit_code}"
+                err_msg = error_code if error_code else (
+                    "" if success else ("EXECUTION_UNKNOWN" if event_type == EXECUTION_UNKNOWN else f"exit_code={exit_code}")
+                )
                 kid, ring = resolve_audit_hmac_keyring()
                 has_hmac_key = bool(kid and kid in ring)
                 if not has_hmac_key and (is_production() or os.environ.get("OPS_AUDIT_REQUIRE_HMAC", "") == "1"):
@@ -2162,25 +2780,29 @@ class HomeOpsAgent:
                     logger.critical("[Offline Audit Failed] External OPS_AUDIT_HMAC_KEY unavailable for v5 audit signing in production; failing closed.")
                     return AuditStatus.AUDIT_FAILED, ""
 
+                comp_val = resolve_canonical_component(safe_target) or safe_target
+                dur_val = max(0, int(duration_ms))
+                hh_val = int(household_id or 1)
                 if has_hmac_key:
+                    key_id_used = kid
                     ev_obj = {
                         "audit_id": event_uuid,
                         "run_id": run_id_val,
-                        "parent_event_id": "",
+                        "parent_event_id": parent_event_id,
                         "correlation_id": corr_id_val,
-                        "household_id": 1,
+                        "household_id": hh_val,
                         "trigger_source": trigger_source,
                         "actor_type": actor_type,
                         "actor_id": actor_id,
                         "event_type": event_type,
                         "action": action,
-                        "target": container_name,
-                        "component": resolve_canonical_component(container_name) or container_name,
-                        "decision": DECISION_ALLOW,
-                        "risk_level": "HIGH",
+                        "target": safe_target,
+                        "component": comp_val,
+                        "decision": decision,
+                        "risk_level": risk_level,
                         "policy_version": AUDIT_POLICY_VERSION,
-                        "proposal_id": "",
-                        "approval_id": "",
+                        "proposal_id": proposal_id,
+                        "approval_id": approval_id,
                         "operation_id": op_id,
                         "fencing_generation": fencing_generation,
                         "before_state": before_str,
@@ -2189,7 +2811,7 @@ class HomeOpsAgent:
                         "parameters_redacted": params_redacted,
                         "result": res_label,
                         "error_code": err_msg,
-                        "duration_ms": 0,
+                        "duration_ms": dur_val,
                         "evidence": evidence_str,
                         "created_at": now_iso,
                         "created_at_ms": now_ms,
@@ -2197,22 +2819,29 @@ class HomeOpsAgent:
                         "previous_hash": prev_hash,
                     }
                     entry_hash = compute_event_entry_hash(ev_obj)
-                    hmac_sig = compute_event_hmac(kid, ring[kid], "offline-agent", offline_seq, entry_hash, now_ms)
+                    hmac_sig = compute_event_hmac(kid, ring[kid], origin_stream_id, offline_seq, entry_hash, now_ms)
                 else:
                     # Dev/test compatibility when OPS_AUDIT_HMAC_KEY is not injected: keep origin proof empty so Core treats as legacy row.
                     offline_seq = 0
                     prev_hash = ""
                     entry_hash = ""
                     hmac_sig = ""
-                    ev_obj = {"component": resolve_canonical_component(container_name) or container_name}
 
                 payload_meta = json.dumps({
+                    "origin_stream_id": origin_stream_id,
+                    "key_id": key_id_used,
+                    "household_id": hh_val,
+                    "policy_version": AUDIT_POLICY_VERSION,
+                    "parent_event_id": parent_event_id,
+                    "proposal_id": proposal_id,
+                    "approval_id": approval_id,
+                    "duration_ms": dur_val,
                     "trigger_source": trigger_source,
                     "actor_type": actor_type,
                     "actor_id": actor_id,
-                    "component": ev_obj["component"],
-                    "decision": DECISION_ALLOW,
-                    "risk_level": "HIGH",
+                    "component": comp_val,
+                    "decision": decision,
+                    "risk_level": risk_level,
                     "before_state": before_str,
                     "after_state": after_str,
                     "parameters_digest": params_digest,
@@ -2234,7 +2863,7 @@ class HomeOpsAgent:
                         (
                             event_uuid,
                             op_id,
-                            container_name,
+                            safe_target,
                             action,
                             actor_id,
                             fencing_generation,
@@ -2267,7 +2896,7 @@ class HomeOpsAgent:
                         (
                             event_uuid,
                             op_id,
-                            container_name,
+                            safe_target,
                             action,
                             actor_id,
                             fencing_generation,
@@ -2297,7 +2926,7 @@ class HomeOpsAgent:
                     (
                         event_uuid,
                         op_id,
-                        container_name,
+                        safe_target,
                         action,
                         actor_id,
                         fencing_generation,
@@ -2314,20 +2943,23 @@ class HomeOpsAgent:
                     INSERT INTO offline_ops_audit (event_uuid, container_name, action, exit_code, success, executed_at, synced)
                     VALUES (?, ?, ?, ?, ?, ?, 0)
                     """,
-                    (event_uuid, container_name, action, exit_code, 1 if success else 0, now_iso),
+                    (event_uuid, safe_target, action, exit_code, 1 if success else 0, now_iso),
                 )
             cur.execute("COMMIT")
             self._last_audit_status = AuditStatus.AUDIT_COMMITTED
             if archive_dir:
-                append_jsonl_audit_stub(
+                stub_ok = append_jsonl_audit_stub(
                     archive_dir,
                     "python-offline-audit.jsonl",
                     {
                         "event_uuid": event_uuid,
+                        "origin_stream_id": origin_stream_id,
+                        "key_id": key_id_used,
                         "run_id": run_id_val,
                         "correlation_id": corr_id_val,
+                        "parent_event_id": parent_event_id,
                         "event_type": event_type,
-                        "container_name": container_name,
+                        "container_name": safe_target,
                         "action": action,
                         "success": success,
                         "offline_seq": offline_seq,
@@ -2336,6 +2968,9 @@ class HomeOpsAgent:
                         "executed_at": now_iso,
                     },
                 )
+                if not stub_ok and (is_production() or os.environ.get("OPS_AUDIT_REQUIRE_HMAC", "") == "1"):
+                    self.metrics.inc("recovery_audit_failed")
+                    logger.critical(f"[Offline Audit Archive Failed] Failed to append JSONL audit archive for {event_uuid}.")
             logger.info(
                 f"[Offline Audit] Recorded offline event {event_uuid} (run={run_id_val}, op={op_id}, seq={offline_seq}, gen={fencing_generation})"
             )
@@ -2363,7 +2998,7 @@ class HomeOpsAgent:
         return event_uuid
 
     async def sync_offline_audit_logs(self) -> int:
-        """Probes Go Core /health, and if alive, pushes buffered offline audit logs to Go Core."""
+        """Probes Go Core /health, verifies local audit chain, pushes buffered logs, and quarantines rejects."""
         db_path = getattr(self.config, "db_path", "/data/sqlite/app.db")
         if not os.path.exists(db_path):
             return 0
@@ -2384,25 +3019,32 @@ class HomeOpsAgent:
         if not is_alive:
             return 0
 
-        # 2. Query unsynced events from SQLite (never auto-create DB)
+        # 2. Query unsynced events ordered by offline_seq ASC, id ASC (never auto-create DB)
         def read_unsynced():
             if not db_path or not os.path.isfile(db_path):
-                return []
+                return [], set()
             conn = None
             try:
                 conn = open_readonly_sqlite(db_path)
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM offline_ops_audit WHERE synced = 0 ORDER BY id ASC LIMIT 50")
+                cursor.execute("PRAGMA table_info(offline_ops_audit)")
+                cols = {str(c[1]).lower() for c in cursor.fetchall()}
+                if "offline_seq" in cols:
+                    cursor.execute(
+                        "SELECT * FROM offline_ops_audit WHERE synced = 0 ORDER BY COALESCE(offline_seq, 0) ASC, id ASC LIMIT 50"
+                    )
+                else:
+                    cursor.execute("SELECT * FROM offline_ops_audit WHERE synced = 0 ORDER BY id ASC LIMIT 50")
                 rows = cursor.fetchall()
-                return [dict(r) for r in rows]
+                return [dict(r) for r in rows], cols
             except sqlite3.OperationalError:
-                return []
+                return [], set()
             finally:
                 if conn:
                     conn.close()
 
-        records = await loop.run_in_executor(None, read_unsynced)
+        records, audit_cols = await loop.run_in_executor(None, read_unsynced)
         if not records:
             return 0
 
@@ -2415,6 +3057,8 @@ class HomeOpsAgent:
                 try:
                     meta = json.loads(raw_meta)
                     for k in (
+                        "origin_stream_id", "key_id", "household_id", "policy_version",
+                        "parent_event_id", "proposal_id", "approval_id", "duration_ms",
                         "trigger_source", "actor_type", "actor_id", "component",
                         "decision", "risk_level", "before_state", "after_state",
                         "parameters_digest", "parameters_redacted", "evidence", "error_message",
@@ -2425,63 +3069,158 @@ class HomeOpsAgent:
                     pass
             out.setdefault("audit_id", out.get("event_uuid", ""))
             out.setdefault("target", out.get("container_name", ""))
+            if not out.get("origin_stream_id"):
+                out["origin_stream_id"] = "offline-agent"
+            if not out.get("key_id") and out.get("hmac_signature"):
+                out["key_id"] = extract_hmac_key_id(str(out.get("hmac_signature") or ""))
             enriched_records.append(out)
 
-        # 3. Push to Go Core
+        # Pre-verify local cryptographic hash chain before pushing to Go Core (R7)
+        _, hmac_ring = resolve_audit_hmac_keyring()
+        valid_records: List[Dict[str, Any]] = []
+        tampered_ids: List[int] = []
+        chain_ok, chain_reason = verify_offline_audit_chain(enriched_records, ring=hmac_ring or None)
+        if not chain_ok:
+            self.metrics.inc("recovery_audit_failed")
+            logger.critical(f"[Offline Audit Tamper Detected] Local chain check failed before sync: {chain_reason}")
+            prev_valid_seq = None
+            prev_valid_hash = ""
+            for rec in enriched_records:
+                single_ok, _ = verify_offline_audit_chain([rec], ring=hmac_ring or None)
+                seq_val = int(rec.get("offline_seq") or 0)
+                if single_ok and seq_val > 0 and prev_valid_seq is not None:
+                    if seq_val <= prev_valid_seq or str(rec.get("local_prev_hash") or "") != prev_valid_hash:
+                        single_ok = False
+                if single_ok:
+                    valid_records.append(rec)
+                    if seq_val > 0:
+                        prev_valid_seq = seq_val
+                        prev_valid_hash = str(rec.get("entry_hash") or "")
+                else:
+                    if "id" in rec:
+                        tampered_ids.append(rec["id"])
+        else:
+            valid_records = enriched_records
+
+        if tampered_ids:
+            def mark_tampered():
+                if not db_path or not os.path.isfile(db_path):
+                    return
+                conn = None
+                try:
+                    conn = open_readwrite_sqlite(db_path)
+                    ph = ",".join("?" * len(tampered_ids))
+                    conn.execute("BEGIN IMMEDIATE")
+                    if "audit_status" in audit_cols:
+                        conn.execute(
+                            f"UPDATE offline_ops_audit SET synced = -1, audit_status = 'AUDIT_TAMPERED' WHERE id IN ({ph})",
+                            tampered_ids,
+                        )
+                    else:
+                        conn.execute(
+                            f"UPDATE offline_ops_audit SET synced = -1 WHERE id IN ({ph})",
+                            tampered_ids,
+                        )
+                    conn.execute("COMMIT")
+                except Exception as err:
+                    if conn:
+                        try:
+                            conn.execute("ROLLBACK")
+                        except Exception:
+                            pass
+                    logger.error(f"[Offline Audit Sync] Failed to quarantine tampered rows: {err}")
+                finally:
+                    if conn:
+                        conn.close()
+
+            await loop.run_in_executor(None, mark_tampered)
+
+        if not valid_records:
+            return 0
+
+        # 3. Push verified events to Go Core
         sync_url = f"{self.config.api_base_url.rstrip('/')}/api/v1/ops/audit/offline-sync"
         headers = {
             "Content-Type": "application/json"
         }
         if getattr(self.config, "internal_token", None):
             headers["X-Internal-Secret"] = self.config.internal_token
-        sync_payload = json.dumps({"events": enriched_records}).encode("utf-8")
+        sync_payload = json.dumps({"events": valid_records}).encode("utf-8")
 
-        def do_sync() -> Tuple[bool, Optional[List[str]]]:
+        def do_sync() -> Tuple[bool, Optional[List[str]], List[str]]:
             try:
                 sync_req = urllib.request.Request(sync_url, data=sync_payload, headers=headers)
                 with urllib.request.urlopen(sync_req, timeout=5.0) as resp:
                     if resp.status not in (200, 201):
-                        return False, None
+                        return False, None, []
                     raw_body = resp.read()
                     if isinstance(raw_body, (bytes, bytearray, str)):
                         text_body = raw_body.decode("utf-8", errors="ignore") if isinstance(raw_body, (bytes, bytearray)) else raw_body
-                        if text_body.strip():
-                            parsed = json.loads(text_body)
-                            data_obj = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
-                            if isinstance(data_obj, dict) and "accepted_uuids" in data_obj:
-                                acc = data_obj.get("accepted_uuids") or []
-                                return True, [str(u) for u in acc if u]
-                            return True, []
+                        if not text_body.strip():
+                            return False, None, []
+                        parsed = json.loads(text_body)
+                        if not isinstance(parsed, dict):
+                            return False, None, []
+                        data_obj = parsed.get("data") if isinstance(parsed.get("data"), dict) else parsed
+                        if not isinstance(data_obj, dict) or "accepted_uuids" not in data_obj:
+                            logger.error("[Offline Audit Sync] Response missing required 'accepted_uuids'; failing closed.")
+                            return False, None, []
+                        acc = data_obj.get("accepted_uuids") or []
+                        rej_uuids: List[str] = []
+                        for item in (data_obj.get("rejected") or []):
+                            if isinstance(item, dict):
+                                r_uuid = str(item.get("event_uuid") or item.get("audit_id") or "").strip()
+                                r_code = str(item.get("code") or "").strip().upper()
+                                if r_uuid and r_code not in ("RATE_LIMITED", "TEMPORARY_UNAVAILABLE", "RETRY_LATER"):
+                                    rej_uuids.append(r_uuid)
+                        return True, [str(u) for u in acc if u], rej_uuids
                     # Fallback for unconfigured unittest MagicMocks with no JSON body
-                    return True, None
+                    return True, None, []
             except Exception as err:
                 logger.debug(f"[Offline Audit Sync] Request failed: {err}")
-                return False, None
+                return False, None, []
 
-        sync_ok, accepted_uuids = await loop.run_in_executor(None, do_sync)
+        sync_ok, accepted_uuids, rejected_uuids = await loop.run_in_executor(None, do_sync)
         if not sync_ok:
             return 0
 
         if accepted_uuids is not None:
             accepted_set = set(accepted_uuids)
-            records_to_ack = [r for r in records if r.get("event_uuid") in accepted_set]
+            rejected_set = set(rejected_uuids) - accepted_set
+            records_to_ack = [r for r in valid_records if r.get("event_uuid") in accepted_set]
+            records_to_reject = [r for r in valid_records if r.get("event_uuid") in rejected_set]
         else:
-            records_to_ack = records
+            records_to_ack = valid_records
+            records_to_reject = []
 
-        if not records_to_ack:
+        if not records_to_ack and not records_to_reject:
             return 0
 
-        # 4. Mark synced = 1 via read-write BEGIN IMMEDIATE transaction ONLY for accepted records
+        # 4. Mark synced = 1 for accepted and synced = -1 for permanently rejected (quarantine)
         def mark_synced():
             if not db_path or not os.path.isfile(db_path):
                 return
             conn = None
             try:
                 conn = open_readwrite_sqlite(db_path)
-                synced_ids = [r["id"] for r in records_to_ack]
-                placeholders = ",".join("?" * len(synced_ids))
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute(f"UPDATE offline_ops_audit SET synced = 1 WHERE id IN ({placeholders})", synced_ids)
+                if records_to_ack:
+                    synced_ids = [r["id"] for r in records_to_ack]
+                    placeholders = ",".join("?" * len(synced_ids))
+                    conn.execute(f"UPDATE offline_ops_audit SET synced = 1 WHERE id IN ({placeholders})", synced_ids)
+                if records_to_reject:
+                    rej_ids = [r["id"] for r in records_to_reject]
+                    placeholders_rej = ",".join("?" * len(rej_ids))
+                    if "audit_status" in audit_cols:
+                        conn.execute(
+                            f"UPDATE offline_ops_audit SET synced = -1, audit_status = ? WHERE id IN ({placeholders_rej})",
+                            [AuditStatus.AUDIT_REJECTED.value, *rej_ids],
+                        )
+                    else:
+                        conn.execute(
+                            f"UPDATE offline_ops_audit SET synced = -1 WHERE id IN ({placeholders_rej})",
+                            rej_ids,
+                        )
                 conn.execute("COMMIT")
             except Exception as err:
                 if conn:
@@ -2489,13 +3228,16 @@ class HomeOpsAgent:
                         conn.execute("ROLLBACK")
                     except Exception:
                         pass
-                logger.error(f"[Offline Audit Sync] Failed to mark synced: {err}")
+                logger.error(f"[Offline Audit Sync] Failed to update sync statuses: {err}")
             finally:
                 if conn:
                     conn.close()
 
         await loop.run_in_executor(None, mark_synced)
-        logger.info(f"[Offline Audit Sync] Successfully synchronized {len(records_to_ack)} offline events to Go Core.")
+        if records_to_reject:
+            logger.warning(f"[Offline Audit Sync] Quarantined {len(records_to_reject)} permanently rejected offline events (synced=-1).")
+        if records_to_ack:
+            logger.info(f"[Offline Audit Sync] Successfully synchronized {len(records_to_ack)} offline events to Go Core.")
         return len(records_to_ack)
 
     async def _sync_offline_audit_logs_loop(self) -> None:
@@ -2656,23 +3398,58 @@ class HomeOpsAgent:
         )
         return False
 
-    async def _restart_docker_container(self, container_name: str, sock_path: str) -> bool:
-        """Sends POST /containers/{name}/restart to Docker socket."""
+    async def _restart_docker_container(
+        self,
+        container_name: str,
+        sock_path: str,
+        fencing_generation: int = 0,
+        operation_id: str = "",
+    ) -> bool:
+        """Sends POST /containers/{name}/restart to Docker socket with fencing headers & EXECUTION_UNKNOWN tracking."""
+        import urllib.parse
+
+        self._last_restart_ambiguous = False
         writer = None
+        request_sent = False
         try:
             reader, writer = await asyncio.wait_for(self._connect_docker(sock_path), timeout=5.0)
+            quoted_name = urllib.parse.quote(str(container_name), safe="")
+            extra_headers = ""
+            if fencing_generation > 0:
+                extra_headers += f"X-Ops-Fencing-Generation: {fencing_generation}\r\n"
+            if operation_id:
+                extra_headers += f"X-Ops-Operation-ID: {operation_id}\r\n"
             req = (
-                f"POST /containers/{container_name}/restart?t=5 HTTP/1.1\r\n"
+                f"POST /containers/{quoted_name}/restart?t=5 HTTP/1.1\r\n"
                 f"Host: docker\r\n"
                 f"User-Agent: home-ops-agent\r\n"
+                f"{extra_headers}"
                 f"Content-Length: 0\r\n"
                 f"Connection: close\r\n\r\n"
             ).encode("utf-8")
             writer.write(req)
             await asyncio.wait_for(writer.drain(), timeout=5.0)
+            request_sent = True
             resp = await asyncio.wait_for(reader.read(256), timeout=15.0)
+            if not resp:
+                self._last_restart_ambiguous = True
+                self.metrics.inc("recovery_execution_unknown")
+                logger.critical(
+                    f"[EXECUTION_UNKNOWN] Empty EOF from Docker socket after restart dispatch for {container_name}."
+                )
+                return False
             logger.info(f"[Tier 1] Issued restart for container {container_name}")
             return b"204 No Content" in resp or b"200 OK" in resp
+        except (asyncio.TimeoutError, TimeoutError, ConnectionError, EOFError, OSError) as e:
+            if request_sent:
+                self._last_restart_ambiguous = True
+                self.metrics.inc("recovery_execution_unknown")
+                logger.critical(
+                    f"[EXECUTION_UNKNOWN] Docker restart outcome ambiguous after dispatch for {container_name}: {e}"
+                )
+            else:
+                logger.error(f"Failed to restart container {container_name} via Docker socket: {e}")
+            return False
         except Exception as e:
             logger.error(f"Failed to restart container {container_name} via Docker socket: {e}")
             return False
@@ -2683,6 +3460,44 @@ class HomeOpsAgent:
                     await writer.wait_closed()
                 except Exception:
                     pass
+
+    def _process_mqtt_security_message(self, topic: str, payload_str: str) -> None:
+        """Validates MQTT security topic/schema before dispatching auth-failure counters and emits audit trail."""
+        clean_topic = (topic or "").strip()
+        if not clean_topic or ("auth_fail" not in clean_topic and not clean_topic.startswith("security/")):
+            return
+        if not payload_str or len(payload_str) > 8192:
+            logger.warning(f"[MQTT Reject] Empty or oversized payload on topic {clean_topic}")
+            return
+        try:
+            data = json.loads(payload_str)
+        except Exception:
+            logger.warning(f"[MQTT Reject] Malformed JSON payload on topic {clean_topic}")
+            return
+        if not isinstance(data, dict):
+            logger.warning(f"[MQTT Reject] Non-object JSON payload on topic {clean_topic}")
+            return
+
+        raw_ip = data.get("ip") or data.get("client_ip")
+        if not isinstance(raw_ip, str) or not raw_ip.strip():
+            logger.warning(f"[MQTT Reject] Missing/invalid IP field on topic {clean_topic}")
+            return
+
+        res = self.rule_engine.handle_auth_failure(raw_ip.strip(), source="mqtt", authenticated=True)
+        action = str(res.get("action") or "ignored")
+        if action == "ignored" or action.startswith("rejected_"):
+            logger.warning(f"[MQTT Reject] RuleEngine rejected auth failure event ({action}) on {clean_topic}")
+            return
+        logger.info(f"MQTT security event from {raw_ip.strip()}: action={action}")
+        archive_dir = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
+        if archive_dir:
+            append_jsonl_audit_stub(archive_dir, "python-mqtt-audit.jsonl", {
+                "event_type": "MQTT_AUTH_FAILURE",
+                "topic": redact_sensitive_string(clean_topic),
+                "source_ip": raw_ip.strip(),
+                "action": action,
+                "executed_at": format_rfc3339_ms(),
+            })
 
     async def _mqtt_listener(self) -> None:
         """
@@ -2707,15 +3522,7 @@ class HomeOpsAgent:
                 try:
                     # Wait for messages dispatched from paho thread
                     topic, payload_str = await self._mqtt_queue.get()
-                    if "auth_fail" in topic or "security" in topic:
-                        try:
-                            data = json.loads(payload_str)
-                            ip = data.get("ip") or data.get("client_ip")
-                            if ip:
-                                res = self.rule_engine.handle_auth_failure(ip)
-                                logger.info(f"MQTT security event from {ip}: action={res.get('action')}")
-                        except Exception:
-                            pass
+                    self._process_mqtt_security_message(topic, payload_str)
                     self._mqtt_queue.task_done()
                 except asyncio.CancelledError:
                     break
@@ -2768,16 +3575,7 @@ class HomeOpsAgent:
                         topic_len = (body[0] << 8) | body[1]
                         msg_topic = body[2:2 + topic_len].decode("utf-8", errors="ignore")
                         payload_data = body[2 + topic_len:].decode("utf-8", errors="ignore")
-
-                        if "auth_fail" in msg_topic or "security" in msg_topic:
-                            try:
-                                data = json.loads(payload_data)
-                                ip = data.get("ip") or data.get("client_ip")
-                                if ip:
-                                    res = self.rule_engine.handle_auth_failure(ip)
-                                    logger.info(f"MQTT security event from {ip}: action={res.get('action')}")
-                            except Exception:
-                                pass
+                        self._process_mqtt_security_message(msg_topic, payload_data)
             except asyncio.CancelledError:
                 break
             except Exception as e:

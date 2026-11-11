@@ -62,6 +62,18 @@ func (e *AgentAuditEngine) QueryRuns(q RunQuery) ([]model.AgentAuditRun, int64, 
 	if v := strings.TrimSpace(q.ActorID); v != "" {
 		tx = tx.Where("actor_id = ?", v)
 	}
+	if v := strings.TrimSpace(q.ProposalID); v != "" {
+		tx = tx.Where("proposal_id = ?", v)
+	}
+	if v := strings.TrimSpace(q.ApprovalID); v != "" {
+		tx = tx.Where("approval_id = ?", v)
+	}
+	if v := strings.TrimSpace(q.OperationID); v != "" {
+		tx = tx.Where("operation_id = ?", v)
+	}
+	if v := strings.TrimSpace(q.CorrelationID); v != "" {
+		tx = tx.Where("correlation_id = ?", v)
+	}
 	if q.IsOffline != nil {
 		tx = tx.Where("is_offline = ?", *q.IsOffline)
 	}
@@ -73,8 +85,8 @@ func (e *AgentAuditEngine) QueryRuns(q RunQuery) ([]model.AgentAuditRun, int64, 
 	}
 	if v := strings.TrimSpace(q.Search); v != "" {
 		like := "%" + v + "%"
-		tx = tx.Where("(run_id LIKE ? OR target LIKE ? OR component LIKE ? OR action LIKE ? OR proposal_id LIKE ? OR summary LIKE ?)",
-			like, like, like, like, like, like)
+		tx = tx.Where("(run_id LIKE ? OR target LIKE ? OR component LIKE ? OR action LIKE ? OR proposal_id LIKE ? OR operation_id LIKE ? OR approval_id LIKE ? OR correlation_id LIKE ? OR summary LIKE ?)",
+			like, like, like, like, like, like, like, like, like)
 	}
 
 	var total int64
@@ -192,8 +204,20 @@ func (e *AgentAuditEngine) QueryEvents(q EventQuery, maxLimit int) ([]model.Agen
 	if v := strings.TrimSpace(q.ProposalID); v != "" {
 		tx = tx.Where("proposal_id = ?", v)
 	}
+	if v := strings.TrimSpace(q.ApprovalID); v != "" {
+		tx = tx.Where("approval_id = ?", v)
+	}
 	if v := strings.TrimSpace(q.OperationID); v != "" {
 		tx = tx.Where("operation_id = ?", v)
+	}
+	if v := strings.TrimSpace(q.ActorID); v != "" {
+		tx = tx.Where("actor_id = ?", v)
+	}
+	if v := strings.TrimSpace(q.RiskLevel); v != "" {
+		tx = tx.Where("risk_level = ?", strings.ToUpper(v))
+	}
+	if q.IsOffline != nil {
+		tx = tx.Where("is_offline = ?", *q.IsOffline)
 	}
 	if v := strings.TrimSpace(q.Result); v != "" {
 		tx = tx.Where("result = ?", v)
@@ -210,8 +234,12 @@ func (e *AgentAuditEngine) QueryEvents(q EventQuery, maxLimit int) ([]model.Agen
 		return nil, 0, err
 	}
 
+	orderExpr := "seq DESC"
+	if q.SortAsc {
+		orderExpr = "seq ASC"
+	}
 	var events []model.AgentAuditEvent
-	if err := tx.Order("seq DESC").
+	if err := tx.Order(orderExpr).
 		Offset((page - 1) * pageSize).
 		Limit(pageSize).
 		Find(&events).Error; err != nil {
@@ -230,7 +258,8 @@ func (e *AgentAuditEngine) QueryEvents(q EventQuery, maxLimit int) ([]model.Agen
 func (e *AgentAuditEngine) ExportEvents(q EventQuery, format string) ([]byte, string, string, error) {
 	q.Page = 1
 	q.PageSize = maxExportRows
-	events, _, err := e.QueryEvents(q, maxExportRows)
+	q.SortAsc = true
+	events, total, err := e.QueryEvents(q, maxExportRows)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -299,6 +328,8 @@ func (e *AgentAuditEngine) ExportEvents(q EventQuery, format string) ([]byte, st
 		raw, err := json.MarshalIndent(map[string]interface{}{
 			"exported_at": FormatRFC3339Ms(e.nowUTC()),
 			"count":       len(events),
+			"total":       total,
+			"truncated":   total > int64(len(events)),
 			"events":      events,
 		}, "", "  ")
 		if err != nil {

@@ -2,7 +2,6 @@ package ops
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -165,7 +164,7 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 		return
 	}
 	computed := h.ComputeFingerprint(req.TargetComponent)
-	if computed == "" {
+	if computed == "" || (IsProductionRuntime() && !IsRealBaselineHash(computed, req.TargetComponent)) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   ErrEmptyBaseline.Error(),
 			"message": "failed to compute valid baseline state fingerprint; proposal creation rejected",
@@ -202,11 +201,13 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 			actorType = "internal_service"
 		}
 		actorID := getOperatorName(c)
-		_, runCtx, _ := ae.StartRun(c.Request.Context(), audit.StartRunInput{
+		opID := GenerateOperationID("proposal_create")
+		_, runCtx, startErr := ae.StartRun(c.Request.Context(), audit.StartRunInput{
 			HouseholdID:   req.HouseholdID,
 			TriggerSource: "proposal_create",
 			ActorType:     actorType,
 			ActorID:       actorID,
+			OperationID:   opID,
 			Action:        "proposal.create",
 			Target:        req.TargetComponent,
 			Component:     req.TargetComponent,
@@ -215,29 +216,47 @@ func (h *OpsHandler) CreateProposal(c *gin.Context) {
 			ProposalID:    req.ProposalID,
 			Summary:       req.Title,
 		})
-		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
-			EventType:    model.AuditEventProposalCreated,
-			Action:       "proposal.create",
-			Target:       req.TargetComponent,
-			Component:    req.TargetComponent,
-			Decision:     auditDecisionForRisk(req.RiskLevel),
-			RiskLevel:    strings.ToUpper(req.RiskLevel),
-			ProposalID:   req.ProposalID,
-			Parameters:   map[string]interface{}{"action_spec": redact.StructuredJSON(req.ActionSpec), "execution_policy": req.ExecutionPolicy},
-			AfterState:   map[string]interface{}{"status": req.Status, "baseline_hash": req.BaselineHash},
-			Result:       "CREATED",
-			MirrorLegacy: true,
-		})
-		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
-			EventType:  model.AuditEventApprovalRequested,
-			Action:     "proposal.request_approval",
-			Target:     req.TargetComponent,
-			Component:  req.TargetComponent,
-			Decision:   model.AuditDecisionRequireApproval,
-			RiskLevel:  strings.ToUpper(req.RiskLevel),
-			ProposalID: req.ProposalID,
-			Result:     model.ProposalStatusAwaitingApproval,
-		})
+		var ev1Err, ev2Err error
+		if startErr == nil {
+			_, ev1Err = ae.EmitEvent(runCtx, audit.EmitEventInput{
+				EventType:     model.AuditEventProposalCreated,
+				Action:        "proposal.create",
+				Target:        req.TargetComponent,
+				Component:     req.TargetComponent,
+				Decision:      auditDecisionForRisk(req.RiskLevel),
+				RiskLevel:     strings.ToUpper(req.RiskLevel),
+				ProposalID:    req.ProposalID,
+				OperationID:   opID,
+				Parameters:    map[string]interface{}{"action_spec": redact.StructuredJSON(req.ActionSpec), "execution_policy": req.ExecutionPolicy},
+				AfterState:    map[string]interface{}{"status": req.Status, "baseline_hash": req.BaselineHash},
+				Result:        "CREATED",
+				MirrorLegacy:  true,
+				FailurePolicy: audit.PolicyFailClosed,
+			})
+		}
+		if startErr == nil && ev1Err == nil {
+			_, ev2Err = ae.EmitEvent(runCtx, audit.EmitEventInput{
+				EventType:     model.AuditEventApprovalRequested,
+				Action:        "proposal.request_approval",
+				Target:        req.TargetComponent,
+				Component:     req.TargetComponent,
+				Decision:      model.AuditDecisionRequireApproval,
+				RiskLevel:     strings.ToUpper(req.RiskLevel),
+				ProposalID:    req.ProposalID,
+				OperationID:   opID,
+				Result:        model.ProposalStatusAwaitingApproval,
+				FailurePolicy: audit.PolicyFailClosed,
+			})
+		}
+		if auditErr := errors.Join(startErr, ev1Err, ev2Err); auditErr != nil {
+			GlobalSecurityMetrics.IncAuditFailed()
+			_ = h.db.Unscoped().Delete(&req).Error
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "proposal creation blocked: audit persistence failed",
+				"details": auditErr.Error(),
+			})
+			return
+		}
 	}
 
 	// Publish proposal creation event to EventBus
@@ -478,10 +497,27 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 					log.Printf("[ops] synchronous proposal %s execution succeeded: %s", proposal.ProposalID, res.Output)
 				}
 			} else {
+				sessCopy, hasSess := audit.SessionFromContext(c.Request.Context())
 				go func(prop model.OpsProposal) {
 					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 					defer cancel()
-					_, _ = exec.ExecuteProposal(ctx, &prop)
+					if hasSess {
+						ctx = audit.ContextWithSession(ctx, sessCopy)
+					}
+					if res, err := exec.ExecuteProposal(ctx, &prop); err != nil {
+						log.Printf("[ops] asynchronous proposal %s execution failed: %v", prop.ProposalID, err)
+						RecordSecurityEvent(h.db, h.bus, OpsSecurityEvent{
+							OperationID: prop.ProposalID,
+							EventType:   "ops.proposal.async_execution_failed",
+							Severity:    "warning",
+							Component:   prop.TargetComponent,
+							Actor:       "ops-async-dispatcher",
+							ProposalID:  prop.ProposalID,
+							Message:     err.Error(),
+						})
+					} else if res != nil {
+						log.Printf("[ops] asynchronous proposal %s execution succeeded: %s", prop.ProposalID, res.Output)
+					}
 				}(proposal)
 			}
 		}
@@ -798,8 +834,8 @@ func (h *OpsHandler) recordProposalAudit(prop *model.OpsProposal, operator, acti
 	}
 }
 
-// ComputeFingerprint calculates a deterministic SHA-256 baseline state fingerprint
-// for the given target component to protect against TOCTOU state drift.
+// ComputeFingerprint calculates a deterministic Baseline Protocol v1 SHA-256 state
+// fingerprint for the given target component to protect against TOCTOU state drift.
 func (h *OpsHandler) ComputeFingerprint(component string) string {
 	clean := strings.TrimSpace(component)
 	if clean == "" {
@@ -814,73 +850,21 @@ func (h *OpsHandler) ComputeFingerprint(component string) string {
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	var targetContainer *ContainerSummary
-	matchContainer := func(rawName string) bool {
-		cName := strings.TrimPrefix(strings.TrimSpace(rawName), "/")
-		if cName == "" {
-			return false
-		}
-		if strings.EqualFold(cName, canonical) {
-			return true
-		}
-		if expectedName, ok := canonicalContainerNames[canonical]; ok && strings.EqualFold(cName, expectedName) {
-			return true
-		}
-		return model.CanonicalizeComponent(cName) == canonical
+	if defExec, ok := h.GetExecutor().(*DefaultOperationExecutor); ok && defExec != nil {
+		return defExec.ExtractBaseline(canonical).Hash
 	}
 
-	// 1. Try querying via 1PanelClient if available
-	clientSucceeded := false
-	if h.client != nil && strings.TrimSpace(h.client.baseURL) != "" {
-		if containers, err := h.client.ListContainers(ctx); err == nil {
-			clientSucceeded = true
-			for i := range containers {
-				if matchContainer(containers[i].Name) {
-					targetContainer = &containers[i]
-					break
-				}
-			}
-		} else if IsProductionRuntime() && (errors.Is(err, context.DeadlineExceeded) || strings.Contains(strings.ToLower(err.Error()), "deadline exceeded") || strings.Contains(strings.ToLower(err.Error()), "timeout")) {
-			return ""
-		}
+	sockPath := "/var/run/docker.sock"
+	if h.fallback != nil && strings.TrimSpace(h.fallback.dockerSocket) != "" {
+		sockPath = h.fallback.dockerSocket
 	}
-
-	// 2. Fallback to host Docker inspection via HostFallbackProvider (only if 1Panel did not authoritatively respond)
-	if targetContainer == nil && !clientSucceeded && h.fallback != nil {
-		fallbackContainers := h.fallback.GetHostContainers(ctx)
-		for i := range fallbackContainers {
-			if matchContainer(fallbackContainers[i].Name) {
-				targetContainer = &fallbackContainers[i]
-				break
-			}
-		}
+	tempExec := &DefaultOperationExecutor{
+		db:           h.db,
+		client:       h.client,
+		fallback:     h.fallback,
+		dockerSocket: sockPath,
 	}
-
-	if targetContainer != nil {
-		state := strings.ToLower(strings.TrimSpace(targetContainer.State))
-		if state == "" || state == "unknown" || strings.TrimSpace(targetContainer.Image) == "" {
-			return ""
-		}
-		if IsProductionRuntime() && targetContainer.Status == "Up (host monitored)" && targetContainer.CreatedAt == "" {
-			return ""
-		}
-		hasher := sha256.New()
-		raw := fmt.Sprintf("%s:%s:%s:%s", canonical, targetContainer.Image, targetContainer.State, targetContainer.CreatedAt)
-		hasher.Write([]byte(raw))
-		return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
-	}
-
-	if IsProductionRuntime() {
-		return ""
-	}
-	// Deterministic baseline for offline, uncreated, or test components
-	hasher := sha256.New()
-	raw := fmt.Sprintf("%s:offline:none", canonical)
-	hasher.Write([]byte(raw))
-	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+	return tempExec.ExtractBaseline(canonical).Hash
 }
 
 // InvalidateProposalApproval resets the approval status of a proposal when any bound field is modified.
@@ -962,6 +946,7 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 		origRev = 1
 	}
 
+	prevProposal := proposal
 	updates := make(map[string]interface{})
 	boundFieldChanged := false
 	specNeedsRevalidation := false
@@ -972,7 +957,7 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 		}
 		proposal.TargetComponent = *updateReq.TargetComponent
 		fp := h.ComputeFingerprint(proposal.TargetComponent)
-		if fp == "" {
+		if fp == "" || (IsProductionRuntime() && !IsRealBaselineHash(fp, proposal.TargetComponent)) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": ErrEmptyBaseline.Error()})
 			return
 		}
@@ -1078,7 +1063,7 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 	}
 
 	if ae := h.getAuditEngine(); ae != nil {
-		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+		if _, auditErr := ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
 			HouseholdID:    proposal.HouseholdID,
 			TriggerSource:  "proposal_update",
 			ActorType:      "user",
@@ -1090,13 +1075,42 @@ func (h *OpsHandler) UpdateProposal(c *gin.Context) {
 			Decision:       model.AuditDecisionAllow,
 			RiskLevel:      strings.ToUpper(proposal.RiskLevel),
 			ProposalID:     proposal.ProposalID,
+			OperationID:    GenerateOperationID("proposal_update"),
 			BeforeState:    map[string]interface{}{"status": origStatus, "version": origVersion, "revision": origRev},
 			AfterState:     map[string]interface{}{"status": proposal.Status, "version": proposal.Version, "revision": proposal.Revision, "approval_invalidated": boundFieldChanged},
 			Parameters:     updates,
 			Result:         "UPDATED",
 			FinalRunStatus: model.AuditRunStatusCompleted,
 			MirrorLegacy:   true,
-		})
+			FailurePolicy:  audit.PolicyFailClosed,
+		}); auditErr != nil {
+			GlobalSecurityMetrics.IncAuditFailed()
+			revertUpdates := map[string]interface{}{
+				"target_component": prevProposal.TargetComponent,
+				"baseline_hash":    prevProposal.BaselineHash,
+				"execution_policy": prevProposal.ExecutionPolicy,
+				"action_spec":      prevProposal.ActionSpec,
+				"execution_plan":   prevProposal.ExecutionPlan,
+				"rollback_plan":    prevProposal.RollbackPlan,
+				"scheduled_at":     prevProposal.ScheduledAt,
+				"risk_level":       prevProposal.RiskLevel,
+				"title":            prevProposal.Title,
+				"description":      prevProposal.Description,
+				"status":           prevProposal.Status,
+				"approval_digest":  prevProposal.ApprovalDigest,
+				"approved_by":      prevProposal.ApprovedBy,
+				"approved_at":      prevProposal.ApprovedAt,
+				"version":          prevProposal.Version,
+				"revision":         prevProposal.Revision,
+				"updated_at":       prevProposal.UpdatedAt,
+			}
+			_ = h.db.Model(&model.OpsProposal{}).Where("id = ?", prevProposal.ID).Updates(revertUpdates).Error
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "proposal update blocked (reverted): audit persistence failed",
+				"details": auditErr.Error(),
+			})
+			return
+		}
 	}
 
 	c.JSON(http.StatusOK, proposal)

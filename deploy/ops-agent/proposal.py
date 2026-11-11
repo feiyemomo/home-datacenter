@@ -64,6 +64,81 @@ class ProposalLifecycleManager:
         if self.db_path and os.path.isfile(self.db_path):
             self._load_from_sqlite()
 
+    def _load_row_from_sqlite(self, prop_id: str) -> Tuple[bool, Optional[Dict[str, Any]], str]:
+        """
+        Reads the authoritative proposal row from SQLite inside a read transaction.
+        Returns (table_present, row_dict_or_None, error_msg).
+        """
+        if not self.db_path or not os.path.isfile(self.db_path):
+            return False, None, ""
+        conn = None
+        cur = None
+        try:
+            conn = _open_existing_sqlite(self.db_path, readonly=True)
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute("BEGIN")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_proposals'")
+            if not cur.fetchone():
+                cur.execute("COMMIT")
+                return False, None, ""
+            cur.execute("SELECT * FROM pending_proposals WHERE proposal_id = ? LIMIT 1", (prop_id,))
+            row = cur.fetchone()
+            cur.execute("COMMIT")
+            if not row:
+                return True, None, ""
+            row_keys = set(row.keys())
+            loaded = {
+                "id": row["proposal_id"] or f"prop-{row['id']}",
+                "title": row["title"],
+                "risk_level": row["risk_level"],
+                "action": row["execution_plan"],
+                "rollback_cmd": row["rollback_plan"],
+                "target_component": row["target_component"] or "",
+                "estimated_seconds": row["estimated_seconds"] or 30,
+                "downtime_seconds": row["downtime_seconds"] or 0,
+                "baseline_hash": row["baseline_hash"] if "baseline_hash" in row_keys else "",
+                "action_spec": row["action_spec"] if "action_spec" in row_keys else "",
+                "approval_digest": row["approval_digest"] if "approval_digest" in row_keys else "",
+                "version": int(row["version"] or 1) if "version" in row_keys else 1,
+                "revision": int(row["revision"] or 1) if "revision" in row_keys else 1,
+                "status": row["status"],
+                "approved_by": row["approved_by"],
+                "scheduled_at": row["scheduled_at"],
+            }
+            return True, loaded, ""
+        except Exception as e:
+            if cur is not None:
+                try:
+                    cur.execute("ROLLBACK")
+                except Exception:
+                    pass
+            logger.error(f"[Fail-Closed] Failed to reload proposal {prop_id} from SQLite: {e}")
+            return True, None, str(e)
+        finally:
+            if conn:
+                conn.close()
+
+    def _check_memory_vs_db_consistency(self, mem: Dict[str, Any], db_row: Dict[str, Any]) -> Tuple[bool, str]:
+        """Rejects execution/approval if in-memory proposal fields disagree with authoritative SQLite row."""
+        for field in ("target_component", "action", "rollback_cmd", "risk_level", "baseline_hash", "action_spec"):
+            m_val = str(mem.get(field) or "").strip()
+            d_val = str(db_row.get(field) or "").strip()
+            if m_val and d_val and m_val != d_val:
+                return False, f"In-memory '{field}' disagrees with authoritative SQLite record"
+            if field == "baseline_hash" and m_val != d_val:
+                return False, "In-memory 'baseline_hash' disagrees with authoritative SQLite record"
+        if str(mem.get("approval_digest") or "").strip() != str(db_row.get("approval_digest") or "").strip():
+            if mem.get("approval_digest") or db_row.get("approval_digest"):
+                return False, "In-memory 'approval_digest' disagrees with authoritative SQLite record"
+        if int(mem.get("version") or 1) != int(db_row.get("version") or 1):
+            return False, "In-memory 'version' disagrees with authoritative SQLite record"
+        mem_rev = int(mem.get("revision") or 0)
+        db_rev = int(db_row.get("revision") or 0)
+        if mem_rev > 0 and db_rev > 0 and mem_rev != db_rev:
+            return False, f"CAS revision mismatch: memory revision={mem_rev} != SQLite revision={db_rev}"
+        return True, "ok"
+
     def _validate_proposal_baseline(self, proposal: Dict[str, Any], phase: str) -> Tuple[bool, str]:
         """
         Validates component resolution and real BaselineHash integrity (R5).
@@ -139,6 +214,7 @@ class ProposalLifecycleManager:
             "action_spec": action_spec,
             "approval_digest": approval_digest,
             "version": int(version or 1),
+            "revision": 1,
             "status": self.STATE_AWAITING,
             "created_at": now,
             "approved_at": None,
@@ -171,6 +247,18 @@ class ProposalLifecycleManager:
         if not proposal:
             return False, "Proposal not found"
 
+        if self.db_path and os.path.isfile(self.db_path):
+            tbl_present, db_row, db_err = self._load_row_from_sqlite(prop_id)
+            if db_err:
+                return False, f"SQLite read failure during approval: {db_err}"
+            if tbl_present:
+                if db_row is None:
+                    return False, "Proposal not found in authoritative SQLite store"
+                ok_cons, cons_msg = self._check_memory_vs_db_consistency(proposal, db_row)
+                if not ok_cons:
+                    return False, cons_msg
+                proposal.update({k: v for k, v in db_row.items() if k in proposal})
+
         if proposal["status"] != self.STATE_AWAITING:
             return False, f"Invalid state transition from {proposal['status']}: must be AWAITING_APPROVAL first"
 
@@ -180,6 +268,7 @@ class ProposalLifecycleManager:
             return False, base_msg
 
         now = time.time()
+        prev_status = proposal["status"]
         proposal["approved_at"] = now
         proposal["approved_by"] = approver
 
@@ -191,8 +280,13 @@ class ProposalLifecycleManager:
             proposal["status"] = self.STATE_APPROVED
             msg = f"Proposal {prop_id} approved successfully"
 
-        if self.db_path:
-            self._update_sqlite_status(proposal)
+        if self.db_path and os.path.isfile(self.db_path):
+            ok_upd, upd_err = self._update_sqlite_status(proposal, expected_statuses=(prev_status,))
+            if not ok_upd:
+                proposal["status"] = prev_status
+                proposal["approved_at"] = None
+                proposal["approved_by"] = None
+                return False, f"Failed to persist approval CAS in SQLite: {upd_err}"
 
         logger.info(msg)
         return True, msg
@@ -213,8 +307,24 @@ class ProposalLifecycleManager:
         if not proposal:
             return False, "Proposal not found"
 
+        if self.db_path and os.path.isfile(self.db_path):
+            tbl_present, db_row, db_err = self._load_row_from_sqlite(prop_id)
+            if db_err:
+                return False, f"SQLite read failure before execution: {db_err}"
+            if tbl_present:
+                if db_row is None:
+                    return False, "Proposal not found in authoritative SQLite store"
+                ok_cons, cons_msg = self._check_memory_vs_db_consistency(proposal, db_row)
+                if not ok_cons:
+                    logger.error(f"Rejecting execution for proposal {prop_id}: {cons_msg}")
+                    return False, cons_msg
+                proposal.update({k: v for k, v in db_row.items() if k in proposal})
+
         if proposal["status"] not in (self.STATE_APPROVED, self.STATE_SCHEDULED):
             return False, f"Cannot execute proposal in state {proposal['status']}: must be APPROVED first"
+
+        if is_production_env() and not str(proposal.get("approval_digest") or "").strip():
+            return False, "Missing approval_digest: refusing execution in production"
 
         ok_base, base_msg = self._validate_proposal_baseline(proposal, "execution")
         if not ok_base:
@@ -272,29 +382,30 @@ class ProposalLifecycleManager:
                 logger.error(f"Proposal {prop_id} execution ambiguous failure via Go Core: {e}")
                 return False, f"Execution failed via Go Core (EXECUTION_UNKNOWN): {e}"
 
-        env_mode = os.environ.get("ENVIRONMENT", os.environ.get("APP_ENV", os.environ.get("ENV", ""))).strip().lower()
-        is_prod = env_mode in ("production", "prod") or (
-            env_mode not in ("development", "dev", "test", "testing") and os.path.exists("/.dockerenv")
-        )
-        if is_prod:
+        if is_production_env():
             logger.critical(f"[Fail-Closed] Refusing local proposal {prop_id} execution without Go Core API in production.")
             return False, "Go Core API URL required for proposal execution in production"
 
+        prev_status = proposal["status"]
         proposal["status"] = self.STATE_EXECUTING
 
         if simulate_failure:
             # Trigger rollback command
             proposal["status"] = self.STATE_FAILED_ROLLEDBACK
             proposal["rollback_executed"] = True
-            if self.db_path:
-                self._update_sqlite_status(proposal)
+            if self.db_path and os.path.isfile(self.db_path):
+                ok_upd, upd_err = self._update_sqlite_status(proposal, expected_statuses=(prev_status,))
+                if not ok_upd:
+                    return False, f"Failed to persist rollback status in SQLite: {upd_err}"
             logger.error(f"Proposal {prop_id} execution failed! Executed rollback command: {proposal['rollback_cmd']}")
             return False, "Execution failed: auto-rollback triggered"
 
         proposal["status"] = self.STATE_EXECUTED
         proposal["executed_at"] = time.time()
-        if self.db_path:
-            self._update_sqlite_status(proposal)
+        if self.db_path and os.path.isfile(self.db_path):
+            ok_upd, upd_err = self._update_sqlite_status(proposal, expected_statuses=(prev_status,))
+            if not ok_upd:
+                return False, f"Failed to persist executed status in SQLite: {upd_err}"
 
         logger.info(f"Proposal {prop_id} executed successfully: {proposal['action']}")
         return True, "Executed successfully"
@@ -377,72 +488,116 @@ class ProposalLifecycleManager:
         conn = None
         try:
             conn = _open_existing_sqlite(self.db_path, readonly=False)
-            with conn:
-                cols = {str(c[1]).lower() for c in conn.execute("PRAGMA table_info(pending_proposals)").fetchall()}
-                if "baseline_hash" in cols:
-                    conn.execute("""
-                        INSERT INTO pending_proposals
-                        (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, baseline_hash, status, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                        ON CONFLICT(proposal_id) DO NOTHING
-                    """, (
-                        prop["id"],
-                        prop["title"],
-                        prop["risk_level"],
-                        prop["action"],
-                        prop["rollback_cmd"],
-                        prop["target_component"],
-                        prop["estimated_seconds"],
-                        prop["downtime_seconds"],
-                        prop.get("baseline_hash", ""),
-                        prop["status"]
-                    ))
-                else:
-                    conn.execute("""
-                        INSERT INTO pending_proposals
-                        (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, status, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-                        ON CONFLICT(proposal_id) DO NOTHING
-                    """, (
-                        prop["id"],
-                        prop["title"],
-                        prop["risk_level"],
-                        prop["action"],
-                        prop["rollback_cmd"],
-                        prop["target_component"],
-                        prop["estimated_seconds"],
-                        prop["downtime_seconds"],
-                        prop["status"]
-                    ))
+            conn.isolation_level = None
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_proposals'")
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                return
+            cols = {str(c[1]).lower() for c in cur.execute("PRAGMA table_info(pending_proposals)").fetchall()}
+            if "baseline_hash" in cols:
+                cur.execute("""
+                    INSERT INTO pending_proposals
+                    (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, baseline_hash, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(proposal_id) DO NOTHING
+                """, (
+                    prop["id"],
+                    prop["title"],
+                    prop["risk_level"],
+                    prop["action"],
+                    prop["rollback_cmd"],
+                    prop["target_component"],
+                    prop["estimated_seconds"],
+                    prop["downtime_seconds"],
+                    prop.get("baseline_hash", ""),
+                    prop["status"]
+                ))
+            else:
+                cur.execute("""
+                    INSERT INTO pending_proposals
+                    (proposal_id, title, risk_level, execution_plan, rollback_plan, target_component, estimated_seconds, downtime_seconds, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+                    ON CONFLICT(proposal_id) DO NOTHING
+                """, (
+                    prop["id"],
+                    prop["title"],
+                    prop["risk_level"],
+                    prop["action"],
+                    prop["rollback_cmd"],
+                    prop["target_component"],
+                    prop["estimated_seconds"],
+                    prop["downtime_seconds"],
+                    prop["status"]
+                ))
+            cur.execute("COMMIT")
         except Exception as e:
-            logger.debug(f"SQLite persist note: {e}")
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            logger.error(f"[Fail-Closed] SQLite proposal persist error for {prop.get('id')}: {e}")
+            raise
         finally:
             if conn:
                 conn.close()
 
-    def _update_sqlite_status(self, prop: Dict[str, Any]) -> None:
+    def _update_sqlite_status(
+        self,
+        prop: Dict[str, Any],
+        expected_statuses: Optional[Tuple[str, ...]] = None,
+    ) -> Tuple[bool, str]:
         if not self.db_path or not os.path.isfile(self.db_path):
-            return
+            return True, "no_db"
         # Go Core is sole authority for SCHEDULED and authoritative status transitions
         if prop.get("status") == self.STATE_SCHEDULED or self.go_api_url:
             logger.debug(f"Skipping direct SQLite status write for proposal {prop.get('id')}; Go Core owns authoritative transitions")
-            return
+            return True, "delegated_to_core"
         conn = None
         try:
             conn = _open_existing_sqlite(self.db_path, readonly=False)
-            with conn:
-                conn.execute("""
-                    UPDATE pending_proposals
-                    SET status = ?, approved_by = ?, scheduled_at = ?, updated_at = datetime('now')
-                    WHERE proposal_id = ?
-                """, (
-                    prop["status"],
-                    prop.get("approved_by"),
-                    prop.get("scheduled_at"),
-                    prop["id"]
-                ))
+            conn.isolation_level = None
+            cur = conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pending_proposals'")
+            if not cur.fetchone():
+                cur.execute("ROLLBACK")
+                return True, "no_table"
+            cols = {str(c[1]).lower() for c in cur.execute("PRAGMA table_info(pending_proposals)").fetchall()}
+            set_clauses = ["status = ?", "approved_by = ?", "scheduled_at = ?", "updated_at = datetime('now')"]
+            params: List[Any] = [prop["status"], prop.get("approved_by"), prop.get("scheduled_at")]
+            if "revision" in cols:
+                set_clauses.append("revision = revision + 1")
+
+            where_clauses = ["proposal_id = ?"]
+            where_params: List[Any] = [prop["id"]]
+            if expected_statuses:
+                placeholders = ",".join("?" for _ in expected_statuses)
+                where_clauses.append(f"status IN ({placeholders})")
+                where_params.extend(expected_statuses)
+            if "revision" in cols and prop.get("revision"):
+                where_clauses.append("revision = ?")
+                where_params.append(int(prop["revision"]))
+
+            sql = f"UPDATE pending_proposals SET {', '.join(set_clauses)} WHERE {' AND '.join(where_clauses)}"
+            cur.execute(sql, params + where_params)
+            if cur.rowcount != 1:
+                cur.execute("ROLLBACK")
+                return False, "CAS conflict or missing proposal row"
+            cur.execute("COMMIT")
+            if "revision" in cols:
+                prop["revision"] = int(prop.get("revision") or 1) + 1
+            return True, "ok"
         except Exception as e:
-            logger.debug(f"SQLite update note: {e}")
+            if conn:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+            logger.error(f"[Fail-Closed] SQLite status update error for {prop.get('id')}: {e}")
+            return False, str(e)
         finally:
             if conn:
                 conn.close()

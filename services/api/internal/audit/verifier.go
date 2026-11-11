@@ -1,7 +1,9 @@
 package audit
 
 import (
+	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"home-datacenter-api/internal/model"
@@ -44,9 +46,10 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 		streamID = model.AuditPrimaryStreamID
 	}
 	res := VerifyResult{
-		StreamID:       streamID,
-		LimitationNote: localNASLimitationNote,
-		VerifiedAt:     FormatRFC3339Ms(e.nowUTC()),
+		StreamID:         streamID,
+		SecurityBoundary: buildSecurityBoundaryNote(e != nil && e.remoteStore != nil, false, false, false, false),
+		LimitationNote:   localNASLimitationNote,
+		VerifiedAt:       FormatRFC3339Ms(e.nowUTC()),
 	}
 
 	if e == nil || e.db == nil {
@@ -54,6 +57,14 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 		res.FailureReason = "audit database unavailable"
 		return res
 	}
+
+	verifyRemote := e.remoteStore != nil && (req.VerifyRemote == nil || *req.VerifyRemote)
+	_, extVerifier := e.activeExternalSignerAndVerifier()
+	if e.remoteStore != nil {
+		res.RemoteStoreConfigured = true
+		res.RemoteStoreType = e.remoteStore.Type()
+	}
+	res.SecurityBoundary = buildSecurityBoundaryNote(e.remoteStore != nil, false, false, extVerifier != nil, false)
 
 	_, ring, err := ResolveAuditHMACKeyring()
 	if err != nil {
@@ -121,6 +132,18 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 
 	// Honest non-empty guarantee: never return Valid=true when count == 0.
 	if len(events) == 0 {
+		if verifyRemote {
+			rep := e.CompareWithRemote(context.Background(), streamID)
+			res.RemoteSyncStatus = rep.Status
+			res.RemoteTailSeq = rep.RemoteTailSeq
+			res.RemoteTailHash = rep.RemoteTailHash
+			res.SecurityBoundary = buildSecurityBoundaryNote(true, rep.Reachable, false, extVerifier != nil, rep.ExternalSigVerified)
+			if rep.Status == RemoteStatusDBRollback || rep.Status == RemoteStatusTailTruncated || rep.RemoteTailSeq > 0 {
+				res.IntegrityStatus = IntegrityDBRollbackDetected
+				res.FailureReason = fmt.Sprintf("whole-DB rollback/truncation detected against remote store (%s): %s", rep.StoreType, strings.Join(rep.Discrepancies, "; "))
+				return res
+			}
+		}
 		var runCount int64
 		_ = e.db.Model(&model.AgentAuditRun{}).Count(&runCount).Error
 		if latestCP != nil || runCount > 0 {
@@ -178,6 +201,12 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 			res.FailureReason = fmt.Sprintf("HMAC verification failed at seq=%d: %v", ev.Seq, macErr)
 			return res
 		}
+		if ev.KeyID != "" && ev.KeyID != kid {
+			res.IntegrityStatus = IntegrityHMACInvalid
+			res.BrokenAtSeq = ev.Seq
+			res.FailureReason = fmt.Sprintf("key_id mismatch at seq=%d: column=%q signature=%q", ev.Seq, ev.KeyID, kid)
+			return res
+		}
 		keyUsedSet[kid] = true
 		expectedPrevHash = ev.EntryHash
 		expectedSeq++
@@ -190,20 +219,30 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 	for kid := range keyUsedSet {
 		res.KeyIDsUsed = append(res.KeyIDsUsed, kid)
 	}
+	sort.Strings(res.KeyIDsUsed)
+
+	var dbMaxSeq uint64
+	_ = e.db.Model(&model.AgentAuditEvent{}).Where("stream_id = ?", streamID).Select("COALESCE(MAX(seq), 0)").Scan(&dbMaxSeq).Error
 
 	// Verify checkpoints and tail truncation when verifying full stream or checkpoints requested.
 	if req.VerifyCheckpoints {
-		allCheckpoints := append([]model.AgentAuditCheckpoint{}, dbCheckpoints...)
-		allCheckpoints = append(allCheckpoints, extCheckpoints...)
-
 		prevChainDigest := model.AuditGenesisHash
-		// Track DB checkpoint chain digest order separately from external file mirror.
+		dbCPByID := make(map[string]model.AgentAuditCheckpoint, len(dbCheckpoints))
+		allDBExtSigsOK := extVerifier != nil && len(dbCheckpoints) > 0
 		for _, cp := range dbCheckpoints {
 			if err := VerifyCheckpointHMAC(&cp, ring); err != nil {
 				res.IntegrityStatus = IntegrityHMACInvalid
 				res.BrokenAtSeq = cp.ToSeq
 				res.FailureReason = fmt.Sprintf("checkpoint %s HMAC invalid: %v", cp.CheckpointID, err)
 				return res
+			}
+			if extVerifier != nil {
+				if err := extVerifier.VerifyCheckpointExternal(&cp); err != nil {
+					res.IntegrityStatus = IntegrityHMACInvalid
+					res.BrokenAtSeq = cp.ToSeq
+					res.FailureReason = fmt.Sprintf("checkpoint %s external asymmetric signature invalid: %v", cp.CheckpointID, err)
+					return res
+				}
 			}
 			expectedDigest := ComputeCheckpointChainDigest(prevChainDigest, cp.TailEntryHash, cp.EventCount)
 			if cp.PrevChainDigest != prevChainDigest || cp.ChainDigest != expectedDigest {
@@ -213,20 +252,60 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 				return res
 			}
 			prevChainDigest = cp.ChainDigest
+			dbCPByID[cp.CheckpointID] = cp
 			res.CheckedCheckpoints++
 		}
+		if allDBExtSigsOK {
+			res.ExternalSigVerified = true
+		}
 
-		for _, cp := range allCheckpoints {
+		// Verify external checkpoints chain continuity and cross-check against DB checkpoints.
+		extPrevDigest := model.AuditGenesisHash
+		for _, cp := range extCheckpoints {
 			if err := VerifyCheckpointHMAC(&cp, ring); err != nil {
 				res.IntegrityStatus = IntegrityHMACInvalid
 				res.BrokenAtSeq = cp.ToSeq
 				res.FailureReason = fmt.Sprintf("external checkpoint %s HMAC invalid: %v", cp.CheckpointID, err)
 				return res
 			}
-			if res.TailSeq < cp.ToSeq && req.ToSeq == 0 {
+			if extVerifier != nil {
+				if err := extVerifier.VerifyCheckpointExternal(&cp); err != nil {
+					res.IntegrityStatus = IntegrityHMACInvalid
+					res.BrokenAtSeq = cp.ToSeq
+					res.FailureReason = fmt.Sprintf("external checkpoint %s asymmetric signature invalid: %v", cp.CheckpointID, err)
+					return res
+				}
+			}
+			expectedExtDigest := ComputeCheckpointChainDigest(extPrevDigest, cp.TailEntryHash, cp.EventCount)
+			if cp.PrevChainDigest != extPrevDigest || cp.ChainDigest != expectedExtDigest {
+				res.IntegrityStatus = IntegrityHashMismatch
+				res.BrokenAtSeq = cp.ToSeq
+				res.FailureReason = fmt.Sprintf("external checkpoint %s chain_digest mismatch", cp.CheckpointID)
+				return res
+			}
+			extPrevDigest = cp.ChainDigest
+			if dbCP, exists := dbCPByID[cp.CheckpointID]; exists {
+				if dbCP.ChainDigest != cp.ChainDigest || dbCP.TailEntryHash != cp.TailEntryHash || dbCP.ToSeq != cp.ToSeq {
+					res.IntegrityStatus = IntegrityHashMismatch
+					res.BrokenAtSeq = cp.ToSeq
+					res.FailureReason = fmt.Sprintf("DB checkpoint %s diverges from external checkpoint log", cp.CheckpointID)
+					return res
+				}
+			} else if len(dbCheckpoints) > 0 && cp.ToSeq <= dbMaxSeq {
 				res.IntegrityStatus = IntegrityTruncatedTail
-				res.BrokenAtSeq = res.TailSeq + 1
-				res.FailureReason = fmt.Sprintf("tail truncation detected: DB tail_seq=%d < checkpoint to_seq=%d (%s)", res.TailSeq, cp.ToSeq, cp.CheckpointID)
+				res.BrokenAtSeq = cp.ToSeq
+				res.FailureReason = fmt.Sprintf("external checkpoint %s missing from DB checkpoints table", cp.CheckpointID)
+				return res
+			}
+		}
+
+		allCheckpoints := append([]model.AgentAuditCheckpoint{}, dbCheckpoints...)
+		allCheckpoints = append(allCheckpoints, extCheckpoints...)
+		for _, cp := range allCheckpoints {
+			if dbMaxSeq < cp.ToSeq {
+				res.IntegrityStatus = IntegrityTruncatedTail
+				res.BrokenAtSeq = dbMaxSeq + 1
+				res.FailureReason = fmt.Sprintf("tail truncation detected: DB tail_seq=%d < checkpoint to_seq=%d (%s)", dbMaxSeq, cp.ToSeq, cp.CheckpointID)
 				return res
 			}
 			if req.FromSeq <= cp.FromSeq && (req.ToSeq == 0 || req.ToSeq >= cp.ToSeq) {
@@ -253,8 +332,51 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 		return res
 	}
 
+	if verifyRemote {
+		rep := e.CompareWithRemote(context.Background(), streamID)
+		res.RemoteStoreConfigured = rep.Configured
+		res.RemoteStoreType = rep.StoreType
+		res.RemoteSyncStatus = rep.Status
+		res.RemoteTailSeq = rep.RemoteTailSeq
+		res.RemoteTailHash = rep.RemoteTailHash
+		if rep.ExternalSigVerified {
+			res.ExternalSigVerified = true
+		}
+		res.SecurityBoundary = buildSecurityBoundaryNote(
+			rep.Configured,
+			rep.Reachable,
+			rep.Status == RemoteStatusInSync,
+			extVerifier != nil,
+			res.ExternalSigVerified,
+		)
+		switch rep.Status {
+		case RemoteStatusDBRollback:
+			res.Valid = false
+			res.IntegrityStatus = IntegrityDBRollbackDetected
+			res.FailureReason = strings.Join(rep.Discrepancies, "; ")
+			return res
+		case RemoteStatusChainDiverged:
+			res.Valid = false
+			res.IntegrityStatus = IntegrityChainDiverged
+			res.FailureReason = strings.Join(rep.Discrepancies, "; ")
+			return res
+		case RemoteStatusTailTruncated:
+			res.Valid = false
+			res.IntegrityStatus = IntegrityTruncatedTail
+			res.FailureReason = strings.Join(rep.Discrepancies, "; ")
+			return res
+		case RemoteStatusCheckpointMismatch:
+			res.Valid = false
+			res.IntegrityStatus = IntegrityCheckpointMismatch
+			res.FailureReason = strings.Join(rep.Discrepancies, "; ")
+			return res
+		}
+	}
+
 	res.Valid = true
-	if res.CheckedCheckpoints > 0 || res.LastCheckpointID != "" {
+	if res.RemoteStoreConfigured && res.RemoteSyncStatus == RemoteStatusInSync {
+		res.IntegrityStatus = IntegrityVerifiedAgainstRemote
+	} else if res.CheckedCheckpoints > 0 || res.LastCheckpointID != "" {
 		res.IntegrityStatus = IntegrityVerifiedAgainstCheckpoint
 	} else {
 		res.IntegrityStatus = IntegrityChainIntactLocalOnly
@@ -262,26 +384,127 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 	return res
 }
 
-// VerifyRunChain verifies the primary stream and ensures all events of a given run_id match computed hashes.
+// VerifyRunChain verifies triggers, hashes, predecessor links, HMACs, and covering checkpoints for a household-scoped run_id.
 func (e *AgentAuditEngine) VerifyRunChain(runID string, householdID uint) VerifyResult {
-	res := e.VerifyChain(VerifyRequest{
-		StreamID:          model.AuditPrimaryStreamID,
-		VerifyCheckpoints: true,
-		VerifyTriggers:    true,
-	})
-	if !res.Valid {
+	res := VerifyResult{
+		StreamID:       model.AuditPrimaryStreamID,
+		LimitationNote: localNASLimitationNote,
+		VerifiedAt:     FormatRFC3339Ms(e.nowUTC()),
+	}
+	if e == nil || e.db == nil || strings.TrimSpace(runID) == "" || householdID == 0 {
+		res.IntegrityStatus = IntegrityUnverifiable
+		res.FailureReason = "audit database or run scope unavailable"
 		return res
 	}
-	var count int64
-	if e != nil && e.db != nil {
-		_ = e.db.Model(&model.AgentAuditEvent{}).
-			Where("run_id = ? AND household_id = ?", runID, householdID).
-			Count(&count).Error
+	_, ring, err := ResolveAuditHMACKeyring()
+	if err != nil {
+		res.IntegrityStatus = IntegrityHMACInvalid
+		res.FailureReason = fmt.Sprintf("audit keyring unavailable: %v", err)
+		return res
 	}
-	if count == 0 {
-		res.Valid = false
+	triggersOK, trigReason := e.VerifyTriggers()
+	res.TriggersIntact = triggersOK
+	if !triggersOK {
+		res.IntegrityStatus = IntegrityTriggerMissing
+		res.FailureReason = trigReason
+		return res
+	}
+
+	var events []model.AgentAuditEvent
+	if err := e.db.Where("run_id = ? AND household_id = ?", strings.TrimSpace(runID), householdID).
+		Order("seq ASC").Find(&events).Error; err != nil {
+		res.IntegrityStatus = IntegrityUnverifiable
+		res.FailureReason = fmt.Sprintf("failed to load run events: %v", err)
+		return res
+	}
+	if len(events) == 0 {
 		res.IntegrityStatus = IntegrityUnverifiable
 		res.FailureReason = "run has no verified audit events"
+		return res
+	}
+
+	keyUsedSet := make(map[string]bool)
+	res.HeadSeq = events[0].Seq
+	for _, ev := range events {
+		expectedPrev := model.AuditGenesisHash
+		if ev.Seq > 1 {
+			var prevHash string
+			if err := e.db.Model(&model.AgentAuditEvent{}).
+				Where("stream_id = ? AND seq = ?", ev.StreamID, ev.Seq-1).
+				Select("entry_hash").Scan(&prevHash).Error; err != nil || prevHash == "" {
+				res.IntegrityStatus = IntegritySeqGap
+				res.BrokenAtSeq = ev.Seq - 1
+				res.FailureReason = fmt.Sprintf("missing predecessor seq %d", ev.Seq-1)
+				return res
+			}
+			expectedPrev = prevHash
+		}
+		if ev.PreviousHash != expectedPrev {
+			res.IntegrityStatus = IntegrityHashMismatch
+			res.BrokenAtSeq = ev.Seq
+			res.FailureReason = fmt.Sprintf("previous_hash mismatch at seq=%d", ev.Seq)
+			return res
+		}
+		computed, hErr := ComputeEventEntryHash(&ev)
+		if hErr != nil || computed != ev.EntryHash {
+			res.IntegrityStatus = IntegrityHashMismatch
+			res.BrokenAtSeq = ev.Seq
+			res.FailureReason = fmt.Sprintf("entry_hash tamper detected at seq=%d", ev.Seq)
+			return res
+		}
+		kid, macErr := VerifyEventHMAC(&ev, ring)
+		if macErr != nil || (ev.KeyID != "" && ev.KeyID != kid) {
+			res.IntegrityStatus = IntegrityHMACInvalid
+			res.BrokenAtSeq = ev.Seq
+			res.FailureReason = fmt.Sprintf("HMAC verification failed at seq=%d", ev.Seq)
+			return res
+		}
+		keyUsedSet[kid] = true
+		res.CheckedEvents++
+		res.TailSeq = ev.Seq
+		res.TailEntryHash = ev.EntryHash
+	}
+	for kid := range keyUsedSet {
+		res.KeyIDsUsed = append(res.KeyIDsUsed, kid)
+	}
+	sort.Strings(res.KeyIDsUsed)
+
+	_, extVerifier := e.activeExternalSignerAndVerifier()
+	if e.remoteStore != nil {
+		res.RemoteStoreConfigured = true
+		res.RemoteStoreType = e.remoteStore.Type()
+	}
+
+	var cps []model.AgentAuditCheckpoint
+	_ = e.db.Where("stream_id = ? AND to_seq >= ?", model.AuditPrimaryStreamID, res.TailSeq).
+		Order("to_seq ASC").Find(&cps).Error
+	allExtSigsOK := extVerifier != nil && len(cps) > 0
+	for _, cp := range cps {
+		if err := VerifyCheckpointHMAC(&cp, ring); err != nil {
+			res.IntegrityStatus = IntegrityHMACInvalid
+			res.BrokenAtSeq = cp.ToSeq
+			res.FailureReason = fmt.Sprintf("checkpoint %s HMAC invalid", cp.CheckpointID)
+			return res
+		}
+		if extVerifier != nil {
+			if err := extVerifier.VerifyCheckpointExternal(&cp); err != nil {
+				res.IntegrityStatus = IntegrityHMACInvalid
+				res.BrokenAtSeq = cp.ToSeq
+				res.FailureReason = fmt.Sprintf("checkpoint %s external asymmetric signature invalid", cp.CheckpointID)
+				return res
+			}
+		}
+		res.CheckedCheckpoints++
+		res.LastCheckpointID = cp.CheckpointID
+		res.LastCheckpointSeq = cp.ToSeq
+	}
+	res.ExternalSigVerified = allExtSigsOK
+	res.SecurityBoundary = buildSecurityBoundaryNote(res.RemoteStoreConfigured, false, false, extVerifier != nil, res.ExternalSigVerified)
+	res.Valid = true
+	if res.CheckedCheckpoints > 0 {
+		res.IntegrityStatus = IntegrityVerifiedAgainstCheckpoint
+	} else {
+		res.IntegrityStatus = IntegrityChainIntactLocalOnly
 	}
 	return res
 }

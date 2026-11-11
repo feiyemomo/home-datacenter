@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/hostsec"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/security"
@@ -23,30 +25,36 @@ import (
 
 // AllowedCoreContainers defines the security whitelist of containers that may be restarted via API.
 var AllowedCoreContainers = map[string]bool{
-	"home-api":          true,
-	"home-web":          true,
-	"home-frigate":      true,
-	"home-mosquitto":    true,
-	"home-vision":       true,
-	"home-cloudflared":  true,
-	"home-h3c-keepalive": true,
-	"home-new-api":      true,
-	"home-ops-agent":    true,
-	"home-backup":       true,
-	"mihomo":            true,
-	"tailscale":         true,
+	"home-api":              true,
+	"home-web":              true,
+	"home-frigate":          true,
+	"home-mosquitto":        true,
+	"home-vision":           true,
+	"home-cloudflared":      true,
+	"home-h3c-keepalive":    true,
+	"home-new-api":          true,
+	"home-ops-agent":        true,
+	"home-backup":           true,
+	"mihomo":                true,
+	"tailscale":             true,
+	"openresty":             true,
+	"1Panel-openresty-WuDU": true,
+	"1pwaf":                 true,
 }
 
 // OpsHandler manages BFF endpoints for 1Panel and datacenter ops.
 type OpsHandler struct {
-	client      *OnePanelClient
-	fallback    *HostFallbackProvider
-	db          *gorm.DB
-	bus         *eventbus.Bus
-	defenseMgr  *security.DefenseManager
-	executor    OperationExecutor
-	vulnScanner *VulnScanner
-	auditEngine *audit.AgentAuditEngine
+	client         *OnePanelClient
+	fallback       *HostFallbackProvider
+	db             *gorm.DB
+	bus            *eventbus.Bus
+	defenseMgr     *security.DefenseManager
+	executor       OperationExecutor
+	vulnScanner    *VulnScanner
+	auditEngine    *audit.AgentAuditEngine
+	hostProvider   hostsec.HostSecurityProvider
+	hostMonitor    *security.HostSecurityMonitor
+	hostUpdateExec *hostsec.HostUpdateExecutor
 
 	mu                  sync.RWMutex
 	newAPIFailCount     int
@@ -58,10 +66,101 @@ func (h *OpsHandler) SetAuditEngine(ae *audit.AgentAuditEngine) {
 	h.mu.Lock()
 	h.auditEngine = ae
 	exec := h.executor
+	mon := h.hostMonitor
+	hue := h.hostUpdateExec
 	h.mu.Unlock()
 	if defExec, ok := exec.(*DefaultOperationExecutor); ok && defExec != nil {
 		defExec.SetAuditEngine(ae)
 	}
+	if mon != nil {
+		mon.SetAuditEngine(ae)
+	}
+	if hue != nil {
+		hue.AuditEngine = ae
+	}
+}
+
+func (h *OpsHandler) dockerSocketPath() string {
+	if h.fallback != nil && strings.TrimSpace(h.fallback.dockerSocket) != "" {
+		return h.fallback.dockerSocket
+	}
+	if envSock := strings.TrimSpace(os.Getenv("DOCKER_SOCKET")); envSock != "" {
+		return envSock
+	}
+	return "/var/run/docker.sock"
+}
+
+// SetHostSecurityProvider configures the read-only host asset provider on OpsHandler and its executor.
+func (h *OpsHandler) SetHostSecurityProvider(p hostsec.HostSecurityProvider) {
+	h.mu.Lock()
+	h.hostProvider = p
+	exec := h.executor
+	h.mu.Unlock()
+	if defExec, ok := exec.(*DefaultOperationExecutor); ok && defExec != nil {
+		defExec.SetHostSecurityProvider(p)
+	}
+}
+
+// GetHostSecurityProvider returns the configured HostSecurityProvider, lazily creating a default if needed.
+func (h *OpsHandler) GetHostSecurityProvider() hostsec.HostSecurityProvider {
+	h.mu.RLock()
+	p := h.hostProvider
+	h.mu.RUnlock()
+	if p != nil {
+		return p
+	}
+	def := hostsec.NewDefaultHostSecurityProvider(strings.TrimSpace(os.Getenv("HOST_ROOT")), h.dockerSocketPath())
+	h.SetHostSecurityProvider(def)
+	return def
+}
+
+// SetHostSecurityMonitor configures the R9.3 HostSecurityMonitor on OpsHandler.
+func (h *OpsHandler) SetHostSecurityMonitor(m *security.HostSecurityMonitor) {
+	h.mu.Lock()
+	h.hostMonitor = m
+	h.mu.Unlock()
+}
+
+// GetHostSecurityMonitor returns the configured HostSecurityMonitor, lazily creating one if needed.
+func (h *OpsHandler) GetHostSecurityMonitor() *security.HostSecurityMonitor {
+	h.mu.RLock()
+	m := h.hostMonitor
+	h.mu.RUnlock()
+	if m != nil {
+		return m
+	}
+	created := security.NewHostSecurityMonitor(strings.TrimSpace(os.Getenv("HOST_ROOT")), h.dockerSocketPath(), h.defenseMgr, h.getAuditEngine())
+	h.mu.Lock()
+	if h.hostMonitor == nil {
+		h.hostMonitor = created
+	}
+	m = h.hostMonitor
+	h.mu.Unlock()
+	return m
+}
+
+// SetHostUpdateExecutor configures the guarded R9.4 HostUpdateExecutor on OpsHandler and its executor.
+func (h *OpsHandler) SetHostUpdateExecutor(hue *hostsec.HostUpdateExecutor) {
+	h.mu.Lock()
+	h.hostUpdateExec = hue
+	exec := h.executor
+	h.mu.Unlock()
+	if defExec, ok := exec.(*DefaultOperationExecutor); ok && defExec != nil {
+		defExec.SetHostUpdateExecutor(hue)
+	}
+}
+
+// GetHostUpdateExecutor returns the configured HostUpdateExecutor.
+func (h *OpsHandler) GetHostUpdateExecutor() *hostsec.HostUpdateExecutor {
+	h.mu.RLock()
+	hue := h.hostUpdateExec
+	h.mu.RUnlock()
+	if hue != nil {
+		return hue
+	}
+	created := hostsec.NewHostUpdateExecutor(strings.TrimSpace(os.Getenv("HOST_ROOT")), strings.TrimSpace(os.Getenv("HOST_SNAPSHOT_DIR")), h.getAuditEngine())
+	h.SetHostUpdateExecutor(created)
+	return created
 }
 
 func (h *OpsHandler) getAuditEngine() *audit.AgentAuditEngine {
@@ -178,30 +277,41 @@ func (h *OpsHandler) GetOnePanelSession(c *gin.Context) {
 	if ae := h.getAuditEngine(); ae != nil {
 		resStr := "SUCCESS"
 		errStr := ""
+		evType := model.AuditEventExecutionCompleted
+		runFinal := model.AuditRunStatusCompleted
 		if err != nil {
 			resStr = "FAILED"
 			errStr = err.Error()
+			evType = model.AuditEventExecutionFailed
+			runFinal = model.AuditRunStatusFailed
 		}
 		hhID := c.GetUint("household_id")
 		if hhID == 0 {
 			hhID = 1
 		}
-		_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+		_, auditErr := ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
 			HouseholdID:    hhID,
 			TriggerSource:  "api_manual",
 			ActorType:      "user",
 			ActorID:        getOperatorName(c),
-			EventType:      model.AuditEventExecutionCompleted,
+			EventType:      evType,
 			Action:         "onepanel.session.fetch",
 			Target:         "1panel",
 			Component:      "1panel",
+			OperationID:    GenerateOperationID("onepanel_session"),
 			Decision:       model.AuditDecisionAllow,
 			RiskLevel:      model.AuditRiskMedium,
 			Result:         resStr,
 			ErrorCode:      errStr,
 			Evidence:       map[string]interface{}{"client_ip": c.ClientIP()},
-			FinalRunStatus: model.AuditRunStatusCompleted,
+			FinalRunStatus: runFinal,
+			FailurePolicy:  audit.PolicyFailClosed,
 		})
+		if auditErr != nil && err == nil {
+			GlobalSecurityMetrics.IncAuditFailed()
+			utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("审计落盘失败，Fail-Closed 阻断返回凭据: %v", auditErr))
+			return
+		}
 	}
 	if err != nil {
 		log.Printf("[ops] failed to fetch 1Panel session: %v", err)
@@ -353,17 +463,39 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 	rawName := c.Param("name")
 	name := strings.TrimPrefix(strings.TrimSpace(rawName), "/")
 
-	// Security check 2: Unified whitelist & canonical resolution (no OperationExecutor bypass)
-	canonical, resolveErr := ResolveComponent(name)
-	if resolveErr != nil || !AllowedCoreContainers[name] {
-		utils.Fail(c, http.StatusBadRequest, fmt.Sprintf("容器 '%s' 不在受管安全重启白名单中", name))
-		return
-	}
-
 	operator := getOperatorName(c)
 	clientIP := c.GetString("real_client_ip")
 	if clientIP == "" {
 		clientIP = c.ClientIP()
+	}
+
+	// Security check 2: Unified whitelist & canonical resolution (no OperationExecutor bypass)
+	canonical, resolveErr := ResolveComponent(name)
+	if resolveErr != nil || (!AllowedCoreContainers[name] && !AllowedCoreContainers[canonical]) {
+		if ae := h.getAuditEngine(); ae != nil {
+			hhID := c.GetUint("household_id")
+			if hhID == 0 {
+				hhID = 1
+			}
+			_, _ = ae.EmitEvent(c.Request.Context(), audit.EmitEventInput{
+				HouseholdID:    hhID,
+				TriggerSource:  "api_manual",
+				ActorType:      "user",
+				ActorID:        operator,
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         ActionDockerRestart,
+				Target:         name,
+				Component:      name,
+				OperationID:    GenerateOperationID("manual_restart_deny"),
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskHigh,
+				Result:         "DENIED",
+				ErrorCode:      "container not in managed restart whitelist",
+				FinalRunStatus: model.AuditRunStatusFailed,
+			})
+		}
+		utils.Fail(c, http.StatusBadRequest, fmt.Sprintf("容器 '%s' 不在受管安全重启白名单中", name))
+		return
 	}
 
 	exec := h.GetExecutor()
@@ -386,6 +518,7 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 			TriggerSource: "api_manual",
 			ActorType:     "user",
 			ActorID:       operator,
+			OperationID:   GenerateOperationID("manual_restart"),
 			Action:        ActionDockerRestart,
 			Target:        canonical,
 			Component:     canonical,
@@ -394,6 +527,7 @@ func (h *OpsHandler) RestartNASContainer(c *gin.Context) {
 			Summary:       fmt.Sprintf("Manual admin container restart by %s (%s)", operator, clientIP),
 		})
 		if rErr != nil {
+			GlobalSecurityMetrics.IncAuditFailed()
 			h.recordAuditLog(name, operator, clientIP, false, rErr.Error())
 			utils.Fail(c, http.StatusInternalServerError, fmt.Sprintf("审计落盘失败，Fail-Closed 阻断重启: %v", rErr))
 			return

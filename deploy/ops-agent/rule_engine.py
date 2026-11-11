@@ -135,31 +135,60 @@ class TwoTierRuleEngine:
                 return True
         return False
 
-    def handle_auth_failure(self, ip: str) -> Dict[str, Any]:
+    def handle_auth_failure(self, ip: str, source: str = "mqtt", authenticated: bool = True) -> Dict[str, Any]:
         """
-        Tier 1 Rule: 5 failed attempts from same IP within window -> IP ban (0 token consumption).
+        Tier 1 Rule: 5 failed attempts from same valid unicast IP within window -> IP ban (0 token consumption).
+        Rejects malformed/loopback/unspecified/link-local/multicast IPs before mutating counters.
         """
+        raw_ip = (ip or "").strip()
+        try:
+            addr = ipaddress.ip_address(raw_ip)
+        except ValueError:
+            logger.warning(f"[Rule Engine] Rejected malformed auth-failure IP '{ip}' from {source}.")
+            return {
+                "handled_by": "tier1_rule_engine",
+                "action": "rejected_invalid_ip",
+                "tokens_used": 0,
+            }
+        if addr.is_loopback or addr.is_unspecified or addr.is_link_local or addr.is_multicast:
+            logger.warning(f"[Rule Engine] Rejected protected/non-routable IP {addr} from {source}.")
+            return {
+                "handled_by": "tier1_rule_engine",
+                "action": "rejected_protected_ip",
+                "target_ip": str(addr),
+                "tokens_used": 0,
+            }
+        if not authenticated:
+            logger.warning(f"[Rule Engine] Rejected unauthenticated auth-failure event for {addr} from {source}.")
+            return {
+                "handled_by": "tier1_rule_engine",
+                "action": "rejected_unauthenticated",
+                "target_ip": str(addr),
+                "tokens_used": 0,
+            }
+        norm_ip = str(addr)
+
         now = time.time()
-        timestamps = self.auth_fail_timestamps.setdefault(ip, [])
+        timestamps = self.auth_fail_timestamps.setdefault(norm_ip, [])
         # Prune older than window
         cutoff = now - self.config.auth_fail_window_sec
         timestamps = [t for t in timestamps if t >= cutoff]
         timestamps.append(now)
-        self.auth_fail_timestamps[ip] = timestamps
+        self.auth_fail_timestamps[norm_ip] = timestamps
 
         count = len(timestamps)
-        self.auth_fail_counts[ip] = count
+        self.auth_fail_counts[norm_ip] = count
         self.tier1_intercept_count += 1
 
         if count >= self.config.auth_fail_threshold:
-            self.banned_ips.add(ip)
-            ban_cmd = f"iptables -I INPUT -s {ip} -j DROP"
-            self._execute_firewall_drop(ip, ban_cmd)
-            logger.warning(f"[Tier 1] IP {ip} banned after {count} failed auth attempts: {ban_cmd}")
+            self.banned_ips.add(norm_ip)
+            ban_cmd = f"iptables -I INPUT -s {norm_ip} -j DROP"
+            self._execute_firewall_drop(norm_ip, ban_cmd)
+            logger.warning(f"[Tier 1] IP {norm_ip} banned after {count} failed auth attempts: {ban_cmd}")
             return {
                 "handled_by": "tier1_rule_engine",
                 "action": "ip_ban",
-                "target_ip": ip,
+                "target_ip": norm_ip,
                 "count": count,
                 "ban_command": ban_cmd,
                 "tokens_used": 0
@@ -352,13 +381,15 @@ class TwoTierRuleEngine:
             )
             archive_dir = os.environ.get("OPS_AUDIT_ARCHIVE_DIR", "").strip()
             if archive_dir:
-                append_jsonl_audit_stub(archive_dir, "python-rule-audit.jsonl", {
+                ok_stub = append_jsonl_audit_stub(archive_dir, "python-rule-audit.jsonl", {
                     "event_type": EXECUTION_COMPLETED,
                     "action": "firewall.iptables.drop",
                     "target": str(addr),
                     "returncode": proc.returncode,
                     "executed_at": format_rfc3339_ms(),
                 })
+                if not ok_stub:
+                    logger.error(f"[Rule Engine Audit Failure] Failed to archive firewall drop for {addr}")
         except Exception as e:
             logger.debug(f"iptables command skipped or simulated: {e}")
 
@@ -369,7 +400,10 @@ class TwoTierRuleEngine:
             return True
         conn = None
         try:
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=2.0)
+            import pathlib
+            posix_path = pathlib.Path(os.path.abspath(db_path)).as_posix()
+            conn = sqlite3.connect(f"file:{posix_path}?mode=ro", uri=True, timeout=5.0)
+            conn.execute("PRAGMA busy_timeout=5000;")
             row = conn.execute("SELECT active FROM ops_maintenance_locks ORDER BY id DESC LIMIT 1").fetchone()
             return bool(row and row[0])
         except Exception:

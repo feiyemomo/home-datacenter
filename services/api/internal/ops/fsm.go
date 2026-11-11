@@ -1668,15 +1668,17 @@ const (
 
 // RecoveryDecision represents the final verdict of the FSM on a container event.
 type RecoveryDecision struct {
-	Action       RecoveryDecisionAction `json:"action"`
-	EventClass   ContainerEventClass    `json:"event_class"`
-	Container    string                 `json:"container"`
-	Reason       string                 `json:"reason"`
-	BackoffSec   int                    `json:"backoff_sec"`
-	CircuitState CircuitState           `json:"circuit_state"`
-	ProposalID   string                 `json:"proposal_id,omitempty"`
-	ProbeToken   string                 `json:"probe_token,omitempty"`
-	ProbeTicket  *ProbeTicket           `json:"probe_ticket,omitempty"`
+	Action                  RecoveryDecisionAction `json:"action"`
+	EventClass              ContainerEventClass    `json:"event_class"`
+	Container               string                 `json:"container"`
+	Reason                  string                 `json:"reason"`
+	BackoffSec              int                    `json:"backoff_sec"`
+	CircuitState            CircuitState           `json:"circuit_state"`
+	ProposalID              string                 `json:"proposal_id,omitempty"`
+	ProbeToken              string                 `json:"probe_token,omitempty"`
+	ProbeTicket             *ProbeTicket           `json:"probe_ticket,omitempty"`
+	BaselineHash            string                 `json:"baseline_hash,omitempty"`
+	BaselineProtocolVersion string                 `json:"baseline_protocol_version,omitempty"`
 }
 
 // ContainerRecoveryFSM encapsulates event classification, topology validation,
@@ -2022,6 +2024,9 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 	if defExec, ok := curExec.(*DefaultOperationExecutor); ok && defExec != nil && defExec.baselineExtractor != nil {
 		baselineHash = defExec.baselineExtractor(canonical)
 	}
+	if IsProductionRuntime() && (baselineHash == "" || !IsRealBaselineHash(baselineHash, canonical) || IsOfflinePlaceholderBaseline(canonical, baselineHash)) {
+		baselineHash = ""
+	}
 	if baselineHash == "" && !IsProductionRuntime() {
 		baselineHash = model.ComputeDefaultBaseline(canonical)
 	}
@@ -2067,7 +2072,7 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 	}
 
 	if ae := fsm.getAuditEngine(); ae != nil {
-		_, runCtx, _ := ae.StartRun(context.Background(), audit.StartRunInput{
+		_, runCtx, sErr := ae.StartRun(context.Background(), audit.StartRunInput{
 			HouseholdID:   1,
 			TriggerSource: "circuit_breaker_trip",
 			ActorType:     "system_daemon",
@@ -2078,21 +2083,42 @@ func (fsm *ContainerRecoveryFSM) createCircuitTripProposal(container string, cra
 			Decision:      model.AuditDecisionRequireApproval,
 			RiskLevel:     model.AuditRiskHigh,
 			ProposalID:    propID,
+			OperationID:   propID,
 			Summary:       prop.Title,
 		})
-		_, _ = ae.EmitEvent(runCtx, audit.EmitEventInput{
-			EventType:    model.AuditEventProposalCreated,
-			Action:       "circuit_breaker.trip_proposal",
-			Target:       canonical,
-			Component:    canonical,
-			Decision:     model.AuditDecisionRequireApproval,
-			RiskLevel:    model.AuditRiskHigh,
-			ProposalID:   propID,
-			Evidence:     map[string]interface{}{"crash_count": crashCount},
-			AfterState:   map[string]interface{}{"circuit_state": CircuitOpen, "proposal_id": propID},
-			Result:       "TRIPPED",
-			MirrorLegacy: true,
-		})
+		if sErr != nil {
+			GlobalSecurityMetrics.IncAuditFailed()
+		} else {
+			if _, eErr := ae.EmitEvent(runCtx, audit.EmitEventInput{
+				EventType:    model.AuditEventProposalCreated,
+				Action:       "circuit_breaker.trip_proposal",
+				Target:       canonical,
+				Component:    canonical,
+				Decision:     model.AuditDecisionRequireApproval,
+				RiskLevel:    model.AuditRiskHigh,
+				ProposalID:   propID,
+				OperationID:  propID,
+				Evidence:     map[string]interface{}{"crash_count": crashCount},
+				AfterState:   map[string]interface{}{"circuit_state": CircuitOpen, "proposal_id": propID},
+				Result:       "TRIPPED",
+				MirrorLegacy: true,
+			}); eErr != nil {
+				GlobalSecurityMetrics.IncAuditFailed()
+			}
+			if _, eErr := ae.EmitEvent(runCtx, audit.EmitEventInput{
+				EventType:   model.AuditEventApprovalRequested,
+				Action:      "circuit_breaker.request_approval",
+				Target:      canonical,
+				Component:   canonical,
+				Decision:    model.AuditDecisionRequireApproval,
+				RiskLevel:   model.AuditRiskHigh,
+				ProposalID:  propID,
+				OperationID: propID,
+				Result:      model.ProposalStatusAwaitingApproval,
+			}); eErr != nil {
+				GlobalSecurityMetrics.IncAuditFailed()
+			}
+		}
 	}
 
 	if fsm.bus != nil {
@@ -2178,11 +2204,12 @@ func (fsm *ContainerRecoveryFSM) ReconcileDegradedState(actor string) error {
 // acquire LeaseGuard -> backoff -> pre-exec fencing -> executor.Execute(leaseCtx) -> circuit breaker persistence -> ReleaseLease.
 func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event ContainerEvent) (*ContainerRecoveryResult, error) {
 	ae := fsm.getAuditEngine()
+	opID := GenerateOperationID("recover")
 	resolvedComp := ResolveTopologyComponent(event.ContainerName)
 	targetLabel := defaultStringVal(resolvedComp, event.ContainerName)
 	if ae != nil {
 		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
-			_, runCtx, _ := ae.StartRun(ctx, audit.StartRunInput{
+			_, runCtx, rErr := ae.StartRun(ctx, audit.StartRunInput{
 				HouseholdID:   1,
 				TriggerSource: "docker_fsm",
 				ActorType:     "system_daemon",
@@ -2191,20 +2218,40 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				Target:        targetLabel,
 				Component:     targetLabel,
 				RiskLevel:     model.AuditRiskHigh,
+				OperationID:   opID,
 				Summary:       fmt.Sprintf("Container lifecycle event: %s (%s)", event.Action, targetLabel),
 			})
 			ctx = runCtx
+			if rErr != nil {
+				return &ContainerRecoveryResult{
+					Status:         StatusFailed,
+					Executed:       false,
+					Error:          rErr.Error(),
+					HealthVerified: false,
+				}, rErr
+			}
 		}
-		_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+		if _, evErr := ae.EmitEvent(ctx, audit.EmitEventInput{
 			EventType:     model.AuditEventReceived,
 			TriggerSource: "docker_fsm",
 			Action:        "container.event",
 			Target:        targetLabel,
 			Component:     targetLabel,
 			RiskLevel:     model.AuditRiskMedium,
+			OperationID:   opID,
 			Parameters:    map[string]interface{}{"status": event.Action, "exit_code": event.ExitCode, "action": event.Action},
 			Result:        "RECEIVED",
-		})
+		}); evErr != nil {
+			if sess, ok := audit.SessionFromContext(ctx); ok {
+				_ = ae.FinishRun(sess.RunID, model.AuditRunStatusAuditCommitFailed, "", evErr.Error())
+			}
+			return &ContainerRecoveryResult{
+				Status:         StatusFailed,
+				Executed:       false,
+				Error:          evErr.Error(),
+				HealthVerified: false,
+			}, evErr
+		}
 	}
 
 	if fsm.lock.IsDegraded() || fsm.breaker.IsDegraded() {
@@ -2216,6 +2263,7 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				Component:      targetLabel,
 				Decision:       model.AuditDecisionDeny,
 				RiskLevel:      model.AuditRiskCritical,
+				OperationID:    opID,
 				Result:         "BLOCKED",
 				ErrorCode:      ErrFailClosedMode.Error(),
 				FinalRunStatus: model.AuditRunStatusBlocked,
@@ -2251,6 +2299,7 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				Component:      targetLabel,
 				Decision:       model.AuditDecisionDeny,
 				RiskLevel:      model.AuditRiskHigh,
+				OperationID:    opID,
 				Result:         string(status),
 				ErrorCode:      errMsg,
 				FinalRunStatus: model.AuditRunStatusBlocked,
@@ -2275,6 +2324,7 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				Component:      decision.Container,
 				Decision:       model.AuditDecisionAllow,
 				RiskLevel:      model.AuditRiskLow,
+				OperationID:    opID,
 				Evidence:       map[string]interface{}{"event_class": decision.EventClass, "reason": decision.Reason},
 				Result:         "ACCEPTED",
 				FinalRunStatus: model.AuditRunStatusCompleted,
@@ -2297,6 +2347,7 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				Component:      decision.Container,
 				Decision:       model.AuditDecisionDeny,
 				RiskLevel:      model.AuditRiskHigh,
+				OperationID:    opID,
 				Evidence:       map[string]interface{}{"action": decision.Action, "reason": decision.Reason, "circuit_state": decision.CircuitState},
 				Result:         "BLOCKED",
 				ErrorCode:      decision.Reason,
@@ -2312,18 +2363,6 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		}, nil
 
 	case ActionRestart:
-		if ae != nil {
-			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
-				EventType:  model.AuditEventPolicyEvaluated,
-				Action:     "container.recovery.restart_authorized",
-				Target:     decision.Container,
-				Component:  decision.Container,
-				Decision:   model.AuditDecisionAllow,
-				RiskLevel:  model.AuditRiskHigh,
-				Evidence:   map[string]interface{}{"backoff_sec": decision.BackoffSec, "circuit_state": decision.CircuitState, "probe_token": decision.ProbeToken != ""},
-				Result:     "AUTHORIZED",
-			})
-		}
 		fsm.mu.RLock()
 		exec := fsm.executor
 		leaseMgr := fsm.leaseManager
@@ -2331,6 +2370,20 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 
 		canonical := ResolveTopologyComponent(decision.Container)
 		if canonical == "" {
+			if ae != nil {
+				_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+					EventType:      model.AuditEventPolicyEvaluated,
+					Action:         "container.recovery.blocked",
+					Target:         decision.Container,
+					Component:      decision.Container,
+					Decision:       model.AuditDecisionDeny,
+					RiskLevel:      model.AuditRiskHigh,
+					OperationID:    opID,
+					Result:         "BLOCKED",
+					ErrorCode:      ErrComponentNotWhitelisted.Error(),
+					FinalRunStatus: model.AuditRunStatusBlocked,
+				})
+			}
 			return &ContainerRecoveryResult{
 				Decision:       decision,
 				Status:         StatusBlocked,
@@ -2340,9 +2393,88 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			}, ErrComponentNotWhitelisted
 		}
 
+		// R5/R8: Capture live BaselineHash before authorizing or returning AUTHORIZED to Python
+		var liveBaselineHash string
+		if defExec, ok := exec.(*DefaultOperationExecutor); ok && defExec != nil && defExec.baselineExtractor != nil {
+			liveBaselineHash = defExec.baselineExtractor(canonical)
+			if IsProductionRuntime() && (liveBaselineHash == "" || !IsRealBaselineHash(liveBaselineHash, canonical) || IsOfflinePlaceholderBaseline(canonical, liveBaselineHash)) {
+				if decision.ProbeToken != "" {
+					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "baseline unavailable or placeholder in production")
+				}
+				if ae != nil {
+					_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+						EventType:      model.AuditEventPolicyEvaluated,
+						Action:         "container.recovery.blocked",
+						Target:         canonical,
+						Component:      canonical,
+						Decision:       model.AuditDecisionDeny,
+						RiskLevel:      model.AuditRiskHigh,
+						OperationID:    opID,
+						Result:         "BLOCKED",
+						ErrorCode:      ErrBaselineMismatch.Error(),
+						FinalRunStatus: model.AuditRunStatusBlocked,
+					})
+				}
+				return &ContainerRecoveryResult{
+					Decision:       decision,
+					Status:         StatusBlocked,
+					Executed:       false,
+					Error:          fmt.Sprintf("%v: live baseline unavailable or placeholder in production for %s", ErrBaselineMismatch, canonical),
+					HealthVerified: false,
+				}, ErrBaselineMismatch
+			}
+			if liveBaselineHash != "" {
+				decision.BaselineHash = liveBaselineHash
+				decision.BaselineProtocolVersion = BaselineProtocolVersion
+			}
+		}
+
+		if ae != nil {
+			if _, authAuditErr := ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:   model.AuditEventPolicyEvaluated,
+				Action:      "container.recovery.restart_authorized",
+				Target:      decision.Container,
+				Component:   decision.Container,
+				Decision:    model.AuditDecisionAllow,
+				RiskLevel:   model.AuditRiskHigh,
+				OperationID: opID,
+				BeforeState: map[string]interface{}{"baseline_hash": liveBaselineHash},
+				Evidence:    map[string]interface{}{"backoff_sec": decision.BackoffSec, "circuit_state": decision.CircuitState, "probe_token": decision.ProbeToken != ""},
+				Result:      "AUTHORIZED",
+			}); authAuditErr != nil {
+				if decision.ProbeToken != "" {
+					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "pre-exec policy audit failed: "+authAuditErr.Error())
+				}
+				if sess, ok := audit.SessionFromContext(ctx); ok {
+					_ = ae.FinishRun(sess.RunID, model.AuditRunStatusAuditCommitFailed, "", authAuditErr.Error())
+				}
+				return &ContainerRecoveryResult{
+					Decision:       decision,
+					Status:         StatusFailed,
+					Executed:       false,
+					Error:          authAuditErr.Error(),
+					HealthVerified: false,
+				}, authAuditErr
+			}
+		}
+
 		if exec == nil {
 			if decision.ProbeToken != "" {
 				_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "operation executor is not configured on Go Active Core")
+			}
+			if ae != nil {
+				_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+					EventType:      model.AuditEventExecutionFailed,
+					Action:         "container.recovery",
+					Target:         canonical,
+					Component:      canonical,
+					Decision:       model.AuditDecisionDeny,
+					RiskLevel:      model.AuditRiskHigh,
+					OperationID:    opID,
+					Result:         "FAILED",
+					ErrorCode:      "operation executor not available",
+					FinalRunStatus: model.AuditRunStatusFailed,
+				})
 			}
 			return &ContainerRecoveryResult{
 				Decision:       decision,
@@ -2363,6 +2495,20 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				if decision.ProbeToken != "" {
 					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "recovery lease acquisition failed: "+lErr.Error())
 				}
+				if ae != nil {
+					_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+						EventType:      model.AuditEventPolicyEvaluated,
+						Action:         "recovery.lease.acquire",
+						Target:         canonical,
+						Component:      canonical,
+						Decision:       model.AuditDecisionDeny,
+						RiskLevel:      model.AuditRiskHigh,
+						OperationID:    opID,
+						Result:         "BLOCKED",
+						ErrorCode:      lErr.Error(),
+						FinalRunStatus: model.AuditRunStatusBlocked,
+					})
+				}
 				return &ContainerRecoveryResult{
 					Decision:       decision,
 					Status:         StatusBlocked,
@@ -2371,20 +2517,36 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 					HealthVerified: false,
 				}, fmt.Errorf("failed to acquire recovery lease for %s: %w", canonical, lErr)
 			}
+			guard.BindAuditContext(ae, lCtx)
 			workCtx = lCtx
 			leaseGuard = guard
 			if ae != nil {
-				_, _ = ae.EmitEvent(workCtx, audit.EmitEventInput{
+				if _, leaseAuditErr := ae.EmitEvent(workCtx, audit.EmitEventInput{
 					EventType:         model.AuditEventRecoveryLeaseAcquired,
 					Action:            "recovery.lease.acquire",
 					Target:            canonical,
 					Component:         canonical,
 					Decision:          model.AuditDecisionAllow,
 					RiskLevel:         model.AuditRiskHigh,
-					OperationID:       guard.Grant.OperationID,
+					OperationID:       opID,
 					FencingGeneration: guard.Grant.FencingGeneration,
 					Result:            "ACQUIRED",
-				})
+				}); leaseAuditErr != nil {
+					if decision.ProbeToken != "" {
+						_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "lease acquired audit failed: "+leaseAuditErr.Error())
+					}
+					_ = guard.Release(fsm.db, fsm.bus)
+					if sess, ok := audit.SessionFromContext(workCtx); ok {
+						_ = ae.FinishRun(sess.RunID, model.AuditRunStatusAuditCommitFailed, "", leaseAuditErr.Error())
+					}
+					return &ContainerRecoveryResult{
+						Decision:       decision,
+						Status:         StatusFailed,
+						Executed:       false,
+						Error:          leaseAuditErr.Error(),
+						HealthVerified: false,
+					}, leaseAuditErr
+				}
 			}
 		}
 
@@ -2395,12 +2557,32 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			return leaseGuard.Release(fsm.db, fsm.bus)
 		}
 
+		var fencingGen int64
+		if leaseGuard != nil {
+			fencingGen = leaseGuard.Grant.FencingGeneration
+		}
+
 		if decision.BackoffSec > 0 {
 			select {
 			case <-time.After(time.Duration(decision.BackoffSec) * time.Second):
 			case <-workCtx.Done():
 				if decision.ProbeToken != "" {
 					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "context cancelled during backoff: "+workCtx.Err().Error())
+				}
+				if ae != nil {
+					_, _ = ae.EmitEvent(context.WithoutCancel(workCtx), audit.EmitEventInput{
+						EventType:         model.AuditEventExecutionCancelled,
+						Action:            "container.recovery",
+						Target:            canonical,
+						Component:         canonical,
+						Decision:          model.AuditDecisionDeny,
+						RiskLevel:         model.AuditRiskHigh,
+						OperationID:       opID,
+						FencingGeneration: fencingGen,
+						Result:            "CANCELLED",
+						ErrorCode:         workCtx.Err().Error(),
+						FinalRunStatus:    model.AuditRunStatusCancelled,
+					})
 				}
 				_ = releaseLease()
 				return &ContainerRecoveryResult{
@@ -2413,11 +2595,26 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			}
 		}
 
-		// Re-verify lease & maintenance/degraded state right before invoking executor (R4-08)
+		// Re-verify lease & maintenance/degraded state right before invoking executor (R4-08, R6)
 		if leaseGuard != nil {
-			if fErr := leaseGuard.VerifyBeforeMutation(0); fErr != nil {
+			if fErr := leaseGuard.VerifyBeforeMutation(time.Duration(DefaultLeaseSafetyGuardMs) * time.Millisecond); fErr != nil {
 				if decision.ProbeToken != "" {
 					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "lease fencing check failed before execute: "+fErr.Error())
+				}
+				if ae != nil {
+					_, _ = ae.EmitEvent(context.WithoutCancel(workCtx), audit.EmitEventInput{
+						EventType:         model.AuditEventPolicyEvaluated,
+						Action:            "container.recovery.fencing",
+						Target:            canonical,
+						Component:         canonical,
+						Decision:          model.AuditDecisionDeny,
+						RiskLevel:         model.AuditRiskCritical,
+						OperationID:       opID,
+						FencingGeneration: fencingGen,
+						Result:            "BLOCKED",
+						ErrorCode:         fErr.Error(),
+						FinalRunStatus:    model.AuditRunStatusBlocked,
+					})
 				}
 				_ = releaseLease()
 				return &ContainerRecoveryResult{
@@ -2431,8 +2628,9 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		}
 
 		spec := OperationSpec{
-			Action: ActionDockerRestart,
-			Target: canonical,
+			Action:       ActionDockerRestart,
+			Target:       canonical,
+			BaselineHash: liveBaselineHash,
 		}
 
 		execRes, execErr := exec.Execute(workCtx, spec)
@@ -2467,6 +2665,21 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 				if decision.ProbeToken != "" {
 					_ = fsm.breaker.RecordRecoveryFailure(canonical, decision.ProbeToken, "lease lost before circuit recovery commit: "+fErr.Error())
 				}
+				if ae != nil {
+					_, _ = ae.RecordPostMutation(context.WithoutCancel(workCtx), audit.EmitEventInput{
+						EventType:         model.AuditEventExecutionUnknown,
+						Action:            "container.recovery.fencing",
+						Target:            canonical,
+						Component:         canonical,
+						Decision:          model.AuditDecisionDeny,
+						RiskLevel:         model.AuditRiskCritical,
+						OperationID:       opID,
+						FencingGeneration: fencingGen,
+						Result:            "EXECUTION_UNKNOWN",
+						ErrorCode:         fErr.Error(),
+						FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
+					}, nil)
+				}
 				_ = releaseLease()
 				return &ContainerRecoveryResult{
 					Decision:       decision,
@@ -2487,6 +2700,21 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 			cbUpdateErr = fsm.breaker.RecordRecoverySuccess(canonical)
 		}
 		if cbUpdateErr != nil {
+			if ae != nil {
+				_, _ = ae.RecordPostMutation(context.WithoutCancel(workCtx), audit.EmitEventInput{
+					EventType:         model.AuditEventExecutionUnknown,
+					Action:            "container.recovery.circuit_commit",
+					Target:            canonical,
+					Component:         canonical,
+					Decision:          model.AuditDecisionAllow,
+					RiskLevel:         model.AuditRiskCritical,
+					OperationID:       opID,
+					FencingGeneration: fencingGen,
+					Result:            "EXECUTION_UNKNOWN",
+					ErrorCode:         cbUpdateErr.Error(),
+					FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
+				}, nil)
+			}
 			_ = releaseLease()
 			return &ContainerRecoveryResult{
 				Decision:       decision,
@@ -2500,6 +2728,21 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 
 		// Explicitly release lease and forbid reporting RECOVERED if release failed (R4-05, R4-08)
 		if relErr := releaseLease(); relErr != nil {
+			if ae != nil {
+				_, _ = ae.RecordPostMutation(context.WithoutCancel(workCtx), audit.EmitEventInput{
+					EventType:         model.AuditEventExecutionUnknown,
+					Action:            "container.recovery.lease_release",
+					Target:            canonical,
+					Component:         canonical,
+					Decision:          model.AuditDecisionAllow,
+					RiskLevel:         model.AuditRiskCritical,
+					OperationID:       opID,
+					FencingGeneration: fencingGen,
+					Result:            "EXECUTION_UNKNOWN",
+					ErrorCode:         relErr.Error(),
+					FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
+				}, nil)
+			}
 			return &ContainerRecoveryResult{
 				Decision:       decision,
 				Status:         StatusFailed,
@@ -2511,17 +2754,39 @@ func (fsm *ContainerRecoveryFSM) ProcessAndRecover(ctx context.Context, event Co
 		}
 
 		if ae != nil {
-			_, _ = ae.EmitEvent(context.WithoutCancel(workCtx), audit.EmitEventInput{
-				EventType:      model.AuditEventRecoveryVerified,
-				Action:         "container.recovery.verified",
-				Target:         canonical,
-				Component:      canonical,
-				Decision:       model.AuditDecisionAllow,
-				RiskLevel:      model.AuditRiskHigh,
-				AfterState:     map[string]interface{}{"health_verified": true, "circuit_state": fsm.breaker.GetState(canonical)},
-				Result:         "RECOVERED",
-				FinalRunStatus: model.AuditRunStatusCompleted,
-			})
+			if _, verErr := ae.RecordPostMutation(context.WithoutCancel(workCtx), audit.EmitEventInput{
+				EventType:         model.AuditEventRecoveryVerified,
+				Action:            "container.recovery.verified",
+				Target:            canonical,
+				Component:         canonical,
+				Decision:          model.AuditDecisionAllow,
+				RiskLevel:         model.AuditRiskHigh,
+				OperationID:       opID,
+				FencingGeneration: fencingGen,
+				AfterState:        map[string]interface{}{"health_verified": true, "circuit_state": fsm.breaker.GetState(canonical)},
+				Result:            "RECOVERED",
+				FinalRunStatus:    model.AuditRunStatusCompleted,
+			}, func(cause error) {
+				GlobalSecurityMetrics.IncExecutionUnknown()
+				RecordSecurityEvent(fsm.db, fsm.bus, OpsSecurityEvent{
+					OperationID:       opID,
+					EventType:         "ops.audit.post_commit_failed",
+					Severity:          "critical",
+					Component:         canonical,
+					FencingGeneration: fencingGen,
+					Message:           fmt.Sprintf("post-recovery verification audit failed: %v", cause),
+				})
+			}); verErr != nil {
+				combErr := fmt.Errorf("%w: recovery verified audit commit failed (%v)", ErrExecutionAmbiguous, verErr)
+				return &ContainerRecoveryResult{
+					Decision:       decision,
+					Status:         StatusFailed,
+					Executed:       true,
+					Output:         execRes.Output,
+					Error:          combErr.Error(),
+					HealthVerified: true,
+				}, combErr
+			}
 		}
 
 		return &ContainerRecoveryResult{

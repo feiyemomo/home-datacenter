@@ -4,7 +4,9 @@ import {
     CheckCircle2,
     ChevronDown,
     ChevronRight,
+    Cloud,
     Download,
+    KeyRound,
     RefreshCw,
     Search,
     ShieldAlert,
@@ -12,11 +14,17 @@ import {
     X,
 } from "lucide-react";
 import {
+    createAuditCheckpoint,
     exportAuditFile,
+    getAuditKeyStatus,
+    getAuditRemoteStatus,
     getAuditRunDetail,
     listAuditRuns,
+    syncAuditRemote,
     verifyAuditChain,
     type AgentAuditRun,
+    type AuditKeyStatus,
+    type AuditRemoteStatusResponse,
     type AuditRunDetail,
     type AuditVerifyResult,
 } from "@/api/opsAudit";
@@ -51,6 +59,13 @@ function integrityBadgeInfo(res: AuditVerifyResult | null) {
             icon: <ShieldAlert size={14} />,
         };
     }
+    if (res.valid && res.integrity_status === "VERIFIED_AGAINST_REMOTE") {
+        return {
+            label: "远程副本与全链已验签",
+            className: "border-emerald-500/40 bg-emerald-500/15 text-emerald-400",
+            icon: <ShieldCheck size={14} />,
+        };
+    }
     if (res.valid && res.integrity_status === "VERIFIED_AGAINST_CHECKPOINT") {
         return {
             label: "检查点与全链已验签",
@@ -77,6 +92,21 @@ function integrityBadgeInfo(res: AuditVerifyResult | null) {
         className: "border-rose-500/50 bg-rose-500/20 text-rose-400",
         icon: <ShieldAlert size={14} />,
     };
+}
+
+function remoteStatusTone(status?: string): string {
+    switch (status) {
+        case "IN_SYNC":
+            return "border-emerald-500/40 bg-emerald-500/15 text-emerald-400";
+        case "PENDING_REMOTE_SYNC":
+            return "border-sky-500/40 bg-sky-500/15 text-sky-400";
+        case "DISABLED":
+            return "border-amber-500/40 bg-amber-500/15 text-amber-300";
+        case "REMOTE_UNREACHABLE":
+            return "border-orange-500/50 bg-orange-500/20 text-orange-300";
+        default:
+            return "border-rose-500/50 bg-rose-500/20 text-rose-400";
+    }
 }
 
 function formatTs(iso?: string | null, ms?: number): string {
@@ -109,10 +139,17 @@ export default function OpsAudit() {
     const [triggerSource, setTriggerSource] = useState("");
     const [statusFilter, setStatusFilter] = useState("");
     const [riskFilter, setRiskFilter] = useState("");
+    const [operationIdFilter, setOperationIdFilter] = useState("");
+    const [proposalIdFilter, setProposalIdFilter] = useState("");
+    const [actorIdFilter, setActorIdFilter] = useState("");
     const [offlineOnly, setOfflineOnly] = useState(false);
 
     const [verifyResult, setVerifyResult] = useState<AuditVerifyResult | null>(null);
     const [verifying, setVerifying] = useState(false);
+    const [keyStatus, setKeyStatus] = useState<AuditKeyStatus | null>(null);
+    const [remoteStatus, setRemoteStatus] = useState<AuditRemoteStatusResponse | null>(null);
+    const [syncingRemote, setSyncingRemote] = useState(false);
+    const [creatingCheckpoint, setCreatingCheckpoint] = useState(false);
     const [exporting, setExporting] = useState(false);
 
     const [detail, setDetail] = useState<AuditRunDetail | null>(null);
@@ -131,6 +168,9 @@ export default function OpsAudit() {
                 trigger_source: triggerSource || undefined,
                 status: statusFilter || undefined,
                 risk_level: riskFilter || undefined,
+                operation_id: operationIdFilter.trim() || undefined,
+                proposal_id: proposalIdFilter.trim() || undefined,
+                actor_id: actorIdFilter.trim() || undefined,
                 is_offline: offlineOnly ? true : undefined,
             });
             setRuns(res.items || []);
@@ -140,14 +180,37 @@ export default function OpsAudit() {
         } finally {
             setLoading(false);
         }
-    }, [isAdmin, page, search, triggerSource, statusFilter, riskFilter, offlineOnly]);
+    }, [
+        isAdmin,
+        page,
+        search,
+        triggerSource,
+        statusFilter,
+        riskFilter,
+        operationIdFilter,
+        proposalIdFilter,
+        actorIdFilter,
+        offlineOnly,
+    ]);
+
+    const loadSecurityPosture = useCallback(async () => {
+        if (!isAdmin) return;
+        try {
+            const [ks, rs] = await Promise.all([getAuditKeyStatus(), getAuditRemoteStatus("core")]);
+            setKeyStatus(ks);
+            setRemoteStatus(rs);
+        } catch {
+            // Best-effort posture panel load; verification endpoint still reports core errors.
+        }
+    }, [isAdmin]);
 
     const runVerification = useCallback(async () => {
         if (!isAdmin) return;
         setVerifying(true);
         try {
-            const res = await verifyAuditChain(true, true);
+            const res = await verifyAuditChain(true, true, true);
             setVerifyResult(res);
+            await loadSecurityPosture();
         } catch (err: any) {
             setVerifyResult({
                 valid: false,
@@ -165,7 +228,7 @@ export default function OpsAudit() {
         } finally {
             setVerifying(false);
         }
-    }, [isAdmin]);
+    }, [isAdmin, loadSecurityPosture]);
 
     useEffect(() => {
         loadRuns();
@@ -174,6 +237,33 @@ export default function OpsAudit() {
     useEffect(() => {
         runVerification();
     }, [runVerification]);
+
+    const handleRemoteSync = async () => {
+        setSyncingRemote(true);
+        setError(null);
+        try {
+            const rs = await syncAuditRemote("core");
+            setRemoteStatus(rs);
+            await runVerification();
+        } catch (err: any) {
+            setError(err?.message || "远程副本同步失败");
+        } finally {
+            setSyncingRemote(false);
+        }
+    };
+
+    const handleCreateCheckpoint = async () => {
+        setCreatingCheckpoint(true);
+        setError(null);
+        try {
+            await createAuditCheckpoint("core");
+            await runVerification();
+        } catch (err: any) {
+            setError(err?.message || "创建审计检查点失败");
+        } finally {
+            setCreatingCheckpoint(false);
+        }
+    };
 
     const openRunDetail = async (runId: string) => {
         setDetail(null);
@@ -205,6 +295,11 @@ export default function OpsAudit() {
         try {
             await exportAuditFile(fmt, {
                 trigger_source: triggerSource || undefined,
+                proposal_id: proposalIdFilter.trim() || undefined,
+                operation_id: operationIdFilter.trim() || undefined,
+                actor_id: actorIdFilter.trim() || undefined,
+                risk_level: riskFilter || undefined,
+                is_offline: offlineOnly ? true : undefined,
             });
         } catch (err: any) {
             setError(err?.message || `导出 ${fmt.toUpperCase()} 失败`);
@@ -253,6 +348,28 @@ export default function OpsAudit() {
                         type="button"
                         variant="outline"
                         size="sm"
+                        onClick={handleCreateCheckpoint}
+                        disabled={creatingCheckpoint}
+                        className="gap-1.5 text-xs"
+                    >
+                        <ShieldCheck size={13} />
+                        {creatingCheckpoint ? "生成检查点…" : "创建检查点"}
+                    </Button>
+                    <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        onClick={handleRemoteSync}
+                        disabled={syncingRemote || !remoteStatus?.diff?.configured}
+                        className="gap-1.5 text-xs"
+                    >
+                        <Cloud size={13} className={syncingRemote ? "animate-pulse" : ""} />
+                        同步远程副本
+                    </Button>
+                    <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
                         onClick={() => handleExport("json")}
                         disabled={exporting}
                         className="gap-1.5 text-xs"
@@ -274,43 +391,109 @@ export default function OpsAudit() {
                 </div>
             </div>
 
-            {/* Integrity Verification Card */}
+            {/* Integrity Verification, Remote Replica & Key Security Card */}
             <Card>
-                <CardContent className="flex flex-col gap-3 pt-4 md:flex-row md:items-center md:justify-between">
-                    <div className="space-y-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                            <span
-                                className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${badge.className}`}
-                            >
-                                {badge.icon}
-                                {badge.label}
-                            </span>
-                            {verifyResult && (
-                                <span className="text-xs text-fg-muted">
-                                    已校验 {verifyResult.checked_events} 条事件 ·{" "}
-                                    {verifyResult.checked_checkpoints} 个检查点 · 触发器{" "}
-                                    {verifyResult.triggers_intact ? "完好" : "缺失"} · Tail Seq #
-                                    {verifyResult.tail_seq}
+                <CardContent className="space-y-3 pt-4">
+                    <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                        <div className="space-y-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                                <span
+                                    className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-0.5 text-xs font-medium ${badge.className}`}
+                                >
+                                    {badge.icon}
+                                    {badge.label}
                                 </span>
+                                {remoteStatus?.diff && (
+                                    <span
+                                        className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${remoteStatusTone(
+                                            remoteStatus.diff.status,
+                                        )}`}
+                                    >
+                                        <Cloud size={11} />
+                                        远程副本: {remoteStatus.diff.status}
+                                        {remoteStatus.diff.configured
+                                            ? ` (${remoteStatus.diff.store_type})`
+                                            : ""}
+                                    </span>
+                                )}
+                                {verifyResult && (
+                                    <span className="text-xs text-fg-muted">
+                                        已校验 {verifyResult.checked_events} 条事件 ·{" "}
+                                        {verifyResult.checked_checkpoints} 个检查点 · 触发器{" "}
+                                        {verifyResult.triggers_intact ? "完好" : "缺失"} · Local Tail #
+                                        {verifyResult.tail_seq}
+                                        {remoteStatus?.diff?.configured
+                                            ? ` · Remote Tail #${remoteStatus.diff.remote_tail_seq}`
+                                            : ""}
+                                    </span>
+                                )}
+                            </div>
+                            {verifyResult?.failure_reason && (
+                                <p className="text-xs text-rose-400">
+                                    诊断详情：{verifyResult.failure_reason}
+                                    {verifyResult.broken_at_seq
+                                        ? ` (断链位置 Seq #${verifyResult.broken_at_seq})`
+                                        : ""}
+                                </p>
                             )}
+                            {remoteStatus?.diff?.discrepancies &&
+                                remoteStatus.diff.discrepancies.length > 0 && (
+                                    <div className="rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                                        <div className="font-medium">远程差异告警：</div>
+                                        <ul className="mt-1 list-disc pl-4 text-[11px]">
+                                            {remoteStatus.diff.discrepancies.map((item, idx) => (
+                                                <li key={idx}>{item}</li>
+                                            ))}
+                                        </ul>
+                                    </div>
+                                )}
                         </div>
-                        {verifyResult?.failure_reason && (
-                            <p className="text-xs text-rose-400">
-                                诊断详情：{verifyResult.failure_reason}
-                                {verifyResult.broken_at_seq
-                                    ? ` (断链位置 Seq #${verifyResult.broken_at_seq})`
-                                    : ""}
-                            </p>
-                        )}
-                        {verifyResult?.limitation_note && (
-                            <p className="text-[11px] text-fg-subtle">{verifyResult.limitation_note}</p>
+                        {verifyResult?.last_checkpoint_id && (
+                            <div className="shrink-0 text-right text-[11px] font-mono text-fg-muted">
+                                <div>Anchor: {verifyResult.last_checkpoint_id}</div>
+                                <div>Seq #{verifyResult.last_checkpoint_seq}</div>
+                                {verifyResult.external_sig_verified && (
+                                    <div className="text-emerald-400">Ed25519 外部验签通过</div>
+                                )}
+                            </div>
                         )}
                     </div>
-                    {verifyResult?.last_checkpoint_id && (
-                        <div className="shrink-0 text-right text-[11px] font-mono text-fg-muted">
-                            <div>Anchor: {verifyResult.last_checkpoint_id}</div>
-                            <div>Seq #{verifyResult.last_checkpoint_seq}</div>
+
+                    {/* Key Lifecycle & fnOS Root-Attacker Boundary */}
+                    <div className="flex flex-col gap-2 border-t border-[rgb(var(--border)/0.25)] pt-2.5 text-[11px] text-fg-muted md:flex-row md:items-center md:justify-between">
+                        <div className="flex flex-wrap items-center gap-2">
+                            <span className="inline-flex items-center gap-1 font-medium text-fg">
+                                <KeyRound size={12} />
+                                签名密钥生命周期:
+                            </span>
+                            <span className="font-mono">
+                                Active KeyID: {keyStatus?.active_key_id || "-"}
+                            </span>
+                            {keyStatus?.configured_key_ids &&
+                                keyStatus.configured_key_ids.length > 0 && (
+                                    <span className="font-mono text-fg-subtle">
+                                        (Keyring: {keyStatus.configured_key_ids.join(", ")})
+                                    </span>
+                                )}
+                            {keyStatus?.external_sig_alg && (
+                                <span className="font-mono text-emerald-400">
+                                    非对称锚点: {keyStatus.external_sig_alg} ({keyStatus.external_key_id})
+                                </span>
+                            )}
+                            {keyStatus && (
+                                <span>轮换次数: {keyStatus.rotation_count}</span>
+                            )}
+                            {remoteStatus?.diff?.pending_events ? (
+                                <span className="text-amber-300">
+                                    待同步事件: {remoteStatus.diff.pending_events} 条
+                                </span>
+                            ) : null}
                         </div>
+                    </div>
+                    {(verifyResult?.security_boundary || keyStatus?.security_boundary_note) && (
+                        <p className="text-[11px] text-fg-subtle">
+                            {verifyResult?.security_boundary || keyStatus?.security_boundary_note}
+                        </p>
                     )}
                 </CardContent>
             </Card>
@@ -330,7 +513,7 @@ export default function OpsAudit() {
                                 setPage(1);
                                 setSearch(e.target.value);
                             }}
-                            placeholder="搜索 run_id / 目标 / 动作 / 提案号…"
+                            placeholder="搜索 run_id / operation_id / 提案号 / 目标…"
                             className="w-full rounded-lg border border-[rgb(var(--border)/0.4)] bg-[rgb(var(--bg-elevated)/0.6)] py-1.5 pl-8 pr-3 text-xs text-fg focus:outline-none focus:ring-1 focus:ring-[rgb(var(--accent-warm))]"
                         />
                     </div>
@@ -353,6 +536,7 @@ export default function OpsAudit() {
                         <option value="security_defense">入侵防御 (security_defense)</option>
                         <option value="automation">联动规则 (automation)</option>
                         <option value="vuln_scanner">漏洞扫描 (vuln_scanner)</option>
+                        <option value="audit_keyring">密钥轮换 (audit_keyring)</option>
                         <option value="maintenance">系统维护 (maintenance)</option>
                     </select>
                     <select
@@ -398,6 +582,39 @@ export default function OpsAudit() {
                         />
                         仅离线应急恢复
                     </label>
+                    <input
+                        type="search"
+                        value={operationIdFilter}
+                        onChange={(e) => {
+                            setPage(1);
+                            setOperationIdFilter(e.target.value);
+                        }}
+                        aria-label="按 operation_id 筛选"
+                        placeholder="按 operation_id 精确筛选…"
+                        className="rounded-lg border border-[rgb(var(--border)/0.4)] bg-[rgb(var(--bg-elevated)/0.6)] px-2.5 py-1.5 font-mono text-xs text-fg focus:outline-none focus:ring-1 focus:ring-[rgb(var(--accent-warm))] lg:col-span-2"
+                    />
+                    <input
+                        type="search"
+                        value={proposalIdFilter}
+                        onChange={(e) => {
+                            setPage(1);
+                            setProposalIdFilter(e.target.value);
+                        }}
+                        aria-label="按 proposal_id 筛选"
+                        placeholder="按 proposal_id 筛选…"
+                        className="rounded-lg border border-[rgb(var(--border)/0.4)] bg-[rgb(var(--bg-elevated)/0.6)] px-2.5 py-1.5 font-mono text-xs text-fg focus:outline-none focus:ring-1 focus:ring-[rgb(var(--accent-warm))] lg:col-span-2"
+                    />
+                    <input
+                        type="search"
+                        value={actorIdFilter}
+                        onChange={(e) => {
+                            setPage(1);
+                            setActorIdFilter(e.target.value);
+                        }}
+                        aria-label="按 actor_id 筛选"
+                        placeholder="按 actor_id 筛选…"
+                        className="rounded-lg border border-[rgb(var(--border)/0.4)] bg-[rgb(var(--bg-elevated)/0.6)] px-2.5 py-1.5 font-mono text-xs text-fg focus:outline-none focus:ring-1 focus:ring-[rgb(var(--accent-warm))] lg:col-span-2"
+                    />
                 </CardContent>
             </Card>
 
@@ -499,6 +716,7 @@ export default function OpsAudit() {
                                                 <div className="text-[11px] text-fg-muted">
                                                     {run.component || run.target || "-"}
                                                     {run.proposal_id ? ` · ${run.proposal_id}` : ""}
+                                                    {run.operation_id ? ` · op:${run.operation_id}` : ""}
                                                 </div>
                                             </td>
                                             <td className="px-3 py-2.5">
@@ -636,6 +854,11 @@ export default function OpsAudit() {
                                         提案：{detail.run.proposal_id}
                                     </span>
                                 )}
+                                {detail.run.operation_id && (
+                                    <span className="font-mono text-[11px] text-fg-muted">
+                                        Operation：{detail.run.operation_id}
+                                    </span>
+                                )}
                             </div>
 
                             <ol className="space-y-2.5">
@@ -690,6 +913,8 @@ export default function OpsAudit() {
                                                         AuditID: {ev.audit_id} | FencingGen:{" "}
                                                         {ev.fencing_generation} | Duration:{" "}
                                                         {ev.duration_ms}ms
+                                                        {ev.key_id ? ` | KeyID: ${ev.key_id}` : ""}
+                                                        {ev.operation_id ? ` | OpID: ${ev.operation_id}` : ""}
                                                     </div>
                                                     {ev.error_code && (
                                                         <div className="text-rose-400">

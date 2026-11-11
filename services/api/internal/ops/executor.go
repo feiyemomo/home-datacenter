@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,6 +24,7 @@ import (
 
 	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/hostsec"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/utils"
@@ -58,9 +60,10 @@ const (
 	ActionDBDropIndex       = "db.drop_index"
 	ActionDBVacuumSnapshot  = "db.vacuum_snapshot"
 	ActionWAFReload         = "waf.reload"
-	ActionWAFBanIP          = "waf.ban_ip"
-	ActionWAFUnbanIP        = "waf.unban_ip"
-	ActionCachePurge        = "cache.purge"
+	ActionWAFBanIP           = "waf.ban_ip"
+	ActionWAFUnbanIP         = "waf.unban_ip"
+	ActionCachePurge         = "cache.purge"
+	ActionHostPackageUpgrade = hostsec.ActionHostPackageUpgrade
 )
 
 // Canonical component names
@@ -79,6 +82,7 @@ const (
 	ComponentHomeBackup   = "home-backup"
 	ComponentMihomo       = "mihomo"
 	ComponentTailscale    = "tailscale"
+	ComponentHostOS       = "host-os"
 )
 
 // coreComponentWhitelist defines the strict bidirectional core component boundary.
@@ -97,43 +101,54 @@ var coreComponentWhitelist = map[string]bool{
 	ComponentHomeBackup:   true,
 	ComponentMihomo:       true,
 	ComponentTailscale:    true,
+	ComponentHostOS:       true,
 }
 
 // componentAliases maps user, LLM, or container aliases to canonical names.
 var componentAliases = map[string]string{
 	// home-api
-	"home-api": ComponentHomeAPI,
-	"api":      ComponentHomeAPI,
-	"backend":  ComponentHomeAPI,
-	"go-api":   ComponentHomeAPI,
+	"home-api":            ComponentHomeAPI,
+	"api":                 ComponentHomeAPI,
+	"backend":             ComponentHomeAPI,
+	"go-api":              ComponentHomeAPI,
+	"home-datacenter-api": ComponentHomeAPI,
 
 	// home-web
-	"home-web": ComponentHomeWeb,
-	"web":      ComponentHomeWeb,
-	"frontend": ComponentHomeWeb,
-	"nginx":    ComponentHomeWeb,
+	"home-web":            ComponentHomeWeb,
+	"web":                 ComponentHomeWeb,
+	"frontend":            ComponentHomeWeb,
+	"nginx":               ComponentHomeWeb,
+	"home-datacenter-web": ComponentHomeWeb,
 
 	// home-vision
-	"home-vision": ComponentHomeVision,
-	"vision":      ComponentHomeVision,
-	"ai-vision":   ComponentHomeVision,
+	"home-vision":            ComponentHomeVision,
+	"vision":                 ComponentHomeVision,
+	"ai-vision":              ComponentHomeVision,
+	"home-datacenter-vision": ComponentHomeVision,
 
 	// frigate
-	"frigate":      ComponentFrigate,
-	"home-frigate": ComponentFrigate,
-	"nvr":          ComponentFrigate,
-	"go2rtc":       ComponentFrigate,
+	"frigate":                 ComponentFrigate,
+	"home-frigate":            ComponentFrigate,
+	"nvr":                     ComponentFrigate,
+	"go2rtc":                  ComponentFrigate,
+	"home-datacenter-frigate": ComponentFrigate,
 
 	// mosquitto
-	"mosquitto":      ComponentMosquitto,
-	"home-mosquitto": ComponentMosquitto,
-	"mqtt":           ComponentMosquitto,
+	"mosquitto":                 ComponentMosquitto,
+	"home-mosquitto":            ComponentMosquitto,
+	"mqtt":                      ComponentMosquitto,
+	"broker":                    ComponentMosquitto,
+	"mosquitto-broker":          ComponentMosquitto,
+	"home-datacenter-mosquitto": ComponentMosquitto,
 
 	// openresty
-	"openresty":             ComponentOpenResty,
-	"1panel-openresty":      ComponentOpenResty,
-	"nginx-proxy":           ComponentOpenResty,
-	"1panel-openresty-wudu": ComponentOpenResty,
+	"openresty":               ComponentOpenResty,
+	"1panel-openresty":        ComponentOpenResty,
+	"nginx-proxy":             ComponentOpenResty,
+	"1panel-openresty-wudu":   ComponentOpenResty,
+	"home-gateway":            ComponentOpenResty,
+	"gateway":                 ComponentOpenResty,
+	"home-datacenter-gateway": ComponentOpenResty,
 
 	// 1pwaf
 	"1pwaf":         Component1PWAF,
@@ -141,18 +156,25 @@ var componentAliases = map[string]string{
 	"openresty-waf": Component1PWAF,
 
 	// cloudflared / h3c / new-api / ops-agent / backup / vpn
-	"home-cloudflared":   ComponentCloudflared,
-	"cloudflared":        ComponentCloudflared,
-	"home-h3c-keepalive": ComponentH3CKeepalive,
-	"h3c":                ComponentH3CKeepalive,
-	"home-new-api":       ComponentNewAPI,
-	"new-api":            ComponentNewAPI,
-	"home-ops-agent":     ComponentOpsAgent,
-	"ops-agent":          ComponentOpsAgent,
-	"home-backup":        ComponentHomeBackup,
-	"backup":             ComponentHomeBackup,
-	"mihomo":             ComponentMihomo,
-	"tailscale":          ComponentTailscale,
+	"home-cloudflared":            ComponentCloudflared,
+	"cloudflared":                 ComponentCloudflared,
+	"home-datacenter-cloudflared": ComponentCloudflared,
+	"home-h3c-keepalive":          ComponentH3CKeepalive,
+	"h3c":                         ComponentH3CKeepalive,
+	"home-datacenter-h3c-keepalive": ComponentH3CKeepalive,
+	"home-new-api":                ComponentNewAPI,
+	"new-api":                     ComponentNewAPI,
+	"home-datacenter-new-api":     ComponentNewAPI,
+	"home-ops-agent":              ComponentOpsAgent,
+	"ops-agent":                   ComponentOpsAgent,
+	"home-datacenter-ops-agent":   ComponentOpsAgent,
+	"home-backup":                 ComponentHomeBackup,
+	"backup":                      ComponentHomeBackup,
+	"home-datacenter-backup":      ComponentHomeBackup,
+	"mihomo":                      ComponentMihomo,
+	"tailscale":                   ComponentTailscale,
+	"host-os":                     ComponentHostOS,
+	"nas-host":                    ComponentHostOS,
 }
 
 // canonicalContainerNames maps canonical component names to Docker container names.
@@ -242,18 +264,24 @@ type DefaultOperationExecutor struct {
 	dockerRunner      func(ctx context.Context, action string, container string, params map[string]interface{}) (string, error)
 	baselineExtractor func(target string) string
 
-	leaseManager *RecoveryLeaseManager
-	recoveryFSM  *ContainerRecoveryFSM
-	auditEngine  *audit.AgentAuditEngine
-	componentLocks sync.Map // canonical string -> *sync.Mutex
-	mu             sync.RWMutex
+	leaseManager    *RecoveryLeaseManager
+	recoveryFSM     *ContainerRecoveryFSM
+	auditEngine     *audit.AgentAuditEngine
+	hostSecProvider hostsec.HostSecurityProvider
+	hostUpdateExec  *hostsec.HostUpdateExecutor
+	componentLocks  sync.Map // canonical string -> *sync.Mutex
+	mu              sync.RWMutex
 }
 
 // SetAuditEngine attaches a unified AgentAuditEngine to the executor.
 func (e *DefaultOperationExecutor) SetAuditEngine(engine *audit.AgentAuditEngine) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.auditEngine = engine
+	hue := e.hostUpdateExec
+	e.mu.Unlock()
+	if hue != nil {
+		hue.AuditEngine = engine
+	}
 }
 
 // GetAuditEngine returns the configured AgentAuditEngine (if any).
@@ -261,6 +289,52 @@ func (e *DefaultOperationExecutor) GetAuditEngine() *audit.AgentAuditEngine {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.auditEngine
+}
+
+// SetHostSecurityProvider configures the read-only host asset provider.
+func (e *DefaultOperationExecutor) SetHostSecurityProvider(p hostsec.HostSecurityProvider) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.hostSecProvider = p
+}
+
+// GetHostSecurityProvider returns the configured HostSecurityProvider.
+func (e *DefaultOperationExecutor) GetHostSecurityProvider() hostsec.HostSecurityProvider {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.hostSecProvider
+}
+
+// SetHostUpdateExecutor configures the guarded host OS update executor.
+func (e *DefaultOperationExecutor) SetHostUpdateExecutor(hue *hostsec.HostUpdateExecutor) {
+	e.mu.Lock()
+	e.hostUpdateExec = hue
+	ae := e.auditEngine
+	e.mu.Unlock()
+	if hue != nil && hue.AuditEngine == nil && ae != nil {
+		hue.AuditEngine = ae
+	}
+}
+
+// GetHostUpdateExecutor returns the configured HostUpdateExecutor.
+func (e *DefaultOperationExecutor) GetHostUpdateExecutor() *hostsec.HostUpdateExecutor {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.hostUpdateExec
+}
+
+// WithHostSecurityProvider injects a HostSecurityProvider during executor construction.
+func WithHostSecurityProvider(p hostsec.HostSecurityProvider) ExecutorOption {
+	return func(e *DefaultOperationExecutor) {
+		e.hostSecProvider = p
+	}
+}
+
+// WithHostUpdateExecutor injects a HostUpdateExecutor during executor construction.
+func WithHostUpdateExecutor(hue *hostsec.HostUpdateExecutor) ExecutorOption {
+	return func(e *DefaultOperationExecutor) {
+		e.hostUpdateExec = hue
+	}
 }
 
 // WithAuditEngine injects an AgentAuditEngine during executor construction.
@@ -348,16 +422,23 @@ func WithLeaseManager(mgr *RecoveryLeaseManager) ExecutorOption {
 	}
 }
 
-// BaselineInfo describes an extracted resource baseline fingerprint and its provenance (R5).
+// BaselineInfo describes an extracted resource baseline fingerprint and its provenance (R5, R8).
 type BaselineInfo struct {
-	Hash          string `json:"hash"`
-	Canonical     string `json:"canonical"`
-	Image         string `json:"image,omitempty"`
-	State         string `json:"state,omitempty"`
-	CreatedAt     string `json:"created_at,omitempty"`
-	Source        string `json:"source"` // "1panel", "docker_socket", "offline_catalog", ""
-	IsPlaceholder bool   `json:"is_placeholder"`
-	Error         string `json:"error,omitempty"`
+	Hash            string            `json:"hash"`
+	ProtocolVersion string            `json:"protocol_version,omitempty"`
+	Canonical       string            `json:"canonical"`
+	ContainerID     string            `json:"container_id,omitempty"`
+	Image           string            `json:"image,omitempty"`
+	State           string            `json:"state,omitempty"`
+	CreatedAt       string            `json:"created_at,omitempty"`
+	IdentityHash    string            `json:"identity_hash,omitempty"`
+	SecurityHash    string            `json:"security_hash,omitempty"`
+	StateHash       string            `json:"state_hash,omitempty"`
+	Identity        *BaselineIdentity `json:"identity,omitempty"`
+	Security        *BaselineSecurity `json:"security,omitempty"`
+	Source          string            `json:"source"` // "docker_socket", "1panel", "offline_catalog", ""
+	IsPlaceholder   bool              `json:"is_placeholder"`
+	Error           string            `json:"error,omitempty"`
 }
 
 // IsProductionRuntime reports whether the process is running in production/strict baseline mode.
@@ -388,16 +469,13 @@ func IsProductionRuntime() bool {
 	return false
 }
 
-// ComputeOfflinePlaceholderBaseline computes the deterministic offline placeholder fingerprint for a component.
+// ComputeOfflinePlaceholderBaseline computes the deterministic offline placeholder marker for a component.
 func ComputeOfflinePlaceholderBaseline(component string) string {
-	canonical, err := ResolveComponent(component)
-	if err != nil {
+	canonical := ResolveBaselineComponent(component)
+	if canonical == "" {
 		return ""
 	}
-	hasher := sha256.New()
-	raw := fmt.Sprintf("%s:offline:none", canonical)
-	hasher.Write([]byte(raw))
-	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+	return "offline-placeholder:" + canonical
 }
 
 // IsOfflinePlaceholderBaseline reports whether baselineHash matches any offline/static placeholder fingerprint (R5).
@@ -406,64 +484,185 @@ func IsOfflinePlaceholderBaseline(component string, baselineHash string) bool {
 	if trimmed == "" {
 		return false
 	}
-	if strings.HasPrefix(trimmed, "offline-placeholder:") || strings.HasPrefix(trimmed, "placeholder:") {
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "offline-placeholder:") ||
+		strings.HasPrefix(lower, "offline:") ||
+		strings.HasPrefix(lower, "placeholder:") ||
+		lower == "placeholder" || lower == "none" || lower == "default" || lower == "unknown" {
 		return true
 	}
-	canonical, err := ResolveComponent(component)
-	if err != nil {
+	canonical := ResolveBaselineComponent(component)
+	if canonical == "" {
 		canonical = model.CanonicalizeComponent(component)
 	}
 	if canonical == "" {
 		return false
 	}
-	if offHash := ComputeOfflinePlaceholderBaseline(canonical); offHash != "" && trimmed == offHash {
+	if offHash := ComputeOfflinePlaceholderBaseline(canonical); offHash != "" && lower == strings.ToLower(offHash) {
 		return true
 	}
-	if defHash := model.ComputeDefaultBaseline(canonical); defHash != "" && trimmed == defHash {
+	legacyOffline := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(fmt.Sprintf("%s:offline:none", canonical))))
+	if lower == legacyOffline {
 		return true
+	}
+	if defHash := model.ComputeDefaultBaseline(canonical); defHash != "" && lower == strings.ToLower(defHash) {
+		return true
+	}
+	if dockerName := canonicalContainerNames[canonical]; dockerName != "" {
+		legacyStatic := fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(fmt.Sprintf("%s:channels-tool/%s:latest:running:", canonical, dockerName))))
+		if lower == legacyStatic {
+			return true
+		}
 	}
 	return false
 }
 
-// ExtractBaseline extracts the container baseline fingerprint and distinguishes real runtime
-// fingerprints from offline placeholders. Unknown components, unknown states, API timeouts,
-// and missing containers fail closed with empty Hash (R5).
+// ExtractBaseline extracts the container baseline fingerprint (Baseline Protocol v1 + 20-field R8 inspect)
+// and distinguishes real runtime fingerprints from offline placeholders. Unknown components, ambiguous matches,
+// unknown states, API timeouts, and missing containers fail closed with empty Hash (R5, R8).
 func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 	clean := strings.TrimSpace(target)
-	canonical, err := ResolveComponent(clean)
-	if err != nil {
+	if _, err := ResolveComponent(clean); err != nil {
 		return BaselineInfo{Error: err.Error()}
 	}
-	expectedDockerName := canonicalContainerNames[canonical]
-
-	matchContainer := func(containers []ContainerSummary) *ContainerSummary {
-		for i := range containers {
-			cName := strings.TrimPrefix(strings.TrimSpace(containers[i].Name), "/")
-			if strings.EqualFold(cName, canonical) ||
-				(expectedDockerName != "" && strings.EqualFold(cName, expectedDockerName)) ||
-				ResolveTopologyComponent(cName) == canonical {
-				return &containers[i]
-			}
+	canonical := ResolveBaselineComponent(clean)
+	if canonical == "" {
+		return BaselineInfo{Error: ErrComponentNotWhitelisted.Error()}
+	}
+	if canonical == ComponentHostOS {
+		hue := e.GetHostUpdateExecutor()
+		if hue == nil {
+			return BaselineInfo{Canonical: canonical, Error: "host update executor not configured"}
 		}
-		return nil
+		bCtx, bCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer bCancel()
+		hash, _, bErr := hue.ComputeBaselineHash(bCtx, nil)
+		if bErr != nil || hash == "" {
+			errMsg := "failed to compute host-os baseline hash"
+			if bErr != nil {
+				errMsg = bErr.Error()
+			}
+			return BaselineInfo{Canonical: canonical, Error: errMsg}
+		}
+		return BaselineInfo{
+			Hash:            hash,
+			ProtocolVersion: "host-v1",
+			Canonical:       canonical,
+			Source:          "host_os",
+			IsPlaceholder:   false,
+		}
+	}
+	expectedDockerName := canonicalContainerNames[canonical]
+	if expectedDockerName == "" {
+		return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("component %s has no mapped container", canonical)}
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	var targetContainer *ContainerSummary
-	var source string
-	var isPlaceholder bool
+	// 1. Prefer direct Docker socket /containers/{name}/json inspect (authoritative 20-field R8 posture + digest)
+	sockPath := e.dockerSocket
+	if sockPath == "" && e.fallback != nil {
+		sockPath = e.fallback.dockerSocket
+	}
+	if sockPath != "" {
+		if _, statErr := os.Stat(sockPath); statErr == nil {
+			inspectData, insErr := inspectContainerViaDockerSocket(ctx, sockPath, canonical)
+			if insErr != nil {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed: %v", insErr)}
+			}
+			comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectData)
+			if cErr != nil {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
+			}
+			return BaselineInfo{
+				Hash:            comp.Hash,
+				ProtocolVersion: BaselineProtocolVersion,
+				Canonical:       canonical,
+				ContainerID:     comp.Document.Identity.ContainerID,
+				Image:           comp.Document.Identity.ImageReference,
+				State:           comp.Document.State.ContainerState,
+				CreatedAt:       comp.Document.State.CreatedAt,
+				IdentityHash:    comp.IdentityHash,
+				SecurityHash:    comp.SecurityHash,
+				StateHash:       comp.StateHash,
+				Identity:        &comp.Document.Identity,
+				Security:        &comp.Document.Security,
+				Source:          "docker_socket",
+				IsPlaceholder:   false,
+			}
+		}
+	}
+
+	// 2. Fallback to 1Panel container list when Docker socket is unavailable (e.g., remote 1Panel host or Windows mock tests)
 	var clientSucceeded bool
 	var clientTimedOut bool
-
-	if e.client != nil && strings.TrimSpace(e.client.baseURL) != "" {
+	clientConfigured := e.client != nil && strings.TrimSpace(e.client.baseURL) != "" &&
+		!(strings.TrimSpace(e.client.baseURL) == "http://172.18.0.1:10000" &&
+			strings.TrimSpace(e.client.username) == "" &&
+			strings.TrimSpace(e.client.password) == "" &&
+			strings.TrimSpace(e.client.psession) == "")
+	if clientConfigured {
 		containers, lErr := e.client.ListContainers(ctx)
 		if lErr == nil {
 			clientSucceeded = true
-			if matched := matchContainer(containers); matched != nil {
-				targetContainer = matched
-				source = "1panel"
+			var matches []*ContainerSummary
+			for i := range containers {
+				cName := strings.TrimPrefix(strings.TrimSpace(containers[i].Name), "/")
+				if strings.EqualFold(cName, expectedDockerName) ||
+					strings.EqualFold(cName, canonical) ||
+					ResolveBaselineComponent(cName) == canonical {
+					matches = append(matches, &containers[i])
+				}
+			}
+			if len(matches) > 1 {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: ErrBaselineAmbiguousContainer.Error()}
+			}
+			if len(matches) == 1 {
+				tc := matches[0]
+				stateLower := strings.ToLower(strings.TrimSpace(tc.State))
+				if stateLower == "" || stateLower == "unknown" || strings.TrimSpace(tc.Image) == "" {
+					return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s has invalid state %q or empty image", canonical, tc.State)}
+				}
+				cid := strings.TrimSpace(tc.ContainerID)
+				if cid == "" {
+					cid = "1panel:" + strings.TrimPrefix(strings.TrimSpace(tc.Name), "/")
+				}
+				createdStr := strings.TrimSpace(tc.CreatedAt)
+				if createdStr != "" {
+					if _, normErr := normalizeBaselineTimestamp(createdStr); normErr != nil {
+						if parsed, pErr := time.Parse("2006-01-02 15:04:05", createdStr); pErr == nil {
+							createdStr = parsed.UTC().Format("2006-01-02T15:04:05.000Z")
+						}
+					}
+				}
+				inspectMap := map[string]interface{}{
+					"Id":      cid,
+					"Name":    "/" + strings.TrimPrefix(strings.TrimSpace(tc.Name), "/"),
+					"Created": createdStr,
+					"Config":  map[string]interface{}{"Image": tc.Image},
+					"State":   map[string]interface{}{"Status": tc.State},
+				}
+				comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectMap)
+				if cErr != nil {
+					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
+				}
+				return BaselineInfo{
+					Hash:            comp.Hash,
+					ProtocolVersion: BaselineProtocolVersion,
+					Canonical:       canonical,
+					ContainerID:     comp.Document.Identity.ContainerID,
+					Image:           comp.Document.Identity.ImageReference,
+					State:           comp.Document.State.ContainerState,
+					CreatedAt:       comp.Document.State.CreatedAt,
+					IdentityHash:    comp.IdentityHash,
+					SecurityHash:    comp.SecurityHash,
+					StateHash:       comp.StateHash,
+					Identity:        &comp.Document.Identity,
+					Security:        &comp.Document.Security,
+					Source:          "1panel",
+					IsPlaceholder:   false,
+				}
 			}
 		} else if errors.Is(lErr, context.DeadlineExceeded) ||
 			errors.Is(ctx.Err(), context.DeadlineExceeded) ||
@@ -473,66 +672,22 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 		}
 	}
 
-	if targetContainer == nil && e.fallback != nil {
-		sockPath := e.dockerSocket
-		if sockPath == "" {
-			sockPath = e.fallback.dockerSocket
-		}
-		if sockPath != "" {
-			if _, statErr := os.Stat(sockPath); statErr == nil {
-				fb := &HostFallbackProvider{dockerSocket: sockPath}
-				containers, dErr := fb.queryDockerSocket(ctx)
-				if dErr != nil {
-					return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("docker socket query failed: %v", dErr)}
-				}
-				if matched := matchContainer(containers); matched != nil {
-					targetContainer = matched
-					source = "docker_socket"
-				} else {
-					return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not found in docker", canonical)}
-				}
-			}
-		}
-
-		if targetContainer == nil {
-			if clientTimedOut {
-				return BaselineInfo{Canonical: canonical, Error: "1panel container query timed out"}
-			}
-			if clientSucceeded {
-				return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not found in 1panel", canonical)}
-			}
-			if IsProductionRuntime() {
-				return BaselineInfo{Canonical: canonical, Error: "live container runtime unavailable in production"}
-			}
-			fallbackContainers := e.fallback.GetHostContainers(ctx)
-			if matched := matchContainer(fallbackContainers); matched != nil {
-				targetContainer = matched
-				source = "offline_catalog"
-				isPlaceholder = true
-			}
-		}
+	if clientTimedOut {
+		return BaselineInfo{Canonical: canonical, Error: "1panel container query timed out"}
+	}
+	if clientSucceeded {
+		return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not found in 1panel", canonical)}
+	}
+	if IsProductionRuntime() {
+		return BaselineInfo{Canonical: canonical, Error: "live container runtime unavailable in production"}
 	}
 
-	if targetContainer == nil {
-		return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s not resolved", canonical)}
-	}
-
-	stateLower := strings.ToLower(strings.TrimSpace(targetContainer.State))
-	if stateLower == "" || stateLower == "unknown" || strings.TrimSpace(targetContainer.Image) == "" {
-		return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s has invalid state %q or empty image", canonical, targetContainer.State)}
-	}
-
-	hasher := sha256.New()
-	raw := fmt.Sprintf("%s:%s:%s:%s", canonical, targetContainer.Image, targetContainer.State, targetContainer.CreatedAt)
-	hasher.Write([]byte(raw))
 	return BaselineInfo{
-		Hash:          fmt.Sprintf("sha256:%x", hasher.Sum(nil)),
-		Canonical:     canonical,
-		Image:         targetContainer.Image,
-		State:         targetContainer.State,
-		CreatedAt:     targetContainer.CreatedAt,
-		Source:        source,
-		IsPlaceholder: isPlaceholder,
+		Hash:            ComputeOfflinePlaceholderBaseline(canonical),
+		ProtocolVersion: BaselineProtocolVersion,
+		Canonical:       canonical,
+		Source:          "offline_catalog",
+		IsPlaceholder:   true,
 	}
 }
 
@@ -565,6 +720,15 @@ func NewOperationExecutor(
 	if exec.auditEngine == nil && db != nil {
 		exec.auditEngine = audit.NewAgentAuditEngine(db, bus, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
 	}
+	hostRoot := strings.TrimSpace(os.Getenv("HOST_ROOT"))
+	if exec.hostSecProvider == nil {
+		exec.hostSecProvider = hostsec.NewDefaultHostSecurityProvider(hostRoot, exec.dockerSocket)
+	}
+	if exec.hostUpdateExec == nil {
+		exec.hostUpdateExec = hostsec.NewHostUpdateExecutor(hostRoot, strings.TrimSpace(os.Getenv("HOST_SNAPSHOT_DIR")), exec.auditEngine)
+	} else if exec.hostUpdateExec.AuditEngine == nil && exec.auditEngine != nil {
+		exec.hostUpdateExec.AuditEngine = exec.auditEngine
+	}
 	if exec.baselineExtractor == nil {
 		exec.baselineExtractor = func(target string) string {
 			return exec.ExtractBaseline(target).Hash
@@ -579,14 +743,18 @@ func ResolveComponent(target string) (string, error) {
 	if clean == "" {
 		return "", ErrComponentNotWhitelisted
 	}
-	// Strip parenthetical text, e.g. "home-web (Nginx)" -> "home-web"
+	// Strip parenthetical text, e.g. "home-web (Nginx)" -> "home-web" (reject path/traversal chars inside parens)
 	if idx := strings.Index(clean, "("); idx != -1 {
+		suffix := clean[idx:]
+		if strings.ContainsAny(suffix, "/\\") || strings.Contains(suffix, "..") {
+			return "", ErrComponentNotWhitelisted
+		}
 		prefix := strings.TrimSpace(clean[:idx])
 		if prefix != "" {
 			clean = prefix
 		}
 	}
-	clean = strings.ToLower(clean)
+	clean = strings.ToLower(strings.TrimPrefix(clean, "/"))
 
 	canonical, ok := componentAliases[clean]
 	if !ok {
@@ -631,6 +799,29 @@ func ValidateSpecSafety(spec OperationSpec) error {
 }
 
 type componentLockHeldKey struct{}
+type approvedProposalContextKey struct{}
+
+type errHostPkgUpgradeRolledBack struct {
+	cause error
+}
+
+func (e errHostPkgUpgradeRolledBack) Error() string { return e.cause.Error() }
+func (e errHostPkgUpgradeRolledBack) Unwrap() error { return e.cause }
+
+func withApprovedProposalContext(ctx context.Context, proposal *model.OpsProposal) context.Context {
+	if proposal == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, approvedProposalContextKey{}, proposal)
+}
+
+func approvedProposalFromContext(ctx context.Context) *model.OpsProposal {
+	if ctx == nil {
+		return nil
+	}
+	p, _ := ctx.Value(approvedProposalContextKey{}).(*model.OpsProposal)
+	return p
+}
 
 func withComponentLockHeld(ctx context.Context, canonical string) context.Context {
 	return context.WithValue(ctx, componentLockHeldKey{}, canonical)
@@ -657,7 +848,8 @@ func isMutatingContainerAction(action string) bool {
 func isAllowedProductionAction(action string) bool {
 	switch strings.ToLower(strings.TrimSpace(action)) {
 	case ActionDockerRestart, ActionDockerRecreate, ActionDockerUpdateImage, ActionDockerExec,
-		ActionDBCreateIndex, ActionDBDropIndex, ActionDBVacuumSnapshot, ActionWAFReload, ActionCachePurge:
+		ActionDBCreateIndex, ActionDBDropIndex, ActionDBVacuumSnapshot, ActionWAFReload, ActionCachePurge,
+		ActionHostPackageUpgrade:
 		return true
 	default:
 		return false
@@ -695,15 +887,59 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		defer cancel()
 	}
 
+	if e.db != nil && ae == nil {
+		return &ExecutionResult{
+			Success:    false,
+			Action:     spec.Action,
+			Target:     spec.Target,
+			Error:      audit.ErrAuditCommitFailed.Error(),
+			ExecutedAt: startTime,
+		}, audit.ErrAuditCommitFailed
+	}
+
 	// 1. Validate spec safety against shell metacharacters
 	if err := ValidateSpecSafety(spec); err != nil {
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         spec.Action,
+				Target:         spec.Target,
+				Component:      spec.Target,
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskHigh,
+				OperationID:    opID,
+				Result:         "BLOCKED",
+				ErrorCode:      err.Error(),
+				FinalRunStatus: model.AuditRunStatusBlocked,
+			})
+		}
 		return nil, err
 	}
 
 	// 2. Enforce strict bidirectional component whitelist
 	canonical, err := ResolveComponent(spec.Target)
 	if err != nil {
+		if ae != nil {
+			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+				EventType:      model.AuditEventPolicyEvaluated,
+				Action:         spec.Action,
+				Target:         spec.Target,
+				Component:      spec.Target,
+				Decision:       model.AuditDecisionDeny,
+				RiskLevel:      model.AuditRiskHigh,
+				OperationID:    opID,
+				Result:         "BLOCKED",
+				ErrorCode:      err.Error(),
+				FinalRunStatus: model.AuditRunStatusBlocked,
+			})
+		}
 		return nil, err
+	}
+	if strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade) && canonical != ComponentHostOS {
+		return nil, fmt.Errorf("%w: %s requires target %s", ErrActionNotSupported, ActionHostPackageUpgrade, ComponentHostOS)
+	}
+	if canonical == ComponentHostOS && !strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade) {
+		return nil, fmt.Errorf("%w: %s only permits %s", ErrActionNotSupported, ComponentHostOS, ActionHostPackageUpgrade)
 	}
 
 	// Ensure every Execute invocation is correlated inside an AgentAuditRun (without replacing caller runs).
@@ -732,10 +968,31 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}
 	}
 
+	emitPreExecBlock := func(blockErr error, fencingGen int64) {
+		if ae == nil || blockErr == nil {
+			return
+		}
+		_, _ = ae.EmitEvent(context.WithoutCancel(ctx), audit.EmitEventInput{
+			EventType:         model.AuditEventPolicyEvaluated,
+			Action:            spec.Action,
+			Target:            canonical,
+			Component:         canonical,
+			Decision:          model.AuditDecisionDeny,
+			RiskLevel:         model.AuditRiskHigh,
+			OperationID:       opID,
+			FencingGeneration: fencingGen,
+			Parameters:        spec.Params,
+			Result:            "BLOCKED",
+			ErrorCode:         blockErr.Error(),
+			FinalRunStatus:    model.AuditRunStatusBlocked,
+		})
+	}
+
 	// 2.0 If no mock runner is installed (production path), enforce closed action whitelist
 	if e.dockerRunner == nil && !isAllowedProductionAction(spec.Action) {
+		blockErr := fmt.Errorf("%w: %s", ErrActionNotSupported, spec.Action)
 		if ae != nil {
-			_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+			if _, aErr := ae.EmitEvent(ctx, audit.EmitEventInput{
 				EventType:      model.AuditEventPolicyEvaluated,
 				Action:         spec.Action,
 				Target:         canonical,
@@ -747,15 +1004,17 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				Result:         "BLOCKED",
 				ErrorCode:      ErrActionNotSupported.Error(),
 				FinalRunStatus: model.AuditRunStatusBlocked,
-			})
+			}); aErr != nil {
+				blockErr = errors.Join(blockErr, aErr)
+			}
 		}
 		return &ExecutionResult{
 			Success:    false,
 			Action:     spec.Action,
 			Target:     canonical,
-			Error:      fmt.Sprintf("%v: %s", ErrActionNotSupported, spec.Action),
+			Error:      blockErr.Error(),
 			ExecutedAt: startTime,
-		}, fmt.Errorf("%w: %s", ErrActionNotSupported, spec.Action)
+		}, blockErr
 	}
 
 	// 2.1 Acquire per-component mutex unless already held by enclosing call frame
@@ -766,14 +1025,17 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		ctx = withComponentLockHeld(ctx, canonical)
 	}
 
-	// 2.2 Recovery Lease Lifecycle (R4-04 ~ R4-08):
+	// 2.2 Recovery Lease Lifecycle (R4-04 ~ R4-08, R6):
 	// Reuse existing LeaseGuard passed in context from ProcessAndRecover (never re-acquire!),
 	// or acquire our own LeaseGuard if called standalone on a mutating container action.
+	safetyGuardTTL := time.Duration(DefaultLeaseSafetyGuardMs) * time.Millisecond
 	existingGuard := RecoveryLeaseFromContext(ctx)
 	var ownGuard *LeaseGuard
 	if existingGuard != nil {
+		existingGuard.BindAuditContext(ae, ctx)
 		expectedLeaseComp := ResolveTopologyComponent(canonical)
 		if existingGuard.Grant.Component != expectedLeaseComp && existingGuard.Grant.Component != canonical {
+			emitPreExecBlock(ErrInvalidLeaseToken, existingGuard.Grant.FencingGeneration)
 			return &ExecutionResult{
 				Success:    false,
 				Action:     spec.Action,
@@ -782,7 +1044,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				ExecutedAt: startTime,
 			}, ErrInvalidLeaseToken
 		}
-		if err := existingGuard.VerifyBeforeMutation(0); err != nil {
+		if err := existingGuard.VerifyBeforeMutation(safetyGuardTTL); err != nil {
 			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
 				OperationID:       opID,
 				EventType:         "ops.fencing.rejected",
@@ -792,6 +1054,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				FencingGeneration: existingGuard.Grant.FencingGeneration,
 				Message:           fmt.Sprintf("pre-execution fencing validation failed: %v", err),
 			})
+			emitPreExecBlock(err, existingGuard.Grant.FencingGeneration)
 			return &ExecutionResult{
 				Success:    false,
 				Action:     spec.Action,
@@ -803,6 +1066,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	} else if e.leaseManager != nil && isMutatingContainerAction(spec.Action) {
 		leaseCtx, guard, lErr := AcquireLeaseGuard(ctx, e.leaseManager, canonical, opID, 30*time.Second, e.db, e.bus)
 		if lErr != nil {
+			emitPreExecBlock(lErr, 0)
 			return &ExecutionResult{
 				Success:    false,
 				Action:     spec.Action,
@@ -811,6 +1075,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				ExecutedAt: startTime,
 			}, fmt.Errorf("persistent recovery lease conflict for %s: %w", canonical, lErr)
 		}
+		guard.BindAuditContext(ae, leaseCtx)
 		ctx = leaseCtx
 		ownGuard = guard
 	}
@@ -822,20 +1087,23 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		return ownGuard.Release(e.db, e.bus)
 	}
 
-	// 3. Anti-TOCTOU baseline hash verification (Fail-Closed: calculation failure, placeholder in prod, or drift strictly blocks execution)
+	// 3. Anti-TOCTOU baseline hash & R8 security verification (Fail-Closed: calculation failure, placeholder in prod, or drift strictly blocks execution)
+	effectiveBaselineHash := strings.TrimSpace(spec.BaselineHash)
 	if spec.BaselineHash != "" {
-		if IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonical, spec.BaselineHash) {
+		if IsProductionRuntime() && (!IsRealBaselineHash(spec.BaselineHash, canonical) || IsOfflinePlaceholderBaseline(canonical, spec.BaselineHash)) {
+			emitPreExecBlock(ErrBaselineMismatch, 0)
 			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
 				Target:       canonical,
 				BaselineHash: spec.BaselineHash,
-				Error:        "offline placeholder baseline hash rejected in production",
+				Error:        "offline placeholder or invalid baseline hash rejected in production",
 				ExecutedAt:   startTime,
 			}, ErrBaselineMismatch
 		}
 		if e.baselineExtractor == nil {
+			emitPreExecBlock(ErrBaselineMismatch, 0)
 			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
@@ -847,7 +1115,8 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			}, ErrBaselineMismatch
 		}
 		currentHash := e.baselineExtractor(canonical)
-		if currentHash == "" || currentHash != spec.BaselineHash || (IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonical, currentHash)) {
+		if currentHash == "" || currentHash != spec.BaselineHash || (IsProductionRuntime() && (!IsRealBaselineHash(currentHash, canonical) || IsOfflinePlaceholderBaseline(canonical, currentHash))) {
+			emitPreExecBlock(ErrBaselineMismatch, 0)
 			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
@@ -858,13 +1127,51 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				ExecutedAt:   startTime,
 			}, ErrBaselineMismatch
 		}
+	} else if strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade) {
+		emitPreExecBlock(ErrEmptyBaseline, 0)
+		_ = releaseOwnLease()
+		return &ExecutionResult{
+			Success:    false,
+			Action:     spec.Action,
+			Target:     canonical,
+			Error:      ErrEmptyBaseline.Error(),
+			ExecutedAt: startTime,
+		}, ErrEmptyBaseline
+	} else if isMutatingContainerAction(spec.Action) {
+		if e.baselineExtractor != nil {
+			liveHash := e.baselineExtractor(canonical)
+			if liveHash != "" {
+				effectiveBaselineHash = liveHash
+			}
+			if IsProductionRuntime() && (liveHash == "" || !IsRealBaselineHash(liveHash, canonical) || IsOfflinePlaceholderBaseline(canonical, liveHash)) {
+				emitPreExecBlock(ErrEmptyBaseline, 0)
+				_ = releaseOwnLease()
+				return &ExecutionResult{
+					Success:    false,
+					Action:     spec.Action,
+					Target:     canonical,
+					Error:      fmt.Sprintf("%v: live container baseline unavailable or placeholder in production", ErrEmptyBaseline),
+					ExecutedAt: startTime,
+				}, ErrEmptyBaseline
+			}
+		} else if IsProductionRuntime() {
+			emitPreExecBlock(ErrEmptyBaseline, 0)
+			_ = releaseOwnLease()
+			return &ExecutionResult{
+				Success:    false,
+				Action:     spec.Action,
+				Target:     canonical,
+				Error:      "baseline extractor not configured on executor",
+				ExecutedAt: startTime,
+			}, ErrEmptyBaseline
+		}
 	}
 
-	// 3.5 Final fencing gate right before external Docker/OS mutation (R4-06)
+	// 3.5 Final fencing gate right before external Docker/OS mutation (R4-06, R6)
 	var fencingGen int64
 	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
 		fencingGen = guard.Grant.FencingGeneration
-		if fErr := guard.VerifyBeforeMutation(0); fErr != nil {
+		if fErr := guard.VerifyBeforeMutation(safetyGuardTTL); fErr != nil {
 			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
 				OperationID:       opID,
 				EventType:         "ops.fencing.rejected",
@@ -874,6 +1181,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				FencingGeneration: guard.Grant.FencingGeneration,
 				Message:           fmt.Sprintf("stale lease or expired fencing token blocked right before Docker dispatch: %v", fErr),
 			})
+			emitPreExecBlock(fErr, fencingGen)
 			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:    false,
@@ -885,6 +1193,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}
 	}
 	if err := ctx.Err(); err != nil {
+		emitPreExecBlock(err, fencingGen)
 		_ = releaseOwnLease()
 		return &ExecutionResult{
 			Success:    false,
@@ -907,16 +1216,19 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			OperationID:       opID,
 			FencingGeneration: fencingGen,
 			Parameters:        spec.Params,
-			BeforeState:       map[string]interface{}{"baseline_hash": spec.BaselineHash},
+			BeforeState:       map[string]interface{}{"baseline_hash": effectiveBaselineHash},
 			Result:            "STARTED",
 			FailurePolicy:     audit.PolicyFailClosed,
 		}); preErr != nil {
+			if sess, ok := audit.SessionFromContext(ctx); ok {
+				_ = ae.FinishRun(sess.RunID, model.AuditRunStatusAuditCommitFailed, "", preErr.Error())
+			}
 			_ = releaseOwnLease()
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
 				Target:       canonical,
-				BaselineHash: spec.BaselineHash,
+				BaselineHash: effectiveBaselineHash,
 				DurationMs:   time.Since(startTime).Milliseconds(),
 				Error:        preErr.Error(),
 				ExecutedAt:   startTime,
@@ -936,8 +1248,9 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				Component:   canonical,
 				Message:     fmt.Sprintf("ambiguous mutation failure (%v); blocking automatic rollback/retry", err),
 			})
+			var unkAuditErr error
 			if ae != nil {
-				_, _ = ae.RecordPostMutation(ctx, audit.EmitEventInput{
+				_, unkAuditErr = ae.RecordPostMutation(ctx, audit.EmitEventInput{
 					EventType:         model.AuditEventExecutionUnknown,
 					Action:            spec.Action,
 					Target:            canonical,
@@ -946,36 +1259,48 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 					RiskLevel:         model.AuditRiskCritical,
 					OperationID:       opID,
 					FencingGeneration: fencingGen,
+					Parameters:        spec.Params,
+					AfterState:        map[string]interface{}{"status": "EXECUTION_UNKNOWN", "output": redact.SensitiveString(out)},
 					Result:            "EXECUTION_UNKNOWN",
 					ErrorCode:         err.Error(),
 					DurationMs:        time.Since(startTime).Milliseconds(),
 					Evidence:          map[string]interface{}{"output": redact.SensitiveString(out)},
 					FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
 					MirrorLegacy:      true,
-				}, nil)
+				}, func(cause error) {
+					RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+						OperationID: opID,
+						EventType:   "ops.audit.post_commit_failed",
+						Severity:    "critical",
+						Component:   canonical,
+						Message:     fmt.Sprintf("post-execution unknown-outcome audit failed: %v", cause),
+					})
+				})
 			}
 			histErr := e.recordExecutionHistory(canonical, spec.Action, "execution_unknown", out, fmt.Sprintf("ambiguous failure: %v", err))
-			_ = releaseOwnLease()
+			relErr := releaseOwnLease()
 			combErr := fmt.Errorf("%w: %v", ErrExecutionAmbiguous, err)
-			if histErr != nil {
-				combErr = errors.Join(combErr, histErr)
+			if unkAuditErr != nil || histErr != nil || relErr != nil {
+				combErr = errors.Join(combErr, unkAuditErr, histErr, relErr)
 			}
 			return &ExecutionResult{
 				Success:      false,
 				Action:       spec.Action,
 				Target:       canonical,
 				Output:       redact.SensitiveString(out),
-				BaselineHash: spec.BaselineHash,
+				BaselineHash: effectiveBaselineHash,
 				DurationMs:   time.Since(startTime).Milliseconds(),
 				RolledBack:   false,
-				Error:        fmt.Sprintf("%s: %v", ErrExecutionAmbiguous.Error(), err),
+				Error:        combErr.Error(),
 				ExecutedAt:   startTime,
 			}, combErr
 		}
 
 		// Definite failure -> attempt atomic rollback if specified with decoupled timeout
 		var rbErr error
-		if spec.RollbackSpec != nil {
+		var hostUpgradeRolledBack errHostPkgUpgradeRolledBack
+		alreadyRolledBack := errors.As(err, &hostUpgradeRolledBack)
+		if spec.RollbackSpec != nil && !alreadyRolledBack {
 			rbCtx, rbCancel := context.WithTimeout(withComponentLockHeld(context.Background(), canonical), 30*time.Second)
 			if guard := RecoveryLeaseFromContext(ctx); guard != nil {
 				rbCtx = WithRecoveryLease(rbCtx, guard)
@@ -989,13 +1314,18 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		duration := time.Since(startTime).Milliseconds()
 		status := "failed"
 		finalRunStatus := model.AuditRunStatusFailed
-		if spec.RollbackSpec != nil {
+		rolledBack := alreadyRolledBack
+		if spec.RollbackSpec != nil && !alreadyRolledBack {
 			if rbErr == nil {
 				status = "rolled_back"
 				finalRunStatus = model.AuditRunStatusRolledBack
+				rolledBack = true
 			} else {
 				status = "rollback_failed"
 			}
+		} else if alreadyRolledBack {
+			status = "rolled_back"
+			finalRunStatus = model.AuditRunStatusRolledBack
 		}
 		var postAuditErr error
 		if ae != nil {
@@ -1008,13 +1338,24 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				RiskLevel:         model.AuditRiskHigh,
 				OperationID:       opID,
 				FencingGeneration: fencingGen,
+				Parameters:        spec.Params,
+				AfterState:        map[string]interface{}{"status": strings.ToUpper(status), "rolled_back": rolledBack},
 				Result:            strings.ToUpper(status),
 				ErrorCode:         err.Error(),
 				DurationMs:        duration,
 				Evidence:          map[string]interface{}{"output": redact.SensitiveString(out), "rollback_err": fmt.Sprintf("%v", rbErr)},
 				FinalRunStatus:    finalRunStatus,
 				MirrorLegacy:      true,
-			}, nil)
+			}, func(cause error) {
+				GlobalSecurityMetrics.IncExecutionUnknown()
+				RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+					OperationID: opID,
+					EventType:   "ops.audit.post_commit_failed",
+					Severity:    "critical",
+					Component:   canonical,
+					Message:     fmt.Sprintf("post-execution failure audit failed after mutation: %v", cause),
+				})
+			})
 		}
 		histErr := e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("execution failed: %v; rollback err: %v", err, rbErr))
 		_ = releaseOwnLease()
@@ -1023,8 +1364,11 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		if rbErr != nil {
 			errDetails = fmt.Sprintf("%s (rollback also failed: %v)", errDetails, rbErr)
 		}
-		if postAuditErr != nil || histErr != nil {
-			err = errors.Join(err, postAuditErr, histErr)
+		if postAuditErr != nil {
+			errDetails = fmt.Sprintf("%s (audit commit failed: %v)", errDetails, postAuditErr)
+			err = errors.Join(ErrExecutionAmbiguous, err, postAuditErr, histErr)
+		} else if histErr != nil {
+			err = errors.Join(err, histErr)
 		}
 
 		return &ExecutionResult{
@@ -1032,17 +1376,17 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			Action:       spec.Action,
 			Target:       canonical,
 			Output:       redact.SensitiveString(out),
-			BaselineHash: spec.BaselineHash,
+			BaselineHash: effectiveBaselineHash,
 			DurationMs:   duration,
-			RolledBack:   spec.RollbackSpec != nil && rbErr == nil,
+			RolledBack:   rolledBack,
 			Error:        errDetails,
 			ExecutedAt:   startTime,
 		}, err
 	}
 
-	// 5. Post-mutation 15s health probe polling
+	// 5. Post-mutation 15s health probe polling (R7: audit failure halts in-flight execution -> EXECUTION_UNKNOWN)
 	if ae != nil {
-		_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+		if _, hcStartErr := ae.EmitEvent(ctx, audit.EmitEventInput{
 			EventType:         model.AuditEventHealthCheckStarted,
 			Action:            spec.Action,
 			Target:            canonical,
@@ -1051,8 +1395,35 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			RiskLevel:         model.AuditRiskMedium,
 			OperationID:       opID,
 			FencingGeneration: fencingGen,
+			Parameters:        spec.Params,
 			Result:            "PROBING",
-		})
+		}); hcStartErr != nil {
+			GlobalSecurityMetrics.IncExecutionUnknown()
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID:       opID,
+				EventType:         "ops.audit.inflight_failed",
+				Severity:          "critical",
+				Component:         canonical,
+				FencingGeneration: fencingGen,
+				Message:           fmt.Sprintf("in-flight audit failed before health probe; halting execution: %v", hcStartErr),
+			})
+			if sess, ok := audit.SessionFromContext(ctx); ok {
+				_ = ae.FinishRun(sess.RunID, model.AuditRunStatusExecutionUnknown, "", hcStartErr.Error())
+			}
+			_ = releaseOwnLease()
+			combErr := fmt.Errorf("%w: in-flight audit failed at HEALTH_CHECK_STARTED: %v", ErrExecutionAmbiguous, hcStartErr)
+			return &ExecutionResult{
+				Success:      false,
+				Action:       spec.Action,
+				Target:       canonical,
+				Output:       redact.SensitiveString(out),
+				BaselineHash: effectiveBaselineHash,
+				DurationMs:   time.Since(startTime).Milliseconds(),
+				RolledBack:   false,
+				Error:        combErr.Error(),
+				ExecutedAt:   startTime,
+			}, combErr
+		}
 	}
 	probeErr := e.pollHealth(ctx, canonical)
 	duration := time.Since(startTime).Milliseconds()
@@ -1063,7 +1434,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			hcRes = "UNHEALTHY"
 			hcErr = probeErr.Error()
 		}
-		_, _ = ae.EmitEvent(ctx, audit.EmitEventInput{
+		if _, hcEndErr := ae.EmitEvent(ctx, audit.EmitEventInput{
 			EventType:         model.AuditEventHealthCheckCompleted,
 			Action:            spec.Action,
 			Target:            canonical,
@@ -1072,10 +1443,41 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			RiskLevel:         model.AuditRiskMedium,
 			OperationID:       opID,
 			FencingGeneration: fencingGen,
+			Parameters:        spec.Params,
+			AfterState:        map[string]interface{}{"health_result": hcRes},
 			Result:            hcRes,
 			ErrorCode:         hcErr,
 			DurationMs:        duration,
-		})
+		}); hcEndErr != nil {
+			GlobalSecurityMetrics.IncExecutionUnknown()
+			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+				OperationID:       opID,
+				EventType:         "ops.audit.inflight_failed",
+				Severity:          "critical",
+				Component:         canonical,
+				FencingGeneration: fencingGen,
+				Message:           fmt.Sprintf("post-probe audit failed at HEALTH_CHECK_COMPLETED: %v", hcEndErr),
+			})
+			if sess, ok := audit.SessionFromContext(ctx); ok {
+				_ = ae.FinishRun(sess.RunID, model.AuditRunStatusExecutionUnknown, "", hcEndErr.Error())
+			}
+			_ = releaseOwnLease()
+			combErr := fmt.Errorf("%w: post-probe audit failed at HEALTH_CHECK_COMPLETED: %v", ErrExecutionAmbiguous, hcEndErr)
+			if probeErr != nil {
+				combErr = errors.Join(combErr, probeErr)
+			}
+			return &ExecutionResult{
+				Success:      false,
+				Action:       spec.Action,
+				Target:       canonical,
+				Output:       redact.SensitiveString(out),
+				BaselineHash: effectiveBaselineHash,
+				DurationMs:   duration,
+				RolledBack:   false,
+				Error:        combErr.Error(),
+				ExecutedAt:   startTime,
+			}, combErr
+		}
 	}
 
 	if probeErr != nil {
@@ -1112,13 +1514,24 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				RiskLevel:         model.AuditRiskHigh,
 				OperationID:       opID,
 				FencingGeneration: fencingGen,
+				Parameters:        spec.Params,
+				AfterState:        map[string]interface{}{"status": strings.ToUpper(status), "rolled_back": spec.RollbackSpec != nil && rbErr == nil},
 				Result:            strings.ToUpper(status),
 				ErrorCode:         probeErr.Error(),
 				DurationMs:        duration,
 				Evidence:          map[string]interface{}{"output": redact.SensitiveString(out), "rollback_err": fmt.Sprintf("%v", rbErr)},
 				FinalRunStatus:    finalRunStatus,
 				MirrorLegacy:      true,
-			}, nil)
+			}, func(cause error) {
+				GlobalSecurityMetrics.IncExecutionUnknown()
+				RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
+					OperationID: opID,
+					EventType:   "ops.audit.post_commit_failed",
+					Severity:    "critical",
+					Component:   canonical,
+					Message:     fmt.Sprintf("post-probe failure audit failed: %v", cause),
+				})
+			})
 		}
 		histErr := e.recordExecutionHistory(canonical, spec.Action, status, out, fmt.Sprintf("health probe failed: %v; rollback err: %v", probeErr, rbErr))
 		_ = releaseOwnLease()
@@ -1127,8 +1540,11 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		if rbErr != nil {
 			errDetails = fmt.Sprintf("%s (rollback also failed: %v)", errDetails, rbErr)
 		}
-		if postAuditErr != nil || histErr != nil {
-			probeErr = errors.Join(probeErr, postAuditErr, histErr)
+		if postAuditErr != nil {
+			errDetails = fmt.Sprintf("%s (audit commit failed: %v)", errDetails, postAuditErr)
+			probeErr = errors.Join(ErrExecutionAmbiguous, probeErr, postAuditErr, histErr)
+		} else if histErr != nil {
+			probeErr = errors.Join(probeErr, histErr)
 		}
 
 		return &ExecutionResult{
@@ -1136,7 +1552,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			Action:       spec.Action,
 			Target:       canonical,
 			Output:       redact.SensitiveString(out),
-			BaselineHash: spec.BaselineHash,
+			BaselineHash: effectiveBaselineHash,
 			DurationMs:   duration,
 			RolledBack:   spec.RollbackSpec != nil && rbErr == nil,
 			Error:        errDetails,
@@ -1144,7 +1560,45 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}, probeErr
 	}
 
-	// 6. Post-execution audit persistence & lease release (HC-2: never fake SUCCESS if post-audit fails)
+	// 6. Release own lease & persist execution history BEFORE finalizing COMPLETED audit status (R7)
+	histErr := e.recordExecutionHistory(canonical, spec.Action, "success", out, "health probe passed")
+	relErr := releaseOwnLease()
+	if histErr != nil || relErr != nil {
+		GlobalSecurityMetrics.IncExecutionUnknown()
+		finErr := errors.Join(histErr, relErr)
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(ctx, audit.EmitEventInput{
+				EventType:         model.AuditEventExecutionUnknown,
+				Action:            spec.Action,
+				Target:            canonical,
+				Component:         canonical,
+				Decision:          model.AuditDecisionAllow,
+				RiskLevel:         model.AuditRiskCritical,
+				OperationID:       opID,
+				FencingGeneration: fencingGen,
+				Parameters:        spec.Params,
+				AfterState:        map[string]interface{}{"health": "healthy", "finalization_error": finErr.Error()},
+				Result:            "EXECUTION_UNKNOWN",
+				ErrorCode:         finErr.Error(),
+				DurationMs:        duration,
+				FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
+				MirrorLegacy:      true,
+			}, nil)
+		}
+		combinedErr := fmt.Errorf("%w: lifecycle finalization failed (%v)", ErrExecutionAmbiguous, finErr)
+		return &ExecutionResult{
+			Success:      false,
+			Action:       spec.Action,
+			Target:       canonical,
+			Output:       redact.SensitiveString(out),
+			BaselineHash: effectiveBaselineHash,
+			DurationMs:   duration,
+			RolledBack:   false,
+			Error:        combinedErr.Error(),
+			ExecutedAt:   startTime,
+		}, combinedErr
+	}
+
 	var postAuditErr error
 	if ae != nil {
 		_, postAuditErr = ae.RecordPostMutation(ctx, audit.EmitEventInput{
@@ -1156,6 +1610,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			RiskLevel:         model.AuditRiskHigh,
 			OperationID:       opID,
 			FencingGeneration: fencingGen,
+			Parameters:        spec.Params,
 			AfterState:        map[string]interface{}{"health": "healthy", "output": redact.SensitiveString(out)},
 			Result:            "SUCCESS",
 			DurationMs:        duration,
@@ -1171,19 +1626,15 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			})
 		})
 	}
-	histErr := e.recordExecutionHistory(canonical, spec.Action, "success", out, "health probe passed")
-	relErr := releaseOwnLease()
-	if postAuditErr != nil || histErr != nil || relErr != nil {
-		if postAuditErr != nil || histErr != nil {
-			GlobalSecurityMetrics.IncExecutionUnknown()
-		}
-		combinedErr := fmt.Errorf("%w: lifecycle finalization failed (%v)", ErrExecutionAmbiguous, errors.Join(postAuditErr, histErr, relErr))
+	if postAuditErr != nil {
+		GlobalSecurityMetrics.IncExecutionUnknown()
+		combinedErr := fmt.Errorf("%w: lifecycle finalization failed (%v)", ErrExecutionAmbiguous, postAuditErr)
 		return &ExecutionResult{
 			Success:      false,
 			Action:       spec.Action,
 			Target:       canonical,
 			Output:       redact.SensitiveString(out),
-			BaselineHash: spec.BaselineHash,
+			BaselineHash: effectiveBaselineHash,
 			DurationMs:   duration,
 			RolledBack:   false,
 			Error:        combinedErr.Error(),
@@ -1196,7 +1647,7 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		Action:       spec.Action,
 		Target:       canonical,
 		Output:       redact.SensitiveString(out),
-		BaselineHash: spec.BaselineHash,
+		BaselineHash: effectiveBaselineHash,
 		DurationMs:   duration,
 		RolledBack:   false,
 		ExecutedAt:   startTime,
@@ -1220,7 +1671,7 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 
 	if ae != nil {
 		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
-			_, newCtx, _ := ae.StartRun(ctx, audit.StartRunInput{
+			_, newCtx, rErr := ae.StartRun(ctx, audit.StartRunInput{
 				TriggerSource: "rollback",
 				ActorType:     "system_daemon",
 				ActorID:       "operation-executor",
@@ -1230,6 +1681,9 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 				RiskLevel:     model.AuditRiskHigh,
 				OperationID:   rbOpID,
 			})
+			if rErr != nil {
+				return rErr
+			}
 			ctx = newCtx
 		}
 		if _, preErr := ae.RecordPreMutation(ctx, audit.EmitEventInput{
@@ -1248,8 +1702,27 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 		}
 	}
 
+	emitRollbackAbort := func(cause error, fencingGen int64) error {
+		if ae != nil {
+			_, _ = ae.RecordPostMutation(context.WithoutCancel(ctx), audit.EmitEventInput{
+				EventType:         model.AuditEventExecutionFailed,
+				Action:            "rollback." + rollbackSpec.Action,
+				Target:            canonical,
+				Component:         canonical,
+				Decision:          model.AuditDecisionDeny,
+				RiskLevel:         model.AuditRiskHigh,
+				OperationID:       rbOpID,
+				FencingGeneration: fencingGen,
+				Result:            "ROLLBACK_ABORTED",
+				ErrorCode:         cause.Error(),
+				DurationMs:        time.Since(rbStart).Milliseconds(),
+			}, nil)
+		}
+		return cause
+	}
+
 	if e.dockerRunner == nil && !isAllowedProductionAction(rollbackSpec.Action) {
-		return fmt.Errorf("%w: rollback action %s not permitted", ErrActionNotSupported, rollbackSpec.Action)
+		return emitRollbackAbort(fmt.Errorf("%w: rollback action %s not permitted", ErrActionNotSupported, rollbackSpec.Action), 0)
 	}
 
 	if !isComponentLockHeld(ctx, canonical) {
@@ -1263,7 +1736,7 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
 		fencingGen = guard.Grant.FencingGeneration
 		if err := guard.VerifyBeforeMutation(0); err != nil {
-			return err
+			return emitRollbackAbort(err, fencingGen)
 		}
 	}
 
@@ -1287,12 +1760,17 @@ func (e *DefaultOperationExecutor) ExecuteRollback(ctx context.Context, rollback
 			RiskLevel:         model.AuditRiskHigh,
 			OperationID:       rbOpID,
 			FencingGeneration: fencingGen,
+			Parameters:        rollbackSpec.Params,
 			Result:            resStr,
 			ErrorCode:         errStr,
 			DurationMs:        durMs,
 			Evidence:          map[string]interface{}{"output": redact.SensitiveString(out)},
 		}, nil)
-		if err == nil && postErr != nil {
+		if postErr != nil {
+			GlobalSecurityMetrics.IncExecutionUnknown()
+			if err != nil {
+				return errors.Join(ErrExecutionAmbiguous, err, postErr)
+			}
 			return errors.Join(ErrExecutionAmbiguous, postErr)
 		}
 	}
@@ -1408,6 +1886,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 	}
 
 	ae := e.GetAuditEngine()
+	propExecOpID := GenerateOperationID("propexec")
 	if ae != nil {
 		if _, hasSess := audit.SessionFromContext(ctx); !hasSess {
 			hhID := proposal.HouseholdID
@@ -1426,6 +1905,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 				RiskLevel:     model.AuditRiskHigh,
 				ProposalID:    proposal.ProposalID,
 				ApprovalID:    proposal.ApprovalDigest,
+				OperationID:   propExecOpID,
 				Summary:       proposal.Title,
 			})
 			ctx = newCtx
@@ -1466,6 +1946,9 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		abortPreClaimed := func(cause error) (*ExecutionResult, error) {
 			if schedulerPreClaimed {
 				abortFSM := NewProposalFSMWithBus(e.db, e.bus)
+				if ae != nil {
+					abortFSM.SetAuditEngine(ae)
+				}
 				_, _ = abortFSM.TransitionStrict(ProposalTransitionParams{
 					ProposalID:            propKey,
 					ExpectedStatuses:      []string{model.ProposalStatusExecuting},
@@ -1476,6 +1959,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 						"execution_log":   fmt.Sprintf("Pre-execution guard aborted scheduler-claimed proposal: %v", cause),
 					},
 					Audit: &ProposalTransitionAudit{
+						Context:     ctx,
 						OperationID: GenerateOperationID("abort-sched"),
 						EventType:   "ops.proposal.precheck_aborted",
 						Actor:       "proposal-scheduler",
@@ -1484,6 +1968,21 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 					},
 				})
 				proposal.Status = model.ProposalStatusFailed
+			} else if ae != nil && cause != nil {
+				_, _ = ae.EmitEvent(context.WithoutCancel(ctx), audit.EmitEventInput{
+					EventType:      model.AuditEventPolicyEvaluated,
+					Action:         "proposal.precheck",
+					Target:         curr.TargetComponent,
+					Component:      curr.TargetComponent,
+					Decision:       model.AuditDecisionDeny,
+					RiskLevel:      model.AuditRiskHigh,
+					ProposalID:     curr.ProposalID,
+					ApprovalID:     curr.ApprovalDigest,
+					OperationID:    propExecOpID,
+					Result:         "BLOCKED",
+					ErrorCode:      cause.Error(),
+					FinalRunStatus: model.AuditRunStatusBlocked,
+				})
 			}
 			return nil, cause
 		}
@@ -1572,14 +2071,15 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		_ = specPreview
 
 		// R5: Pre-execution baseline re-validation against live component state (anti-TOCTOU & anti-placeholder)
-		if IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, curr.BaselineHash) {
-			return abortPreClaimed(fmt.Errorf("%w: offline placeholder baseline rejected in production for %s", ErrBaselineMismatch, canonicalTarget))
+		if IsProductionRuntime() && (!IsRealBaselineHash(curr.BaselineHash, canonicalTarget) || IsOfflinePlaceholderBaseline(canonicalTarget, curr.BaselineHash)) {
+			return abortPreClaimed(fmt.Errorf("%w: offline placeholder or invalid baseline rejected in production for %s", ErrBaselineMismatch, canonicalTarget))
 		}
-		if e.baselineExtractor != nil {
-			currentHash := e.baselineExtractor(canonicalTarget)
-			if currentHash == "" || currentHash != curr.BaselineHash || (IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, currentHash)) {
-				return abortPreClaimed(fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, curr.BaselineHash, currentHash))
-			}
+		if e.baselineExtractor == nil {
+			return abortPreClaimed(fmt.Errorf("%w: baseline extractor not configured on executor", ErrBaselineMismatch))
+		}
+		currentHash := e.baselineExtractor(canonicalTarget)
+		if currentHash == "" || currentHash != curr.BaselineHash || (IsProductionRuntime() && (!IsRealBaselineHash(currentHash, canonicalTarget) || IsOfflinePlaceholderBaseline(canonicalTarget, currentHash))) {
+			return abortPreClaimed(fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, curr.BaselineHash, currentHash))
 		}
 
 		// Verify scheduled window prior to claiming if not already claimed by scheduler
@@ -1673,14 +2173,15 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 		if err != nil {
 			return nil, err
 		}
-		if IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, proposal.BaselineHash) {
-			return nil, fmt.Errorf("%w: offline placeholder baseline rejected in production for %s", ErrBaselineMismatch, canonicalTarget)
+		if IsProductionRuntime() && (!IsRealBaselineHash(proposal.BaselineHash, canonicalTarget) || IsOfflinePlaceholderBaseline(canonicalTarget, proposal.BaselineHash)) {
+			return nil, fmt.Errorf("%w: offline placeholder or invalid baseline rejected in production for %s", ErrBaselineMismatch, canonicalTarget)
 		}
-		if e.baselineExtractor != nil {
-			currentHash := e.baselineExtractor(canonicalTarget)
-			if currentHash == "" || currentHash != proposal.BaselineHash || (IsProductionRuntime() && IsOfflinePlaceholderBaseline(canonicalTarget, currentHash)) {
-				return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, proposal.BaselineHash, currentHash)
-			}
+		if e.baselineExtractor == nil {
+			return nil, fmt.Errorf("%w: baseline extractor not configured on executor", ErrBaselineMismatch)
+		}
+		currentHash := e.baselineExtractor(canonicalTarget)
+		if currentHash == "" || currentHash != proposal.BaselineHash || (IsProductionRuntime() && (!IsRealBaselineHash(currentHash, canonicalTarget) || IsOfflinePlaceholderBaseline(canonicalTarget, currentHash))) {
+			return nil, fmt.Errorf("%w: target component %s state drifted before execution (expected %s, got %s)", ErrBaselineMismatch, canonicalTarget, proposal.BaselineHash, currentHash)
 		}
 		if err := validateScheduledWindow(proposal); err != nil {
 			return nil, err
@@ -1716,18 +2217,27 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 					"execution_log": proposal.ExecutionLog,
 					"executed_at":   proposal.ExecutedAt,
 				},
+				Audit: &ProposalTransitionAudit{
+					Context:     ctx,
+					OperationID: execToken,
+					EventType:   "ops.proposal.spec_failed",
+					Actor:       "executor",
+					Level:       model.LevelCritical,
+					Message:     proposal.ExecutionLog,
+				},
 			})
 		}
 		return nil, err
 	}
 
-	// Execute via OperationExecutor
-	res, execErr := e.Execute(ctx, spec)
+	// Execute via OperationExecutor (attach verified authoritative proposal for host update scope checks)
+	execCtx := withApprovedProposalContext(ctx, proposal)
+	res, execErr := e.Execute(execCtx, spec)
 	now := time.Now().UTC()
 	proposal.ExecutedAt = utils.NullTime{Time: now, Valid: true}
 
 	if execErr != nil || (res != nil && !res.Success) {
-		if errors.Is(execErr, ErrExecutionAmbiguous) || isAmbiguousExecutionError(execErr, ctx.Err()) {
+		if errors.Is(execErr, ErrExecutionAmbiguous) || errors.Is(execErr, audit.ErrAuditCommitFailed) || isAmbiguousExecutionError(execErr, ctx.Err()) {
 			proposal.Status = model.ProposalStatusExecutionUnknown
 			proposal.ExecutionLog = fmt.Sprintf("execution timed out or produced unknown state (%v); manual reconciliation required", execErr)
 			if e.db != nil {
@@ -1880,6 +2390,12 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 			return OperationSpec{}, fmt.Errorf("security violation: action spec target '%s' does not match proposal target '%s'", canonicalSpecTarget, canonicalProposalTarget)
 		}
 		spec.Target = canonicalSpecTarget
+		if canonicalSpecTarget == ComponentHostOS && !strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade) {
+			return OperationSpec{}, fmt.Errorf("%w: target %s only permits %s", ErrActionNotSupported, ComponentHostOS, ActionHostPackageUpgrade)
+		}
+		if strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade) && canonicalSpecTarget != ComponentHostOS {
+			return OperationSpec{}, fmt.Errorf("%w: action %s requires target %s", ErrActionNotSupported, ActionHostPackageUpgrade, ComponentHostOS)
+		}
 
 		if spec.BaselineHash != "" && (proposal.BaselineHash == "" || spec.BaselineHash != proposal.BaselineHash) {
 			return OperationSpec{}, fmt.Errorf("%w: action spec baseline hash '%s' does not match approved proposal baseline '%s'", ErrBaselineMismatch, spec.BaselineHash, proposal.BaselineHash)
@@ -1931,6 +2447,9 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 	canonical, err := ResolveComponent(proposal.TargetComponent)
 	if err != nil {
 		return OperationSpec{}, err
+	}
+	if canonical == ComponentHostOS {
+		return OperationSpec{}, fmt.Errorf("%w: host-os proposal requires explicit %s action_spec", ErrInvalidSpec, ActionHostPackageUpgrade)
 	}
 
 	spec := OperationSpec{
@@ -1995,6 +2514,9 @@ func (e *DefaultOperationExecutor) parseProposalSpec(proposal *model.OpsProposal
 
 // dispatchAction handles execution dispatch without bare shell commands.
 func (e *DefaultOperationExecutor) dispatchAction(ctx context.Context, spec OperationSpec, canonical string) (string, error) {
+	if strings.EqualFold(strings.TrimSpace(spec.Action), ActionHostPackageUpgrade) {
+		return e.executeHostPackageUpgrade(ctx, spec)
+	}
 	if e.dockerRunner != nil {
 		containerName := canonicalContainerNames[canonical]
 		return e.dockerRunner(ctx, spec.Action, containerName, spec.Params)
@@ -2025,9 +2547,91 @@ func (e *DefaultOperationExecutor) dispatchAction(ctx context.Context, spec Oper
 	case ActionCachePurge:
 		return e.executeCachePurge(ctx, spec.Params)
 
+	case ActionHostPackageUpgrade:
+		return e.executeHostPackageUpgrade(ctx, spec)
+
 	default:
 		return "", fmt.Errorf("%w: %s", ErrActionNotSupported, spec.Action)
 	}
+}
+
+func (e *DefaultOperationExecutor) executeHostPackageUpgrade(ctx context.Context, spec OperationSpec) (string, error) {
+	proposal := approvedProposalFromContext(ctx)
+	if proposal == nil {
+		return "", hostsec.ErrApprovalRequired
+	}
+	hue := e.GetHostUpdateExecutor()
+	if hue == nil {
+		return "", fmt.Errorf("host update executor not configured")
+	}
+	if ae := e.GetAuditEngine(); ae != nil && hue.AuditEngine == nil {
+		hue.AuditEngine = ae
+	}
+
+	var pkgs []string
+	if spec.Params != nil {
+		switch raw := spec.Params["packages"].(type) {
+		case []string:
+			pkgs = append(pkgs, raw...)
+		case []interface{}:
+			for _, item := range raw {
+				if s, ok := item.(string); ok && strings.TrimSpace(s) != "" {
+					pkgs = append(pkgs, strings.TrimSpace(s))
+				}
+			}
+		}
+	}
+	if len(pkgs) == 0 {
+		return "", fmt.Errorf("%w: missing packages in host.pkg_upgrade params", ErrInvalidSpec)
+	}
+
+	targetVersions := make(map[string]string)
+	if spec.Params != nil {
+		switch rawTV := spec.Params["target_versions"].(type) {
+		case map[string]string:
+			for k, v := range rawTV {
+				targetVersions[k] = v
+			}
+		case map[string]interface{}:
+			for k, v := range rawTV {
+				if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+					targetVersions[k] = strings.TrimSpace(s)
+				}
+			}
+		}
+	}
+	sshProbeAddr, _ := spec.Params["ssh_probe_addr"].(string)
+
+	expectedBaseline := strings.TrimSpace(spec.BaselineHash)
+	if expectedBaseline == "" {
+		expectedBaseline = strings.TrimSpace(proposal.BaselineHash)
+	}
+
+	var timeout time.Duration
+	if spec.TimeoutSec > 0 {
+		timeout = time.Duration(spec.TimeoutSec) * time.Second
+	}
+
+	res, err := hue.Execute(ctx, hostsec.HostUpdateRequest{
+		Proposal:             proposal,
+		Packages:             pkgs,
+		TargetVersions:       targetVersions,
+		ExpectedBaselineHash: expectedBaseline,
+		Timeout:              timeout,
+		SSHProbeAddr:         sshProbeAddr,
+	})
+	var outSummary string
+	if res != nil {
+		outSummary = fmt.Sprintf("host package upgrade op=%s distro=%q packages=%v verified=%v rolled_back=%v",
+			res.OperationID, res.Platform.PrettyName, pkgs, res.Verified, res.RolledBack)
+	}
+	if err != nil {
+		if res != nil && res.RolledBack {
+			return outSummary, errHostPkgUpgradeRolledBack{cause: err}
+		}
+		return outSummary, err
+	}
+	return outSummary, nil
 }
 
 // executeDockerRestart restarts a whitelisted container via a single deterministic provider
@@ -2637,6 +3241,22 @@ func (e *DefaultOperationExecutor) CheckReadiness(ctx context.Context, target st
 		}
 		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: fmt.Sprintf("openresty HTTP status %d", resp.StatusCode)}, nil
 
+	case ComponentHostOS:
+		prov := e.GetHostSecurityProvider()
+		if prov != nil {
+			snap, sErr := prov.CollectAssets(ctx)
+			if sErr != nil {
+				GlobalSecurityMetrics.IncHealthUnknown()
+				return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: sErr.Error()}, sErr
+			}
+			return HealthProbeResult{
+				Component: canonical,
+				Level:     ReadinessBusinessHealthy,
+				Detail:    fmt.Sprintf("host-os assets healthy (distro=%s, kernel=%s)", snap.Platform.PrettyName, snap.KernelVersion),
+			}, nil
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "host-os readiness verified"}, nil
+
 	default:
 		return HealthProbeResult{Component: target, Level: ReadinessUnknown, Detail: ErrComponentNotWhitelisted.Error()}, ErrComponentNotWhitelisted
 	}
@@ -2705,7 +3325,7 @@ func (e *DefaultOperationExecutor) publishEvent(severity string, eventType strin
 // minimize that external race window to sub-millisecond transport commit time (R4-06).
 func verifyContextLeaseBeforeSocket(ctx context.Context) error {
 	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
-		if err := guard.VerifyBeforeMutation(0); err != nil {
+		if err := guard.VerifyBeforeMutation(time.Duration(DefaultLeaseSafetyGuardMs) * time.Millisecond); err != nil {
 			return err
 		}
 	}
@@ -2730,7 +3350,7 @@ func executeDockerSocketRestart(ctx context.Context, sockPath, containerName str
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
-	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", containerName)
+	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", url.PathEscape(containerName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
 	if err != nil {
 		return err
@@ -2783,7 +3403,7 @@ func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName 
 		return "", err
 	}
 
-	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", containerName)
+	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", url.PathEscape(containerName))
 	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, strings.NewReader(string(createPayload)))
 	if err != nil {
 		return "", err
@@ -2836,9 +3456,12 @@ func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName 
 
 // ContainerInspectSafetyConfig decodes ALL runtime and security parameters from docker inspect.
 type ContainerInspectSafetyConfig struct {
-	ID     string `json:"Id"`
-	Name   string `json:"Name"`
-	Config struct {
+	ID              string `json:"Id"`
+	Name            string `json:"Name"`
+	Image           string `json:"Image,omitempty"`
+	AppArmorProfile string `json:"AppArmorProfile,omitempty"`
+	ProcessLabel    string `json:"ProcessLabel,omitempty"`
+	Config          struct {
 		Image        string              `json:"Image"`
 		User         string              `json:"User"` // MUST NOT BE DROPPED! Preserves non-root user
 		Env          []string            `json:"Env"`
@@ -2860,11 +3483,25 @@ type ContainerInspectSafetyConfig struct {
 		Devices        []map[string]interface{} `json:"Devices"`
 		DeviceRequests []map[string]interface{} `json:"DeviceRequests"`
 		NetworkMode    string                   `json:"NetworkMode"`
+		PidMode        string                   `json:"PidMode,omitempty"`
+		IpcMode        string                   `json:"IpcMode,omitempty"`
+		UTSMode        string                   `json:"UTSMode,omitempty"`
+		UsernsMode     string                   `json:"UsernsMode,omitempty"`
+		CgroupnsMode   string                   `json:"CgroupnsMode,omitempty"`
+		CgroupParent   string                   `json:"CgroupParent,omitempty"`
+		GroupAdd       []string                 `json:"GroupAdd,omitempty"`
+		Runtime        string                   `json:"Runtime,omitempty"`
 		Privileged     bool                     `json:"Privileged"`
 		ReadonlyRootfs bool                     `json:"ReadonlyRootfs"`
 		Dns            []string                 `json:"Dns"`
 		ExtraHosts     []string                 `json:"ExtraHosts"`
-		Resources      map[string]interface{}   `json:"Resources"`
+		Memory         int64                    `json:"Memory,omitempty"`
+		MemorySwap     int64                    `json:"MemorySwap,omitempty"`
+		NanoCpus       int64                    `json:"NanoCpus,omitempty"`
+		CpuShares      int64                    `json:"CpuShares,omitempty"`
+		CpuQuota       int64                    `json:"CpuQuota,omitempty"`
+		CpuPeriod      int64                    `json:"CpuPeriod,omitempty"`
+		PidsLimit      *int64                   `json:"PidsLimit,omitempty"`
 	} `json:"HostConfig"`
 	NetworkSettings struct {
 		Networks map[string]interface{} `json:"Networks"`
@@ -3007,7 +3644,7 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 	client := &http.Client{Transport: tr, Timeout: 45 * time.Second}
 
 	// 1. Inspect existing container
-	inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", containerName)
+	inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(containerName))
 	inspectReq, err := http.NewRequestWithContext(ctx, http.MethodGet, inspectURL, nil)
 	if err != nil {
 		return "", err
@@ -3025,6 +3662,12 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 	var inspectData ContainerInspectSafetyConfig
 	if err := json.NewDecoder(inspectResp.Body).Decode(&inspectData); err != nil {
 		return "", fmt.Errorf("failed to decode container inspect json: %w", err)
+	}
+	if inspectedName := strings.TrimPrefix(strings.TrimSpace(inspectData.Name), "/"); inspectedName != "" && !strings.EqualFold(inspectedName, containerName) {
+		return "", fmt.Errorf("security violation: inspected container name %q does not match expected %q", inspectedName, containerName)
+	}
+	if inspectData.HostConfig.Privileged || strings.EqualFold(strings.TrimSpace(inspectData.HostConfig.PidMode), "host") || strings.EqualFold(strings.TrimSpace(inspectData.HostConfig.IpcMode), "host") {
+		return "", fmt.Errorf("security violation: refusing recreate for unsafe host-privileged container %s", containerName)
 	}
 
 	targetImage := newImage

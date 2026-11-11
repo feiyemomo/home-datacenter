@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -62,19 +64,60 @@ func WithFailureCallback(fn func()) EngineOption {
 	}
 }
 
+// WithRemoteStore configures an off-DB append-only/WORM remote audit replica sink and verifier.
+func WithRemoteStore(store RemoteAuditStore) EngineOption {
+	return func(e *AgentAuditEngine) {
+		e.remoteStore = store
+	}
+}
+
+// WithExternalSigner configures an asymmetric external signer (e.g. Ed25519) for checkpoint anchoring.
+func WithExternalSigner(signer ExternalCheckpointSigner) EngineOption {
+	return func(e *AgentAuditEngine) {
+		e.externalSigner = signer
+		if v, ok := signer.(ExternalCheckpointVerifier); ok && e.externalVerifier == nil {
+			e.externalVerifier = v
+		}
+	}
+}
+
+// WithExternalVerifier configures an external public-key verifier for asymmetric checkpoint verification.
+func WithExternalVerifier(verifier ExternalCheckpointVerifier) EngineOption {
+	return func(e *AgentAuditEngine) {
+		e.externalVerifier = verifier
+	}
+}
+
+// WithCheckpointPeriod enables periodic background checkpoint creation and remote catch-up sync.
+func WithCheckpointPeriod(period time.Duration) EngineOption {
+	return func(e *AgentAuditEngine) {
+		if period > 0 {
+			e.checkpointPeriod = period
+		}
+	}
+}
+
 // AgentAuditEngine is the unified tamper-evident audit pipeline for autonomous agent and system operations.
 type AgentAuditEngine struct {
 	db                 *gorm.DB
 	bus                *eventbus.Bus
 	archiveDir         string
 	checkpointInterval int
+	checkpointPeriod   time.Duration
 	writeMu            sync.Mutex
+	remoteMu           sync.Mutex
+	remoteStore        RemoteAuditStore
+	externalSigner     ExternalCheckpointSigner
+	externalVerifier   ExternalCheckpointVerifier
 	nowFn              func() time.Time
 	preHook            func(EmitEventInput) error
 	postHook           func(EmitEventInput) error
 	onFailure          func()
 	degradedMu         sync.Mutex
 	degradedWindow     map[string]time.Time
+	stopOnce           sync.Once
+	stopCh             chan struct{}
+	loopWG             sync.WaitGroup
 }
 
 // NewAgentAuditEngine creates an AgentAuditEngine bound to db and eventbus.
@@ -83,23 +126,79 @@ func NewAgentAuditEngine(db *gorm.DB, bus *eventbus.Bus, opts ...EngineOption) *
 	if defaultDir == "" {
 		defaultDir = filepath.Join(os.TempDir(), "home-datacenter-audit")
 	}
+	var defaultPeriod time.Duration
+	if rawSec := strings.TrimSpace(os.Getenv("OPS_AUDIT_CHECKPOINT_PERIOD_SEC")); rawSec != "" {
+		if sec, err := strconv.Atoi(rawSec); err == nil && sec > 0 {
+			defaultPeriod = time.Duration(sec) * time.Second
+		}
+	}
 	e := &AgentAuditEngine{
 		db:                 db,
 		bus:                bus,
 		archiveDir:         defaultDir,
 		checkpointInterval: DefaultCheckpointInterval,
+		checkpointPeriod:   defaultPeriod,
 		nowFn:              func() time.Time { return time.Now().UTC() },
 		degradedWindow:     make(map[string]time.Time),
+		stopCh:             make(chan struct{}),
 	}
 	for _, opt := range opts {
 		if opt != nil {
 			opt(e)
 		}
 	}
+	if e.remoteStore == nil {
+		if envStore, err := ResolveRemoteAuditStoreFromEnv(); err == nil && envStore != nil {
+			e.remoteStore = envStore
+		}
+	}
+	if e.externalSigner == nil && e.externalVerifier == nil {
+		if envSigner, envVerifier, err := ResolveExternalCheckpointKeys(); err == nil {
+			e.externalSigner = envSigner
+			e.externalVerifier = envVerifier
+		}
+	}
 	if db != nil {
 		_ = e.EnsureAuditSchema()
+		_, _ = e.RecordKeyRotationIfNeeded(context.Background())
+	}
+	if e.checkpointPeriod > 0 {
+		e.loopWG.Add(1)
+		go e.runPeriodicLoop()
 	}
 	return e
+}
+
+// Close stops background checkpoint and remote sync loops cleanly.
+func (e *AgentAuditEngine) Close() {
+	if e == nil {
+		return
+	}
+	e.stopOnce.Do(func() {
+		if e.stopCh != nil {
+			close(e.stopCh)
+		}
+	})
+	e.loopWG.Wait()
+}
+
+func (e *AgentAuditEngine) runPeriodicLoop() {
+	defer e.loopWG.Done()
+	ticker := time.NewTicker(e.checkpointPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-e.stopCh:
+			return
+		case <-ticker.C:
+			if e.db != nil {
+				_, _ = e.CreateCheckpoint(model.AuditPrimaryStreamID)
+				if e.remoteStore != nil {
+					_ = e.SyncRemote(context.Background(), model.AuditPrimaryStreamID)
+				}
+			}
+		}
+	}
 }
 
 // SetFaultHooks dynamically updates pre/post fault injection hooks (intended for integration tests).
@@ -143,8 +242,8 @@ func (e *AgentAuditEngine) EnsureAuditSchema() error {
 	if bootstrappedVal == "1" {
 		var ver int
 		_ = e.db.Raw("SELECT COALESCE(MAX(version), 0) FROM ops_schema_migrations").Scan(&ver).Error
-		if ver >= 5 {
-			for _, tbl := range []string{"agent_audit_runs", "agent_audit_events", "agent_audit_checkpoints"} {
+		if ver >= 7 {
+			for _, tbl := range []string{"agent_audit_runs", "agent_audit_events", "agent_audit_checkpoints", "agent_audit_remote_sync_states"} {
 				var cnt int64
 				if err := e.db.Raw("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name = ?", tbl).Scan(&cnt).Error; err != nil {
 					return err
@@ -161,6 +260,7 @@ func (e *AgentAuditEngine) EnsureAuditSchema() error {
 		&model.AgentAuditRun{},
 		&model.AgentAuditEvent{},
 		&model.AgentAuditCheckpoint{},
+		&model.AgentAuditRemoteSyncState{},
 		&model.StructuredOpsAuditLog{},
 	); err != nil {
 		return err
@@ -170,6 +270,9 @@ func (e *AgentAuditEngine) EnsureAuditSchema() error {
 		CREATE INDEX IF NOT EXISTS idx_audit_events_run_seq ON agent_audit_events (run_id, seq);
 		CREATE INDEX IF NOT EXISTS idx_audit_events_hh_time ON agent_audit_events (household_id, created_at_ms);
 		CREATE INDEX IF NOT EXISTS idx_audit_events_comp_action ON agent_audit_events (component, action);
+		CREATE INDEX IF NOT EXISTS idx_audit_events_operation_id ON agent_audit_events (operation_id);
+		CREATE INDEX IF NOT EXISTS idx_audit_runs_operation_id ON agent_audit_runs (operation_id);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_events_origin_stream_seq ON agent_audit_events (origin_stream_id, origin_seq) WHERE origin_stream_id <> '' AND origin_seq > 0;
 
 		CREATE TRIGGER IF NOT EXISTS trg_agent_audit_events_no_update
 		BEFORE UPDATE ON agent_audit_events
@@ -265,6 +368,9 @@ func (e *AgentAuditEngine) StartRun(ctx context.Context, in StartRunInput) (stri
 		TriggerSource: trig,
 		ActorType:     actorType,
 		ActorID:       actorID,
+		ProposalID:    strings.TrimSpace(in.ProposalID),
+		ApprovalID:    strings.TrimSpace(in.ApprovalID),
+		OperationID:   strings.TrimSpace(in.OperationID),
 	}
 	outCtx := ContextWithSession(ctx, sess)
 
@@ -399,9 +505,23 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 	actorID := defaultStr(in.ActorID, sess.ActorID)
 	actorID = defaultStr(actorID, "home-api")
 
+	auditIDExplicit := strings.TrimSpace(in.AuditID) != ""
 	auditID := strings.TrimSpace(in.AuditID)
 	if auditID == "" {
 		auditID = fmt.Sprintf("aud-%d-%s", nowMs, generateRandomHex(5))
+	}
+
+	proposalID := strings.TrimSpace(in.ProposalID)
+	if proposalID == "" && hasSess {
+		proposalID = sess.ProposalID
+	}
+	approvalID := strings.TrimSpace(in.ApprovalID)
+	if approvalID == "" && hasSess {
+		approvalID = sess.ApprovalID
+	}
+	operationID := strings.TrimSpace(in.OperationID)
+	if operationID == "" && hasSess {
+		operationID = sess.OperationID
 	}
 
 	synced := true
@@ -427,9 +547,9 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		Decision:           strings.TrimSpace(in.Decision),
 		RiskLevel:          defaultStr(in.RiskLevel, model.AuditRiskMedium),
 		PolicyVersion:      defaultStr(in.PolicyVersion, PolicyVersion),
-		ProposalID:         strings.TrimSpace(in.ProposalID),
-		ApprovalID:         strings.TrimSpace(in.ApprovalID),
-		OperationID:        strings.TrimSpace(in.OperationID),
+		ProposalID:         proposalID,
+		ApprovalID:         approvalID,
+		OperationID:        operationID,
 		FencingGeneration:  in.FencingGeneration,
 		BeforeState:        SerializeEvidence(in.BeforeState),
 		AfterState:         SerializeEvidence(in.AfterState),
@@ -446,7 +566,12 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 	}
 
 	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	writeLocked := true
+	defer func() {
+		if writeLocked {
+			e.writeMu.Unlock()
+		}
+	}()
 
 	if e.preHook != nil {
 		if hErr := e.preHook(in); hErr != nil {
@@ -464,22 +589,123 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 	secret := ring[kid]
 
 	var triggerCheckpoint bool
+	var deduplicated bool
+	var rotationEv *model.AgentAuditEvent
 	err := e.runImmediate(func(conn *sql.Conn) error {
+		if auditIDExplicit {
+			var existingSeq uint64
+			var existingRunID, existingPrevHash, existingEntryHash, existingHMAC, existingKID string
+			var existingMs int64
+			existErr := conn.QueryRowContext(e.bgCtx(),
+				`SELECT seq, run_id, previous_hash, entry_hash, hmac_signature, key_id, created_at_ms FROM agent_audit_events WHERE audit_id = ? LIMIT 1`,
+				ev.AuditID,
+			).Scan(&existingSeq, &existingRunID, &existingPrevHash, &existingEntryHash, &existingHMAC, &existingKID, &existingMs)
+			if existErr == nil {
+				ev.Seq = existingSeq
+				ev.RunID = existingRunID
+				ev.PreviousHash = existingPrevHash
+				ev.EntryHash = existingEntryHash
+				ev.HMACSignature = existingHMAC
+				ev.KeyID = existingKID
+				if existingMs > 0 {
+					ev.CreatedAtMs = existingMs
+					ev.CreatedAt = time.UnixMilli(existingMs).UTC()
+				}
+				deduplicated = true
+				return nil
+			} else if existErr != sql.ErrNoRows {
+				return existErr
+			}
+		}
+
 		var lastSeq uint64
-		var lastHash string
+		var lastHash, lastKID string
 		row := conn.QueryRowContext(e.bgCtx(),
-			`SELECT seq, entry_hash FROM agent_audit_events WHERE stream_id = ? ORDER BY seq DESC LIMIT 1`,
+			`SELECT seq, entry_hash, key_id FROM agent_audit_events WHERE stream_id = ? ORDER BY seq DESC LIMIT 1`,
 			ev.StreamID,
 		)
-		if sErr := row.Scan(&lastSeq, &lastHash); sErr != nil && sErr != sql.ErrNoRows {
+		if sErr := row.Scan(&lastSeq, &lastHash, &lastKID); sErr != nil && sErr != sql.ErrNoRows {
 			return sErr
 		}
 		if lastHash == "" {
 			lastHash = model.AuditGenesisHash
 		}
 
+		// Record an immutable AUDIT_KEY_ROTATED lifecycle event whenever the active HMAC key_id transitions.
+		if ev.EventType != model.AuditEventAuditKeyRotated && lastKID != "" && lastKID != kid {
+			var ringKIDs []string
+			for k := range ring {
+				ringKIDs = append(ringKIDs, k)
+			}
+			sort.Strings(ringKIDs)
+			pDig, pRed := SerializeParams(map[string]interface{}{"configured_key_ids": ringKIDs})
+			rotNow := e.nowUTC()
+			rotMs := rotNow.UnixMilli()
+			rotRunID := fmt.Sprintf("run-%d-%s", rotMs, generateRandomHex(4))
+			rotCorrID := fmt.Sprintf("corr-%d-%s", rotMs, generateRandomHex(4))
+			rotEv := &model.AgentAuditEvent{
+				StreamID:           ev.StreamID,
+				Seq:                lastSeq + 1,
+				AuditID:            fmt.Sprintf("aud-%d-%s", rotMs, generateRandomHex(4)),
+				RunID:              rotRunID,
+				CorrelationID:      rotCorrID,
+				HouseholdID:        1,
+				TriggerSource:      "audit_keyring",
+				ActorType:          "system",
+				ActorID:            "audit-engine",
+				EventType:          model.AuditEventAuditKeyRotated,
+				Action:             "audit.key_rotated",
+				Target:             ev.StreamID,
+				Component:          "audit-engine",
+				Decision:           model.AuditDecisionAllow,
+				RiskLevel:          model.AuditRiskHigh,
+				PolicyVersion:      PolicyVersion,
+				BeforeState:        SerializeEvidence(map[string]string{"active_key_id": lastKID}),
+				AfterState:         SerializeEvidence(map[string]string{"active_key_id": kid}),
+				ParametersDigest:   pDig,
+				ParametersRedacted: pRed,
+				Result:             "SUCCESS",
+				CreatedAt:          rotNow,
+				CreatedAtMs:        rotMs,
+				Synced:             true,
+				KeyID:              kid,
+				PreviousHash:       lastHash,
+			}
+			rotHash, rErr := ComputeEventEntryHash(rotEv)
+			if rErr != nil {
+				return rErr
+			}
+			rotEv.EntryHash = rotHash
+			rotEv.HMACSignature = ComputeEventHMAC(kid, secret, rotEv.StreamID, rotEv.Seq, rotEv.EntryHash, rotEv.CreatedAtMs)
+			if _, execErr := conn.ExecContext(e.bgCtx(), `
+				INSERT INTO agent_audit_events (
+					stream_id, seq, audit_id, run_id, parent_event_id, correlation_id, household_id,
+					trigger_source, actor_type, actor_id, event_type, action, target, component,
+					decision, risk_level, policy_version, proposal_id, approval_id, operation_id,
+					fencing_generation, before_state, after_state, parameters_digest, parameters_redacted,
+					result, error_code, duration_ms, evidence, created_at, created_at_ms, is_offline, synced,
+					origin_stream_id, origin_seq, origin_entry_hash, key_id, previous_hash, entry_hash, hmac_signature
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				rotEv.StreamID, rotEv.Seq, rotEv.AuditID, rotEv.RunID, rotEv.ParentEventID, rotEv.CorrelationID, rotEv.HouseholdID,
+				rotEv.TriggerSource, rotEv.ActorType, rotEv.ActorID, rotEv.EventType, rotEv.Action, rotEv.Target, rotEv.Component,
+				rotEv.Decision, rotEv.RiskLevel, rotEv.PolicyVersion, rotEv.ProposalID, rotEv.ApprovalID, rotEv.OperationID,
+				rotEv.FencingGeneration, rotEv.BeforeState, rotEv.AfterState, rotEv.ParametersDigest, rotEv.ParametersRedacted,
+				rotEv.Result, rotEv.ErrorCode, rotEv.DurationMs, rotEv.Evidence, rotEv.CreatedAt.UTC(), rotEv.CreatedAtMs, 0, 1,
+				"", uint64(0), "", rotEv.KeyID, rotEv.PreviousHash, rotEv.EntryHash, rotEv.HMACSignature,
+			); execErr != nil {
+				return execErr
+			}
+			if upErr := upsertRunProgressConn(conn, rotEv, model.AuditRunStatusCompleted, fmt.Sprintf("Audit HMAC key rotated from %s to %s", lastKID, kid)); upErr != nil {
+				return upErr
+			}
+			lastSeq = rotEv.Seq
+			lastHash = rotEv.EntryHash
+			rotationEv = rotEv
+		}
+
 		ev.Seq = lastSeq + 1
 		ev.PreviousHash = lastHash
+		ev.KeyID = kid
 		entryHash, cErr := ComputeEventEntryHash(ev)
 		if cErr != nil {
 			return cErr
@@ -494,14 +720,14 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 				decision, risk_level, policy_version, proposal_id, approval_id, operation_id,
 				fencing_generation, before_state, after_state, parameters_digest, parameters_redacted,
 				result, error_code, duration_ms, evidence, created_at, created_at_ms, is_offline, synced,
-				origin_stream_id, origin_seq, origin_entry_hash, previous_hash, entry_hash, hmac_signature
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				origin_stream_id, origin_seq, origin_entry_hash, key_id, previous_hash, entry_hash, hmac_signature
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			ev.StreamID, ev.Seq, ev.AuditID, ev.RunID, ev.ParentEventID, ev.CorrelationID, ev.HouseholdID,
 			ev.TriggerSource, ev.ActorType, ev.ActorID, ev.EventType, ev.Action, ev.Target, ev.Component,
 			ev.Decision, ev.RiskLevel, ev.PolicyVersion, ev.ProposalID, ev.ApprovalID, ev.OperationID,
 			ev.FencingGeneration, ev.BeforeState, ev.AfterState, ev.ParametersDigest, ev.ParametersRedacted,
 			ev.Result, ev.ErrorCode, ev.DurationMs, ev.Evidence, ev.CreatedAt.UTC(), ev.CreatedAtMs, boolInt(ev.IsOffline), boolInt(ev.Synced),
-			ev.OriginStreamID, ev.OriginSeq, ev.OriginEntryHash, ev.PreviousHash, ev.EntryHash, ev.HMACSignature,
+			ev.OriginStreamID, ev.OriginSeq, ev.OriginEntryHash, ev.KeyID, ev.PreviousHash, ev.EntryHash, ev.HMACSignature,
 		); execErr != nil {
 			return execErr
 		}
@@ -524,6 +750,9 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 	if err != nil {
 		return ev, e.handleCommitFailure(in, ev, err)
 	}
+	if deduplicated {
+		return ev, nil
+	}
 
 	if e.postHook != nil {
 		if hErr := e.postHook(in); hErr != nil {
@@ -531,6 +760,11 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		}
 	}
 
+	if rotationEv != nil {
+		if err := e.appendArchiveEvent(rotationEv); err != nil {
+			e.recordFailureMetric()
+		}
+	}
 	if err := e.appendArchiveEvent(ev); err != nil {
 		e.recordFailureMetric()
 	}
@@ -539,6 +773,14 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		if _, cpErr := e.createCheckpointLocked(ev.StreamID); cpErr != nil {
 			e.recordFailureMetric()
 		}
+	}
+
+	// Release writeMu before network/remote I/O so local writers are never blocked on remote latency.
+	writeLocked = false
+	e.writeMu.Unlock()
+
+	if e.remoteStore != nil {
+		_ = e.SyncRemote(e.bgCtx(), ev.StreamID)
 	}
 
 	if e.bus != nil {
@@ -678,11 +920,66 @@ func (e *AgentAuditEngine) allowBoundedEmergency(component string) bool {
 	e.degradedMu.Lock()
 	defer e.degradedMu.Unlock()
 	now := e.nowUTC()
+	e.loadDegradedWindowLocked()
 	if last, ok := e.degradedWindow[component]; ok && now.Sub(last) < BoundedEmergencyWindow {
 		return false
 	}
 	e.degradedWindow[component] = now
+	e.saveDegradedWindowLocked()
 	return true
+}
+
+func (e *AgentAuditEngine) degradedWindowFile() string {
+	if strings.TrimSpace(e.archiveDir) == "" {
+		return ""
+	}
+	return filepath.Join(e.archiveDir, "degraded-window.json")
+}
+
+func (e *AgentAuditEngine) loadDegradedWindowLocked() {
+	path := e.degradedWindowFile()
+	if path == "" {
+		return
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	var diskMap map[string]int64
+	if err := json.Unmarshal(raw, &diskMap); err != nil {
+		return
+	}
+	for k, ms := range diskMap {
+		if ms <= 0 {
+			continue
+		}
+		t := time.UnixMilli(ms).UTC()
+		if cur, ok := e.degradedWindow[k]; !ok || t.After(cur) {
+			e.degradedWindow[k] = t
+		}
+	}
+}
+
+func (e *AgentAuditEngine) saveDegradedWindowLocked() {
+	path := e.degradedWindowFile()
+	if path == "" {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return
+	}
+	out := make(map[string]int64, len(e.degradedWindow))
+	for k, t := range e.degradedWindow {
+		out[k] = t.UTC().UnixMilli()
+	}
+	raw, err := json.Marshal(out)
+	if err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err == nil {
+		_ = os.Rename(tmp, path)
+	}
 }
 
 func insertRunIfMissingConn(conn *sql.Conn, r *model.AgentAuditRun) error {

@@ -1,0 +1,973 @@
+{
+  "protocol_version": "v1",
+  "vectors": [
+    {
+      "name": "01_normal",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"}],\"nano_cpus\":1000000000,\"network_mode\":\"home-net\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[\"80/tcp->127.0.0.1:8086\"],\"privileged\":false,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:5842d1387334a06ab28cfd61694ddeeb69cb463262d94afa030efa4f7f7cda0f",
+      "expected_identity_hash": "sha256:71647d4e550e0c0881e3916f1feb7b922661513a61c816feed05e69c8cd53dd8",
+      "expected_security_hash": "sha256:4ec8f96c575f241a9a20a6a3f1da2329257564ff71f42919f91a0c8de104998f",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    },
+    {
+      "name": "02_empty_fields",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "",
+        "Config": {
+          "Cmd": [],
+          "Entrypoint": [],
+          "Env": [],
+          "Image": "nginx:alpine",
+          "User": ""
+        },
+        "Created": "",
+        "HostConfig": {
+          "CapAdd": [],
+          "CapDrop": [],
+          "CgroupParent": "",
+          "CgroupnsMode": "",
+          "Devices": [],
+          "IpcMode": "",
+          "Memory": 0,
+          "NanoCpus": 0,
+          "NetworkMode": "",
+          "PidMode": "",
+          "PidsLimit": 0,
+          "PortBindings": {},
+          "Privileged": false,
+          "ReadonlyRootfs": false,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": ""
+          },
+          "Runtime": "",
+          "SecurityOpt": [],
+          "UTSMode": ""
+        },
+        "Id": "b2c3d4e5f6000000000000000000000000000000000000000000000000000002",
+        "Image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "Mounts": [],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [],
+        "RestartCount": 0,
+        "State": {
+          "StartedAt": "",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"b2c3d4e5f6000000000000000000000000000000000000000000000000000002\",\"container_name\":\"home-web\",\"image_digest\":\"\",\"image_id\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"image_reference\":\"nginx:alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[],\"cap_drop\":[],\"cgroup_mode\":\"\",\"cgroup_parent\":\"\",\"command_digest\":\"\",\"devices\":[],\"entrypoint_digest\":\"\",\"env_digest\":\"\",\"ipc_mode\":\"\",\"memory_limit\":0,\"mounts\":[],\"nano_cpus\":0,\"network_mode\":\"\",\"pid_mode\":\"\",\"pids_limit\":0,\"port_bindings\":[],\"privileged\":false,\"readonly_rootfs\":false,\"restart_policy\":\"\",\"runtime\":\"\",\"runtime_security_profile\":\"\",\"security_opt\":[],\"user\":\"\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"\",\"restart_count\":0,\"started_at\":\"\"}}",
+      "expected_baseline_hash": "v1:787a39ff9b6d89b94babe61decdb88e8642d4da9971b89a0d7497282d1c86e1f",
+      "expected_identity_hash": "sha256:deefcf36e92ef8409be56b9a442e01e8ae24b39947808462425055dbb3ec0992",
+      "expected_security_hash": "sha256:33663ce462fe0085735b89a30f8225d9f0d4e160f080d65e2705488beaa78830",
+      "expected_state_hash": "sha256:13104f2cdfc79d565d7c6f0f4eba5562540d452a519ed0e513e897408b4c252b"
+    },
+    {
+      "name": "03_missing_fields",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "Config": {
+          "Image": "nginx:alpine"
+        },
+        "Id": "b2c3d4e5f6000000000000000000000000000000000000000000000000000002",
+        "Image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "Name": "/home-web",
+        "State": {
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"b2c3d4e5f6000000000000000000000000000000000000000000000000000002\",\"container_name\":\"home-web\",\"image_digest\":\"\",\"image_id\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"image_reference\":\"nginx:alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[],\"cap_drop\":[],\"cgroup_mode\":\"\",\"cgroup_parent\":\"\",\"command_digest\":\"\",\"devices\":[],\"entrypoint_digest\":\"\",\"env_digest\":\"\",\"ipc_mode\":\"\",\"memory_limit\":0,\"mounts\":[],\"nano_cpus\":0,\"network_mode\":\"\",\"pid_mode\":\"\",\"pids_limit\":0,\"port_bindings\":[],\"privileged\":false,\"readonly_rootfs\":false,\"restart_policy\":\"\",\"runtime\":\"\",\"runtime_security_profile\":\"\",\"security_opt\":[],\"user\":\"\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"\",\"restart_count\":0,\"started_at\":\"\"}}",
+      "expected_baseline_hash": "v1:787a39ff9b6d89b94babe61decdb88e8642d4da9971b89a0d7497282d1c86e1f",
+      "expected_identity_hash": "sha256:deefcf36e92ef8409be56b9a442e01e8ae24b39947808462425055dbb3ec0992",
+      "expected_security_hash": "sha256:33663ce462fe0085735b89a30f8225d9f0d4e160f080d65e2705488beaa78830",
+      "expected_state_hash": "sha256:13104f2cdfc79d565d7c6f0f4eba5562540d452a519ed0e513e897408b4c252b"
+    },
+    {
+      "name": "04_unicode_container_name",
+      "component": "1pwaf",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "",
+        "Config": {
+          "Cmd": [],
+          "Entrypoint": [],
+          "Env": [],
+          "Image": "nginx:alpine",
+          "User": ""
+        },
+        "Created": "2026-11-10T01:00:00Z",
+        "HostConfig": {
+          "CapAdd": [],
+          "CapDrop": [],
+          "CgroupParent": "",
+          "CgroupnsMode": "",
+          "Devices": [],
+          "IpcMode": "",
+          "Memory": 0,
+          "NanoCpus": 0,
+          "NetworkMode": "",
+          "PidMode": "",
+          "PidsLimit": 0,
+          "PortBindings": {},
+          "Privileged": false,
+          "ReadonlyRootfs": false,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": ""
+          },
+          "Runtime": "",
+          "SecurityOpt": [],
+          "UTSMode": ""
+        },
+        "Id": "c3d4e5f600000000000000000000000000000000000000000000000000000003",
+        "Image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "Mounts": [
+          {
+            "Destination": "/etc/nginx/conf.d",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/配置/站点",
+            "Type": "bind"
+          }
+        ],
+        "Name": "/1Panel-openresty-网关节点-αβγ<test>&1",
+        "ProcessLabel": "",
+        "RepoDigests": [],
+        "RestartCount": 0,
+        "State": {
+          "StartedAt": "",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"openresty\",\"container_id\":\"c3d4e5f600000000000000000000000000000000000000000000000000000003\",\"container_name\":\"1Panel-openresty-网关节点-αβγ<test>&1\",\"image_digest\":\"\",\"image_id\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"image_reference\":\"nginx:alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[],\"cap_drop\":[],\"cgroup_mode\":\"\",\"cgroup_parent\":\"\",\"command_digest\":\"\",\"devices\":[],\"entrypoint_digest\":\"\",\"env_digest\":\"\",\"ipc_mode\":\"\",\"memory_limit\":0,\"mounts\":[{\"destination\":\"/etc/nginx/conf.d\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/配置/站点\",\"type\":\"bind\"}],\"nano_cpus\":0,\"network_mode\":\"\",\"pid_mode\":\"\",\"pids_limit\":0,\"port_bindings\":[],\"privileged\":false,\"readonly_rootfs\":false,\"restart_policy\":\"\",\"runtime\":\"\",\"runtime_security_profile\":\"\",\"security_opt\":[],\"user\":\"\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:00:00.000Z\",\"restart_count\":0,\"started_at\":\"\"}}",
+      "expected_baseline_hash": "v1:b69eca6e303b7bd07f911a9ca8b6d60a239ba5d9d9b5c2e782fac16e7ecfd14d",
+      "expected_identity_hash": "sha256:1b608bd5064cea9b6572b707bc86f9b4ddc781c79ceb54e84c1088a4d49d94d2",
+      "expected_security_hash": "sha256:d2fe4efb126196189cc1da5c01fc5452447cd8fe57d1af69684c40450accb0c9",
+      "expected_state_hash": "sha256:2cedc634cdb1ff3543de05a2ed9b1836fbdd6b0c527e553658806d5bd846b5bf"
+    },
+    {
+      "name": "05_different_array_orders",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "SECRET_TOKEN=super-secret-value",
+            "TZ=Asia/Shanghai"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "chown",
+            "NET_BIND_SERVICE"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "seccomp=unconfined",
+            "no-new-privileges:true"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          },
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"}],\"nano_cpus\":1000000000,\"network_mode\":\"home-net\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[\"80/tcp->127.0.0.1:8086\"],\"privileged\":false,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:5842d1387334a06ab28cfd61694ddeeb69cb463262d94afa030efa4f7f7cda0f",
+      "expected_identity_hash": "sha256:71647d4e550e0c0881e3916f1feb7b922661513a61c816feed05e69c8cd53dd8",
+      "expected_security_hash": "sha256:4ec8f96c575f241a9a20a6a3f1da2329257564ff71f42919f91a0c8de104998f",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    },
+    {
+      "name": "06_malformed_time",
+      "component": "home-web",
+      "expected_valid": false,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "not-a-valid-timestamp",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_baseline_hash": ""
+    },
+    {
+      "name": "07_image_digest_change",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:3333333333333333333333333333333333333333333333333333333333333333"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:3333333333333333333333333333333333333333333333333333333333333333\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"}],\"nano_cpus\":1000000000,\"network_mode\":\"home-net\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[\"80/tcp->127.0.0.1:8086\"],\"privileged\":false,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:ddd852b082a2498b61b73bbc892cc33d8dd1542f984199eb50e4be21b37a0692",
+      "expected_identity_hash": "sha256:a5e561956d9d088b95486f070acd559333c94d148522b306130fee05d7109e59",
+      "expected_security_hash": "sha256:4ec8f96c575f241a9a20a6a3f1da2329257564ff71f42919f91a0c8de104998f",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    },
+    {
+      "name": "08_mounts_change",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          },
+          {
+            "Destination": "/var/run/docker.sock",
+            "Mode": "rw",
+            "RW": true,
+            "Source": "/var/run/docker.sock",
+            "Type": "bind"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"},{\"destination\":\"/var/run/docker.sock\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/run/docker.sock\",\"type\":\"bind\"}],\"nano_cpus\":1000000000,\"network_mode\":\"home-net\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[\"80/tcp->127.0.0.1:8086\"],\"privileged\":false,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:6ba433624efb732c0b4e21022818ff245a673c6f696a5715cd809faac4296e3a",
+      "expected_identity_hash": "sha256:71647d4e550e0c0881e3916f1feb7b922661513a61c816feed05e69c8cd53dd8",
+      "expected_security_hash": "sha256:09d74f6db7885288286f954cadee2aed037c3349ca1a2c5ad4e9a773a07fccc6",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    },
+    {
+      "name": "09_privileged_change",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": true,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"}],\"nano_cpus\":1000000000,\"network_mode\":\"home-net\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[\"80/tcp->127.0.0.1:8086\"],\"privileged\":true,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:36aac3fc0301a4f72882192b599bab80bbc7da00c8c7ec504e3d6f82ab45461d",
+      "expected_identity_hash": "sha256:71647d4e550e0c0881e3916f1feb7b922661513a61c816feed05e69c8cd53dd8",
+      "expected_security_hash": "sha256:a743e68873f23b3f177cd44cac808bec4fc6beae7ddf7a7eea6b5ef2f03b7efe",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    },
+    {
+      "name": "10_capabilities_change",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN",
+            "SYS_ADMIN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "home-net",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {
+            "80/tcp": [
+              {
+                "HostIp": "127.0.0.1",
+                "HostPort": "8086"
+              }
+            ]
+          },
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\",\"SYS_ADMIN\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"}],\"nano_cpus\":1000000000,\"network_mode\":\"home-net\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[\"80/tcp->127.0.0.1:8086\"],\"privileged\":false,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:ddfda5cf8d40b2e119810ac36ce2a593e6d73d551df2eb5a61d3f47dd55c4937",
+      "expected_identity_hash": "sha256:71647d4e550e0c0881e3916f1feb7b922661513a61c816feed05e69c8cd53dd8",
+      "expected_security_hash": "sha256:6cdee9749d56cb82b2e457bec4b8c77ecd6351ba1105a8e585e08a3b7c910741",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    },
+    {
+      "name": "11_network_config_change",
+      "component": "home-web",
+      "expected_valid": true,
+      "inspect": {
+        "AppArmorProfile": "docker-default",
+        "Config": {
+          "Cmd": [
+            "nginx",
+            "-g",
+            "daemon off;"
+          ],
+          "Entrypoint": [
+            "/docker-entrypoint.sh"
+          ],
+          "Env": [
+            "TZ=Asia/Shanghai",
+            "SECRET_TOKEN=super-secret-value"
+          ],
+          "Image": "nginx:1.25-alpine",
+          "User": "101:101"
+        },
+        "Created": "2026-11-10T01:02:03.456789123Z",
+        "HostConfig": {
+          "CapAdd": [
+            "NET_BIND_SERVICE",
+            "CHOWN"
+          ],
+          "CapDrop": [
+            "ALL"
+          ],
+          "CgroupParent": "/docker",
+          "CgroupnsMode": "private",
+          "Devices": [
+            {
+              "CgroupPermissions": "rwm",
+              "PathInContainer": "/dev/null",
+              "PathOnHost": "/dev/null"
+            }
+          ],
+          "IpcMode": "private",
+          "Memory": 268435456,
+          "NanoCpus": 1000000000,
+          "NetworkMode": "host",
+          "PidMode": "",
+          "PidsLimit": 128,
+          "PortBindings": {},
+          "Privileged": false,
+          "ReadonlyRootfs": true,
+          "RestartPolicy": {
+            "MaximumRetryCount": 0,
+            "Name": "unless-stopped"
+          },
+          "Runtime": "runc",
+          "SecurityOpt": [
+            "no-new-privileges:true",
+            "seccomp=unconfined"
+          ],
+          "UTSMode": ""
+        },
+        "Id": "a1b2c3d4e5f60000000000000000000000000000000000000000000000000001",
+        "Image": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "Mounts": [
+          {
+            "Destination": "/usr/share/nginx/html",
+            "Mode": "ro",
+            "RW": false,
+            "Source": "/vol1/web/dist",
+            "Type": "bind"
+          },
+          {
+            "Destination": "/var/cache/nginx",
+            "Mode": "rw",
+            "Name": "web-cache",
+            "RW": true,
+            "Source": "/var/lib/docker/volumes/web-cache/_data",
+            "Type": "volume"
+          }
+        ],
+        "Name": "/home-web",
+        "ProcessLabel": "",
+        "RepoDigests": [
+          "nginx@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        "RestartCount": 2,
+        "State": {
+          "Running": true,
+          "StartedAt": "2026-11-10T08:02:03+08:00",
+          "Status": "running"
+        }
+      },
+      "expected_canonical_json": "{\"identity\":{\"canonical_component\":\"home-web\",\"container_id\":\"a1b2c3d4e5f60000000000000000000000000000000000000000000000000001\",\"container_name\":\"home-web\",\"image_digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\",\"image_id\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\",\"image_reference\":\"nginx:1.25-alpine\"},\"protocol_version\":\"v1\",\"security\":{\"cap_add\":[\"CHOWN\",\"NET_BIND_SERVICE\"],\"cap_drop\":[\"ALL\"],\"cgroup_mode\":\"private\",\"cgroup_parent\":\"/docker\",\"command_digest\":\"sha256:f573873c6ad0ea1e10325c9aee7ab8d85cfe44cce080bfbfef3b05caa338c141\",\"devices\":[\"/dev/null:/dev/null:rwm\"],\"entrypoint_digest\":\"sha256:050b043b84a4da8a964d1985a434351aa39ab090d91ffc796680970054c2478c\",\"env_digest\":\"sha256:90f78bdca6106aeaa4da4633580b1c14750cd3cff41e5fbfd8231ab5419abbf0\",\"ipc_mode\":\"private\",\"memory_limit\":268435456,\"mounts\":[{\"destination\":\"/usr/share/nginx/html\",\"mode\":\"ro\",\"rw\":false,\"source\":\"/vol1/web/dist\",\"type\":\"bind\"},{\"destination\":\"/var/cache/nginx\",\"mode\":\"rw\",\"rw\":true,\"source\":\"/var/lib/docker/volumes/web-cache/_data\",\"type\":\"volume\"}],\"nano_cpus\":1000000000,\"network_mode\":\"host\",\"pid_mode\":\"\",\"pids_limit\":128,\"port_bindings\":[],\"privileged\":false,\"readonly_rootfs\":true,\"restart_policy\":\"unless-stopped\",\"runtime\":\"runc\",\"runtime_security_profile\":\"docker-default\",\"security_opt\":[\"no-new-privileges:true\",\"seccomp=unconfined\"],\"user\":\"101:101\",\"uts_mode\":\"\"},\"state\":{\"container_state\":\"running\",\"created_at\":\"2026-11-10T01:02:03.456Z\",\"restart_count\":2,\"started_at\":\"2026-11-10T00:02:03.000Z\"}}",
+      "expected_baseline_hash": "v1:83338cdaa94c55ea2d181f2b4ea3ede0fa2f65dd07a6e0364f4d8e2211105e42",
+      "expected_identity_hash": "sha256:71647d4e550e0c0881e3916f1feb7b922661513a61c816feed05e69c8cd53dd8",
+      "expected_security_hash": "sha256:6e0f6b68b8c36af5309c48493f38e356f363b45dc008071b6d9e73d396c4da8c",
+      "expected_state_hash": "sha256:1595776159427cc09094cbd197e27a015b666dafdf41b5d55d729446241602ac"
+    }
+  ]
+}

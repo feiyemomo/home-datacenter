@@ -14,7 +14,9 @@ import (
 
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
+	"home-datacenter-api/internal/model"
 )
 
 var (
@@ -504,15 +506,59 @@ type leaseGuardContextKey struct{}
 
 // LeaseGuard binds an active lease grant to a cancellable execution context and background renewal loop.
 type LeaseGuard struct {
-	mgr    *RecoveryLeaseManager
-	Grant  LeaseGrant
-	mu     sync.RWMutex
-	expMs  int64
-	lost   atomic.Bool
-	cancel context.CancelCauseFunc
-	stopCh chan struct{}
-	doneCh chan struct{}
-	once   sync.Once
+	mgr         *RecoveryLeaseManager
+	Grant       LeaseGrant
+	mu          sync.RWMutex
+	expMs       int64
+	lost        atomic.Bool
+	cancel      context.CancelCauseFunc
+	stopCh      chan struct{}
+	doneCh      chan struct{}
+	once        sync.Once
+	auditEngine *audit.AgentAuditEngine
+	auditCtx    context.Context
+}
+
+// BindAuditContext attaches an AgentAuditEngine and correlation context to the LeaseGuard
+// so renewal and release failures emit tamper-evident audit events.
+func (g *LeaseGuard) BindAuditContext(ae *audit.AgentAuditEngine, ctx context.Context) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.auditEngine = ae
+	if ctx != nil {
+		g.auditCtx = context.WithoutCancel(ctx)
+	}
+	g.mu.Unlock()
+}
+
+func (g *LeaseGuard) emitLeaseAuditFailure(eventType, action, result, errMsg string) {
+	if g == nil {
+		return
+	}
+	g.mu.RLock()
+	ae := g.auditEngine
+	aCtx := g.auditCtx
+	g.mu.RUnlock()
+	if ae == nil {
+		return
+	}
+	if aCtx == nil {
+		aCtx = context.Background()
+	}
+	_, _ = ae.EmitEvent(aCtx, audit.EmitEventInput{
+		EventType:         eventType,
+		Action:            action,
+		Target:            g.Grant.Component,
+		Component:         g.Grant.Component,
+		Decision:          model.AuditDecisionDeny,
+		RiskLevel:         model.AuditRiskCritical,
+		OperationID:       g.Grant.OperationID,
+		FencingGeneration: g.Grant.FencingGeneration,
+		Result:            result,
+		ErrorCode:         errMsg,
+	})
 }
 
 // WithRecoveryLease attaches a LeaseGuard onto ctx.
@@ -600,6 +646,7 @@ func (g *LeaseGuard) renewLoop(ctx context.Context, ttl, interval time.Duration,
 					FencingGeneration: g.Grant.FencingGeneration,
 					Message:           fmt.Sprintf("lease renewal failed for %s: %v; cancelling recovery context", g.Grant.Component, err),
 				})
+				g.emitLeaseAuditFailure(model.AuditEventExecutionFailed, "recovery.lease.renew", "LEASE_RENEWAL_FAILED", err.Error())
 				g.cancel(fmt.Errorf("%w: renewal failed (%v)", ErrFencingTokenStale, err))
 				return
 			}
@@ -648,6 +695,7 @@ func (g *LeaseGuard) Release(db *gorm.DB, bus *eventbus.Bus) error {
 			FencingGeneration: g.Grant.FencingGeneration,
 			Message:           fmt.Sprintf("failed to cleanly release recovery lease for %s (gen=%d): %v", g.Grant.Component, g.Grant.FencingGeneration, err),
 		})
+		g.emitLeaseAuditFailure(model.AuditEventExecutionUnknown, "recovery.lease.release", "LEASE_RELEASE_FAILED", err.Error())
 		return err
 	}
 	return nil

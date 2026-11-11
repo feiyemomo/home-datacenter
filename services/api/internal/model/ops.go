@@ -383,6 +383,8 @@ func CanonicalizeComponent(name string) string {
 		return "mihomo"
 	case "tailscale":
 		return "tailscale"
+	case "host-os", "nas-host":
+		return "host-os"
 	default:
 		return ""
 	}
@@ -622,25 +624,17 @@ func VerifyProposalApprovalDigest(p *OpsProposal) error {
 	return nil
 }
 
-// ComputeDefaultBaseline computes fallback baseline matching HostFallbackProvider.
+// ComputeDefaultBaseline computes an explicit non-production offline placeholder baseline.
+// Production runtimes reject offline placeholders via IsRealBaselineHash / IsOfflinePlaceholderBaseline.
 func ComputeDefaultBaseline(component string) string {
 	canonical := CanonicalizeComponent(component)
 	if canonical == "" {
 		return ""
 	}
-	containerName := canonical
-	switch canonical {
-	case "frigate":
-		containerName = "home-frigate"
-	case "mosquitto":
-		containerName = "home-mosquitto"
-	case "openresty", "1pwaf":
-		containerName = "1Panel-openresty-WuDU"
+	if canonical == "1pwaf" {
+		canonical = "openresty"
 	}
-	hasher := sha256.New()
-	raw := fmt.Sprintf("%s:channels-tool/%s:latest:running:", canonical, containerName)
-	hasher.Write([]byte(raw))
-	return fmt.Sprintf("sha256:%x", hasher.Sum(nil))
+	return "offline-placeholder:" + canonical
 }
 
 // BeforeCreate initializes monotonic version/revision and blocks unapproved production persistence bypasses.

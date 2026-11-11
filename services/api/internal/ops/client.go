@@ -401,31 +401,42 @@ func (c *OnePanelClient) GetOSInfo(ctx context.Context) (*onePanelOSInfo, error)
 	return &resp.Data, nil
 }
 
-// ListContainers queries container statuses from 1Panel.
+// ListContainers queries container statuses from 1Panel with full pagination.
 func (c *OnePanelClient) ListContainers(ctx context.Context) ([]ContainerSummary, error) {
-	reqPayload := map[string]any{
-		"page":     1,
-		"pageSize": 50,
-		"state":    "all",
-		"orderBy":  "name",
-		"order":    "descending",
-	}
+	const pageSize = 50
+	const maxPages = 20
 
-	data, err := c.doRequest(ctx, http.MethodPost, "/api/v2/containers/search", reqPayload)
-	if err != nil {
-		return nil, err
-	}
+	var allItems []onePanelContainerItem
+	for page := 1; page <= maxPages; page++ {
+		reqPayload := map[string]any{
+			"page":     page,
+			"pageSize": pageSize,
+			"state":    "all",
+			"orderBy":  "name",
+			"order":    "descending",
+		}
 
-	var resp struct {
-		Code    int                    `json:"code"`
-		Message string                 `json:"message"`
-		Data    onePanelContainerPage  `json:"data"`
-	}
-	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("%w: invalid container search json: %v", ErrOnePanelUnreachable, err)
-	}
-	if resp.Code != 200 {
-		return nil, fmt.Errorf("%w: container search code %d: %s", ErrOnePanelUnreachable, resp.Code, resp.Message)
+		data, err := c.doRequest(ctx, http.MethodPost, "/api/v2/containers/search", reqPayload)
+		if err != nil {
+			return nil, err
+		}
+
+		var resp struct {
+			Code    int                   `json:"code"`
+			Message string                `json:"message"`
+			Data    onePanelContainerPage `json:"data"`
+		}
+		if err := json.Unmarshal(data, &resp); err != nil {
+			return nil, fmt.Errorf("%w: invalid container search json: %v", ErrOnePanelUnreachable, err)
+		}
+		if resp.Code != 200 {
+			return nil, fmt.Errorf("%w: container search code %d: %s", ErrOnePanelUnreachable, resp.Code, resp.Message)
+		}
+
+		allItems = append(allItems, resp.Data.Items...)
+		if len(resp.Data.Items) == 0 || len(resp.Data.Items) < pageSize || (resp.Data.Total > 0 && len(allItems) >= resp.Data.Total) {
+			break
+		}
 	}
 
 	// Fetch real-time container metrics from dedicated 1Panel stats endpoint
@@ -458,7 +469,7 @@ func (c *OnePanelClient) ListContainers(ctx context.Context) ([]ContainerSummary
 		"tailscale":         true,
 	}
 
-	for _, item := range resp.Data.Items {
+	for _, item := range allItems {
 		cleanName := strings.TrimPrefix(item.Name, "/")
 		cpu := item.CPUPerc
 		memMB := float64(item.MemUsage) / 1024 / 1024
@@ -471,6 +482,7 @@ func (c *OnePanelClient) ListContainers(ctx context.Context) ([]ContainerSummary
 		}
 
 		summaries = append(summaries, ContainerSummary{
+			ContainerID:   item.ContainerID,
 			Name:          cleanName,
 			State:         item.State,
 			Status:        item.Status,
@@ -488,8 +500,8 @@ func (c *OnePanelClient) ListContainers(ctx context.Context) ([]ContainerSummary
 
 // RestartContainer calls 1Panel to restart a container by name.
 func (c *OnePanelClient) RestartContainer(ctx context.Context, name string) error {
-	name = strings.TrimPrefix(name, "/")
-	if name == "" {
+	name = strings.TrimPrefix(strings.TrimSpace(name), "/")
+	if name == "" || strings.ContainsAny(name, "/\\?# \t\r\n") {
 		return ErrInvalidContainer
 	}
 

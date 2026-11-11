@@ -2,7 +2,9 @@ package audit
 
 import (
 	"bufio"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -63,11 +65,25 @@ func (e *AgentAuditEngine) appendEmergencyFallback(record map[string]interface{}
 	if strings.TrimSpace(e.archiveDir) == "" {
 		return fmt.Errorf("archive_dir not configured for emergency audit fallback")
 	}
+	if record == nil {
+		record = map[string]interface{}{}
+	}
+	if kid, ring, err := ResolveAuditHMACKeyring(); err == nil {
+		if secret := ring[kid]; len(secret) >= MinAuditHMACKeyBytes {
+			record["key_id"] = kid
+			if canon, cErr := CanonicalJSONBytes(record); cErr == nil {
+				mac := hmac.New(sha256.New, []byte(secret))
+				mac.Write(canon)
+				record["hmac_signature"] = fmt.Sprintf("hmac-sha256:%s:%s", kid, hex.EncodeToString(mac.Sum(nil)))
+			}
+		}
+	}
 	path := filepath.Join(e.archiveDir, "emergency-audit.jsonl")
 	return e.appendJSONLFile(path, record)
 }
 
-// CreateCheckpoint anchors the latest uncheckpointed slice of streamID into SQLite and external JSONL.
+// CreateCheckpoint anchors the latest uncheckpointed slice of streamID into SQLite, external JSONL,
+// and (when configured) submits it to the remote append-only store.
 func (e *AgentAuditEngine) CreateCheckpoint(streamID string) (*model.AgentAuditCheckpoint, error) {
 	if e == nil || e.db == nil {
 		return nil, ErrAuditCommitFailed
@@ -77,9 +93,15 @@ func (e *AgentAuditEngine) CreateCheckpoint(streamID string) (*model.AgentAuditC
 	}
 
 	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
-
-	return e.createCheckpointLocked(streamID)
+	cp, err := e.createCheckpointLocked(streamID)
+	e.writeMu.Unlock()
+	if err != nil {
+		return cp, err
+	}
+	if cp != nil && e.remoteStore != nil {
+		_ = e.SyncRemote(e.bgCtx(), streamID)
+	}
+	return cp, nil
 }
 
 func (e *AgentAuditEngine) createCheckpointLocked(streamID string) (*model.AgentAuditCheckpoint, error) {
@@ -184,15 +206,27 @@ func (e *AgentAuditEngine) createCheckpointInConn(
 	}
 	cp.HMACSignature = ComputeCheckpointHMAC(kid, secret, cp)
 
+	if signer, _ := e.activeExternalSignerAndVerifier(); signer != nil {
+		extSig, sigErr := signer.SignCheckpoint(cp)
+		if sigErr != nil {
+			return fmt.Errorf("external checkpoint signing failed: %w", sigErr)
+		}
+		cp.ExternalSig = extSig
+		cp.ExternalSigAlg = signer.Algorithm()
+		cp.ExternalKeyID = signer.KeyID()
+	}
+
 	if _, err := conn.ExecContext(e.bgCtx(), `
 		INSERT INTO agent_audit_checkpoints (
 			checkpoint_id, stream_id, from_seq, to_seq, event_count,
 			head_entry_hash, tail_entry_hash, chain_digest, prev_chain_digest,
-			key_id, hmac_signature, archive_file, created_at, created_at_ms
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			key_id, hmac_signature, external_sig, external_sig_alg, external_key_id,
+			archive_file, created_at, created_at_ms
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		cp.CheckpointID, cp.StreamID, cp.FromSeq, cp.ToSeq, cp.EventCount,
 		cp.HeadEntryHash, cp.TailEntryHash, cp.ChainDigest, cp.PrevChainDigest,
-		cp.KeyID, cp.HMACSignature, cp.ArchiveFile, cp.CreatedAt.UTC(), cp.CreatedAtMs,
+		cp.KeyID, cp.HMACSignature, cp.ExternalSig, cp.ExternalSigAlg, cp.ExternalKeyID,
+		cp.ArchiveFile, cp.CreatedAt.UTC(), cp.CreatedAtMs,
 	); err != nil {
 		return err
 	}

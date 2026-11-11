@@ -8,11 +8,14 @@ import datetime
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("home-ops-agent.audit")
 
 AUDIT_GENESIS_HASH = "0" * 64
 AUDIT_POLICY_VERSION = "v5.0"
@@ -89,7 +92,11 @@ _RE_JSON_STRING = re.compile(
     re.IGNORECASE,
 )
 _RE_JSON_UNQUOTED = re.compile(
-    rf'("(?:{_SENSITIVE_PATTERN})"\s*:\s*)([^"\s,\}}]][^\s,\}}]]*)',
+    rf'("(?:{_SENSITIVE_PATTERN})"\s*:\s*)([^"\s,\}}\]][^\s,\}}\]]*)',
+    re.IGNORECASE,
+)
+_RE_HMAC_KEYS_ENV = re.compile(
+    r'\b(OPS_AUDIT_HMAC_KEYS)\s*([=:])\s*(?:"((?:\\.|[^"\\])*)"|\'([^\']*)\'|([^\s;&}]+))',
     re.IGNORECASE,
 )
 _RE_KV_QUOTED = re.compile(
@@ -141,7 +148,13 @@ def canonical_json_bytes(val: Any) -> bytes:
         except Exception:
             pass
     normalized = canonicalize_value(val)
-    return json.dumps(normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return json.dumps(
+        normalized,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
 
 
 def redact_sensitive_string(text: str) -> str:
@@ -155,6 +168,7 @@ def redact_sensitive_string(text: str) -> str:
     res = _RE_BEARER.sub(r"\1[REDACTED]", res)
     res = _RE_BASIC.sub(r"\1[REDACTED]", res)
     res = _RE_JWT.sub("[REDACTED_JWT]", res)
+    res = _RE_HMAC_KEYS_ENV.sub(r"\1\2[REDACTED]", res)
     res = _RE_JSON_STRING.sub(r'\1"[REDACTED]"', res)
     res = _RE_JSON_UNQUOTED.sub(r'\1"[REDACTED]"', res)
     res = _RE_KV_QUOTED.sub(r'\1\2"[REDACTED]"', res)
@@ -194,9 +208,8 @@ def cap_and_redact_text(raw: str, max_bytes: int = MAX_EVIDENCE_BYTES) -> str:
     if trimmed.startswith("{") or trimmed.startswith("["):
         try:
             parsed = json.loads(trimmed)
-            sanitized = redact_sensitive_string(
-                json.dumps(redact_value(parsed), separators=(",", ":"), ensure_ascii=False)
-            )
+            canon_redacted = canonical_json_bytes(redact_value(parsed)).decode("utf-8")
+            sanitized = redact_sensitive_string(canon_redacted)
         except Exception:
             sanitized = redact_sensitive_string(raw)
     else:
@@ -346,6 +359,94 @@ def verify_event_hmac(ev: Dict[str, Any], ring: Dict[str, str], stream_id: str =
     return hmac.compare_digest(sig, expected)
 
 
+def extract_hmac_key_id(sig: str) -> str:
+    """Extracts key_id from 'hmac-sha256:<kid>:<hex>' signature; returns '' if invalid."""
+    parts = str(sig or "").strip().split(":", 2)
+    if len(parts) == 3 and parts[0] == "hmac-sha256" and parts[1] and parts[2]:
+        return parts[1]
+    return ""
+
+
+def verify_offline_audit_chain(
+    records: List[Dict[str, Any]],
+    ring: Optional[Dict[str, str]] = None,
+    default_stream_id: str = "offline-agent",
+) -> Tuple[bool, str]:
+    """
+    Verifies local SQLite offline_ops_audit hash-chain continuity and HMAC signatures
+    for signed v5 records before syncing to Go Core.
+    Returns (ok, reason).
+    """
+    prev_hash_by_stream: Dict[str, str] = {}
+    prev_seq_by_stream: Dict[str, int] = {}
+    for idx, rec in enumerate(records):
+        seq = int(rec.get("offline_seq") or 0)
+        entry_hash = str(rec.get("entry_hash") or "").strip()
+        sig = str(rec.get("hmac_signature") or "").strip()
+        stream_id = str(rec.get("origin_stream_id") or default_stream_id).strip() or default_stream_id
+        if seq == 0 and not entry_hash and not sig:
+            continue
+        if seq <= 0 or not entry_hash or not sig:
+            return False, f"record[{idx}] incomplete v5 cryptographic proof (seq={seq})"
+
+        local_prev = str(rec.get("local_prev_hash") or "").strip() or AUDIT_GENESIS_HASH
+        if stream_id in prev_seq_by_stream:
+            if seq <= prev_seq_by_stream[stream_id]:
+                return False, f"record[{idx}] non-monotonic offline_seq {seq} <= {prev_seq_by_stream[stream_id]}"
+            if local_prev != prev_hash_by_stream[stream_id]:
+                return False, f"record[{idx}] broken local_prev_hash chain at seq={seq}"
+
+        ev_obj = {
+            "audit_id": str(rec.get("audit_id") or rec.get("event_uuid") or ""),
+            "run_id": str(rec.get("run_id") or ""),
+            "parent_event_id": str(rec.get("parent_event_id") or ""),
+            "correlation_id": str(rec.get("correlation_id") or ""),
+            "household_id": int(rec.get("household_id") or 1),
+            "trigger_source": str(rec.get("trigger_source") or "python_offline"),
+            "actor_type": str(rec.get("actor_type") or "offline_agent"),
+            "actor_id": str(rec.get("actor_id") or rec.get("holder") or "home-ops-agent"),
+            "event_type": str(rec.get("event_type") or EXECUTION_COMPLETED),
+            "action": str(rec.get("action") or ""),
+            "target": redact_sensitive_string(str(rec.get("target") or rec.get("container_name") or "")),
+            "component": str(rec.get("component") or rec.get("container_name") or ""),
+            "decision": str(rec.get("decision") or DECISION_ALLOW),
+            "risk_level": str(rec.get("risk_level") or "HIGH"),
+            "policy_version": str(rec.get("policy_version") or AUDIT_POLICY_VERSION),
+            "proposal_id": str(rec.get("proposal_id") or ""),
+            "approval_id": str(rec.get("approval_id") or ""),
+            "operation_id": str(rec.get("operation_id") or ""),
+            "fencing_generation": int(rec.get("fencing_generation") or 0),
+            "before_state": cap_and_redact_text(str(rec.get("before_state") or "")),
+            "after_state": cap_and_redact_text(str(rec.get("after_state") or "")),
+            "parameters_digest": str(rec.get("parameters_digest") or ""),
+            "parameters_redacted": cap_and_redact_text(str(rec.get("parameters_redacted") or "")),
+            "result": "SUCCESS" if int(rec.get("success") or 0) == 1 else "FAILED",
+            "error_code": cap_and_redact_text(str(rec.get("error_message") or ""), 256),
+            "duration_ms": int(rec.get("duration_ms") or 0),
+            "evidence": cap_and_redact_text(str(rec.get("evidence") or "")),
+            "created_at": str(rec.get("executed_at") or ""),
+            "created_at_ms": int(rec.get("executed_at_ms") or 0),
+            "is_offline": True,
+            "previous_hash": local_prev,
+        }
+        computed_hash = compute_event_entry_hash(ev_obj)
+        if computed_hash != entry_hash:
+            return False, f"record[{idx}] entry_hash mismatch at seq={seq}"
+
+        if ring:
+            ev_check = dict(ev_obj)
+            ev_check["stream_id"] = stream_id
+            ev_check["seq"] = seq
+            ev_check["entry_hash"] = entry_hash
+            ev_check["hmac_signature"] = sig
+            if not verify_event_hmac(ev_check, ring, stream_id=stream_id):
+                return False, f"record[{idx}] hmac_signature mismatch at seq={seq}"
+
+        prev_seq_by_stream[stream_id] = seq
+        prev_hash_by_stream[stream_id] = entry_hash
+    return True, "ok"
+
+
 def append_jsonl_audit_stub(archive_dir: str, filename: str, record: Dict[str, Any]) -> bool:
     """Appends an immutable JSONL line into independent local archive dir (mode 0600)."""
     if not archive_dir:
@@ -353,14 +454,15 @@ def append_jsonl_audit_stub(archive_dir: str, filename: str, record: Dict[str, A
     try:
         os.makedirs(archive_dir, exist_ok=True)
         path = os.path.join(archive_dir, filename)
-        line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+        line = json.dumps(record, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n"
         fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(line)
             fh.flush()
             os.fsync(fh.fileno())
         return True
-    except Exception:
+    except Exception as exc:
+        logger.warning(f"Failed to append JSONL audit stub to {archive_dir}/{filename}: {exc}")
         return False
 
 

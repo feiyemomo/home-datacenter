@@ -173,6 +173,11 @@ func (s *ProposalScheduler) Tick() {
 		// 2. Atomic CAS claim via unified ProposalFSM: transition SCHEDULED -> EXECUTING with execution_token
 		execToken := GenerateOperationID("sched")
 		fsm := NewProposalFSM(s.db)
+		if defExec, ok := s.executor.(*DefaultOperationExecutor); ok && defExec != nil {
+			if ae := defExec.GetAuditEngine(); ae != nil {
+				fsm.SetAuditEngine(ae)
+			}
+		}
 		won, casErr := fsm.TransitionStrict(ProposalTransitionParams{
 			ProposalID:       propKey,
 			ExpectedStatuses: []string{model.ProposalStatusScheduled},
@@ -204,7 +209,18 @@ func (s *ProposalScheduler) Tick() {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			defer cancel()
 			claimCtx := WithSchedulerClaim(ctx, key, tok)
-			_, _ = s.executor.ExecuteProposal(claimCtx, &p)
+			if _, execErr := s.executor.ExecuteProposal(claimCtx, &p); execErr != nil {
+				log.Printf("[ops-scheduler] scheduled proposal %s execution failed: %v", key, execErr)
+				RecordSecurityEvent(s.db, nil, OpsSecurityEvent{
+					OperationID: tok,
+					EventType:   "ops.proposal.scheduled_execution_failed",
+					Severity:    "warning",
+					Component:   p.TargetComponent,
+					Actor:       "proposal-scheduler",
+					ProposalID:  key,
+					Message:     execErr.Error(),
+				})
+			}
 		}(pCopy, propKey, execToken)
 	}
 }

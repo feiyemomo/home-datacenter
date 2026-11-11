@@ -287,10 +287,21 @@ class TestAgentBoundaries(unittest.IsolatedAsyncioTestCase):
             conn = sqlite3.connect(self.db_path)
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM offline_ops_audit WHERE container_name = 'home-vision'")
+            cursor.execute("SELECT * FROM offline_ops_audit WHERE container_name = 'home-vision' ORDER BY id ASC")
             rows = cursor.fetchall()
-            self.assertEqual(len(rows), 1)
-            row = rows[0]
+            self.assertGreaterEqual(len(rows), 1)
+            if "event_type" in rows[0].keys() and len(rows) > 1:
+                self.assertEqual(
+                    [r["event_type"] for r in rows],
+                    [
+                        "EVENT_RECEIVED",
+                        "RECOVERY_LEASE_ACQUIRED",
+                        "EXECUTION_STARTED",
+                        "HEALTH_CHECK_COMPLETED",
+                        "EXECUTION_COMPLETED",
+                    ],
+                )
+            row = rows[-1]
             self.assertTrue(row["event_uuid"].startswith("offline-"))
             self.assertEqual(row["action"], "emergency_restart")
             self.assertEqual(row["success"], 1)

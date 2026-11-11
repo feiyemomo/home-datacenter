@@ -72,6 +72,7 @@ export interface AgentAuditEvent {
     origin_stream_id?: string;
     origin_seq?: number;
     origin_entry_hash?: string;
+    key_id?: string;
     previous_hash: string;
     entry_hash: string;
     hmac_signature: string;
@@ -92,8 +93,70 @@ export interface AuditVerifyResult {
     broken_at_seq?: number;
     failure_reason?: string;
     key_ids_used?: string[];
+    remote_store_configured?: boolean;
+    remote_store_type?: string;
+    remote_sync_status?: string;
+    remote_tail_seq?: number;
+    remote_tail_hash?: string;
+    external_sig_verified?: boolean;
+    security_boundary?: string;
     limitation_note: string;
     verified_at: string;
+}
+
+export interface AuditKeyStatus {
+    active_key_id: string;
+    configured_key_ids: string[];
+    historical_key_ids: string[];
+    external_sig_alg?: string;
+    external_key_id?: string;
+    external_public_key?: string;
+    last_rotation_at?: string;
+    rotation_count: number;
+    remote_store_configured: boolean;
+    remote_store_type?: string;
+    security_boundary_note: string;
+}
+
+export interface AuditRemoteDiffReport {
+    configured: boolean;
+    store_type: string;
+    endpoint?: string;
+    reachable: boolean;
+    status: string;
+    local_tail_seq: number;
+    local_tail_hash?: string;
+    local_checkpoint_seq: number;
+    remote_tail_seq: number;
+    remote_tail_hash?: string;
+    remote_checkpoint_id?: string;
+    remote_checkpoint_seq: number;
+    remote_chain_digest?: string;
+    pending_events: number;
+    external_sig_verified: boolean;
+    discrepancies?: string[];
+    error?: string;
+    checked_at: string;
+}
+
+export interface AuditRemoteSyncState {
+    stream_id: string;
+    remote_store_type: string;
+    remote_endpoint?: string;
+    last_synced_seq: number;
+    last_synced_entry_hash?: string;
+    last_synced_checkpoint_id?: string;
+    last_synced_checkpoint_seq: number;
+    last_sync_at_ms: number;
+    last_error?: string;
+    consecutive_failures: number;
+    sync_status: string;
+    updated_at_ms: number;
+}
+
+export interface AuditRemoteStatusResponse {
+    diff: AuditRemoteDiffReport;
+    sync_state?: AuditRemoteSyncState;
 }
 
 export interface AuditRunDetail {
@@ -109,6 +172,10 @@ export interface ListRunsParams {
     component?: string;
     status?: string;
     risk_level?: string;
+    actor_id?: string;
+    proposal_id?: string;
+    approval_id?: string;
+    operation_id?: string;
     is_offline?: boolean;
     q?: string;
 }
@@ -128,6 +195,10 @@ export async function listAuditRuns(params: ListRunsParams = {}): Promise<ListRu
     if (params.component) query.component = params.component;
     if (params.status) query.status = params.status;
     if (params.risk_level) query.risk_level = params.risk_level;
+    if (params.actor_id) query.actor_id = params.actor_id;
+    if (params.proposal_id) query.proposal_id = params.proposal_id;
+    if (params.approval_id) query.approval_id = params.approval_id;
+    if (params.operation_id) query.operation_id = params.operation_id;
     if (params.is_offline !== undefined) query.is_offline = params.is_offline;
     if (params.q) query.q = params.q;
 
@@ -140,15 +211,58 @@ export async function getAuditRunDetail(runId: string): Promise<AuditRunDetail> 
     return data;
 }
 
-export async function verifyAuditChain(verifyTriggers = true, verifyCheckpoints = true): Promise<AuditVerifyResult> {
+export async function verifyAuditChain(
+    verifyTriggers = true,
+    verifyCheckpoints = true,
+    verifyRemote = true,
+): Promise<AuditVerifyResult> {
     const { data } = await client.post<AuditVerifyResult>("/ops/audit/verify", {
         verify_triggers: verifyTriggers,
         verify_checkpoints: verifyCheckpoints,
+        verify_remote: verifyRemote,
     });
     return data;
 }
 
-export async function exportAuditFile(format: "json" | "csv", filters: { run_id?: string; component?: string; trigger_source?: string } = {}): Promise<void> {
+export async function getAuditKeyStatus(): Promise<AuditKeyStatus> {
+    const { data } = await client.get<AuditKeyStatus>("/ops/audit/key-status");
+    return data;
+}
+
+export async function getAuditRemoteStatus(streamId = "core"): Promise<AuditRemoteStatusResponse> {
+    const { data } = await client.get<AuditRemoteStatusResponse>("/ops/audit/remote-status", {
+        params: { stream_id: streamId },
+    });
+    return data;
+}
+
+export async function syncAuditRemote(streamId = "core"): Promise<AuditRemoteStatusResponse> {
+    const { data } = await client.post<AuditRemoteStatusResponse>("/ops/audit/remote/sync", null, {
+        params: { stream_id: streamId },
+    });
+    return data;
+}
+
+export async function createAuditCheckpoint(streamId = "core"): Promise<{ created: boolean; message?: string }> {
+    const { data } = await client.post<{ created: boolean; message?: string }>("/ops/audit/checkpoints", null, {
+        params: { stream_id: streamId },
+    });
+    return data;
+}
+
+export interface ExportAuditFilters {
+    run_id?: string;
+    component?: string;
+    trigger_source?: string;
+    proposal_id?: string;
+    approval_id?: string;
+    operation_id?: string;
+    actor_id?: string;
+    risk_level?: string;
+    is_offline?: boolean;
+}
+
+export async function exportAuditFile(format: "json" | "csv", filters: ExportAuditFilters = {}): Promise<void> {
     try {
         const res = await client.get<Blob>("/ops/audit/export", {
             params: { format, ...filters },

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"sync"
@@ -49,7 +50,10 @@ func CanonicalJSONBytes(v interface{}) ([]byte, error) {
 		dec := json.NewDecoder(strings.NewReader(s))
 		dec.UseNumber()
 		if err := dec.Decode(&decoded); err == nil {
-			v = decoded
+			var extra interface{}
+			if dec.Decode(&extra) == io.EOF {
+				v = decoded
+			}
 		}
 	} else {
 		raw, err := json.Marshal(v)
@@ -256,13 +260,18 @@ func ResolveAuditHMACKeyring() (string, map[string]string, error) {
 				continue
 			}
 			parts := strings.SplitN(trimmed, ":", 2)
-			if len(parts) == 2 {
-				kid := strings.TrimSpace(parts[0])
-				sec := strings.TrimSpace(parts[1])
-				if kid != "" && sec != "" {
-					ring[kid] = sec
-				}
+			if len(parts) != 2 {
+				return "", nil, fmt.Errorf("%w: malformed OPS_AUDIT_HMAC_KEYS entry", ErrAuditKeyWeak)
 			}
+			kid := strings.TrimSpace(parts[0])
+			sec := strings.TrimSpace(parts[1])
+			if kid == "" || strings.Contains(kid, ":") {
+				return "", nil, fmt.Errorf("%w: invalid key id in OPS_AUDIT_HMAC_KEYS", ErrAuditKeyWeak)
+			}
+			if len(sec) < MinAuditHMACKeyBytes {
+				return "", nil, fmt.Errorf("%w: key '%s' has %d bytes", ErrAuditKeyWeak, kid, len(sec))
+			}
+			ring[kid] = sec
 		}
 	}
 
@@ -275,6 +284,9 @@ func ResolveAuditHMACKeyring() (string, map[string]string, error) {
 		if len(primary) < MinAuditHMACKeyBytes {
 			return "", nil, fmt.Errorf("%w: got %d bytes", ErrAuditKeyWeak, len(primary))
 		}
+		if existing, exists := ring[activeKID]; exists && existing != primary {
+			return "", nil, fmt.Errorf("%w: OPS_AUDIT_HMAC_KEY conflicts with OPS_AUDIT_HMAC_KEYS[%s]", ErrAuditKeyWeak, activeKID)
+		}
 		ring[activeKID] = primary
 	}
 
@@ -283,6 +295,7 @@ func ResolveAuditHMACKeyring() (string, map[string]string, error) {
 			if len(sec) < MinAuditHMACKeyBytes {
 				return "", nil, fmt.Errorf("%w: key '%s' has %d bytes", ErrAuditKeyWeak, kid, len(sec))
 			}
+			redact.RegisterRuntimeSecret(sec)
 		}
 		return activeKID, ring, nil
 	}
@@ -383,24 +396,33 @@ func VerifyCheckpointHMAC(cp *model.AgentAuditCheckpoint, ring map[string]string
 }
 
 // VerifyOfflineOriginHMAC validates an offline event HMAC computed by the Python edge agent.
-// Python signs (offline_seq|entry_hash|executed_at_ms) or ("offline-agent"|offline_seq|entry_hash|executed_at_ms).
 func VerifyOfflineOriginHMAC(ev OfflineSyncEvent, ring map[string]string) error {
+	_, err := VerifyOfflineOriginHMACWithKID(ev, ring)
+	return err
+}
+
+// VerifyOfflineOriginHMACWithKID validates an offline event HMAC and returns the signing key_id.
+func VerifyOfflineOriginHMACWithKID(ev OfflineSyncEvent, ring map[string]string) (string, error) {
 	sig := strings.TrimSpace(ev.HMACSignature)
 	if sig == "" {
-		return fmt.Errorf("missing offline HMAC signature")
+		return "", fmt.Errorf("missing offline HMAC signature")
 	}
 	parts := strings.SplitN(sig, ":", 3)
 	if len(parts) != 3 || parts[0] != "hmac-sha256" || parts[1] == "" || parts[2] == "" {
-		return fmt.Errorf("malformed offline HMAC format")
+		return "", fmt.Errorf("malformed offline HMAC format")
 	}
 	kid := parts[1]
+	if strings.TrimSpace(ev.KeyID) != "" && strings.TrimSpace(ev.KeyID) != kid {
+		return kid, fmt.Errorf("offline key_id %q does not match HMAC signature kid %q", ev.KeyID, kid)
+	}
 	secret, ok := ring[kid]
 	if !ok || len(secret) < MinAuditHMACKeyBytes {
-		return fmt.Errorf("unknown offline signing key id %q", kid)
+		return kid, fmt.Errorf("unknown offline signing key id %q", kid)
 	}
-	expected := ComputeEventHMAC(kid, secret, "offline-agent", ev.OfflineSeq, ev.EntryHash, ev.ExecutedAtMs)
+	originStream := defaultStr(strings.TrimSpace(ev.OriginStreamID), "offline-agent")
+	expected := ComputeEventHMAC(kid, secret, originStream, ev.OfflineSeq, ev.EntryHash, ev.ExecutedAtMs)
 	if subtle.ConstantTimeCompare([]byte(sig), []byte(expected)) == 1 {
-		return nil
+		return kid, nil
 	}
-	return fmt.Errorf("offline HMAC verification failed for event %s", ev.EventUUID)
+	return kid, fmt.Errorf("offline HMAC verification failed for event %s", ev.EventUUID)
 }

@@ -11,6 +11,8 @@ import (
 
 	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/middleware"
+	"home-datacenter-api/internal/model"
+	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/utils"
 )
 
@@ -24,6 +26,10 @@ func (h *OpsHandler) RegisterAuditRoutes(rg *gin.RouterGroup) {
 		ag.GET("/events", middleware.RequireAdmin(h.db), h.ListAuditEvents)
 		ag.POST("/verify", middleware.RequireAdmin(h.db), h.VerifyAuditChain)
 		ag.GET("/export", middleware.RequireAdmin(h.db), h.ExportAuditEvents)
+		ag.GET("/key-status", middleware.RequireAdmin(h.db), h.GetAuditKeyStatus)
+		ag.GET("/remote-status", middleware.RequireAdmin(h.db), h.GetAuditRemoteStatus)
+		ag.POST("/remote/sync", middleware.RequireAdmin(h.db), h.TriggerAuditRemoteSync)
+		ag.POST("/checkpoints", middleware.RequireAdmin(h.db), h.CreateAuditCheckpoint)
 	}
 }
 
@@ -73,6 +79,10 @@ func (h *OpsHandler) ListAuditRuns(c *gin.Context) {
 		Status:        c.Query("status"),
 		RiskLevel:     c.Query("risk_level"),
 		ActorID:       c.Query("actor_id"),
+		ProposalID:    c.Query("proposal_id"),
+		ApprovalID:    c.Query("approval_id"),
+		OperationID:   c.Query("operation_id"),
+		CorrelationID: c.Query("correlation_id"),
 		IsOffline:     isOfflinePtr,
 		FromMs:        fromMs,
 		ToMs:          toMs,
@@ -81,7 +91,7 @@ func (h *OpsHandler) ListAuditRuns(c *gin.Context) {
 		PageSize:      pageSize,
 	})
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		utils.Fail(c, http.StatusInternalServerError, redact.SensitiveString(err.Error()))
 		return
 	}
 
@@ -115,7 +125,7 @@ func (h *OpsHandler) GetAuditRunDetail(c *gin.Context) {
 			utils.Fail(c, http.StatusNotFound, "audit run not found")
 			return
 		}
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		utils.Fail(c, http.StatusInternalServerError, redact.SensitiveString(err.Error()))
 		return
 	}
 
@@ -141,6 +151,11 @@ func (h *OpsHandler) ListAuditEvents(c *gin.Context) {
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
 	fromMs, _ := strconv.ParseInt(c.Query("from_ms"), 10, 64)
 	toMs, _ := strconv.ParseInt(c.Query("to_ms"), 10, 64)
+	var isOfflinePtr *bool
+	if v := strings.TrimSpace(c.Query("is_offline")); v != "" {
+		b := strings.EqualFold(v, "true") || v == "1"
+		isOfflinePtr = &b
+	}
 
 	events, total, err := ae.QueryEvents(audit.EventQuery{
 		HouseholdID:   hhID,
@@ -152,15 +167,20 @@ func (h *OpsHandler) ListAuditEvents(c *gin.Context) {
 		Target:        c.Query("target"),
 		CorrelationID: c.Query("correlation_id"),
 		ProposalID:    c.Query("proposal_id"),
+		ApprovalID:    c.Query("approval_id"),
 		OperationID:   c.Query("operation_id"),
+		ActorID:       c.Query("actor_id"),
+		RiskLevel:     c.Query("risk_level"),
+		IsOffline:     isOfflinePtr,
 		Result:        c.Query("result"),
 		FromMs:        fromMs,
 		ToMs:          toMs,
+		SortAsc:       strings.EqualFold(c.Query("sort"), "asc"),
 		Page:          page,
 		PageSize:      pageSize,
 	}, 100)
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		utils.Fail(c, http.StatusInternalServerError, redact.SensitiveString(err.Error()))
 		return
 	}
 
@@ -189,8 +209,11 @@ func (h *OpsHandler) VerifyAuditChain(c *gin.Context) {
 	var req audit.VerifyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		req = audit.VerifyRequest{VerifyCheckpoints: true, VerifyTriggers: true}
-	} else if !req.VerifyCheckpoints && !req.VerifyTriggers && req.FromSeq == 0 && req.ToSeq == 0 {
-		req.VerifyCheckpoints = true
+	} else {
+		if !req.VerifyCheckpoints && !req.VerifyTriggers && req.FromSeq == 0 && req.ToSeq == 0 {
+			req.VerifyCheckpoints = true
+		}
+		// Always enforce append-only SQLite trigger integrity on verification endpoint.
 		req.VerifyTriggers = true
 	}
 
@@ -221,6 +244,12 @@ func (h *OpsHandler) ExportAuditEvents(c *gin.Context) {
 	fromMs, _ := strconv.ParseInt(c.Query("from_ms"), 10, 64)
 	toMs, _ := strconv.ParseInt(c.Query("to_ms"), 10, 64)
 
+	var isOfflinePtr *bool
+	if v := strings.TrimSpace(c.Query("is_offline")); v != "" {
+		b := strings.EqualFold(v, "true") || v == "1"
+		isOfflinePtr = &b
+	}
+
 	raw, contentType, digest, err := ae.ExportEvents(audit.EventQuery{
 		HouseholdID:   hhID,
 		RunID:         c.Query("run_id"),
@@ -231,13 +260,17 @@ func (h *OpsHandler) ExportAuditEvents(c *gin.Context) {
 		Target:        c.Query("target"),
 		CorrelationID: c.Query("correlation_id"),
 		ProposalID:    c.Query("proposal_id"),
+		ApprovalID:    c.Query("approval_id"),
 		OperationID:   c.Query("operation_id"),
+		ActorID:       c.Query("actor_id"),
+		RiskLevel:     c.Query("risk_level"),
+		IsOffline:     isOfflinePtr,
 		Result:        c.Query("result"),
 		FromMs:        fromMs,
 		ToMs:          toMs,
 	}, format)
 	if err != nil {
-		utils.Fail(c, http.StatusInternalServerError, err.Error())
+		utils.Fail(c, http.StatusInternalServerError, redact.SensitiveString(err.Error()))
 		return
 	}
 
@@ -245,4 +278,91 @@ func (h *OpsHandler) ExportAuditEvents(c *gin.Context) {
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", filename))
 	c.Header("X-Audit-Export-SHA256", digest)
 	c.Data(http.StatusOK, contentType, raw)
+}
+
+// GetAuditKeyStatus returns non-secret HMAC key_id metadata, external Ed25519 public key info,
+// rotation counts, and the explicit fnOS root-attacker security boundary statement.
+//
+//	Route: GET /api/v1/ops/audit/key-status
+func (h *OpsHandler) GetAuditKeyStatus(c *gin.Context) {
+	if _, ok := resolveAdminAuditHousehold(c); !ok {
+		utils.Fail(c, http.StatusForbidden, "admin role required for audit key status")
+		return
+	}
+	ae := h.getAuditEngine()
+	if ae == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "audit engine unavailable")
+		return
+	}
+	utils.Success(c, ae.GetKeyStatus())
+}
+
+// GetAuditRemoteStatus inspects local SQLite vs external remote WORM/HTTP store without mutating state.
+//
+//	Route: GET /api/v1/ops/audit/remote-status
+func (h *OpsHandler) GetAuditRemoteStatus(c *gin.Context) {
+	if _, ok := resolveAdminAuditHousehold(c); !ok {
+		utils.Fail(c, http.StatusForbidden, "admin role required for remote audit status")
+		return
+	}
+	ae := h.getAuditEngine()
+	if ae == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "audit engine unavailable")
+		return
+	}
+	streamID := strings.TrimSpace(c.DefaultQuery("stream_id", model.AuditPrimaryStreamID))
+	diff := ae.CompareWithRemote(c.Request.Context(), streamID)
+	syncState, _ := ae.GetRemoteSyncState(streamID)
+	utils.Success(c, gin.H{
+		"diff":       diff,
+		"sync_state": syncState,
+	})
+}
+
+// TriggerAuditRemoteSync pushes un-replicated local audit events and checkpoints to the configured remote replica.
+//
+//	Route: POST /api/v1/ops/audit/remote/sync
+func (h *OpsHandler) TriggerAuditRemoteSync(c *gin.Context) {
+	if _, ok := resolveAdminAuditHousehold(c); !ok {
+		utils.Fail(c, http.StatusForbidden, "admin role required for remote audit sync")
+		return
+	}
+	ae := h.getAuditEngine()
+	if ae == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "audit engine unavailable")
+		return
+	}
+	streamID := strings.TrimSpace(c.DefaultQuery("stream_id", model.AuditPrimaryStreamID))
+	diff := ae.SyncRemote(c.Request.Context(), streamID)
+	syncState, _ := ae.GetRemoteSyncState(streamID)
+	utils.Success(c, gin.H{
+		"diff":       diff,
+		"sync_state": syncState,
+	})
+}
+
+// CreateAuditCheckpoint manually seals a signed checkpoint anchor and replicates it when a remote store is configured.
+//
+//	Route: POST /api/v1/ops/audit/checkpoints
+func (h *OpsHandler) CreateAuditCheckpoint(c *gin.Context) {
+	if _, ok := resolveAdminAuditHousehold(c); !ok {
+		utils.Fail(c, http.StatusForbidden, "admin role required to create audit checkpoint")
+		return
+	}
+	ae := h.getAuditEngine()
+	if ae == nil {
+		utils.Fail(c, http.StatusServiceUnavailable, "audit engine unavailable")
+		return
+	}
+	streamID := strings.TrimSpace(c.DefaultQuery("stream_id", model.AuditPrimaryStreamID))
+	cp, err := ae.CreateCheckpoint(streamID)
+	if err != nil {
+		utils.Fail(c, http.StatusInternalServerError, redact.SensitiveString(err.Error()))
+		return
+	}
+	if cp == nil {
+		utils.Success(c, gin.H{"created": false, "message": "no uncheckpointed events pending"})
+		return
+	}
+	utils.Success(c, gin.H{"created": true, "checkpoint": cp})
 }

@@ -272,10 +272,13 @@ class TestAuditProtocolR5(unittest.IsolatedAsyncioTestCase):
             await self.agent.sync_offline_audit_logs()
 
         conn = sqlite3.connect(self.db_path)
-        statuses = {r[0]: r[1] for r in conn.execute("SELECT event_uuid, synced FROM offline_ops_audit").fetchall()}
+        rows_after = conn.execute("SELECT event_uuid, synced, audit_status FROM offline_ops_audit").fetchall()
         conn.close()
+        statuses = {r[0]: r[1] for r in rows_after}
+        audit_statuses = {r[0]: r[2] for r in rows_after}
         self.assertEqual(statuses[uuids[0]], 1)
-        self.assertEqual(statuses[uuids[1]], 0)
+        self.assertEqual(statuses[uuids[1]], -1)
+        self.assertEqual(audit_statuses[uuids[1]], "AUDIT_REJECTED")
 
     def test_rule_engine_maintenance_lock_blocks_docker_prune_and_emits_audit(self):
         os.environ["ENABLE_LOCAL_DOCKER_PRUNE"] = "1"

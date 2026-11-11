@@ -23,6 +23,7 @@ import (
 	"home-datacenter-api/internal/device"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/handler"
+	"home-datacenter-api/internal/hostsec"
 	logpkg "home-datacenter-api/internal/log"
 	"home-datacenter-api/internal/maintenance"
 	"home-datacenter-api/internal/middleware"
@@ -233,7 +234,17 @@ func main() {
 	logSub.Start()
 
 	// ---- Services & Handlers ----
-	auditEngine := audit.NewAgentAuditEngine(database.DB, bus, audit.WithFailureCallback(ops.GlobalSecurityMetrics.IncAuditFailed))
+	archiveDir := strings.TrimSpace(os.Getenv("OPS_AUDIT_ARCHIVE_DIR"))
+	if archiveDir == "" {
+		archiveDir = filepath.Join(filepath.Dir(cfg.Database.Path), "audit-archive")
+	}
+	auditEngine := audit.NewAgentAuditEngine(
+		database.DB,
+		bus,
+		audit.WithArchiveDir(archiveDir),
+		audit.WithFailureCallback(ops.GlobalSecurityMetrics.IncAuditFailed),
+	)
+	defer auditEngine.Close()
 	alertMgr := security.NewAlertManager(cfg.Security.Alert, database.DB)
 	defenseMgr := security.NewDefenseManager(database.DB, cfg.Security.Defense, alertMgr, bus)
 	defenseMgr.SetAuditEngine(auditEngine)
@@ -294,11 +305,37 @@ func main() {
 		fmt.Sprintf("http://127.0.0.1:%d/health", cfg.Server.Port),
 	)
 	safetyFSM.SetAuditEngine(auditEngine)
+	hostRoot := strings.TrimSpace(os.Getenv("HOST_ROOT"))
+	dockerSocket := strings.TrimSpace(os.Getenv("DOCKER_SOCKET"))
+	snapshotRoot := strings.TrimSpace(os.Getenv("HOST_SNAPSHOT_DIR"))
+	if snapshotRoot == "" {
+		snapshotRoot = filepath.Join(filepath.Dir(cfg.Database.Path), "host-snapshots")
+	}
+	hostSecProvider := hostsec.NewDefaultHostSecurityProvider(hostRoot, dockerSocket)
+	corrEngine := hostsec.NewCorrelationEngine(hostsec.CorrelationConfig{
+		OSVURL:           os.Getenv("OSV_API_URL"),
+		DebianTrackerURL: os.Getenv("DEBIAN_TRACKER_URL"),
+		NVDURL:           os.Getenv("NVD_API_URL"),
+		NVDAPIKey:        os.Getenv("NVD_API_KEY"),
+		GHSAURL:          os.Getenv("GHSA_API_URL"),
+		GHSAToken:        os.Getenv("GITHUB_TOKEN"),
+		CISAKEVURL:       os.Getenv("CISA_KEV_URL"),
+	})
+	hostUpdateExec := hostsec.NewHostUpdateExecutor(hostRoot, snapshotRoot, auditEngine)
+	hostMonitor := security.NewHostSecurityMonitor(hostRoot, dockerSocket, defenseMgr, auditEngine)
+	hostBgCtx, hostBgCancel := context.WithCancel(context.Background())
+	defer hostBgCancel()
+
 	vulnScanner := ops.NewVulnScanner(database.DB, alertMgr)
 	vulnScanner.SetAuditEngine(auditEngine)
+	vulnScanner.SetHostSecurityProvider(hostSecProvider)
+	vulnScanner.SetCorrelationEngine(corrEngine)
 
 	opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
 	opsHandler.SetAuditEngine(auditEngine)
+	opsHandler.SetHostSecurityProvider(hostSecProvider)
+	opsHandler.SetHostSecurityMonitor(hostMonitor)
+	opsHandler.SetHostUpdateExecutor(hostUpdateExec)
 	vulnScanner.SetBaselineExtractor(opsHandler.ComputeFingerprint)
 	opsHandler.SetVulnScanner(vulnScanner)
 	recoveryFSM := opsHandler.GetRecoveryFSM()
@@ -1056,10 +1093,10 @@ func main() {
 				go func() {
 					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 					defer cancel()
-					_, _ = vulnScanner.ScanWorkspaceDependencies(scanCtx, ".")
+					_, _, _ = vulnScanner.ScanHostAndDependencies(scanCtx, ".")
 				}()
 				utils.Success(c, gin.H{
-					"message": "已触发 Google OSV 依赖漏洞情报全量扫描",
+					"message": "已触发宿主机 CVE 关联与 Google OSV 依赖漏洞全量扫描",
 					"ts":      time.Now().Unix(),
 				})
 			})
@@ -1153,16 +1190,44 @@ func main() {
 			})
 		}
 
-		// Periodic off-peak background ticker for autonomous security maintenance & Google OSV scans
+		// Periodic off-peak background ticker for autonomous security maintenance, host CVE correlation & Google OSV scans
 		go func() {
 			ticker := time.NewTicker(1 * time.Hour)
 			defer ticker.Stop()
-			for range ticker.C {
-				now := time.Now()
-				if ops.IsOffPeak(now) {
-					log.Println("[ops] Off-peak maintenance window active (02:00-05:00), executing dependency vulnerability checks")
-					scanCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-					_, _ = vulnScanner.ScanWorkspaceDependencies(scanCtx, ".")
+			for {
+				select {
+				case <-hostBgCtx.Done():
+					return
+				case now := <-ticker.C:
+					if ops.IsOffPeak(now) {
+						log.Println("[ops] Off-peak maintenance window active (02:00-05:00), executing host & dependency vulnerability checks")
+						scanCtx, cancel := context.WithTimeout(hostBgCtx, 2*time.Minute)
+						_, _, _ = vulnScanner.ScanHostAndDependencies(scanCtx, ".")
+						cancel()
+					}
+				}
+			}
+		}()
+
+		// Periodic R9.3 HostSecurityMonitor sweep across all 10 host threat surfaces
+		go func() {
+			initCtx, initCancel := context.WithTimeout(hostBgCtx, 15*time.Second)
+			if _, err := hostMonitor.ScanOnce(initCtx); err != nil {
+				log.Printf("[host-monitor] initial baseline sweep warning: %v", err)
+			}
+			initCancel()
+
+			ticker := time.NewTicker(5 * time.Minute)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-hostBgCtx.Done():
+					return
+				case <-ticker.C:
+					sweepCtx, cancel := context.WithTimeout(hostBgCtx, 15*time.Second)
+					if _, err := hostMonitor.ScanOnce(sweepCtx); err != nil {
+						log.Printf("[host-monitor] periodic sweep warning: %v", err)
+					}
 					cancel()
 				}
 			}
@@ -1253,8 +1318,11 @@ func main() {
 		if err := s.Shutdown(shutCtx); err != nil {
 			log.Printf("main: shutdown drain error: %v", err)
 		}
+		hostBgCancel()
+		hostWatcher.Stop()
 		proposalScheduler.Stop()
 		wafCollector.Stop()
+		auditEngine.Close()
 		logSub.Stop()
 		bus.Close()
 		log.Println("main: shutdown complete")

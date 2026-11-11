@@ -258,6 +258,29 @@ func (fsm *ProposalFSM) TransitionStrict(p ProposalTransitionParams) (bool, erro
 	updates["updated_at"] = now
 	updates["revision"] = gorm.Expr("COALESCE(revision, 1) + 1")
 
+	var prevRow model.OpsProposal
+	qPrev := fsm.db.Model(&model.OpsProposal{}).
+		Where("(id = ? OR proposal_id = ?) AND status IN (?)", p.ProposalID, p.ProposalID, validExpected)
+	if p.RequireVersion != nil {
+		qPrev = qPrev.Where("version = ?", *p.RequireVersion)
+	}
+	if p.RequireRevision != nil {
+		qPrev = qPrev.Where("COALESCE(revision, 1) = ?", *p.RequireRevision)
+	}
+	if p.RequireExecutionToken != "" {
+		qPrev = qPrev.Where("execution_token = ?", p.RequireExecutionToken)
+	}
+	var matched []model.OpsProposal
+	if err := qPrev.Limit(1).Find(&matched).Error; err != nil {
+		GlobalSecurityMetrics.IncDatabaseError()
+		return false, err
+	}
+	if len(matched) == 0 {
+		GlobalSecurityMetrics.IncProposalCASConflict()
+		return false, nil
+	}
+	prevRow = matched[0]
+
 	var won bool
 	txErr := fsm.db.Transaction(func(tx *gorm.DB) error {
 		q := tx.Model(&model.OpsProposal{}).
@@ -359,11 +382,20 @@ func (fsm *ProposalFSM) TransitionStrict(p ProposalTransitionParams) (bool, erro
 			if evCtx == nil {
 				evCtx = context.Background()
 			}
+			if strings.TrimSpace(opID) == "" {
+				opID = GenerateOperationID("proposal_" + strings.ToLower(targetStatus))
+			}
+			actorType := "user"
+			actorLower := strings.ToLower(strings.TrimSpace(actor))
+			if actorLower == "proposal-fsm" || actorLower == "proposal-scheduler" || actorLower == "startup-reconciler" ||
+				actorLower == "executor" || actorLower == "fsm-recovery" || strings.HasPrefix(actorLower, "system") || strings.HasPrefix(actorLower, "agent:") {
+				actorType = "system_daemon"
+			}
 			canonEventType, runFinalStatus, dec := mapProposalStatusToAudit(targetStatus)
-			_, _ = ae.EmitEvent(evCtx, audit.EmitEventInput{
+			_, auditErr := ae.EmitEvent(evCtx, audit.EmitEventInput{
 				HouseholdID:    hhID,
 				TriggerSource:  "proposal_fsm",
-				ActorType:      "user",
+				ActorType:      actorType,
 				ActorID:        actor,
 				EventType:      canonEventType,
 				Action:         "proposal." + strings.ToLower(targetStatus),
@@ -381,6 +413,56 @@ func (fsm *ProposalFSM) TransitionStrict(p ProposalTransitionParams) (bool, erro
 				MirrorLegacy:   IsTerminalProposalStatus(targetStatus) || targetStatus == model.ProposalStatusApproved || targetStatus == model.ProposalStatusScheduled,
 				LegacyApprover: propRow.ApprovedBy,
 			})
+			if auditErr != nil {
+				GlobalSecurityMetrics.IncAuditFailed()
+				isPostExec := targetStatus == model.ProposalStatusExecuted ||
+					targetStatus == model.ProposalStatusSuccess ||
+					targetStatus == model.ProposalStatusFailed ||
+					targetStatus == model.ProposalStatusRolledBack ||
+					targetStatus == model.ProposalStatusFailedRolledback ||
+					targetStatus == model.ProposalStatusRollbackFailed ||
+					targetStatus == model.ProposalStatusExecutionUnknown ||
+					targetStatus == model.ProposalStatusReconciliationRequired
+				if targetStatus == model.ProposalStatusExecutionUnknown || targetStatus == model.ProposalStatusReconciliationRequired {
+					return won, fmt.Errorf("%w: transition to %s persisted, audit write failed: %v", ErrExecutionAmbiguous, targetStatus, auditErr)
+				}
+				if isPostExec {
+					_ = fsm.db.Model(&model.OpsProposal{}).
+						Where("id = ?", prevRow.ID).
+						Updates(map[string]interface{}{
+							"status":        model.ProposalStatusExecutionUnknown,
+							"updated_at":    time.Now().UTC(),
+							"execution_log": fmt.Sprintf("%s\n[AUDIT_FAIL_ESCALATION] %s -> %s audit failed: %v", propRow.ExecutionLog, prevRow.Status, targetStatus, auditErr),
+						}).Error
+					GlobalSecurityMetrics.IncExecutionUnknown()
+					RecordSecurityEvent(fsm.db, fsm.bus, OpsSecurityEvent{
+						OperationID: opID,
+						EventType:   "ops.audit.proposal_post_exec_failed",
+						Severity:    "critical",
+						Component:   propRow.TargetComponent,
+						Actor:       actor,
+						ProposalID:  defaultPropStr(propRow.ProposalID, p.ProposalID),
+						Message:     auditErr.Error(),
+					})
+					return false, fmt.Errorf("%w: proposal transition audit failed for %s -> %s: %v", ErrExecutionAmbiguous, prevRow.Status, targetStatus, auditErr)
+				}
+				revertMap := map[string]interface{}{
+					"status":          prevRow.Status,
+					"version":         prevRow.Version,
+					"revision":        prevRow.Revision,
+					"approved_by":     prevRow.ApprovedBy,
+					"approved_at":     prevRow.ApprovedAt,
+					"approval_digest": prevRow.ApprovalDigest,
+					"scheduled_at":    prevRow.ScheduledAt,
+					"execution_token": prevRow.ExecutionToken,
+					"execution_log":   prevRow.ExecutionLog,
+					"executed_at":     prevRow.ExecutedAt,
+					"reconciled_at":   prevRow.ReconciledAt,
+					"updated_at":      prevRow.UpdatedAt,
+				}
+				_ = fsm.db.Model(&model.OpsProposal{}).Where("id = ?", prevRow.ID).Updates(revertMap).Error
+				return false, fmt.Errorf("proposal transition %s -> %s blocked (reverted): audit write failed: %w", prevRow.Status, targetStatus, auditErr)
+			}
 		}
 		if fsm.bus != nil && p.Audit != nil {
 			payloadBytes, _ := json.Marshal(map[string]any{

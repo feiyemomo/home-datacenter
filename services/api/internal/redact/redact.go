@@ -5,14 +5,41 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 const (
-	sensitiveKeyPattern   = `password|passwd|secret|secret_key|s3_secret|jwt|token|apiKey|api_key|access_token|refresh_token|authorization|pcsrftoken|psession|credential|auth_token|cookie|set-cookie|x-internal-secret|internal_ops_token|emergency_override_token|session_id|hmac|encryption_key|bitiful|totp|otp|private_key`
-	kvSensitiveKeyPattern = `password|passwd|secret|secret_key|s3_secret|jwt|token|apiKey|api_key|access_token|refresh_token|pcsrftoken|psession|credential|auth_token|cookie|set-cookie|x-internal-secret|internal_ops_token|emergency_override_token|session_id|hmac|encryption_key|bitiful|totp|otp|private_key`
+	sensitiveKeyPattern   = `password|passwd|secret|secret_key|s3_secret|jwt|token|apiKey|api_key|access_token|refresh_token|authorization|pcsrftoken|psession|credential|auth_token|cookie|set-cookie|x-internal-secret|internal_ops_token|emergency_override_token|session_id|hmac|encryption_key|bitiful|totp|otp|private_key|ed25519_priv`
+	kvSensitiveKeyPattern = `password|passwd|secret|secret_key|s3_secret|jwt|token|apiKey|api_key|access_token|refresh_token|pcsrftoken|psession|credential|auth_token|cookie|set-cookie|x-internal-secret|internal_ops_token|emergency_override_token|session_id|hmac|encryption_key|bitiful|totp|otp|private_key|ed25519_priv`
 )
 
 var (
+	runtimeSecretMu sync.RWMutex
+	runtimeSecrets  []string
+	runtimeSecretSet = make(map[string]struct{})
+)
+
+// RegisterRuntimeSecret registers an active sensitive secret (e.g. OPS_AUDIT_HMAC_KEY values)
+// so raw occurrences in unstructured logs or error messages are scrubbed even without a key= prefix.
+func RegisterRuntimeSecret(secret string) {
+	trimmed := strings.TrimSpace(secret)
+	if len(trimmed) < 16 {
+		return
+	}
+	runtimeSecretMu.Lock()
+	defer runtimeSecretMu.Unlock()
+	if _, exists := runtimeSecretSet[trimmed]; exists {
+		return
+	}
+	runtimeSecretSet[trimmed] = struct{}{}
+	runtimeSecrets = append(runtimeSecrets, trimmed)
+}
+
+var (
+	// reKeyringEnv matches comma-separated keyring env values (e.g. OPS_AUDIT_HMAC_KEYS=k1:s1,k2:s2)
+	// before reKVUnquoted splits on commas.
+	reKeyringEnv = regexp.MustCompile(`(?i)\b(OPS_AUDIT_HMAC_KEYS|OPS_APPROVAL_HMAC_KEYS)\s*([=:])\s*([^\s;&"']+)`)
+
 	// rePEMKey matches PEM-encoded private keys
 	rePEMKey = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9_\- ]+PRIVATE KEY-----.*?-----END [A-Z0-9_\- ]+PRIVATE KEY-----`)
 
@@ -48,7 +75,7 @@ var (
 		"access_token", "refresh_token", "authorization", "pcsrftoken", "psession",
 		"credential", "auth_token", "cookie", "set-cookie", "x-internal-secret",
 		"internal_ops_token", "emergency_override_token", "session_id", "hmac",
-		"encryption_key", "bitiful", "s3_secret", "totp", "otp", "private_key",
+		"encryption_key", "bitiful", "s3_secret", "totp", "otp", "private_key", "ed25519_priv",
 	}
 )
 
@@ -66,10 +93,20 @@ func SensitiveString(input string) string {
 	result = reBearer.ReplaceAllString(result, "${1}[REDACTED]")
 	result = reBasic.ReplaceAllString(result, "${1}[REDACTED]")
 	result = reJWT.ReplaceAllString(result, "[REDACTED_JWT]")
+	result = reKeyringEnv.ReplaceAllString(result, "${1}${2}[REDACTED]")
 	result = reJSONString.ReplaceAllString(result, `${1}"[REDACTED]"`)
 	result = reJSONUnquoted.ReplaceAllString(result, `${1}"[REDACTED]"`)
 	result = reKVQuoted.ReplaceAllString(result, `${1}${2}"[REDACTED]"`)
 	result = reKVUnquoted.ReplaceAllString(result, `${1}${2}[REDACTED]`)
+
+	runtimeSecretMu.RLock()
+	secretsSnapshot := runtimeSecrets
+	runtimeSecretMu.RUnlock()
+	for _, sec := range secretsSnapshot {
+		if sec != "" && strings.Contains(result, sec) {
+			result = strings.ReplaceAll(result, sec, "[REDACTED_SECRET]")
+		}
+	}
 	return result
 }
 

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -308,8 +309,20 @@ func (f *HostFallbackProvider) queryDockerSocket(ctx context.Context) ([]Contain
 	var results []ContainerSummary
 	for _, item := range rawList {
 		name := ""
-		if len(item.Names) > 0 {
-			name = strings.TrimPrefix(item.Names[0], "/")
+		isCore := false
+		for _, rawN := range item.Names {
+			clean := strings.TrimPrefix(strings.TrimSpace(rawN), "/")
+			if clean == "" {
+				continue
+			}
+			if name == "" {
+				name = clean
+			}
+			if coreMap[clean] {
+				name = clean
+				isCore = true
+				break
+			}
 		}
 		var cpu, memMB, memLimitMB float64
 		if m, ok := metricsMap[item.Id]; ok {
@@ -319,12 +332,13 @@ func (f *HostFallbackProvider) queryDockerSocket(ctx context.Context) ([]Contain
 		}
 
 		results = append(results, ContainerSummary{
+			ContainerID:   item.Id,
 			Name:          name,
 			State:         item.State,
 			Status:        item.Status,
 			Image:         item.Image,
-			IsCore:        coreMap[name],
-			CreatedAt:     time.Unix(item.Created, 0).Format(time.RFC3339),
+			IsCore:        isCore || coreMap[name],
+			CreatedAt:     time.Unix(item.Created, 0).UTC().Format(time.RFC3339),
 			CPUPercent:    cpu,
 			MemoryUsageMB: memMB,
 			MemoryMB:      memMB,
@@ -336,7 +350,7 @@ func (f *HostFallbackProvider) queryDockerSocket(ctx context.Context) ([]Contain
 
 // RestartContainerFallback attempts container restart via Docker socket if 1Panel is offline.
 func (f *HostFallbackProvider) RestartContainerFallback(ctx context.Context, name string) error {
-	name = strings.TrimPrefix(name, "/")
+	name = strings.TrimPrefix(strings.TrimSpace(name), "/")
 	if name == "" {
 		return ErrInvalidContainer
 	}
@@ -352,7 +366,7 @@ func (f *HostFallbackProvider) RestartContainerFallback(ctx context.Context, nam
 	}
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
-	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", name)
+	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", url.PathEscape(name))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
 	if err != nil {
 		return err

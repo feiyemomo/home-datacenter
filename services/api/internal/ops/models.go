@@ -64,6 +64,7 @@ type NASStatus struct {
 
 // ContainerSummary describes a Docker container's health and resource consumption.
 type ContainerSummary struct {
+	ContainerID   string  `json:"container_id,omitempty"`
 	Name          string  `json:"name"`
 	State         string  `json:"state"`  // "running", "exited", "created", etc.
 	Status        string  `json:"status"` // human-readable status, e.g. "Up 2 days"

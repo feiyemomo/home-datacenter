@@ -12,12 +12,18 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/audit"
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 )
 
 func setupAuditDB(t *testing.T) *gorm.DB {
 	t.Helper()
+	cleanup := audit.SetAuditHMACKeyringForTest("k1", map[string]string{
+		"k1": "audit-sync-test-hmac-key-at-least-32-bytes-long",
+	})
+	t.Cleanup(cleanup)
+
 	db, err := gorm.Open(sqlite.Open("file::memory:?cache=shared"), &gorm.Config{})
 	if err != nil {
 		t.Fatalf("failed to open memory db: %v", err)
@@ -26,6 +32,63 @@ func setupAuditDB(t *testing.T) *gorm.DB {
 		t.Fatalf("failed to auto migrate: %v", err)
 	}
 	return db
+}
+
+func makeSignedSyncItem(t *testing.T, seq uint64, uuid, container, prevHash string, tsMs int64) OfflineSyncItem {
+	t.Helper()
+	ev := model.AgentAuditEvent{
+		StreamID:      "offline-agent",
+		Seq:           seq,
+		AuditID:       uuid,
+		RunID:         "run-offline-" + uuid,
+		CorrelationID: "corr-" + uuid,
+		HouseholdID:   1,
+		TriggerSource: "python_offline",
+		ActorType:     "offline_agent",
+		ActorID:       "home-ops-agent",
+		EventType:     model.AuditEventExecutionCompleted,
+		Action:        "docker.restart",
+		Target:        container,
+		Component:     container,
+		Decision:      model.AuditDecisionAllow,
+		RiskLevel:     model.AuditRiskHigh,
+		PolicyVersion: audit.PolicyVersion,
+		Result:        "SUCCESS",
+		CreatedAt:     time.UnixMilli(tsMs).UTC(),
+		CreatedAtMs:   tsMs,
+		IsOffline:     true,
+		PreviousHash:  prevHash,
+	}
+	h, err := audit.ComputeEventEntryHash(&ev)
+	if err != nil {
+		t.Fatalf("ComputeEventEntryHash failed: %v", err)
+	}
+	sig := audit.ComputeEventHMAC("k1", "audit-sync-test-hmac-key-at-least-32-bytes-long", "offline-agent", seq, h, tsMs)
+	return OfflineSyncItem{
+		EventUUID:      uuid,
+		AuditID:        uuid,
+		RunID:          ev.RunID,
+		CorrelationID:  ev.CorrelationID,
+		TriggerSource:  ev.TriggerSource,
+		ActorType:      ev.ActorType,
+		ActorID:        ev.ActorID,
+		EventType:      ev.EventType,
+		ContainerName:  container,
+		Component:      container,
+		Target:         container,
+		Action:         ev.Action,
+		Decision:       ev.Decision,
+		RiskLevel:      ev.RiskLevel,
+		Success:        1,
+		ExecutedAt:     audit.FormatRFC3339Ms(ev.CreatedAt),
+		ExecutedAtMs:   tsMs,
+		OriginStreamID: "offline-agent",
+		OfflineSeq:     seq,
+		LocalPrevHash:  prevHash,
+		EntryHash:      h,
+		KeyID:          "k1",
+		HMACSignature:  sig,
+	}
 }
 
 func TestSyncOfflineAuditLogs_IngestionAndDeduplication(t *testing.T) {
@@ -40,24 +103,10 @@ func TestSyncOfflineAuditLogs_IngestionAndDeduplication(t *testing.T) {
 	validToken := "audit-sync-test-token-at-least-32-chars-long"
 	t.Setenv("INTERNAL_OPS_TOKEN", validToken)
 
-	events := []OfflineSyncItem{
-		{
-			EventUUID:     "offline-event-uuid-001",
-			ContainerName: "home-web",
-			Action:        "docker.restart",
-			ExitCode:      0,
-			Success:       1,
-			ExecutedAt:    time.Now().Format("2006-01-02 15:04:05"),
-		},
-		{
-			EventUUID:     "offline-event-uuid-002",
-			ContainerName: "home-api",
-			Action:        "docker.restart",
-			ExitCode:      0,
-			Success:       1,
-			ExecutedAt:    time.Now().Format("2006-01-02 15:04:05"),
-		},
-	}
+	nowMs := time.Now().UTC().UnixMilli()
+	item1 := makeSignedSyncItem(t, 1, "offline-event-uuid-001", "home-web", model.AuditGenesisHash, nowMs)
+	item2 := makeSignedSyncItem(t, 2, "offline-event-uuid-002", "home-api", item1.EntryHash, nowMs+10)
+	events := []OfflineSyncItem{item1, item2}
 
 	reqBody, _ := json.Marshal(OfflineSyncRequest{Events: events})
 
