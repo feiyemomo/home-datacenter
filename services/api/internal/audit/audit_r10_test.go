@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +21,7 @@ import (
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
+	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/redact"
 )
@@ -201,6 +204,7 @@ func TestRemoteFileWORM_Sync_TailTruncation_And_DBRollback(t *testing.T) {
 		WithArchiveDir(t.TempDir()),
 		WithRemoteStore(wormStore),
 		WithExternalVerifier(verifier),
+		WithStrictRemote(false),
 	)
 	defer forkEngine.Close()
 
@@ -314,7 +318,7 @@ func TestHTTPRemoteAuditStore_Outage_Catchup_And_SecretRedaction(t *testing.T) {
 	}
 
 	db := openAuditTestDBAtPath(t, filepath.Join(t.TempDir(), "http-audit.db"))
-	ae := NewAgentAuditEngine(db, nil, WithRemoteStore(httpStore), WithArchiveDir(t.TempDir()))
+	ae := NewAgentAuditEngine(db, nil, WithRemoteStore(httpStore), WithArchiveDir(t.TempDir()), WithStrictRemote(false))
 	defer ae.Close()
 
 	// Emit 2 events during remote outage: local DB commits, sync state records unreachable + redacted error.
@@ -517,4 +521,255 @@ func TestPeriodicBackgroundCheckpoint_TriggersAndStopsCleanly(t *testing.T) {
 		t.Fatalf("expected periodic background loop to create checkpoint within 2s")
 	}
 	ae.Close()
+}
+
+func TestStrictAuditInit_ConfigFailures_StrictRemote_AndErrorPropagation(t *testing.T) {
+	cleanupRing := SetAuditHMACKeyringForTest("k1", map[string]string{
+		"k1": "r11-strict-audit-hmac-key-at-least-32bytes-01",
+	})
+	defer cleanupRing()
+
+	// Disable test override so ResolveExternalCheckpointKeys inspects env vars directly.
+	restoreExt := SetExternalCheckpointKeysForTest(nil, nil)
+	restoreExt()
+
+	t.Setenv("OPS_AUDIT_ARCHIVE_DIR", t.TempDir())
+	t.Setenv("OPS_AUDIT_REMOTE_TYPE", "")
+	t.Setenv("OPS_AUDIT_REMOTE_URL", "")
+	t.Setenv("OPS_AUDIT_REMOTE_DIR", "")
+	t.Setenv("OPS_AUDIT_REMOTE_TOKEN", "")
+	t.Setenv("OPS_AUDIT_REMOTE_TIMEOUT_SEC", "")
+	t.Setenv("OPS_AUDIT_CHECKPOINT_ED25519_PRIV", "")
+	t.Setenv("OPS_AUDIT_CHECKPOINT_ED25519_PUB", "")
+	t.Setenv("OPS_AUDIT_STRICT_REMOTE", "")
+	t.Setenv("OPS_AUDIT_CHECKPOINT_PERIOD_SEC", "")
+
+	db := openAuditTestDBAtPath(t, filepath.Join(t.TempDir(), "r11-strict.db"))
+
+	// 1. Unconfigured non-strict engine succeeds and explicitly reports LOCAL_ONLY (not DISABLED)
+	localOnlyEngine, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir()))
+	if err != nil {
+		t.Fatalf("expected clean local-only strict init without remote config, got err=%v", err)
+	}
+	defer localOnlyEngine.Close()
+
+	diffLocal := localOnlyEngine.CompareWithRemote(context.Background(), model.AuditPrimaryStreamID)
+	if diffLocal.Status != RemoteStatusLocalOnly {
+		t.Fatalf("expected unconfigured remote diff status=%s, got %q", RemoteStatusLocalOnly, diffLocal.Status)
+	}
+	syncLocal, err := localOnlyEngine.GetRemoteSyncState(model.AuditPrimaryStreamID)
+	if err != nil || syncLocal.SyncStatus != RemoteStatusLocalOnly {
+		t.Fatalf("expected sync_status=%s, got %+v err=%v", RemoteStatusLocalOnly, syncLocal, err)
+	}
+
+	// 2. Invalid configuration cases MUST fail closed with ErrAuditConfigInvalid
+	t.Run("invalid_remote_type", func(t *testing.T) {
+		t.Setenv("OPS_AUDIT_REMOTE_TYPE", "bogus-store")
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditConfigInvalid) {
+			t.Fatalf("expected ErrAuditConfigInvalid for unsupported type, got %v", err)
+		}
+	})
+	t.Run("invalid_remote_url", func(t *testing.T) {
+		t.Setenv("OPS_AUDIT_REMOTE_TYPE", "http-append")
+		t.Setenv("OPS_AUDIT_REMOTE_URL", "ftp://not-http.example.com")
+		t.Setenv("OPS_AUDIT_REMOTE_TOKEN", "valid-bearer-token-32bytes-minimum")
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditConfigInvalid) {
+			t.Fatalf("expected ErrAuditConfigInvalid for invalid URL scheme, got %v", err)
+		}
+	})
+	t.Run("missing_remote_token_for_http", func(t *testing.T) {
+		t.Setenv("OPS_AUDIT_REMOTE_TYPE", "http-append")
+		t.Setenv("OPS_AUDIT_REMOTE_URL", "http://127.0.0.1:9999")
+		t.Setenv("OPS_AUDIT_REMOTE_TOKEN", "short")
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditConfigInvalid) {
+			t.Fatalf("expected ErrAuditConfigInvalid for missing/short token, got %v", err)
+		}
+	})
+	t.Run("invalid_remote_timeout", func(t *testing.T) {
+		t.Setenv("OPS_AUDIT_REMOTE_TIMEOUT_SEC", "not-an-int")
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditConfigInvalid) {
+			t.Fatalf("expected ErrAuditConfigInvalid for non-integer timeout, got %v", err)
+		}
+	})
+	t.Run("invalid_ed25519_priv", func(t *testing.T) {
+		t.Setenv("OPS_AUDIT_CHECKPOINT_ED25519_PRIV", "zz-invalid-hex-key")
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditConfigInvalid) {
+			t.Fatalf("expected ErrAuditConfigInvalid for malformed Ed25519 key, got %v", err)
+		}
+	})
+	t.Run("mismatched_ed25519_pub_priv", func(t *testing.T) {
+		_, privA, _ := ed25519.GenerateKey(rand.Reader)
+		pubB, _, _ := ed25519.GenerateKey(rand.Reader)
+		t.Setenv("OPS_AUDIT_CHECKPOINT_ED25519_PRIV", hex.EncodeToString(privA.Seed()))
+		t.Setenv("OPS_AUDIT_CHECKPOINT_ED25519_PUB", hex.EncodeToString(pubB))
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditConfigInvalid) {
+			t.Fatalf("expected ErrAuditConfigInvalid for mismatched pub/priv keys, got %v", err)
+		}
+	})
+
+	// 3. OPS_AUDIT_STRICT_REMOTE=1 fails closed when remote store is unconfigured OR unreachable
+	t.Run("strict_remote_missing_or_unreachable", func(t *testing.T) {
+		t.Setenv("OPS_AUDIT_STRICT_REMOTE", "1")
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir())); !errors.Is(err, ErrAuditRemoteRequired) {
+			t.Fatalf("expected ErrAuditRemoteRequired when strict remote enabled without store, got %v", err)
+		}
+
+		downSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		downSrv.Close() // closed immediately -> connection refused
+		downStore, sErr := NewHTTPRemoteAuditStore(downSrv.URL, "r11-strict-token-32bytes-minimum-ok", time.Second)
+		if sErr != nil {
+			t.Fatalf("NewHTTPRemoteAuditStore: %v", sErr)
+		}
+		if _, err := NewStrictAgentAuditEngine(db, nil, WithArchiveDir(t.TempDir()), WithRemoteStore(downStore)); !errors.Is(err, ErrAuditRemoteRequired) {
+			t.Fatalf("expected ErrAuditRemoteRequired when remote unreachable in strict mode, got %v", err)
+		}
+	})
+
+	// 4. CreateCheckpoint & EmitEvent remote outage error propagation + sync_state DB persistence error propagation
+	var outageMu sync.Mutex
+	outage := false
+	var remoteEvents []model.AgentAuditEvent
+	var remoteCPs []model.AgentAuditCheckpoint
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		outageMu.Lock()
+		defer outageMu.Unlock()
+		if outage {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"error":"remote outage"}`))
+			return
+		}
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/tail":
+			tail := RemoteTailState{StreamID: model.AuditPrimaryStreamID}
+			if n := len(remoteEvents); n > 0 {
+				tail.TailSeq = remoteEvents[n-1].Seq
+				tail.TailEntryHash = remoteEvents[n-1].EntryHash
+			}
+			if n := len(remoteCPs); n > 0 {
+				tail.LastCheckpointID = remoteCPs[n-1].CheckpointID
+				tail.LastCheckpointSeq = remoteCPs[n-1].ToSeq
+				tail.LastChainDigest = remoteCPs[n-1].ChainDigest
+			}
+			_ = json.NewEncoder(w).Encode(tail)
+		case r.Method == http.MethodGet && r.URL.Path == "/checkpoints":
+			_ = json.NewEncoder(w).Encode(remoteCPs)
+		case r.Method == http.MethodGet && r.URL.Path == "/events":
+			fromQ, _ := strconv.ParseUint(r.URL.Query().Get("from_seq"), 10, 64)
+			toQ, _ := strconv.ParseUint(r.URL.Query().Get("to_seq"), 10, 64)
+			var filtered []model.AgentAuditEvent
+			for _, ev := range remoteEvents {
+				if (fromQ == 0 || ev.Seq >= fromQ) && (toQ == 0 || ev.Seq <= toQ) {
+					filtered = append(filtered, ev)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(filtered)
+		case r.Method == http.MethodPost && r.URL.Path == "/events":
+			var req struct {
+				Events []model.AgentAuditEvent `json:"events"`
+			}
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &req)
+			remoteEvents = append(remoteEvents, req.Events...)
+			w.WriteHeader(http.StatusCreated)
+		case r.Method == http.MethodPost && r.URL.Path == "/checkpoints":
+			var cp model.AgentAuditCheckpoint
+			body, _ := io.ReadAll(r.Body)
+			_ = json.Unmarshal(body, &cp)
+			remoteCPs = append(remoteCPs, cp)
+			w.WriteHeader(http.StatusCreated)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	httpStore, err := NewHTTPRemoteAuditStore(srv.URL, "r11-strict-token-32bytes-minimum-ok", 2*time.Second)
+	if err != nil {
+		t.Fatalf("NewHTTPRemoteAuditStore: %v", err)
+	}
+	bus := eventbus.New()
+	var alertMu sync.Mutex
+	alertSeen := false
+	unsub := bus.Subscribe("ops.audit.remote_sync_failed", func(ev eventbus.Event) {
+		if ev.Severity == eventbus.SeverityCritical {
+			alertMu.Lock()
+			alertSeen = true
+			alertMu.Unlock()
+		}
+	})
+	defer unsub()
+
+	strictDB := openAuditTestDBAtPath(t, filepath.Join(t.TempDir(), "r11-propagation.db"))
+	strictAE, err := NewStrictAgentAuditEngine(strictDB, bus,
+		WithArchiveDir(t.TempDir()),
+		WithRemoteStore(httpStore),
+		WithStrictRemote(true),
+		WithCheckpointInterval(100),
+	)
+	if err != nil {
+		t.Fatalf("strict engine init failed when remote reachable: %v", err)
+	}
+	defer strictAE.Close()
+
+	if _, err := strictAE.EmitEvent(context.Background(), EmitEventInput{
+		HouseholdID:   1,
+		TriggerSource: "api_manual",
+		ActorType:     "user",
+		ActorID:       "admin-1",
+		EventType:     model.AuditEventExecutionCompleted,
+		Action:        "container.restart",
+		Target:        "home-web",
+		Component:     "home-web",
+		Result:        "SUCCESS",
+	}); err != nil {
+		t.Fatalf("EmitEvent before outage failed: %v", err)
+	}
+
+	// Simulate outage: CreateCheckpoint AND strict EmitEvent must propagate ErrAuditSyncFailed and emit critical alert
+	outageMu.Lock()
+	outage = true
+	outageMu.Unlock()
+
+	if _, cpErr := strictAE.CreateCheckpoint(model.AuditPrimaryStreamID); !errors.Is(cpErr, ErrAuditSyncFailed) {
+		t.Fatalf("expected CreateCheckpoint to propagate ErrAuditSyncFailed during outage, got %v", cpErr)
+	}
+	if _, emErr := strictAE.EmitEvent(context.Background(), EmitEventInput{
+		HouseholdID:   1,
+		TriggerSource: "api_manual",
+		ActorType:     "user",
+		ActorID:       "admin-1",
+		EventType:     model.AuditEventExecutionCompleted,
+		Action:        "container.restart",
+		Target:        "home-web",
+		Component:     "home-web",
+		Result:        "SUCCESS",
+	}); !errors.Is(emErr, ErrAuditSyncFailed) {
+		t.Fatalf("expected strict EmitEvent to fail closed with ErrAuditSyncFailed during outage, got %v", emErr)
+	}
+
+	// Verify sync state recorded failure and bus received critical alert
+	st, stErr := strictAE.GetRemoteSyncState(model.AuditPrimaryStreamID)
+	if stErr != nil || st.SyncStatus != RemoteStatusUnreachable || st.ConsecutiveFailures < 1 {
+		t.Fatalf("expected persisted failure sync state, got %+v err=%v", st, stErr)
+	}
+	alertMu.Lock()
+	gotAlert := alertSeen
+	alertMu.Unlock()
+	if !gotAlert {
+		t.Fatalf("expected critical ops.audit.remote_sync_failed eventbus alert during outage")
+	}
+
+	// Verify saveRemoteSyncState DB error propagates cleanly
+	if execErr := strictDB.Exec(`DROP TABLE agent_audit_remote_sync_states`).Error; execErr != nil {
+		t.Fatalf("drop sync state table: %v", execErr)
+	}
+	outageMu.Lock()
+	outage = false
+	outageMu.Unlock()
+	repDBErr := strictAE.SyncRemote(context.Background(), model.AuditPrimaryStreamID)
+	if repDBErr.Error == "" {
+		t.Fatalf("expected SyncRemote to surface saveRemoteSyncState persistence error, got %+v", repDBErr)
+	}
 }

@@ -78,6 +78,12 @@ func (h *OpsHandler) SetAuditEngine(ae *audit.AgentAuditEngine) {
 	if hue != nil {
 		hue.AuditEngine = ae
 	}
+	h.mu.RLock()
+	vs := h.vulnScanner
+	h.mu.RUnlock()
+	if vs != nil {
+		vs.SetAuditEngine(ae)
+	}
 }
 
 func (h *OpsHandler) dockerSocketPath() string {
@@ -212,6 +218,19 @@ func NewOpsHandler(
 	bus *eventbus.Bus,
 	defenseMgr *security.DefenseManager,
 ) *OpsHandler {
+	return NewOpsHandlerWithAuditEngine(client, fallback, db, bus, defenseMgr, nil)
+}
+
+// NewOpsHandlerWithAuditEngine creates an OpsHandler bound to an existing AgentAuditEngine,
+// avoiding duplicate background audit engines during production wiring.
+func NewOpsHandlerWithAuditEngine(
+	client *OnePanelClient,
+	fallback *HostFallbackProvider,
+	db *gorm.DB,
+	bus *eventbus.Bus,
+	defenseMgr *security.DefenseManager,
+	ae *audit.AgentAuditEngine,
+) *OpsHandler {
 	if client == nil {
 		client = NewOnePanelClient("", "", "", "")
 	}
@@ -219,17 +238,46 @@ func NewOpsHandler(
 		fallback = NewHostFallbackProvider("", "")
 	}
 	h := &OpsHandler{
-		client:     client,
-		fallback:   fallback,
-		db:         db,
-		bus:        bus,
-		defenseMgr: defenseMgr,
+		client:      client,
+		fallback:    fallback,
+		db:          db,
+		bus:         bus,
+		defenseMgr:  defenseMgr,
+		auditEngine: ae,
 	}
-	h.executor = NewOperationExecutor(db, bus, client, fallback, WithBaselineExtractor(h.ComputeFingerprint))
-	if defExec, ok := h.executor.(*DefaultOperationExecutor); ok && defExec != nil {
-		h.auditEngine = defExec.GetAuditEngine()
+	execOpts := []ExecutorOption{WithBaselineExtractor(h.ComputeFingerprint)}
+	if ae != nil {
+		execOpts = append(execOpts, WithAuditEngine(ae))
+	}
+	h.executor = NewOperationExecutor(db, bus, client, fallback, execOpts...)
+	if h.auditEngine == nil {
+		if defExec, ok := h.executor.(*DefaultOperationExecutor); ok && defExec != nil {
+			h.auditEngine = defExec.GetAuditEngine()
+		}
 	}
 	return h
+}
+
+// NewStrictOpsHandler initializes a strict fail-closed AgentAuditEngine and binds it to a new OpsHandler.
+// Any remote/Ed25519/schema configuration error returns an explicit error instead of starting degraded.
+func NewStrictOpsHandler(
+	client *OnePanelClient,
+	fallback *HostFallbackProvider,
+	db *gorm.DB,
+	bus *eventbus.Bus,
+	defenseMgr *security.DefenseManager,
+	auditOpts ...audit.EngineOption,
+) (*OpsHandler, error) {
+	opts := make([]audit.EngineOption, 0, len(auditOpts)+1)
+	opts = append(opts, auditOpts...)
+	opts = append(opts, audit.WithFailureCallback(GlobalSecurityMetrics.IncAuditFailed))
+
+	ae, err := audit.NewStrictAgentAuditEngine(db, bus, opts...)
+	if err != nil {
+		GlobalSecurityMetrics.IncAuditFailed()
+		return nil, err
+	}
+	return NewOpsHandlerWithAuditEngine(client, fallback, db, bus, defenseMgr, ae), nil
 }
 
 // SetExecutor sets the OperationExecutor for OpsHandler.

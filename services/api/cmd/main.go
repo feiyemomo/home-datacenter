@@ -31,6 +31,7 @@ import (
 	"home-datacenter-api/internal/mqtt"
 	"home-datacenter-api/internal/network"
 	"home-datacenter-api/internal/ops"
+	"home-datacenter-api/internal/redact"
 	"home-datacenter-api/internal/repository"
 	"home-datacenter-api/internal/security"
 	"home-datacenter-api/internal/service"
@@ -238,12 +239,15 @@ func main() {
 	if archiveDir == "" {
 		archiveDir = filepath.Join(filepath.Dir(cfg.Database.Path), "audit-archive")
 	}
-	auditEngine := audit.NewAgentAuditEngine(
+	auditEngine, auditInitErr := audit.NewStrictAgentAuditEngine(
 		database.DB,
 		bus,
 		audit.WithArchiveDir(archiveDir),
 		audit.WithFailureCallback(ops.GlobalSecurityMetrics.IncAuditFailed),
 	)
+	if auditInitErr != nil {
+		log.Fatalf("FATAL: strict audit engine initialization failed: %s", redact.SensitiveString(auditInitErr.Error()))
+	}
 	defer auditEngine.Close()
 	alertMgr := security.NewAlertManager(cfg.Security.Alert, database.DB)
 	defenseMgr := security.NewDefenseManager(database.DB, cfg.Security.Defense, alertMgr, bus)
@@ -325,14 +329,18 @@ func main() {
 	hostMonitor := security.NewHostSecurityMonitor(hostRoot, dockerSocket, defenseMgr, auditEngine)
 	hostBgCtx, hostBgCancel := context.WithCancel(context.Background())
 	defer hostBgCancel()
+	if recoveredGuards, guardRecErr := hostUpdateExec.ReconcilePendingSSHGuards(hostBgCtx); guardRecErr != nil {
+		log.Printf("[hostsec] warning: SSH dead-man's-switch reconciliation failed: %v", guardRecErr)
+	} else if recoveredGuards > 0 {
+		log.Printf("[hostsec] recovered %d expired SSH dead-man's-switch guard(s) from prior crash/restart", recoveredGuards)
+	}
 
 	vulnScanner := ops.NewVulnScanner(database.DB, alertMgr)
 	vulnScanner.SetAuditEngine(auditEngine)
 	vulnScanner.SetHostSecurityProvider(hostSecProvider)
 	vulnScanner.SetCorrelationEngine(corrEngine)
 
-	opsHandler := ops.NewOpsHandler(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr)
-	opsHandler.SetAuditEngine(auditEngine)
+	opsHandler := ops.NewOpsHandlerWithAuditEngine(onePanelClient, fallbackProvider, database.DB, bus, defenseMgr, auditEngine)
 	opsHandler.SetHostSecurityProvider(hostSecProvider)
 	opsHandler.SetHostSecurityMonitor(hostMonitor)
 	opsHandler.SetHostUpdateExecutor(hostUpdateExec)

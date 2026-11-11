@@ -99,7 +99,9 @@ func (e *AgentAuditEngine) CreateCheckpoint(streamID string) (*model.AgentAuditC
 		return cp, err
 	}
 	if cp != nil && e.remoteStore != nil {
-		_ = e.SyncRemote(e.bgCtx(), streamID)
+		if _, syncErr := e.SyncRemoteStrict(e.bgCtx(), streamID); syncErr != nil {
+			return cp, syncErr
+		}
 	}
 	return cp, nil
 }

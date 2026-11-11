@@ -12,6 +12,8 @@ import (
 	"home-datacenter-api/internal/eventbus"
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/redact"
+
+	"gorm.io/gorm"
 )
 
 func buildSecurityBoundaryNote(remoteConfigured, remoteReachable, remoteVerified, extAsymConfigured, extAsymVerified bool) string {
@@ -44,16 +46,19 @@ func (e *AgentAuditEngine) activeExternalSignerAndVerifier() (ExternalCheckpoint
 	return signer, verifier
 }
 
-func (e *AgentAuditEngine) saveRemoteSyncState(state *model.AgentAuditRemoteSyncState) {
-	if e == nil || e.db == nil || state == nil {
-		return
+func (e *AgentAuditEngine) saveRemoteSyncState(state *model.AgentAuditRemoteSyncState) error {
+	if e == nil || e.db == nil {
+		return ErrAuditCommitFailed
+	}
+	if state == nil {
+		return nil
 	}
 	if state.StreamID == "" {
 		state.StreamID = model.AuditPrimaryStreamID
 	}
 	state.LastError = redact.SensitiveString(state.LastError)
 	state.UpdatedAtMs = e.nowUTC().UnixMilli()
-	_ = e.db.Exec(`
+	if err := e.db.Exec(`
 		INSERT INTO agent_audit_remote_sync_states (
 			stream_id, remote_store_type, remote_endpoint,
 			last_synced_seq, last_synced_entry_hash,
@@ -78,7 +83,13 @@ func (e *AgentAuditEngine) saveRemoteSyncState(state *model.AgentAuditRemoteSync
 		state.LastSyncedCheckpointID, state.LastSyncedCheckpointSeq,
 		state.LastSyncAtMs, state.LastError, state.ConsecutiveFailures,
 		state.SyncStatus, state.UpdatedAtMs,
-	).Error
+	).Error; err != nil {
+		msg := redact.SensitiveString(fmt.Sprintf("persist remote sync state failed: %v", err))
+		e.recordFailureMetric()
+		e.publishRemoteAlert("ops.audit.remote_sync_state_persist_failed", msg)
+		return fmt.Errorf("%w: %s", ErrAuditCommitFailed, msg)
+	}
+	return nil
 }
 
 // GetRemoteSyncState returns the persisted replication cursor for streamID.
@@ -94,7 +105,7 @@ func (e *AgentAuditEngine) GetRemoteSyncState(streamID string) (*model.AgentAudi
 	if err != nil {
 		storeType := "none"
 		endpoint := ""
-		status := RemoteStatusDisabled
+		status := RemoteStatusLocalOnly
 		if e.remoteStore != nil {
 			storeType = e.remoteStore.Type()
 			endpoint = e.remoteStore.EndpointDisplay()
@@ -106,6 +117,13 @@ func (e *AgentAuditEngine) GetRemoteSyncState(streamID string) (*model.AgentAudi
 			RemoteEndpoint:  endpoint,
 			SyncStatus:      status,
 		}, nil
+	}
+	if st.SyncStatus == "" || st.SyncStatus == "DISABLED" {
+		if e.remoteStore == nil {
+			st.SyncStatus = RemoteStatusLocalOnly
+		} else {
+			st.SyncStatus = RemoteStatusPendingSync
+		}
 	}
 	return &st, nil
 }
@@ -148,29 +166,33 @@ func (e *AgentAuditEngine) SyncRemote(ctx context.Context, streamID string) Remo
 	e.remoteMu.Lock()
 	defer e.remoteMu.Unlock()
 
-	prevState, _ := e.GetRemoteSyncState(streamID)
+	prevState, prevErr := e.GetRemoteSyncState(streamID)
 	failures := 0
-	if prevState != nil {
+	if prevErr == nil && prevState != nil {
 		failures = prevState.ConsecutiveFailures
 	}
 
 	reportErr := func(status string, err error) RemoteDiffReport {
 		errMsg := redact.SensitiveString(err.Error())
 		e.recordFailureMetric()
-		e.saveRemoteSyncState(&model.AgentAuditRemoteSyncState{
+		if saveErr := e.saveRemoteSyncState(&model.AgentAuditRemoteSyncState{
 			StreamID:            streamID,
 			RemoteStoreType:     e.remoteStore.Type(),
 			RemoteEndpoint:      e.remoteStore.EndpointDisplay(),
 			LastError:           errMsg,
 			ConsecutiveFailures: failures + 1,
 			SyncStatus:          status,
-		})
+		}); saveErr != nil {
+			errMsg = fmt.Sprintf("%s; %s", errMsg, redact.SensitiveString(saveErr.Error()))
+		}
 		e.publishRemoteAlert("ops.audit.remote_sync_failed", errMsg)
 		rep := e.CompareWithRemote(ctx, streamID)
 		if rep.Error == "" {
 			rep.Error = errMsg
+		} else if !strings.Contains(rep.Error, errMsg) {
+			rep.Error = fmt.Sprintf("%s; %s", rep.Error, errMsg)
 		}
-		if rep.Status == "" || rep.Status == RemoteStatusInSync {
+		if rep.Status == "" || rep.Status == RemoteStatusInSync || rep.Status == RemoteStatusLocalOnly {
 			rep.Status = status
 		}
 		return rep
@@ -182,7 +204,9 @@ func (e *AgentAuditEngine) SyncRemote(ctx context.Context, streamID string) Remo
 	}
 
 	var localTail model.AgentAuditEvent
-	_ = e.db.Where("stream_id = ?", streamID).Order("seq DESC").First(&localTail).Error
+	if qErr := e.db.Where("stream_id = ?", streamID).Order("seq DESC").First(&localTail).Error; qErr != nil && !errors.Is(qErr, gorm.ErrRecordNotFound) {
+		return reportErr(RemoteStatusUnreachable, qErr)
+	}
 
 	// Abort replication immediately if remote has progressed beyond local DB (rollback/truncation)
 	// or if local history at remote's tail seq diverges from remote hash.
@@ -246,7 +270,7 @@ func (e *AgentAuditEngine) SyncRemote(ctx context.Context, streamID string) Remo
 		lastCPSeq = cp.ToSeq
 	}
 
-	e.saveRemoteSyncState(&model.AgentAuditRemoteSyncState{
+	if saveErr := e.saveRemoteSyncState(&model.AgentAuditRemoteSyncState{
 		StreamID:                streamID,
 		RemoteStoreType:         e.remoteStore.Type(),
 		RemoteEndpoint:          e.remoteStore.EndpointDisplay(),
@@ -258,9 +282,38 @@ func (e *AgentAuditEngine) SyncRemote(ctx context.Context, streamID string) Remo
 		LastError:               "",
 		ConsecutiveFailures:     0,
 		SyncStatus:              RemoteStatusInSync,
-	})
+	}); saveErr != nil {
+		saveMsg := redact.SensitiveString(saveErr.Error())
+		e.publishRemoteAlert("ops.audit.remote_sync_failed", saveMsg)
+		rep := e.CompareWithRemote(ctx, streamID)
+		rep.Error = saveMsg
+		if rep.Status == "" || rep.Status == RemoteStatusInSync {
+			rep.Status = RemoteStatusPendingSync
+		}
+		return rep
+	}
 
 	return e.CompareWithRemote(ctx, streamID)
+}
+
+// SyncRemoteStrict executes SyncRemote and returns an explicit error on remote unavailability,
+// persistence error, rollback/truncation, chain divergence, or strict-remote misconfiguration.
+func (e *AgentAuditEngine) SyncRemoteStrict(ctx context.Context, streamID string) (RemoteDiffReport, error) {
+	if e == nil || e.db == nil {
+		return RemoteDiffReport{StoreType: "none", Status: RemoteStatusLocalOnly, Error: ErrAuditCommitFailed.Error()}, ErrAuditCommitFailed
+	}
+	if e.remoteStore == nil {
+		rep := e.CompareWithRemote(ctx, streamID)
+		if e.strictRemote {
+			return rep, fmt.Errorf("%w: remote audit store is not configured", ErrAuditRemoteRequired)
+		}
+		return rep, nil
+	}
+	rep := e.SyncRemote(ctx, streamID)
+	if rep.Error != "" || (rep.Status != RemoteStatusInSync && rep.Status != RemoteStatusLocalOnly) {
+		return rep, fmt.Errorf("%w: status=%s: %s", ErrAuditSyncFailed, rep.Status, rep.Error)
+	}
+	return rep, nil
 }
 
 // CompareWithRemote inspects local SQLite vs external remote WORM/HTTP store to detect
@@ -271,7 +324,7 @@ func (e *AgentAuditEngine) CompareWithRemote(ctx context.Context, streamID strin
 	}
 	rep := RemoteDiffReport{
 		StoreType: "none",
-		Status:    RemoteStatusDisabled,
+		Status:    RemoteStatusLocalOnly,
 		CheckedAt: FormatRFC3339Ms(e.nowUTC()),
 	}
 	if e == nil || e.db == nil {
@@ -280,12 +333,18 @@ func (e *AgentAuditEngine) CompareWithRemote(ctx context.Context, streamID strin
 	}
 
 	var localTail model.AgentAuditEvent
-	_ = e.db.Where("stream_id = ?", streamID).Order("seq DESC").First(&localTail).Error
+	if qErr := e.db.Where("stream_id = ?", streamID).Order("seq DESC").First(&localTail).Error; qErr != nil && !errors.Is(qErr, gorm.ErrRecordNotFound) {
+		rep.Error = redact.SensitiveString(qErr.Error())
+		return rep
+	}
 	rep.LocalTailSeq = localTail.Seq
 	rep.LocalTailHash = localTail.EntryHash
 
 	var localCPs []model.AgentAuditCheckpoint
-	_ = e.db.Where("stream_id = ?", streamID).Order("to_seq ASC").Find(&localCPs).Error
+	if qErr := e.db.Where("stream_id = ?", streamID).Order("to_seq ASC").Find(&localCPs).Error; qErr != nil {
+		rep.Error = redact.SensitiveString(qErr.Error())
+		return rep
+	}
 	localCPByID := make(map[string]model.AgentAuditCheckpoint, len(localCPs))
 	for _, cp := range localCPs {
 		localCPByID[cp.CheckpointID] = cp

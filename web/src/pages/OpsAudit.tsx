@@ -100,6 +100,7 @@ function remoteStatusTone(status?: string): string {
             return "border-emerald-500/40 bg-emerald-500/15 text-emerald-400";
         case "PENDING_REMOTE_SYNC":
             return "border-sky-500/40 bg-sky-500/15 text-sky-400";
+        case "LOCAL_ONLY":
         case "DISABLED":
             return "border-amber-500/40 bg-amber-500/15 text-amber-300";
         case "REMOTE_UNREACHABLE":

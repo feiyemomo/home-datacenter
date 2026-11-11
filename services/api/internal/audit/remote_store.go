@@ -66,7 +66,7 @@ type FileWORMRemoteStore struct {
 func NewFileWORMRemoteStore(rootDir string) (*FileWORMRemoteStore, error) {
 	trimmed := strings.TrimSpace(rootDir)
 	if trimmed == "" {
-		return nil, fmt.Errorf("file-worm remote directory is empty")
+		return nil, fmt.Errorf("%w: file-worm remote directory is empty", ErrAuditConfigInvalid)
 	}
 	if err := os.MkdirAll(trimmed, 0o700); err != nil {
 		return nil, fmt.Errorf("%w: failed to initialize remote dir: %v", ErrRemoteUnavailable, err)
@@ -378,11 +378,11 @@ type HTTPRemoteAuditStore struct {
 func NewHTTPRemoteAuditStore(baseURL, bearerToken string, timeout time.Duration) (*HTTPRemoteAuditStore, error) {
 	trimmed := strings.TrimRight(strings.TrimSpace(baseURL), "/")
 	if trimmed == "" {
-		return nil, fmt.Errorf("remote HTTP audit store URL is empty")
+		return nil, fmt.Errorf("%w: remote HTTP audit store URL is empty", ErrAuditConfigInvalid)
 	}
 	u, err := url.Parse(trimmed)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return nil, fmt.Errorf("invalid remote audit store URL")
+		return nil, fmt.Errorf("%w: invalid remote audit store URL", ErrAuditConfigInvalid)
 	}
 	u.User = nil
 	u.RawQuery = ""
@@ -390,6 +390,9 @@ func NewHTTPRemoteAuditStore(baseURL, bearerToken string, timeout time.Duration)
 
 	if timeout <= 0 {
 		timeout = 3 * time.Second
+	}
+	if strings.ContainsAny(bearerToken, "\r\n\t\x00") {
+		return nil, fmt.Errorf("%w: OPS_AUDIT_REMOTE_TOKEN contains invalid control/whitespace characters", ErrAuditConfigInvalid)
 	}
 	tok := strings.TrimSpace(bearerToken)
 	if tok != "" {
@@ -511,19 +514,25 @@ func ResolveRemoteAuditStoreFromEnv() (RemoteAuditStore, error) {
 	remoteType := strings.ToLower(strings.TrimSpace(os.Getenv("OPS_AUDIT_REMOTE_TYPE")))
 	remoteDir := strings.TrimSpace(os.Getenv("OPS_AUDIT_REMOTE_DIR"))
 	remoteURL := strings.TrimSpace(os.Getenv("OPS_AUDIT_REMOTE_URL"))
-	remoteToken := strings.TrimSpace(os.Getenv("OPS_AUDIT_REMOTE_TOKEN"))
+	rawToken := os.Getenv("OPS_AUDIT_REMOTE_TOKEN")
+	remoteToken := strings.TrimSpace(rawToken)
 	if remoteToken != "" {
 		redact.RegisterRuntimeSecret(remoteToken)
 	}
 
 	timeout := 3 * time.Second
 	if rawSec := strings.TrimSpace(os.Getenv("OPS_AUDIT_REMOTE_TIMEOUT_SEC")); rawSec != "" {
-		if sec, err := strconv.Atoi(rawSec); err == nil && sec > 0 {
-			timeout = time.Duration(sec) * time.Second
+		sec, err := strconv.Atoi(rawSec)
+		if err != nil || sec <= 0 {
+			return nil, fmt.Errorf("%w: invalid OPS_AUDIT_REMOTE_TIMEOUT_SEC %q (expected positive integer seconds)", ErrAuditConfigInvalid, rawSec)
 		}
+		timeout = time.Duration(sec) * time.Second
 	}
 
 	if remoteType == "" {
+		if remoteURL != "" && remoteDir != "" {
+			return nil, fmt.Errorf("%w: ambiguous config with both OPS_AUDIT_REMOTE_URL and OPS_AUDIT_REMOTE_DIR set without OPS_AUDIT_REMOTE_TYPE", ErrAuditConfigInvalid)
+		}
 		if remoteURL != "" {
 			remoteType = "http-append"
 		} else if remoteDir != "" {
@@ -532,13 +541,30 @@ func ResolveRemoteAuditStoreFromEnv() (RemoteAuditStore, error) {
 	}
 
 	switch remoteType {
-	case "", "none", "disabled":
+	case "":
+		if remoteToken != "" {
+			return nil, fmt.Errorf("%w: OPS_AUDIT_REMOTE_TOKEN set without OPS_AUDIT_REMOTE_URL or OPS_AUDIT_REMOTE_TYPE", ErrAuditConfigInvalid)
+		}
+		return nil, nil
+	case "none", "disabled":
+		if remoteURL != "" || remoteDir != "" {
+			return nil, fmt.Errorf("%w: OPS_AUDIT_REMOTE_TYPE=%q conflicts with OPS_AUDIT_REMOTE_URL/OPS_AUDIT_REMOTE_DIR", ErrAuditConfigInvalid, remoteType)
+		}
 		return nil, nil
 	case "file-worm", "worm", "file":
+		if remoteURL != "" {
+			return nil, fmt.Errorf("%w: OPS_AUDIT_REMOTE_TYPE=%q does not accept OPS_AUDIT_REMOTE_URL", ErrAuditConfigInvalid, remoteType)
+		}
 		return NewFileWORMRemoteStore(remoteDir)
 	case "http-append", "http", "s3-proxy":
+		if strings.ContainsAny(rawToken, "\r\n\t\x00") {
+			return nil, fmt.Errorf("%w: OPS_AUDIT_REMOTE_TOKEN contains invalid control/whitespace characters", ErrAuditConfigInvalid)
+		}
+		if len(remoteToken) < 16 {
+			return nil, fmt.Errorf("%w: OPS_AUDIT_REMOTE_TOKEN must be at least 16 characters when using %q", ErrAuditConfigInvalid, remoteType)
+		}
 		return NewHTTPRemoteAuditStore(remoteURL, remoteToken, timeout)
 	default:
-		return nil, fmt.Errorf("unsupported OPS_AUDIT_REMOTE_TYPE: %q", remoteType)
+		return nil, fmt.Errorf("%w: unsupported OPS_AUDIT_REMOTE_TYPE: %q", ErrAuditConfigInvalid, remoteType)
 	}
 }

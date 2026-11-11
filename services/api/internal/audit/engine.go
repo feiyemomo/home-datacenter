@@ -97,6 +97,15 @@ func WithCheckpointPeriod(period time.Duration) EngineOption {
 	}
 }
 
+// WithStrictRemote explicitly enforces or relaxes strict remote replication mode.
+// In strict mode, missing or unreachable remote audit stores fail closed instead of silently degrading.
+func WithStrictRemote(strict bool) EngineOption {
+	return func(e *AgentAuditEngine) {
+		e.strictRemote = strict
+		e.strictRemoteSet = true
+	}
+}
+
 // AgentAuditEngine is the unified tamper-evident audit pipeline for autonomous agent and system operations.
 type AgentAuditEngine struct {
 	db                 *gorm.DB
@@ -104,6 +113,9 @@ type AgentAuditEngine struct {
 	archiveDir         string
 	checkpointInterval int
 	checkpointPeriod   time.Duration
+	strictRemote       bool
+	strictRemoteSet    bool
+	initErr            error
 	writeMu            sync.Mutex
 	remoteMu           sync.Mutex
 	remoteStore        RemoteAuditStore
@@ -120,17 +132,58 @@ type AgentAuditEngine struct {
 	loopWG             sync.WaitGroup
 }
 
-// NewAgentAuditEngine creates an AgentAuditEngine bound to db and eventbus.
-func NewAgentAuditEngine(db *gorm.DB, bus *eventbus.Bus, opts ...EngineOption) *AgentAuditEngine {
+func isAuditProductionRuntime() bool {
+	appEnv := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
+	if appEnv == "development" || appEnv == "dev" || appEnv == "test" || appEnv == "testing" {
+		return false
+	}
+	if appEnv == "production" || appEnv == "prod" {
+		return true
+	}
+	env := strings.ToLower(strings.TrimSpace(os.Getenv("ENV")))
+	if env == "development" || env == "dev" || env == "test" || env == "testing" {
+		return false
+	}
+	if env == "production" || env == "prod" {
+		return true
+	}
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	if os.Getenv("APP_CONFIG") == "/configs/config.yaml" {
+		return true
+	}
+	return false
+}
+
+func resolveStrictRemoteEnv() (val bool, set bool, err error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("OPS_AUDIT_STRICT_REMOTE")))
+	switch raw {
+	case "":
+		return false, false, nil
+	case "1", "true", "yes", "on":
+		return true, true, nil
+	case "0", "false", "no", "off":
+		return false, true, nil
+	default:
+		return false, false, fmt.Errorf("%w: invalid OPS_AUDIT_STRICT_REMOTE %q", ErrAuditConfigInvalid, raw)
+	}
+}
+
+// NewStrictAgentAuditEngine creates an AgentAuditEngine and fails closed on invalid remote/signer configuration,
+// schema initialization failures, key rotation recording failures, or unavailable required remote stores.
+func NewStrictAgentAuditEngine(db *gorm.DB, bus *eventbus.Bus, opts ...EngineOption) (*AgentAuditEngine, error) {
 	defaultDir := strings.TrimSpace(os.Getenv("OPS_AUDIT_ARCHIVE_DIR"))
 	if defaultDir == "" {
 		defaultDir = filepath.Join(os.TempDir(), "home-datacenter-audit")
 	}
 	var defaultPeriod time.Duration
 	if rawSec := strings.TrimSpace(os.Getenv("OPS_AUDIT_CHECKPOINT_PERIOD_SEC")); rawSec != "" {
-		if sec, err := strconv.Atoi(rawSec); err == nil && sec > 0 {
-			defaultPeriod = time.Duration(sec) * time.Second
+		sec, err := strconv.Atoi(rawSec)
+		if err != nil || sec <= 0 {
+			return nil, fmt.Errorf("%w: invalid OPS_AUDIT_CHECKPOINT_PERIOD_SEC %q", ErrAuditConfigInvalid, rawSec)
 		}
+		defaultPeriod = time.Duration(sec) * time.Second
 	}
 	e := &AgentAuditEngine{
 		db:                 db,
@@ -148,25 +201,110 @@ func NewAgentAuditEngine(db *gorm.DB, bus *eventbus.Bus, opts ...EngineOption) *
 		}
 	}
 	if e.remoteStore == nil {
-		if envStore, err := ResolveRemoteAuditStoreFromEnv(); err == nil && envStore != nil {
-			e.remoteStore = envStore
+		envStore, err := ResolveRemoteAuditStoreFromEnv()
+		if err != nil {
+			e.initErr = err
+			return nil, err
 		}
+		e.remoteStore = envStore
 	}
 	if e.externalSigner == nil && e.externalVerifier == nil {
-		if envSigner, envVerifier, err := ResolveExternalCheckpointKeys(); err == nil {
-			e.externalSigner = envSigner
-			e.externalVerifier = envVerifier
+		envSigner, envVerifier, err := ResolveExternalCheckpointKeys()
+		if err != nil {
+			e.initErr = err
+			return nil, err
+		}
+		e.externalSigner = envSigner
+		e.externalVerifier = envVerifier
+	}
+	envStrict, envStrictSet, err := resolveStrictRemoteEnv()
+	if err != nil {
+		e.initErr = err
+		return nil, err
+	}
+	if !e.strictRemoteSet {
+		if envStrictSet {
+			e.strictRemote = envStrict
+		} else if isAuditProductionRuntime() && e.remoteStore != nil {
+			e.strictRemote = true
+		}
+	}
+	if e.strictRemote {
+		if e.remoteStore == nil {
+			err := fmt.Errorf("%w: remote audit store must be configured when strict remote mode is enabled", ErrAuditRemoteRequired)
+			e.initErr = err
+			return nil, err
+		}
+		probeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, probeErr := e.remoteStore.FetchTail(probeCtx, model.AuditPrimaryStreamID)
+		cancel()
+		if probeErr != nil {
+			err := fmt.Errorf("%w: remote audit store unreachable at startup: %s", ErrAuditRemoteRequired, redact.SensitiveString(probeErr.Error()))
+			e.initErr = err
+			return nil, err
 		}
 	}
 	if db != nil {
-		_ = e.EnsureAuditSchema()
-		_, _ = e.RecordKeyRotationIfNeeded(context.Background())
+		if err := e.EnsureAuditSchema(); err != nil {
+			e.initErr = err
+			return nil, err
+		}
+		if _, err := e.RecordKeyRotationIfNeeded(context.Background()); err != nil {
+			e.initErr = err
+			return nil, err
+		}
 	}
 	if e.checkpointPeriod > 0 {
 		e.loopWG.Add(1)
 		go e.runPeriodicLoop()
 	}
-	return e
+	return e, nil
+}
+
+// NewAgentAuditEngine creates an AgentAuditEngine bound to db and eventbus.
+// Legacy callers without error handling receive a non-nil engine with InitError() populated if initialization failed.
+func NewAgentAuditEngine(db *gorm.DB, bus *eventbus.Bus, opts ...EngineOption) *AgentAuditEngine {
+	e, err := NewStrictAgentAuditEngine(db, bus, opts...)
+	if err == nil && e != nil {
+		return e
+	}
+	// Preserve non-nil engine handle for non-strict legacy callers while refusing background loops
+	// and surfacing the exact failure via InitError(), metrics, and eventbus alerts.
+	fallback := &AgentAuditEngine{
+		db:                 db,
+		bus:                bus,
+		checkpointInterval: DefaultCheckpointInterval,
+		nowFn:              func() time.Time { return time.Now().UTC() },
+		degradedWindow:     make(map[string]time.Time),
+		stopCh:             make(chan struct{}),
+		initErr:            err,
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(fallback)
+		}
+	}
+	fallback.recordFailureMetric()
+	if err != nil {
+		fallback.publishRemoteAlert("ops.audit.init_failed", err.Error())
+	}
+	return fallback
+}
+
+// InitError returns any initialization error captured during non-strict construction.
+func (e *AgentAuditEngine) InitError() error {
+	if e == nil {
+		return ErrAuditCommitFailed
+	}
+	return e.initErr
+}
+
+// IsStrictRemote reports whether strict remote replication enforcement is active.
+func (e *AgentAuditEngine) IsStrictRemote() bool {
+	if e == nil {
+		return false
+	}
+	return e.strictRemote
 }
 
 // Close stops background checkpoint and remote sync loops cleanly.
@@ -192,9 +330,14 @@ func (e *AgentAuditEngine) runPeriodicLoop() {
 			return
 		case <-ticker.C:
 			if e.db != nil {
-				_, _ = e.CreateCheckpoint(model.AuditPrimaryStreamID)
-				if e.remoteStore != nil {
-					_ = e.SyncRemote(context.Background(), model.AuditPrimaryStreamID)
+				cp, cpErr := e.CreateCheckpoint(model.AuditPrimaryStreamID)
+				if cpErr != nil {
+					e.recordFailureMetric()
+					e.publishRemoteAlert("ops.audit.checkpoint_failed", cpErr.Error())
+					continue
+				}
+				if cp == nil && e.remoteStore != nil {
+					_, _ = e.SyncRemoteStrict(context.Background(), model.AuditPrimaryStreamID)
 				}
 			}
 		}
@@ -432,6 +575,9 @@ func (e *AgentAuditEngine) StartRun(ctx context.Context, in StartRunInput) (stri
 		if evIn.Decision == "" {
 			evIn.Decision = runRow.Decision
 		}
+		if evIn.FencingGeneration == 0 && in.FencingGeneration > 0 {
+			evIn.FencingGeneration = in.FencingGeneration
+		}
 		if evIn.RiskLevel == "" {
 			evIn.RiskLevel = runRow.RiskLevel
 		}
@@ -577,6 +723,9 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		if hErr := e.preHook(in); hErr != nil {
 			return ev, e.handleCommitFailure(in, ev, hErr)
 		}
+	}
+	if e != nil && e.initErr != nil {
+		return ev, e.handleCommitFailure(in, ev, e.initErr)
 	}
 	if e.db == nil {
 		return ev, e.handleCommitFailure(in, ev, errors.New("audit database handle is nil"))
@@ -772,6 +921,7 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 	if triggerCheckpoint {
 		if _, cpErr := e.createCheckpointLocked(ev.StreamID); cpErr != nil {
 			e.recordFailureMetric()
+			e.publishRemoteAlert("ops.audit.checkpoint_failed", cpErr.Error())
 		}
 	}
 
@@ -779,8 +929,15 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 	writeLocked = false
 	e.writeMu.Unlock()
 
+	var syncErr error
 	if e.remoteStore != nil {
-		_ = e.SyncRemote(e.bgCtx(), ev.StreamID)
+		if _, sErr := e.SyncRemoteStrict(e.bgCtx(), ev.StreamID); sErr != nil && e.strictRemote {
+			syncErr = sErr
+		}
+	} else if e.strictRemote {
+		e.recordFailureMetric()
+		syncErr = fmt.Errorf("%w: remote audit store unavailable in strict mode", ErrAuditRemoteRequired)
+		e.publishRemoteAlert("ops.audit.remote_sync_failed", syncErr.Error())
 	}
 
 	if e.bus != nil {
@@ -809,6 +966,9 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		}
 	}
 
+	if syncErr != nil {
+		return ev, syncErr
+	}
 	return ev, nil
 }
 

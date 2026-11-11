@@ -54,7 +54,8 @@ const (
 
 // Remote replica sync & divergence statuses.
 const (
-	RemoteStatusDisabled           = "DISABLED"
+	RemoteStatusLocalOnly          = "LOCAL_ONLY"
+	RemoteStatusDisabled           = RemoteStatusLocalOnly
 	RemoteStatusInSync             = "IN_SYNC"
 	RemoteStatusPendingSync        = "PENDING_REMOTE_SYNC"
 	RemoteStatusUnreachable        = "REMOTE_UNREACHABLE"
@@ -67,6 +68,12 @@ const (
 var (
 	// ErrAuditCommitFailed indicates persistent audit commit failure blocking further mutation.
 	ErrAuditCommitFailed = errors.New("AUDIT_COMMIT_FAILED: failed to commit mandatory audit record")
+	// ErrAuditConfigInvalid indicates invalid audit remote store, signer, or period configuration.
+	ErrAuditConfigInvalid = errors.New("AUDIT_CONFIG_INVALID: invalid audit configuration")
+	// ErrAuditRemoteRequired indicates strict remote audit mode cannot proceed without an available remote store.
+	ErrAuditRemoteRequired = errors.New("AUDIT_REMOTE_REQUIRED: strict remote audit store is unavailable or unconfigured")
+	// ErrAuditSyncFailed indicates remote audit replication or checkpoint submission failed.
+	ErrAuditSyncFailed = errors.New("AUDIT_SYNC_FAILED: remote audit replication failed")
 	// ErrAuditKeyMissing indicates external OPS_AUDIT_HMAC_KEY is not configured.
 	ErrAuditKeyMissing = errors.New("external OPS_AUDIT_HMAC_KEY is not configured")
 	// ErrAuditKeyWeak indicates the configured HMAC key does not satisfy minimum entropy length.
@@ -127,13 +134,14 @@ type StartRunInput struct {
 	Component     string
 	Decision      string
 	RiskLevel     string
-	ProposalID    string
-	ApprovalID    string
-	OperationID   string
-	Summary       string
-	IsOffline     bool
-	Synced        *bool
-	InitialEvent  *EmitEventInput
+	ProposalID        string
+	ApprovalID        string
+	OperationID       string
+	FencingGeneration int64
+	Summary           string
+	IsOffline         bool
+	Synced            *bool
+	InitialEvent      *EmitEventInput
 }
 
 // EmitEventInput describes a single lifecycle event emitted to AgentAuditEngine.

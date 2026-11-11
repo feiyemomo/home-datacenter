@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
@@ -49,26 +50,45 @@ type Ed25519CheckpointKey struct {
 	priv ed25519.PrivateKey
 }
 
+func isAllZeroBytes(b []byte) bool {
+	for _, v := range b {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
 // NewEd25519CheckpointSigner creates a signer+verifier pair from an Ed25519 private key.
 func NewEd25519CheckpointSigner(kid string, priv ed25519.PrivateKey) (*Ed25519CheckpointKey, error) {
 	if len(priv) != ed25519.PrivateKeySize {
-		return nil, fmt.Errorf("invalid ed25519 private key length %d", len(priv))
+		return nil, fmt.Errorf("%w: invalid ed25519 private key length %d", ErrAuditConfigInvalid, len(priv))
+	}
+	if isAllZeroBytes(priv.Seed()) {
+		return nil, fmt.Errorf("%w: ed25519 private key seed cannot be all zeros", ErrAuditConfigInvalid)
+	}
+	derived := ed25519.NewKeyFromSeed(priv.Seed())
+	if !bytes.Equal(priv, derived) {
+		return nil, fmt.Errorf("%w: ed25519 private key public segment mismatch", ErrAuditConfigInvalid)
 	}
 	if strings.TrimSpace(kid) == "" {
 		kid = "ed25519-k1"
 	}
-	pub := priv.Public().(ed25519.PublicKey)
+	pub := derived.Public().(ed25519.PublicKey)
 	return &Ed25519CheckpointKey{
 		kid:  strings.TrimSpace(kid),
 		pub:  pub,
-		priv: append(ed25519.PrivateKey(nil), priv...),
+		priv: append(ed25519.PrivateKey(nil), derived...),
 	}, nil
 }
 
 // NewEd25519CheckpointVerifier creates a public-key-only verifier (safe to distribute without private key).
 func NewEd25519CheckpointVerifier(kid string, pub ed25519.PublicKey) (*Ed25519CheckpointKey, error) {
 	if len(pub) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("invalid ed25519 public key length %d", len(pub))
+		return nil, fmt.Errorf("%w: invalid ed25519 public key length %d", ErrAuditConfigInvalid, len(pub))
+	}
+	if isAllZeroBytes(pub) {
+		return nil, fmt.Errorf("%w: ed25519 public key cannot be all zeros", ErrAuditConfigInvalid)
 	}
 	if strings.TrimSpace(kid) == "" {
 		kid = "ed25519-k1"
@@ -197,7 +217,7 @@ func ResolveExternalCheckpointKeys() (ExternalCheckpointSigner, ExternalCheckpoi
 		redact.RegisterRuntimeSecret(rawPriv)
 		b, err := decodeHexOrBase64Bytes(rawPriv)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid OPS_AUDIT_CHECKPOINT_ED25519_PRIV: %w", err)
+			return nil, nil, fmt.Errorf("%w: invalid OPS_AUDIT_CHECKPOINT_ED25519_PRIV: %v", ErrAuditConfigInvalid, err)
 		}
 		var priv ed25519.PrivateKey
 		switch len(b) {
@@ -206,7 +226,7 @@ func ResolveExternalCheckpointKeys() (ExternalCheckpointSigner, ExternalCheckpoi
 		case ed25519.PrivateKeySize:
 			priv = ed25519.PrivateKey(b)
 		default:
-			return nil, nil, fmt.Errorf("OPS_AUDIT_CHECKPOINT_ED25519_PRIV must be 32-byte seed or 64-byte private key")
+			return nil, nil, fmt.Errorf("%w: OPS_AUDIT_CHECKPOINT_ED25519_PRIV must be 32-byte seed or 64-byte private key", ErrAuditConfigInvalid)
 		}
 		k, err := NewEd25519CheckpointSigner(kid, priv)
 		if err != nil {
@@ -219,14 +239,14 @@ func ResolveExternalCheckpointKeys() (ExternalCheckpointSigner, ExternalCheckpoi
 	if rawPub != "" {
 		b, err := decodeHexOrBase64Bytes(rawPub)
 		if err != nil {
-			return nil, nil, fmt.Errorf("invalid OPS_AUDIT_CHECKPOINT_ED25519_PUB: %w", err)
+			return nil, nil, fmt.Errorf("%w: invalid OPS_AUDIT_CHECKPOINT_ED25519_PUB: %v", ErrAuditConfigInvalid, err)
 		}
 		pubKey, err := NewEd25519CheckpointVerifier(kid, ed25519.PublicKey(b))
 		if err != nil {
 			return nil, nil, err
 		}
 		if signer != nil && signer.PublicKeyHex() != pubKey.PublicKeyHex() {
-			return nil, nil, fmt.Errorf("OPS_AUDIT_CHECKPOINT_ED25519_PUB does not match OPS_AUDIT_CHECKPOINT_ED25519_PRIV")
+			return nil, nil, fmt.Errorf("%w: OPS_AUDIT_CHECKPOINT_ED25519_PUB does not match OPS_AUDIT_CHECKPOINT_ED25519_PRIV", ErrAuditConfigInvalid)
 		}
 		verifier = pubKey
 	}
