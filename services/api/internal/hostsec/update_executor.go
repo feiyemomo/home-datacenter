@@ -14,7 +14,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"home-datacenter-api/internal/audit"
@@ -99,6 +98,9 @@ type realHostExecRunner struct{}
 
 func (realHostExecRunner) Run(ctx context.Context, env []string, name string, args ...string) (string, string, error) {
 	base := filepath.Base(strings.TrimSpace(name))
+	if detectInContainer() {
+		return "", "", fmt.Errorf("%w: direct %s execution inside container namespace is forbidden", ErrContainerHostExecutionBoundary, base)
+	}
 	allowedBins := map[string]bool{
 		"apt-get":    true,
 		"apt-cache":  true,
@@ -120,69 +122,18 @@ func (realHostExecRunner) Run(ctx context.Context, env []string, name string, ar
 	return outBuf.String(), errBuf.String(), err
 }
 
-// SSHRecoveryGuard manages a local dead-man's-switch timer that restores SSH config
+// SSHRecoveryGuard manages a persistent local dead-man's-switch that restores SSH config
 // and restarts sshd if post-update verification or disarm fails after touching SSH/TLS.
 type SSHRecoveryGuard interface {
 	Arm(ctx context.Context, snapshotDir string, timeout time.Duration, recoverFn func(context.Context) error) (guardID string, err error)
 	Disarm(guardID string) error
 }
 
-type localTimerSSHGuard struct {
-	mu     sync.Mutex
-	timers map[string]*time.Timer
-	fired  map[string]bool
-}
-
-func newLocalTimerSSHGuard() *localTimerSSHGuard {
-	return &localTimerSSHGuard{
-		timers: make(map[string]*time.Timer),
-		fired:  make(map[string]bool),
-	}
-}
-
-func (g *localTimerSSHGuard) Arm(ctx context.Context, snapshotDir string, timeout time.Duration, recoverFn func(context.Context) error) (string, error) {
-	if timeout <= 0 {
-		timeout = DefaultSSHRecoveryWindow
-	}
-	id := fmt.Sprintf("ssh-guard-%d", time.Now().UnixNano())
-	timer := time.AfterFunc(timeout, func() {
-		g.mu.Lock()
-		if _, active := g.timers[id]; !active {
-			g.mu.Unlock()
-			return
-		}
-		delete(g.timers, id)
-		g.fired[id] = true
-		g.mu.Unlock()
-		if recoverFn != nil {
-			rCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			_ = recoverFn(rCtx)
-		}
-	})
-	g.mu.Lock()
-	g.timers[id] = timer
-	g.mu.Unlock()
-	return id, nil
-}
-
-func (g *localTimerSSHGuard) Disarm(guardID string) error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	if t, ok := g.timers[guardID]; ok {
-		t.Stop()
-		delete(g.timers, guardID)
-		return nil
-	}
-	if g.fired[guardID] {
-		return fmt.Errorf("SSH recovery guard %s already triggered rollback", guardID)
-	}
-	return nil
-}
-
 // HostUpdateRequest defines a human-approved host package upgrade operation.
 type HostUpdateRequest struct {
 	Proposal             *model.OpsProposal `json:"proposal"`
+	ApprovalID           string             `json:"approval_id,omitempty"`
+	FencingGeneration    int64              `json:"fencing_generation,omitempty"`
 	Packages             []string           `json:"packages"`
 	TargetVersions       map[string]string  `json:"target_versions,omitempty"` // optional pinned versions
 	ExpectedBaselineHash string             `json:"expected_baseline_hash"`
@@ -219,6 +170,8 @@ type HostUpdateResult struct {
 type HostUpdateExecutor struct {
 	Detector          *PlatformDetector
 	Runner            HostExecRunner
+	Bridge            RestrictedHostExecutionBridge
+	RequireFencing    bool
 	AuditEngine       *audit.AgentAuditEngine
 	SnapshotRoot      string
 	AllowedPackages   map[string]bool
@@ -227,7 +180,8 @@ type HostUpdateExecutor struct {
 	SSHProbeFn        func(ctx context.Context, addr string) error
 }
 
-// NewHostUpdateExecutor constructs a HostUpdateExecutor with safe defaults.
+// NewHostUpdateExecutor constructs a HostUpdateExecutor with safe fail-closed defaults,
+// persistent disk-backed SSH dead-man's-switch guard, and optional env-configured HMAC bridge.
 func NewHostUpdateExecutor(hostRoot, snapshotRoot string, auditEngine *audit.AgentAuditEngine) *HostUpdateExecutor {
 	if strings.TrimSpace(snapshotRoot) == "" {
 		snapshotRoot = filepath.Join(os.TempDir(), "home-datacenter-host-snapshots")
@@ -236,16 +190,44 @@ func NewHostUpdateExecutor(hostRoot, snapshotRoot string, auditEngine *audit.Age
 	for k, v := range AllowedHostPackages {
 		allowedCopy[k] = v
 	}
+	detector := NewPlatformDetector(hostRoot)
+	var bridge RestrictedHostExecutionBridge
+	if envBridge := NewHMACHostExecutionBridgeFromEnv(); envBridge != nil {
+		bridge = envBridge
+	}
+	guardDir := strings.TrimSpace(os.Getenv("HOST_SSH_WATCHDOG_DIR"))
+	if guardDir == "" {
+		guardDir = filepath.Join(snapshotRoot, "ssh-watchdog")
+	}
+	runner := realHostExecRunner{}
 	return &HostUpdateExecutor{
-		Detector:          NewPlatformDetector(hostRoot),
-		Runner:            realHostExecRunner{},
+		Detector:          detector,
+		Runner:            runner,
+		Bridge:            bridge,
 		AuditEngine:       auditEngine,
 		SnapshotRoot:      snapshotRoot,
 		AllowedPackages:   allowedCopy,
-		SSHGuard:          newLocalTimerSSHGuard(),
+		SSHGuard:          NewPersistentHostSSHGuard(guardDir, detector.HostRoot, snapshotRoot, runner, bridge),
 		SSHRecoveryWindow: DefaultSSHRecoveryWindow,
 		SSHProbeFn:        defaultSSHProbe,
 	}
+}
+
+// SetBridge configures the authenticated RestrictedHostExecutionBridge and updates SSHGuard.
+func (e *HostUpdateExecutor) SetBridge(bridge RestrictedHostExecutionBridge) {
+	e.Bridge = bridge
+	if pg, ok := e.SSHGuard.(*PersistentHostSSHGuard); ok && pg != nil {
+		pg.Bridge = bridge
+	}
+}
+
+// ReconcilePendingSSHGuards recovers any expired ARMED SSH dead-man's-switch guards persisted
+// across prior container restarts or API crashes.
+func (e *HostUpdateExecutor) ReconcilePendingSSHGuards(ctx context.Context) (int, error) {
+	if pg, ok := e.SSHGuard.(*PersistentHostSSHGuard); ok && pg != nil {
+		return pg.ReconcileExpired(ctx)
+	}
+	return 0, nil
 }
 
 func (e *HostUpdateExecutor) resolvePath(rel string) string {
@@ -319,9 +301,47 @@ func (e *HostUpdateExecutor) ComputeBaselineHash(ctx context.Context, packages [
 	return fmt.Sprintf("host-v1:%x", sum[:]), versions, nil
 }
 
+// AuthorizeMutation enforces Tier E privilege isolation:
+// tiers A (assets), B (CVE scan), C (proposal), D (approval) do NOT grant mutation capability
+// if platform policy (fnOS fail-closed), fencing, or container execution boundary rejects it.
+func (e *HostUpdateExecutor) AuthorizeMutation(ctx context.Context, platform PlatformInfo, binding HostExecutionBinding) error {
+	if polErr := platform.HostUpdatePolicyError(); polErr != nil {
+		return polErr
+	}
+	if e.RequireFencing && binding.FencingGeneration <= 0 {
+		return fmt.Errorf("%w: fencing_generation (> 0) required for host update", ErrBridgeBindingInvalid)
+	}
+	if platform.RequiresHostExecutionBridge() {
+		if e.Bridge == nil {
+			return fmt.Errorf("%w: direct host mutation forbidden (InContainer=%v, HostRoot=%q)", ErrContainerHostExecutionBoundary, platform.InContainer, platform.HostRoot)
+		}
+		if err := e.Bridge.VerifyBinding(ctx, binding); err != nil {
+			return fmt.Errorf("%w: %v", ErrContainerHostExecutionBoundary, err)
+		}
+	}
+	return nil
+}
+
+func (e *HostUpdateExecutor) runTypedHostAction(ctx context.Context, platform PlatformInfo, req HostActionRequest) (HostActionResult, error) {
+	if e.Bridge != nil {
+		return e.Bridge.ExecuteTypedAction(ctx, req)
+	}
+	if platform.RequiresHostExecutionBridge() {
+		return HostActionResult{}, fmt.Errorf("%w: refusing direct %s across namespace boundary without RestrictedHostExecutionBridge", ErrContainerHostExecutionBoundary, req.Action)
+	}
+	if err := ValidateHostActionRequest(req, e.AllowedPackages, e.RequireFencing); err != nil {
+		return HostActionResult{}, err
+	}
+	if e.Runner == nil {
+		return HostActionResult{}, errors.New("host command runner is not configured")
+	}
+	return dispatchTypedBridgeAction(ctx, e.Runner, e.Detector, e.SnapshotRoot, req)
+}
+
 // Execute validates OS compatibility (failing closed on fnOS), package whitelist,
-// human approval HMAC, baseline hash, apt repository GPG trust, takes a pre-update
-// snapshot, runs bounded non-interactive upgrade, verifies post-update health & SSH,
+// human approval HMAC, container namespace execution boundary, baseline hash, apt repository
+// GPG trust, takes a pre-update snapshot, arms a persistent crash-survivable SSH guard,
+// runs strictly typed non-interactive upgrade, verifies post-update health & SSH,
 // and triggers automatic rollback + SSH recovery on failure.
 func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest) (*HostUpdateResult, error) {
 	start := time.Now()
@@ -335,7 +355,7 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		e.Runner = realHostExecRunner{}
 	}
 	if e.SSHGuard == nil {
-		e.SSHGuard = newLocalTimerSSHGuard()
+		e.SSHGuard = NewPersistentHostSSHGuard("", e.Detector.HostRoot, e.SnapshotRoot, e.Runner, e.Bridge)
 	}
 	if e.SSHProbeFn == nil {
 		e.SSHProbeFn = defaultSSHProbe
@@ -363,7 +383,10 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 	var hhID uint = 1
 	if req.Proposal != nil {
 		propID = req.Proposal.ProposalID
-		approvalID = req.Proposal.ApprovalDigest
+		approvalID = strings.TrimSpace(req.ApprovalID)
+		if approvalID == "" {
+			approvalID = req.Proposal.ApprovalDigest
+		}
 		actorID = req.Proposal.ApprovedBy
 		if req.Proposal.HouseholdID > 0 {
 			hhID = req.Proposal.HouseholdID
@@ -377,19 +400,20 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 	runCtx := execCtx
 	if e.AuditEngine != nil && !hasParentSession {
 		_, rCtx, sErr := e.AuditEngine.StartRun(execCtx, audit.StartRunInput{
-			HouseholdID:   hhID,
-			TriggerSource: "host_update_executor",
-			ActorType:     "user",
-			ActorID:       actorID,
-			Action:        ActionHostPackageUpgrade,
-			Target:        strings.Join(req.Packages, ","),
-			Component:     "host-os",
-			Decision:      model.AuditDecisionAllow,
-			RiskLevel:     model.AuditRiskCritical,
-			ProposalID:    propID,
-			ApprovalID:    approvalID,
-			OperationID:   opID,
-			Summary:       fmt.Sprintf("Host OS package update (%v) on %s", req.Packages, platform.PrettyName),
+			HouseholdID:       hhID,
+			TriggerSource:     "host_update_executor",
+			ActorType:         "user",
+			ActorID:           actorID,
+			Action:            ActionHostPackageUpgrade,
+			Target:            strings.Join(req.Packages, ","),
+			Component:         "host-os",
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			Summary:           fmt.Sprintf("Host OS package update (%v) on %s", req.Packages, platform.PrettyName),
 		})
 		if sErr != nil {
 			res.Error = sErr.Error()
@@ -418,22 +442,23 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		res.Error = cause.Error()
 		res.DurationMs = time.Since(start).Milliseconds()
 		_ = emitTerminalOrStep(audit.EmitEventInput{
-			EventType:      model.AuditEventExecutionFailed,
-			Action:         ActionHostPackageUpgrade,
-			Target:         strings.Join(req.Packages, ","),
-			Component:      "host-os",
-			Decision:       model.AuditDecisionDeny,
-			RiskLevel:      model.AuditRiskCritical,
-			ProposalID:     propID,
-			ApprovalID:     approvalID,
-			OperationID:    opID,
-			BeforeState:    res.BeforeVersions,
-			AfterState:     res.AfterVersions,
-			Result:         code,
-			ErrorCode:      cause.Error(),
-			DurationMs:     res.DurationMs,
-			FinalRunStatus: model.AuditRunStatusBlocked,
-			MirrorLegacy:   true,
+			EventType:         model.AuditEventExecutionFailed,
+			Action:            ActionHostPackageUpgrade,
+			Target:            strings.Join(req.Packages, ","),
+			Component:         "host-os",
+			Decision:          model.AuditDecisionDeny,
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			BeforeState:       res.BeforeVersions,
+			AfterState:        res.AfterVersions,
+			Result:            code,
+			ErrorCode:         cause.Error(),
+			DurationMs:        res.DurationMs,
+			FinalRunStatus:    model.AuditRunStatusBlocked,
+			MirrorLegacy:      true,
 		})
 		return res, cause
 	}
@@ -482,7 +507,12 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		return failAudit("APPROVAL_SCOPE_MISMATCH", err)
 	}
 
-	// 4. Baseline verification (anti-TOCTOU)
+	// 4. Container & cross-namespace host execution boundary gate (fail-closed if bridge missing)
+	if platform.RequiresHostExecutionBridge() && e.Bridge == nil {
+		return failAudit("CONTAINER_EXECUTION_BOUNDARY", fmt.Errorf("%w: InContainer=%v HostRoot=%q", ErrContainerHostExecutionBoundary, platform.InContainer, platform.HostRoot))
+	}
+
+	// 5. Baseline verification (anti-TOCTOU)
 	liveBaseline, beforeVersions, err := e.ComputeBaselineHash(execCtx, cleanPkgs)
 	if err != nil {
 		return failAudit("BASELINE_ERROR", err)
@@ -499,27 +529,41 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		return failAudit("BASELINE_DRIFT", fmt.Errorf("%w: expected=%q got=%q", ErrBaselineDrift, req.ExpectedBaselineHash, liveBaseline))
 	}
 
-	// 5. Repository source & GPG signature policy verification
-	if err := e.verifyAptSecurity(execCtx, cleanPkgs); err != nil {
+	binding := HostExecutionBinding{
+		ProposalID:        propID,
+		ApprovalID:        approvalID,
+		OperationID:       opID,
+		BaselineHash:      liveBaseline,
+		FencingGeneration: req.FencingGeneration,
+		HouseholdID:       hhID,
+		ActorID:           actorID,
+	}
+	if authErr := e.AuthorizeMutation(execCtx, platform, binding); authErr != nil {
+		return failAudit("AUTHORIZATION_BOUNDARY_DENIED", authErr)
+	}
+
+	// 6. Repository source & GPG signature policy verification
+	if err := e.verifyAptSecurity(execCtx, platform, binding, cleanPkgs); err != nil {
 		return failAudit("APT_SOURCE_UNTRUSTED", err)
 	}
 
-	// 6. Fail-Closed Pre-Mutation Audit Gate (HC-1)
+	// 7. Fail-Closed Pre-Mutation Audit Gate (HC-1)
 	if e.AuditEngine != nil && !hasParentSession {
 		if _, preErr := e.AuditEngine.RecordPreMutation(runCtx, audit.EmitEventInput{
-			EventType:     model.AuditEventExecutionStarted,
-			Action:        ActionHostPackageUpgrade,
-			Target:        strings.Join(cleanPkgs, ","),
-			Component:     "host-os",
-			Decision:      model.AuditDecisionAllow,
-			RiskLevel:     model.AuditRiskCritical,
-			ProposalID:    propID,
-			ApprovalID:    approvalID,
-			OperationID:   opID,
-			Parameters:    map[string]interface{}{"packages": cleanPkgs, "target_versions": req.TargetVersions},
-			BeforeState:   beforeVersions,
-			Result:        "STARTED",
-			FailurePolicy: audit.PolicyFailClosed,
+			EventType:         model.AuditEventExecutionStarted,
+			Action:            ActionHostPackageUpgrade,
+			Target:            strings.Join(cleanPkgs, ","),
+			Component:         "host-os",
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			Parameters:        map[string]interface{}{"packages": cleanPkgs, "target_versions": req.TargetVersions},
+			BeforeState:       beforeVersions,
+			Result:            "STARTED",
+			FailurePolicy:     audit.PolicyFailClosed,
 		}); preErr != nil {
 			res.Error = preErr.Error()
 			res.DurationMs = time.Since(start).Milliseconds()
@@ -527,19 +571,20 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		}
 	} else if e.AuditEngine != nil && hasParentSession {
 		if _, preErr := e.AuditEngine.EmitEvent(runCtx, audit.EmitEventInput{
-			EventType:     model.AuditEventExecutionStepCompleted,
-			Action:        ActionHostPackageUpgrade + ".preflight",
-			Target:        strings.Join(cleanPkgs, ","),
-			Component:     "host-os",
-			Decision:      model.AuditDecisionAllow,
-			RiskLevel:     model.AuditRiskCritical,
-			ProposalID:    propID,
-			ApprovalID:    approvalID,
-			OperationID:   opID,
-			Parameters:    map[string]interface{}{"packages": cleanPkgs, "target_versions": req.TargetVersions},
-			BeforeState:   beforeVersions,
-			Result:        "PREFLIGHT_VERIFIED",
-			FailurePolicy: audit.PolicyFailClosed,
+			EventType:         model.AuditEventExecutionStepCompleted,
+			Action:            ActionHostPackageUpgrade + ".preflight",
+			Target:            strings.Join(cleanPkgs, ","),
+			Component:         "host-os",
+			Decision:          model.AuditDecisionAllow,
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			Parameters:        map[string]interface{}{"packages": cleanPkgs, "target_versions": req.TargetVersions},
+			BeforeState:       beforeVersions,
+			Result:            "PREFLIGHT_VERIFIED",
+			FailurePolicy:     audit.PolicyFailClosed,
 		}); preErr != nil {
 			res.Error = preErr.Error()
 			res.DurationMs = time.Since(start).Milliseconds()
@@ -547,23 +592,25 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		}
 	}
 
-	// 7. Pre-update configuration & package snapshot
+	// 8. Pre-update configuration & package snapshot
 	snap, snapErr := e.createPreUpdateSnapshot(opID, platform, beforeVersions)
 	if snapErr != nil {
 		res.Error = snapErr.Error()
 		res.DurationMs = time.Since(start).Milliseconds()
 		_ = emitTerminalOrStep(audit.EmitEventInput{
-			EventType:      model.AuditEventExecutionFailed,
-			Action:         ActionHostPackageUpgrade,
-			Target:         strings.Join(cleanPkgs, ","),
-			Component:      "host-os",
-			RiskLevel:      model.AuditRiskCritical,
-			ProposalID:     propID,
-			OperationID:    opID,
-			Result:         "SNAPSHOT_FAILED",
-			ErrorCode:      snapErr.Error(),
-			DurationMs:     res.DurationMs,
-			FinalRunStatus: model.AuditRunStatusFailed,
+			EventType:         model.AuditEventExecutionFailed,
+			Action:            ActionHostPackageUpgrade,
+			Target:            strings.Join(cleanPkgs, ","),
+			Component:         "host-os",
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			Result:            "SNAPSHOT_FAILED",
+			ErrorCode:         snapErr.Error(),
+			DurationMs:        res.DurationMs,
+			FinalRunStatus:    model.AuditRunStatusFailed,
 		})
 		return res, fmt.Errorf("%w: %v", ErrSnapshotFailed, snapErr)
 	}
@@ -571,15 +618,17 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 
 	if e.AuditEngine != nil {
 		if _, evErr := e.AuditEngine.EmitEvent(runCtx, audit.EmitEventInput{
-			EventType:   model.AuditEventExecutionStepCompleted,
-			Action:      "host.pkg_upgrade.snapshot",
-			Target:      strings.Join(cleanPkgs, ","),
-			Component:   "host-os",
-			RiskLevel:   model.AuditRiskMedium,
-			ProposalID:  propID,
-			OperationID: opID,
-			AfterState:  map[string]interface{}{"snapshot_dir": snap.SnapshotDir, "before_versions": beforeVersions},
-			Result:      "SNAPSHOT_CREATED",
+			EventType:         model.AuditEventExecutionStepCompleted,
+			Action:            "host.pkg_upgrade.snapshot",
+			Target:            strings.Join(cleanPkgs, ","),
+			Component:         "host-os",
+			RiskLevel:         model.AuditRiskMedium,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			AfterState:        map[string]interface{}{"snapshot_dir": snap.SnapshotDir, "before_versions": beforeVersions},
+			Result:            "SNAPSHOT_CREATED",
 		}); evErr != nil {
 			res.Error = evErr.Error()
 			res.DurationMs = time.Since(start).Milliseconds()
@@ -587,7 +636,7 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		}
 	}
 
-	// 8. Arm local SSH-lockout recovery dead-man's-switch if touching SSH/OpenSSL
+	// 9. Arm persistent disk-backed SSH-lockout recovery dead-man's-switch if touching SSH/OpenSSL
 	var guardID string
 	if touchesSSH {
 		win := e.SSHRecoveryWindow
@@ -595,7 +644,7 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 			win = DefaultSSHRecoveryWindow
 		}
 		gID, gErr := e.SSHGuard.Arm(execCtx, snap.SnapshotDir, win, func(rCtx context.Context) error {
-			return e.rollbackFromSnapshot(rCtx, snap, cleanPkgs)
+			return e.rollbackFromSnapshot(rCtx, platform, binding, snap, cleanPkgs)
 		})
 		if gErr != nil {
 			res.Error = gErr.Error()
@@ -605,32 +654,20 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		guardID = gID
 	}
 
-	// 9. Execute non-interactive apt-get upgrade strictly via argv (never shell, never --allow-unauthenticated)
-	pkgArgs := []string{
-		"install", "-y", "--only-upgrade",
-		"-o", "Acquire::AllowInsecureRepositories=false",
-		"-o", "Acquire::AllowDowngradeToInsecureRepositories=false",
-		"-o", "Dpkg::Options::=--force-confdef",
-		"-o", "Dpkg::Options::=--force-confold",
-		"--",
-	}
-	for _, pkg := range cleanPkgs {
-		if ver := strings.TrimSpace(req.TargetVersions[pkg]); ver != "" {
-			pkgArgs = append(pkgArgs, pkg+"="+ver)
-		} else {
-			pkgArgs = append(pkgArgs, pkg)
-		}
-	}
-
-	aptEnv := []string{"DEBIAN_FRONTEND=noninteractive", "LC_ALL=C"}
-	_, aptErrOut, aptErr := e.Runner.Run(execCtx, aptEnv, "apt-get", pkgArgs...)
+	// 10. Execute strictly typed upgrade action via RestrictedHostExecutionBridge (never shell or container apt-get)
+	upgradeRes, aptErr := e.runTypedHostAction(execCtx, platform, HostActionRequest{
+		Action:         HostActionAptUpgrade,
+		Binding:        binding,
+		Packages:       cleanPkgs,
+		TargetVersions: req.TargetVersions,
+	})
 	if aptErr != nil {
-		rbErr := e.rollbackFromSnapshot(context.Background(), snap, cleanPkgs)
+		rbErr := e.rollbackFromSnapshot(context.Background(), platform, binding, snap, cleanPkgs)
 		if guardID != "" {
 			_ = e.SSHGuard.Disarm(guardID)
 		}
 		res.RolledBack = rbErr == nil
-		errMsg := fmt.Sprintf("apt-get upgrade failed: %v (%s)", aptErr, strings.TrimSpace(aptErrOut))
+		errMsg := fmt.Sprintf("apt-get upgrade failed: %v (%s)", aptErr, strings.TrimSpace(upgradeRes.Stderr))
 		if rbErr != nil {
 			errMsg = fmt.Sprintf("%s; rollback error: %v", errMsg, rbErr)
 		}
@@ -641,28 +678,30 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 			finalStatus = model.AuditRunStatusFailed
 		}
 		_ = emitTerminalOrStep(audit.EmitEventInput{
-			EventType:      model.AuditEventExecutionFailed,
-			Action:         ActionHostPackageUpgrade,
-			Target:         strings.Join(cleanPkgs, ","),
-			Component:      "host-os",
-			RiskLevel:      model.AuditRiskCritical,
-			ProposalID:     propID,
-			OperationID:    opID,
-			BeforeState:    beforeVersions,
-			Result:         strings.ToUpper(string(finalStatus)),
-			ErrorCode:      errMsg,
-			DurationMs:     res.DurationMs,
-			FinalRunStatus: finalStatus,
-			MirrorLegacy:   true,
+			EventType:         model.AuditEventExecutionFailed,
+			Action:            ActionHostPackageUpgrade,
+			Target:            strings.Join(cleanPkgs, ","),
+			Component:         "host-os",
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			BeforeState:       beforeVersions,
+			Result:            strings.ToUpper(string(finalStatus)),
+			ErrorCode:         errMsg,
+			DurationMs:        res.DurationMs,
+			FinalRunStatus:    finalStatus,
+			MirrorLegacy:      true,
 		})
 		return res, fmt.Errorf("%w: %s", ErrRollbackAttempted, errMsg)
 	}
 
-	// 10. Post-update verification (installed version + sshd -t + SSH connectivity)
-	afterVersions, verifyErr := e.verifyPostUpdate(execCtx, cleanPkgs, req.TargetVersions, touchesSSH, req.SSHProbeAddr)
+	// 11. Post-update verification (installed version + sshd -t + SSH connectivity)
+	afterVersions, verifyErr := e.verifyPostUpdate(execCtx, platform, binding, cleanPkgs, req.TargetVersions, touchesSSH, req.SSHProbeAddr)
 	res.AfterVersions = afterVersions
 	if verifyErr != nil {
-		rbErr := e.rollbackFromSnapshot(context.Background(), snap, cleanPkgs)
+		rbErr := e.rollbackFromSnapshot(context.Background(), platform, binding, snap, cleanPkgs)
 		if guardID != "" {
 			_ = e.SSHGuard.Disarm(guardID)
 		}
@@ -678,20 +717,22 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 			finalStatus = model.AuditRunStatusFailed
 		}
 		_ = emitTerminalOrStep(audit.EmitEventInput{
-			EventType:      model.AuditEventRollbackCompleted,
-			Action:         ActionHostPackageUpgrade,
-			Target:         strings.Join(cleanPkgs, ","),
-			Component:      "host-os",
-			RiskLevel:      model.AuditRiskCritical,
-			ProposalID:     propID,
-			OperationID:    opID,
-			BeforeState:    beforeVersions,
-			AfterState:     afterVersions,
-			Result:         strings.ToUpper(string(finalStatus)),
-			ErrorCode:      errMsg,
-			DurationMs:     res.DurationMs,
-			FinalRunStatus: finalStatus,
-			MirrorLegacy:   true,
+			EventType:         model.AuditEventRollbackCompleted,
+			Action:            ActionHostPackageUpgrade,
+			Target:            strings.Join(cleanPkgs, ","),
+			Component:         "host-os",
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        propID,
+			ApprovalID:        approvalID,
+			OperationID:       opID,
+			FencingGeneration: req.FencingGeneration,
+			BeforeState:       beforeVersions,
+			AfterState:        afterVersions,
+			Result:            strings.ToUpper(string(finalStatus)),
+			ErrorCode:         errMsg,
+			DurationMs:        res.DurationMs,
+			FinalRunStatus:    finalStatus,
+			MirrorLegacy:      true,
 		})
 		return res, fmt.Errorf("%w: %s", ErrRollbackAttempted, errMsg)
 	}
@@ -710,21 +751,22 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 	res.DurationMs = time.Since(start).Milliseconds()
 
 	if postErr := emitTerminalOrStep(audit.EmitEventInput{
-		EventType:      model.AuditEventExecutionCompleted,
-		Action:         ActionHostPackageUpgrade,
-		Target:         strings.Join(cleanPkgs, ","),
-		Component:      "host-os",
-		Decision:       model.AuditDecisionAllow,
-		RiskLevel:      model.AuditRiskCritical,
-		ProposalID:     propID,
-		ApprovalID:     approvalID,
-		OperationID:    opID,
-		BeforeState:    beforeVersions,
-		AfterState:     afterVersions,
-		Result:         "SUCCESS",
-		DurationMs:     res.DurationMs,
-		FinalRunStatus: model.AuditRunStatusCompleted,
-		MirrorLegacy:   true,
+		EventType:         model.AuditEventExecutionCompleted,
+		Action:            ActionHostPackageUpgrade,
+		Target:            strings.Join(cleanPkgs, ","),
+		Component:         "host-os",
+		Decision:          model.AuditDecisionAllow,
+		RiskLevel:         model.AuditRiskCritical,
+		ProposalID:        propID,
+		ApprovalID:        approvalID,
+		OperationID:       opID,
+		FencingGeneration: req.FencingGeneration,
+		BeforeState:       beforeVersions,
+		AfterState:        afterVersions,
+		Result:            "SUCCESS",
+		DurationMs:        res.DurationMs,
+		FinalRunStatus:    model.AuditRunStatusCompleted,
+		MirrorLegacy:      true,
 	}); postErr != nil {
 		res.Success = false
 		res.Error = postErr.Error()
@@ -734,7 +776,7 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 	return res, nil
 }
 
-func (e *HostUpdateExecutor) verifyAptSecurity(ctx context.Context, pkgs []string) error {
+func (e *HostUpdateExecutor) verifyAptSecurity(ctx context.Context, platform PlatformInfo, binding HostExecutionBinding, pkgs []string) error {
 	// Reject explicitly unsigned/trusted=yes APT source overrides
 	sourceFiles := []string{e.resolvePath("etc/apt/sources.list")}
 	if entries, err := os.ReadDir(e.resolvePath("etc/apt/sources.list.d")); err == nil {
@@ -757,11 +799,15 @@ func (e *HostUpdateExecutor) verifyAptSecurity(ctx context.Context, pkgs []strin
 
 	// Verify apt-cache policy shows a signed candidate origin (not purely local/unsigned)
 	for _, pkg := range pkgs {
-		out, errOut, err := e.Runner.Run(ctx, []string{"LC_ALL=C"}, "apt-cache", "policy", pkg)
+		actRes, err := e.runTypedHostAction(ctx, platform, HostActionRequest{
+			Action:   HostActionAptCachePolicy,
+			Binding:  binding,
+			Packages: []string{pkg},
+		})
 		if err != nil {
-			return fmt.Errorf("%w: apt-cache policy %s failed: %v (%s)", ErrInsecureAptSource, pkg, err, strings.TrimSpace(errOut))
+			return fmt.Errorf("%w: apt-cache policy %s failed: %v (%s)", ErrInsecureAptSource, pkg, err, strings.TrimSpace(actRes.Stderr))
 		}
-		if strings.TrimSpace(out) == "" || strings.Contains(out, "Candidate: (none)") {
+		if strings.TrimSpace(actRes.Stdout) == "" || strings.Contains(actRes.Stdout, "Candidate: (none)") {
 			return fmt.Errorf("%w: no upgrade candidate for %s", ErrInsecureAptSource, pkg)
 		}
 	}
@@ -822,6 +868,8 @@ func (e *HostUpdateExecutor) createPreUpdateSnapshot(opID string, platform Platf
 
 func (e *HostUpdateExecutor) verifyPostUpdate(
 	ctx context.Context,
+	platform PlatformInfo,
+	binding HostExecutionBinding,
 	pkgs []string,
 	targetVersions map[string]string,
 	touchesSSH bool,
@@ -829,13 +877,17 @@ func (e *HostUpdateExecutor) verifyPostUpdate(
 ) (map[string]string, error) {
 	after := make(map[string]string, len(pkgs))
 	for _, pkg := range pkgs {
-		out, errOut, err := e.Runner.Run(ctx, []string{"LC_ALL=C"}, "dpkg-query", "-W", "-f=${Status}\t${Version}", pkg)
+		actRes, err := e.runTypedHostAction(ctx, platform, HostActionRequest{
+			Action:   HostActionDpkgQuery,
+			Binding:  binding,
+			Packages: []string{pkg},
+		})
 		if err != nil {
-			return after, fmt.Errorf("dpkg-query failed for %s: %v (%s)", pkg, err, strings.TrimSpace(errOut))
+			return after, fmt.Errorf("dpkg-query failed for %s: %v (%s)", pkg, err, strings.TrimSpace(actRes.Stderr))
 		}
-		parts := strings.SplitN(strings.TrimSpace(out), "\t", 2)
+		parts := strings.SplitN(strings.TrimSpace(actRes.Stdout), "\t", 2)
 		if len(parts) != 2 || !strings.Contains(parts[0], "install ok installed") {
-			return after, fmt.Errorf("package %s not cleanly installed: %q", pkg, strings.TrimSpace(out))
+			return after, fmt.Errorf("package %s not cleanly installed: %q", pkg, strings.TrimSpace(actRes.Stdout))
 		}
 		ver := strings.TrimSpace(parts[1])
 		after[pkg] = ver
@@ -845,8 +897,11 @@ func (e *HostUpdateExecutor) verifyPostUpdate(
 	}
 
 	if touchesSSH {
-		if _, errOut, err := e.Runner.Run(ctx, nil, "sshd", "-t"); err != nil {
-			return after, fmt.Errorf("sshd -t config check failed after update: %v (%s)", err, strings.TrimSpace(errOut))
+		if actRes, err := e.runTypedHostAction(ctx, platform, HostActionRequest{
+			Action:  HostActionSSHDTest,
+			Binding: binding,
+		}); err != nil {
+			return after, fmt.Errorf("sshd -t config check failed after update: %v (%s)", err, strings.TrimSpace(actRes.Stderr))
 		}
 		addr := strings.TrimSpace(sshProbeAddr)
 		if addr == "" {
@@ -859,57 +914,70 @@ func (e *HostUpdateExecutor) verifyPostUpdate(
 	return after, nil
 }
 
-func (e *HostUpdateExecutor) rollbackFromSnapshot(ctx context.Context, snap *HostUpdateSnapshot, pkgs []string) error {
+func (e *HostUpdateExecutor) rollbackFromSnapshot(ctx context.Context, platform PlatformInfo, binding HostExecutionBinding, snap *HostUpdateSnapshot, pkgs []string) error {
 	if snap == nil {
 		return errors.New("rollback snapshot is nil")
 	}
 	var errs []string
 	// 1. Restore backed-up config files (SSH config first to prevent lockout)
-	for rel, backupPath := range snap.CopiedFiles {
-		if rel == "var/lib/dpkg/status" {
-			continue
+	if e.Bridge != nil {
+		if _, err := e.runTypedHostAction(ctx, platform, HostActionRequest{
+			Action:     HostActionRestoreConfig,
+			Binding:    binding,
+			SnapshotID: snap.SnapshotID,
+		}); err != nil {
+			errs = append(errs, fmt.Sprintf("bridge restore config failed: %v", err))
 		}
-		data, err := os.ReadFile(backupPath)
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("read backup %s: %v", backupPath, err))
-			continue
-		}
-		dst := e.resolvePath(rel)
-		if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
-			errs = append(errs, fmt.Sprintf("mkdir %s: %v", dst, err))
-			continue
-		}
-		if err := os.WriteFile(dst, data, 0644); err != nil {
-			errs = append(errs, fmt.Sprintf("restore %s: %v", dst, err))
+	} else {
+		for rel, backupPath := range snap.CopiedFiles {
+			if rel == "var/lib/dpkg/status" {
+				continue
+			}
+			data, err := os.ReadFile(backupPath)
+			if err != nil {
+				errs = append(errs, fmt.Sprintf("read backup %s: %v", backupPath, err))
+				continue
+			}
+			dst := e.resolvePath(rel)
+			if err := os.MkdirAll(filepath.Dir(dst), 0755); err != nil {
+				errs = append(errs, fmt.Sprintf("mkdir %s: %v", dst, err))
+				continue
+			}
+			if err := os.WriteFile(dst, data, 0644); err != nil {
+				errs = append(errs, fmt.Sprintf("restore %s: %v", dst, err))
+			}
 		}
 	}
 
 	// 2. Downgrade modified packages back to pre-update versions when known
-	var downgradeTargets []string
+	var downgradePkgs []string
+	downgradeVersions := make(map[string]string)
 	for _, pkg := range pkgs {
 		if oldVer := strings.TrimSpace(snap.PackageVersions[pkg]); oldVer != "" {
 			if ValidatePackageName(pkg) == nil && ValidatePackageVersion(oldVer) == nil {
-				downgradeTargets = append(downgradeTargets, pkg+"="+oldVer)
+				downgradePkgs = append(downgradePkgs, pkg)
+				downgradeVersions[pkg] = oldVer
 			}
 		}
 	}
-	if len(downgradeTargets) > 0 && e.Runner != nil {
-		args := append([]string{
-			"install", "-y", "--allow-downgrades",
-			"-o", "Acquire::AllowInsecureRepositories=false",
-			"--",
-		}, downgradeTargets...)
-		if _, errOut, err := e.Runner.Run(ctx, []string{"DEBIAN_FRONTEND=noninteractive", "LC_ALL=C"}, "apt-get", args...); err != nil {
-			errs = append(errs, fmt.Sprintf("package downgrade failed: %v (%s)", err, strings.TrimSpace(errOut)))
+	if len(downgradePkgs) > 0 {
+		if actRes, err := e.runTypedHostAction(ctx, platform, HostActionRequest{
+			Action:         HostActionAptDowngrade,
+			Binding:        binding,
+			Packages:       downgradePkgs,
+			TargetVersions: downgradeVersions,
+		}); err != nil {
+			errs = append(errs, fmt.Sprintf("package downgrade failed: %v (%s)", err, strings.TrimSpace(actRes.Stderr)))
 		}
 	}
 
 	// 3. Reload/restart sshd if SSH config was part of snapshot
-	if _, hasSSH := snap.CopiedFiles["etc/ssh/sshd_config"]; hasSSH && e.Runner != nil {
-		if _, errOut, err := e.Runner.Run(ctx, nil, "systemctl", "restart", "ssh"); err != nil {
-			if _, errOut2, err2 := e.Runner.Run(ctx, nil, "systemctl", "restart", "sshd"); err2 != nil {
-				errs = append(errs, fmt.Sprintf("ssh restart failed: %v (%s) / %v (%s)", err, errOut, err2, errOut2))
-			}
+	if _, hasSSH := snap.CopiedFiles["etc/ssh/sshd_config"]; hasSSH {
+		if actRes, err := e.runTypedHostAction(ctx, platform, HostActionRequest{
+			Action:  HostActionSSHDRestart,
+			Binding: binding,
+		}); err != nil {
+			errs = append(errs, fmt.Sprintf("ssh restart failed: %v (%s)", err, strings.TrimSpace(actRes.Stderr)))
 		}
 	}
 

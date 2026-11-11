@@ -168,15 +168,21 @@ func (r execReadOnlyRunner) Run(ctx context.Context, name string, args ...string
 		return "", "", fmt.Errorf("read-only runner refused non-allowlisted command: %s", base)
 	}
 	if base == "apt-get" {
-		// Strictly require dry-run simulation for read-only asset inspection.
+		// Strictly require dry-run simulation for read-only asset inspection and forbid mutating verbs/flags.
 		hasSim := false
+		hasUpgrade := false
 		for _, a := range args {
-			if a == "-s" || a == "--simulate" || a == "--dry-run" {
+			lowerArg := strings.ToLower(strings.TrimSpace(a))
+			switch lowerArg {
+			case "-s", "--simulate", "--dry-run":
 				hasSim = true
-				break
+			case "upgrade":
+				hasUpgrade = true
+			case "install", "remove", "purge", "autoremove", "dist-upgrade", "full-upgrade", "dselect-upgrade", "--only-upgrade", "--allow-downgrades":
+				return "", "", fmt.Errorf("read-only runner refused mutating apt-get argument %q (Tier A is strictly read-only)", a)
 			}
 		}
-		if !hasSim {
+		if !hasSim || !hasUpgrade {
 			return "", "", fmt.Errorf("read-only runner refused non-simulated apt-get command")
 		}
 	}

@@ -372,11 +372,43 @@ func TestCorrelationEngine_BackportSuppressionAndCISAKEV(t *testing.T) {
 	}
 }
 
+func attachTestHMACBridge(t *testing.T, hostRoot, snapshotRoot string, runner HostExecRunner, requireFencing bool) *HMACHostExecutionBridge {
+	t.Helper()
+	bridgeKey := []byte("bridge-test-hmac-secret-key-at-least-32-bytes-long-0123456789")
+	handler, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
+		HostRoot:       hostRoot,
+		SnapshotRoot:   snapshotRoot,
+		KeyID:          "bridge-test-k1",
+		HMACKey:        bridgeKey,
+		Runner:         runner,
+		RequireFencing: requireFencing,
+	})
+	if err != nil {
+		t.Fatalf("NewHostBridgeHTTPHandler: %v", err)
+	}
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+
+	bridge, err := NewHMACHostExecutionBridge(HostBridgeConfig{
+		Endpoint:       srv.URL,
+		KeyID:          "bridge-test-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: requireFencing,
+	})
+	if err != nil {
+		t.Fatalf("NewHMACHostExecutionBridge: %v", err)
+	}
+	return bridge
+}
+
 func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
-	// 1. fnOS fail-closed test
+	// 1. fnOS fail-closed test (even with a bridge attached, fnOS must still fail closed!)
 	fnosRoot := writeHostFixture(t, true)
 	_, ae := setupHostsecAuditDB(t)
-	fnosExec := NewHostUpdateExecutor(fnosRoot, t.TempDir(), ae)
+	defer ae.Close()
+	fnosSnap := t.TempDir()
+	fnosExec := NewHostUpdateExecutor(fnosRoot, fnosSnap, ae)
+	fnosExec.SetBridge(attachTestHMACBridge(t, fnosRoot, fnosSnap, &mockHostExecRunner{}, false))
 	prop := makeSignedHostUpdateProposal(t, []string{"openssh-server"})
 	baseHash, _, _ := fnosExec.ComputeBaselineHash(context.Background(), []string{"openssh-server"})
 
@@ -389,9 +421,22 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 		t.Fatalf("expected ErrFnOSUpdateUnsupported on fnOS, got %v", err)
 	}
 
-	// 2. Whitelist, injection, approval, baseline, and insecure apt source gates on Debian
+	// 2. Container / Cross-Namespace Execution Boundary MUST fail closed without RestrictedHostExecutionBridge
 	debRoot := writeHostFixture(t, false)
-	debExec := NewHostUpdateExecutor(debRoot, t.TempDir(), ae)
+	noBridgeExec := NewHostUpdateExecutor(debRoot, t.TempDir(), ae)
+	noBridgeExec.Detector.InDocker = true
+	noBridgeBase, _, _ := noBridgeExec.ComputeBaselineHash(context.Background(), []string{"openssh-server"})
+	if _, bErr := noBridgeExec.Execute(context.Background(), HostUpdateRequest{
+		Proposal:             prop,
+		Packages:             []string{"openssh-server"},
+		ExpectedBaselineHash: noBridgeBase,
+	}); !errors.Is(bErr, ErrContainerHostExecutionBoundary) {
+		t.Fatalf("expected ErrContainerHostExecutionBoundary when bridge missing across container boundary, got %v", bErr)
+	}
+
+	// 3. Whitelist, injection, approval, baseline, and insecure apt source gates on Debian (with authenticated bridge)
+	debSnap := t.TempDir()
+	debExec := NewHostUpdateExecutor(debRoot, debSnap, ae)
 	debBase, _, _ := debExec.ComputeBaselineHash(context.Background(), []string{"openssh-server"})
 
 	if _, err := debExec.Execute(context.Background(), HostUpdateRequest{
@@ -410,14 +455,6 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 		t.Fatalf("expected ErrPackageNotWhitelisted, got %v", err)
 	}
 
-	if _, err := debExec.Execute(context.Background(), HostUpdateRequest{
-		Proposal:             prop,
-		Packages:             []string{"openssh-server"},
-		ExpectedBaselineHash: "host-v1:tampered",
-	}); !errors.Is(err, ErrBaselineDrift) {
-		t.Fatalf("expected ErrBaselineDrift, got %v", err)
-	}
-
 	badProp := makeSignedHostUpdateProposal(t, []string{"openssh-server"})
 	badProp.ApprovalDigest = "hmac-sha256:k1:deadbeef"
 	if _, err := debExec.Execute(context.Background(), HostUpdateRequest{
@@ -428,7 +465,7 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 		t.Fatalf("expected ErrApprovalRequired on tampered digest, got %v", err)
 	}
 
-	// 3. Successful upgrade + post-update SSH banner verification + audit trail
+	// Wire real HMAC-authenticated bridge for baseline drift + verified execution + rollback tests
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -461,22 +498,46 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 			},
 		},
 	}
-	debExec.Runner = mockRunner
+	debExec.RequireFencing = true
+	debExec.SetBridge(attachTestHMACBridge(t, debRoot, debSnap, mockRunner, true))
+
+	if _, err := debExec.Execute(context.Background(), HostUpdateRequest{
+		Proposal:             prop,
+		FencingGeneration:    1,
+		Packages:             []string{"openssh-server"},
+		ExpectedBaselineHash: "host-v1:tampered",
+	}); !errors.Is(err, ErrBaselineDrift) {
+		t.Fatalf("expected ErrBaselineDrift, got %v", err)
+	}
+
+	// Missing fencing_generation rejected fail-closed
+	if _, err := debExec.Execute(context.Background(), HostUpdateRequest{
+		Proposal:             prop,
+		FencingGeneration:    0,
+		Packages:             []string{"openssh-server"},
+		ExpectedBaselineHash: debBase,
+	}); !errors.Is(err, ErrBridgeBindingInvalid) {
+		t.Fatalf("expected ErrBridgeBindingInvalid on missing fencing_generation, got %v", err)
+	}
+
+	// 4. Successful upgrade via authenticated HMAC bridge + post-update SSH banner verification + audit trail
 	res, err := debExec.Execute(context.Background(), HostUpdateRequest{
 		Proposal:             prop,
+		FencingGeneration:    42,
 		Packages:             []string{"openssh-server"},
 		TargetVersions:       map[string]string{"openssh-server": "1:9.2p1-2+deb12u4"},
 		ExpectedBaselineHash: debBase,
 		SSHProbeAddr:         ln.Addr().String(),
 	})
 	if err != nil || !res.Success || !res.Verified {
-		t.Fatalf("expected successful verified host update, got res=%+v err=%v", res, err)
+		t.Fatalf("expected successful verified host update through bridge, got res=%+v err=%v", res, err)
 	}
 
-	// 4. Failed SSH verification triggers rollback & restores sshd_config
-	sshFailExec := NewHostUpdateExecutor(debRoot, t.TempDir(), ae)
+	// 5. Failed SSH verification triggers rollback through authenticated HMAC bridge & restores sshd_config
+	sshFailSnap := t.TempDir()
+	sshFailExec := NewHostUpdateExecutor(debRoot, sshFailSnap, ae)
 	sshFailBase, _, _ := sshFailExec.ComputeBaselineHash(context.Background(), []string{"openssh-server"})
-	sshFailExec.Runner = &mockHostExecRunner{
+	sshFailRunner := &mockHostExecRunner{
 		handlers: map[string]func(args []string) (string, string, error){
 			"apt-cache": func(args []string) (string, string, error) {
 				return "Candidate: 1:9.2p1-2+deb12u4\n", "", nil
@@ -501,6 +562,7 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 			},
 		},
 	}
+	sshFailExec.SetBridge(attachTestHMACBridge(t, debRoot, sshFailSnap, sshFailRunner, false))
 	rbRes, rbErr := sshFailExec.Execute(context.Background(), HostUpdateRequest{
 		Proposal:             prop,
 		Packages:             []string{"openssh-server"},
@@ -514,20 +576,23 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 		t.Fatalf("expected sshd_config to be restored on rollback, got %q", string(restoredCfg))
 	}
 
-	// 5. Proposal scope mismatch (cannot upgrade sudo using openssh-server proposal)
+	// 6. Proposal scope mismatch (cannot upgrade sudo using openssh-server proposal)
 	sudoBase, _, _ := debExec.ComputeBaselineHash(context.Background(), []string{"sudo"})
 	if _, err := debExec.Execute(context.Background(), HostUpdateRequest{
 		Proposal:             prop,
+		FencingGeneration:    43,
 		Packages:             []string{"sudo"},
 		ExpectedBaselineHash: sudoBase,
 	}); !errors.Is(err, ErrApprovalRequired) {
 		t.Fatalf("expected ErrApprovalRequired on scope mismatch, got %v", err)
 	}
 
-	// 6. Insecure [trusted=yes] apt source rejected fail-closed
+	// 7. Insecure [trusted=yes] apt source rejected fail-closed
 	insRoot := writeHostFixture(t, false)
+	insSnap := t.TempDir()
 	_ = os.WriteFile(filepath.Join(insRoot, "etc/apt/sources.list"), []byte("deb [trusted=yes] http://insecure.example/debian bookworm main\n"), 0644)
-	insExec := NewHostUpdateExecutor(insRoot, t.TempDir(), ae)
+	insExec := NewHostUpdateExecutor(insRoot, insSnap, ae)
+	insExec.SetBridge(attachTestHMACBridge(t, insRoot, insSnap, mockRunner, false))
 	insBase, _, _ := insExec.ComputeBaselineHash(context.Background(), []string{"openssh-server"})
 	if _, err := insExec.Execute(context.Background(), HostUpdateRequest{
 		Proposal:             prop,
@@ -537,9 +602,10 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 		t.Fatalf("expected ErrInsecureAptSource, got %v", err)
 	}
 
-	// 7. SSH dead-man's-switch local recovery guard triggers automatically if not disarmed
+	// 8. Persistent SSH dead-man's-switch: in-process timer AND crash-survivable ReconcileExpired across restart
 	recovered := make(chan bool, 1)
-	guard := newLocalTimerSSHGuard()
+	guardDir := t.TempDir()
+	guard := NewPersistentHostSSHGuard(guardDir, debRoot, debSnap, mockRunner, nil)
 	gID, err := guard.Arm(context.Background(), t.TempDir(), 40*time.Millisecond, func(_ context.Context) error {
 		recovered <- true
 		return nil
@@ -550,10 +616,169 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 	select {
 	case <-recovered:
 	case <-time.After(1 * time.Second):
-		t.Fatalf("expected SSH dead-man's-switch recovery guard to fire automatically")
+		t.Fatalf("expected persistent SSH dead-man's-switch recovery guard to fire automatically")
 	}
 	if err := guard.Disarm(gID); err == nil {
 		t.Fatalf("expected Disarm after guard already fired to return error")
+	}
+
+	// Crash survival test: arm guard with DisableLocalTimer=true, corrupt sshd_config,
+	// simulate process restart with a brand new PersistentHostSSHGuard instance after deadline,
+	// and verify ReconcileExpired restores sshd_config from persisted snapshot manifest!
+	crashRoot := writeHostFixture(t, false)
+	crashSnapDir := filepath.Join(t.TempDir(), "snap-crash-1")
+	backupSSH := filepath.Join(crashSnapDir, "etc/ssh/sshd_config")
+	if err := os.MkdirAll(filepath.Dir(backupSSH), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(backupSSH, []byte("Port 22\nPermitRootLogin no\nPasswordAuthentication no\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	manifestBytes, _ := json.Marshal(HostUpdateSnapshot{
+		SnapshotID:      "snap-crash-1",
+		SnapshotDir:     crashSnapDir,
+		PackageVersions: map[string]string{"openssh-server": "1:9.2p1-2+deb12u3"},
+		CopiedFiles:     map[string]string{"etc/ssh/sshd_config": backupSSH},
+	})
+	if err := os.WriteFile(filepath.Join(crashSnapDir, "manifest.json"), manifestBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	crashGuardDir := t.TempDir()
+	g1 := NewPersistentHostSSHGuard(crashGuardDir, crashRoot, filepath.Dir(crashSnapDir), mockRunner, nil)
+	g1.DisableLocalTimer = true
+	crashGuardID, err := g1.Arm(context.Background(), crashSnapDir, 30*time.Millisecond, nil)
+	if err != nil {
+		t.Fatalf("crash guard Arm failed: %v", err)
+	}
+	// Simulate failed forward update + API process death leaving corrupted sshd_config
+	if err := os.WriteFile(filepath.Join(crashRoot, "etc/ssh/sshd_config"), []byte("CORRUPTED_BEFORE_CRASH\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	// New guard instance after container/process restart reconciles expired ARMED state from disk
+	g2 := NewPersistentHostSSHGuard(crashGuardDir, crashRoot, filepath.Dir(crashSnapDir), mockRunner, nil)
+	reconciled, recErr := g2.ReconcileExpired(context.Background())
+	if recErr != nil || reconciled != 1 {
+		t.Fatalf("expected 1 recovered guard after restart, got count=%d err=%v", reconciled, recErr)
+	}
+	restoredAfterCrash, _ := os.ReadFile(filepath.Join(crashRoot, "etc/ssh/sshd_config"))
+	if strings.Contains(string(restoredAfterCrash), "CORRUPTED_BEFORE_CRASH") || !strings.Contains(string(restoredAfterCrash), "PermitRootLogin no") {
+		t.Fatalf("expected crash reconciliation to restore sshd_config, got %q", string(restoredAfterCrash))
+	}
+	if err := g2.Disarm(crashGuardID); err == nil {
+		t.Fatalf("expected Disarm on crash-recovered guard to report rollback already triggered")
+	}
+
+	// Disarm before deadline across process restart prevents spurious rollback
+	preCrashID, err := g1.Arm(context.Background(), crashSnapDir, 5*time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := g2.Disarm(preCrashID); err != nil {
+		t.Fatalf("cross-restart Disarm before deadline failed: %v", err)
+	}
+	if cnt, rErr := g2.ReconcileExpired(context.Background()); rErr != nil || cnt != 0 {
+		t.Fatalf("disarmed guard must never trigger rollback on reconcile: cnt=%d err=%v", cnt, rErr)
+	}
+}
+
+func TestRestrictedHostExecutionBridge_SecurityAndCapabilityIsolation(t *testing.T) {
+	debRoot := writeHostFixture(t, false)
+	snapRoot := t.TempDir()
+	mockRunner := &mockHostExecRunner{}
+	bridge := attachTestHMACBridge(t, debRoot, snapRoot, mockRunner, true)
+
+	validBinding := HostExecutionBinding{
+		ProposalID:        "prop-1",
+		ApprovalID:        "hmac-sha256:k1:abc",
+		OperationID:       "op-1",
+		BaselineHash:      "host-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		FencingGeneration: 7,
+	}
+
+	// 1. Untyped / arbitrary shell action rejected fail-closed
+	if _, err := bridge.ExecuteTypedAction(context.Background(), HostActionRequest{
+		Action:  HostActionType("shell.exec"),
+		Binding: validBinding,
+	}); !errors.Is(err, ErrBridgeActionRejected) {
+		t.Fatalf("expected ErrBridgeActionRejected for arbitrary action, got %v", err)
+	}
+
+	// 2. Non-whitelisted package rejected fail-closed
+	if _, err := bridge.ExecuteTypedAction(context.Background(), HostActionRequest{
+		Action:   HostActionAptUpgrade,
+		Binding:  validBinding,
+		Packages: []string{"bash"},
+	}); !errors.Is(err, ErrPackageNotWhitelisted) {
+		t.Fatalf("expected ErrPackageNotWhitelisted for bash, got %v", err)
+	}
+
+	// 3. Missing fencing generation rejected fail-closed
+	noFence := validBinding
+	noFence.FencingGeneration = 0
+	if _, err := bridge.ExecuteTypedAction(context.Background(), HostActionRequest{
+		Action:   HostActionAptUpgrade,
+		Binding:  noFence,
+		Packages: []string{"openssh-server"},
+	}); !errors.Is(err, ErrBridgeBindingInvalid) {
+		t.Fatalf("expected ErrBridgeBindingInvalid without fencing_generation, got %v", err)
+	}
+
+	// 4. Wrong HMAC key rejected by bridge server (401 -> ErrBridgeAuthenticationFailed)
+	badBridge, err := NewHMACHostExecutionBridge(HostBridgeConfig{
+		Endpoint:       bridge.cfg.Endpoint,
+		KeyID:          "bridge-test-k1",
+		HMACKey:        []byte("wrong-hmac-secret-key-at-least-32-bytes-long-0000000000000000"),
+		RequireFencing: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := badBridge.ExecuteTypedAction(context.Background(), HostActionRequest{
+		Action:   HostActionSSHDTest,
+		Binding:  validBinding,
+	}); !errors.Is(err, ErrBridgeAuthenticationFailed) {
+		t.Fatalf("expected ErrBridgeAuthenticationFailed with wrong HMAC key, got %v", err)
+	}
+
+	// 5. Tier A..D capability isolation: A (CollectAssets) succeeds read-only on fnOS and unbridged container,
+	// D (signed APPROVED proposal) succeeds, yet Tier E (Execute) still fails closed!
+	fnosRoot := writeHostFixture(t, true)
+	fnosProv := NewDefaultHostSecurityProvider(fnosRoot, filepath.Join(t.TempDir(), "missing.sock"))
+	fnosProv.Runner = &mockROCommandRunner{responses: map[string]struct {
+		out string
+		err string
+		e   error
+	}{
+		"systemctl list-units --type=service --all --no-pager --no-legend": {out: "ssh.service loaded active running OpenSSH\n"},
+		"ipset list -n":       {out: ""},
+		"ufw status verbose":  {out: "Status: inactive\n"},
+		"apt-get -s upgrade":  {out: ""},
+	}}
+	snap, err := fnosProv.CollectAssets(context.Background())
+	if err != nil || !snap.Platform.IsFnOS {
+		t.Fatalf("Tier A read-only CollectAssets must succeed on fnOS, got err=%v snap=%+v", err, snap)
+	}
+	// Tier A read-only runner refuses mutating apt-get install even if invoked directly
+	if _, _, roErr := (execReadOnlyRunner{}).Run(context.Background(), "apt-get", "install", "-y", "openssh-server"); roErr == nil {
+		t.Fatalf("execReadOnlyRunner MUST refuse mutating apt-get install")
+	}
+
+	_, ae := setupHostsecAuditDB(t)
+	defer ae.Close()
+	signedProp := makeSignedHostUpdateProposal(t, []string{"openssh-server"})
+	fnosExec := NewHostUpdateExecutor(fnosRoot, t.TempDir(), ae)
+	fnosExec.SetBridge(bridge) // even with a valid Debian bridge, fnOS detector on executor blocks Tier E!
+	fnosBase, _, _ := fnosExec.ComputeBaselineHash(context.Background(), []string{"openssh-server"})
+	if _, err := fnosExec.Execute(context.Background(), HostUpdateRequest{
+		Proposal:             signedProp,
+		FencingGeneration:    1,
+		Packages:             []string{"openssh-server"},
+		ExpectedBaselineHash: fnosBase,
+	}); !errors.Is(err, ErrFnOSUpdateUnsupported) {
+		t.Fatalf("Tier A..D MUST NOT grant Tier E on fnOS, got %v", err)
 	}
 }
 

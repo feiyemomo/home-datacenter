@@ -294,8 +294,9 @@ func TestHostRoutes_RBAC_Isolation_FnOSFailClosed_And_DebianEndToEnd(t *testing.
 		}
 	}()
 
-	hue := hostsec.NewHostUpdateExecutor(debRoot, t.TempDir(), ae)
-	hue.Runner = &stubHostExecRunner{
+	debSnapRoot := t.TempDir()
+	hue := hostsec.NewHostUpdateExecutor(debRoot, debSnapRoot, ae)
+	stubExecRunner := &stubHostExecRunner{
 		handlers: map[string]func(args []string) (string, string, error){
 			"apt-cache": func(args []string) (string, string, error) {
 				return "openssh-server:\n  Installed: 1:9.2p1-2+deb12u2\n  Candidate: 1:9.2p1-2+deb12u3\n", "", nil
@@ -311,6 +312,31 @@ func TestHostRoutes_RBAC_Isolation_FnOSFailClosed_And_DebianEndToEnd(t *testing.
 			},
 		},
 	}
+	bridgeKey := []byte("ops-route-test-bridge-hmac-secret-key-32-bytes-minimum-123456")
+	bridgeHTTPHandler, err := hostsec.NewHostBridgeHTTPHandler(hostsec.HostBridgeServerConfig{
+		HostRoot:       debRoot,
+		SnapshotRoot:   debSnapRoot,
+		KeyID:          "ops-route-k1",
+		HMACKey:        bridgeKey,
+		Runner:         stubExecRunner,
+		RequireFencing: true,
+	})
+	if err != nil {
+		t.Fatalf("NewHostBridgeHTTPHandler: %v", err)
+	}
+	bridgeSrv := httptest.NewServer(bridgeHTTPHandler)
+	defer bridgeSrv.Close()
+	authBridge, err := hostsec.NewHMACHostExecutionBridge(hostsec.HostBridgeConfig{
+		Endpoint:       bridgeSrv.URL,
+		KeyID:          "ops-route-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: true,
+	})
+	if err != nil {
+		t.Fatalf("NewHMACHostExecutionBridge: %v", err)
+	}
+	hue.RequireFencing = true
+	hue.SetBridge(authBridge)
 
 	h := NewOpsHandler(NewOnePanelClient("", "", "", ""), nil, db, bus, dm)
 	h.SetAuditEngine(ae)
@@ -496,6 +522,46 @@ func TestHostRoutes_RBAC_Isolation_FnOSFailClosed_And_DebianEndToEnd(t *testing.
 	wFnOS := doHostJSONReq(fnosRouter, http.MethodPost, "/api/v1/ops/host/update", map[string]string{"proposal_id": fnosProp.ProposalID})
 	if wFnOS.Code != http.StatusConflict || !strings.Contains(wFnOS.Body.String(), "fnOS") {
 		t.Fatalf("expected 409 Conflict fail-closed fnOS rejection, got %d: %s", wFnOS.Code, wFnOS.Body.String())
+	}
+
+	// Container / cross-namespace boundary gate: missing RestrictedHostExecutionBridge MUST return 409 Conflict
+	noBridgeHandler := NewOpsHandler(NewOnePanelClient("", "", "", ""), nil, db, bus, dm)
+	noBridgeHandler.SetAuditEngine(ae)
+	noBridgeHandler.SetHostSecurityProvider(prov)
+	noBridgeHue := hostsec.NewHostUpdateExecutor(debRoot, t.TempDir(), ae)
+	noBridgeHue.Detector.InDocker = true
+	noBridgeHandler.SetHostUpdateExecutor(noBridgeHue)
+	noBridgeProp := model.OpsProposal{
+		HouseholdID:      1,
+		ProposalID:       "prop-host-nobridge-1",
+		Title:            "Attempt host upgrade without execution bridge",
+		TargetComponent:  ComponentHostOS,
+		ActionSpec:       string(specBytes),
+		BaselineHash:     liveBaseline,
+		RiskLevel:        model.RiskLevelHigh,
+		EstimatedSeconds: 60,
+		DowntimeSeconds:  5,
+		ExecutionPlan:    "Blocked across container boundary",
+		RollbackPlan:     "none",
+		Status:           model.ProposalStatusApproved,
+		ApprovedBy:       "admin",
+		ApprovedAt:       utils.NullTime{Time: time.Now().UTC().Truncate(time.Second), Valid: true},
+		Version:          1,
+		Revision:         1,
+		CreatedAt:        time.Now().UTC(),
+	}
+	noBridgeDigest, err := model.ComputeProposalApprovalDigest(&noBridgeProp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	noBridgeProp.ApprovalDigest = noBridgeDigest
+	if err := db.Create(&noBridgeProp).Error; err != nil {
+		t.Fatal(err)
+	}
+	noBridgeRouter := makeHostRouter(noBridgeHandler, 1, true, false)
+	wNoBridge := doHostJSONReq(noBridgeRouter, http.MethodPost, "/api/v1/ops/host/update", map[string]string{"proposal_id": noBridgeProp.ProposalID})
+	if wNoBridge.Code != http.StatusConflict || !strings.Contains(wNoBridge.Body.String(), "container namespace boundary") {
+		t.Fatalf("expected 409 Conflict fail-closed container boundary rejection, got %d: %s", wNoBridge.Code, wNoBridge.Body.String())
 	}
 
 	// Execute valid signed Debian proposal end-to-end via POST /api/v1/ops/host/update

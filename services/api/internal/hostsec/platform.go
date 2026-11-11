@@ -41,26 +41,47 @@ var (
 	// ErrUnsupportedHostOS is returned fail-closed when the host OS is not a verified
 	// Debian/Ubuntu apt-dpkg environment (e.g., unknown or container Alpine rootfs).
 	ErrUnsupportedHostOS = errors.New("host package mutation blocked: unsupported or unverified host OS platform")
+
+	// ErrContainerHostExecutionBoundary is returned fail-closed when host package mutation
+	// is attempted from inside a container or across a non-root HostRoot without an
+	// authenticated RestrictedHostExecutionBridge (direct container apt-get is forbidden).
+	ErrContainerHostExecutionBoundary = errors.New("host package mutation blocked across container namespace boundary: authenticated restricted host execution bridge required")
+)
+
+// HostCapabilityTier distinguishes strictly isolated privilege tiers so read-only
+// asset inspection (A), correlation (B), proposal drafting (C), and approval (D)
+// never grant host mutation capability (E).
+type HostCapabilityTier string
+
+const (
+	CapabilityReadOnlyAssets     HostCapabilityTier = "A_READ_ONLY_ASSETS"
+	CapabilityVulnCorrelation    HostCapabilityTier = "B_VULN_CORRELATION"
+	CapabilityProposalDraft      HostCapabilityTier = "C_PROPOSAL_DRAFT"
+	CapabilityHumanApproval      HostCapabilityTier = "D_HUMAN_APPROVAL"
+	CapabilityHostUpdateMutation HostCapabilityTier = "E_HOST_UPDATE_MUTATION"
 )
 
 // PlatformInfo captures host OS identity, fnOS compatibility status, and update eligibility.
 type PlatformInfo struct {
-	OSFamily            OSFamily           `json:"os_family"`
-	DistroID            string             `json:"distro_id"`
-	DistroIDLike        string             `json:"distro_id_like,omitempty"`
-	DistroName          string             `json:"distro_name"`
-	PrettyName          string             `json:"pretty_name"`
-	VersionID           string             `json:"version_id"`
-	Codename            string             `json:"codename,omitempty"`
-	KernelVersion       string             `json:"kernel_version"`
-	KernelArch          string             `json:"kernel_arch"`
-	IsFnOS              bool               `json:"is_fnos"`
-	FnOSVersion         string             `json:"fnos_version,omitempty"`
-	PackageManager      PackageManagerKind `json:"package_manager"`
-	HostUpdateSupported bool               `json:"host_update_supported"`
-	UnsupportedReason   string             `json:"unsupported_reason,omitempty"`
-	Markers             []string           `json:"markers,omitempty"`
-	HostRoot            string             `json:"host_root"`
+	OSFamily                OSFamily           `json:"os_family"`
+	DistroID                string             `json:"distro_id"`
+	DistroIDLike            string             `json:"distro_id_like,omitempty"`
+	DistroName              string             `json:"distro_name"`
+	PrettyName              string             `json:"pretty_name"`
+	VersionID               string             `json:"version_id"`
+	Codename                string             `json:"codename,omitempty"`
+	KernelVersion           string             `json:"kernel_version"`
+	KernelArch              string             `json:"kernel_arch"`
+	IsFnOS                  bool               `json:"is_fnos"`
+	FnOSVersion             string             `json:"fnos_version,omitempty"`
+	PackageManager          PackageManagerKind `json:"package_manager"`
+	HostUpdateSupported     bool               `json:"host_update_supported"`
+	UnsupportedReason       string             `json:"unsupported_reason,omitempty"`
+	Markers                 []string           `json:"markers,omitempty"`
+	HostRoot                string             `json:"host_root"`
+	InContainer             bool               `json:"in_container"`
+	CrossNamespaceRoot      bool               `json:"cross_namespace_root"`
+	RequiresExecutionBridge bool               `json:"requires_execution_bridge"`
 }
 
 // HostUpdatePolicyError returns a fail-closed error if mutating host package/system
@@ -77,6 +98,13 @@ func (p PlatformInfo) HostUpdatePolicyError() error {
 		return fmt.Errorf("%w: %s", ErrUnsupportedHostOS, reason)
 	}
 	return nil
+}
+
+// RequiresHostExecutionBridge returns true when executing from a container namespace
+// or against an external/non-root HostRoot (e.g., /host), where local apt-get execution
+// is forbidden and an authenticated RestrictedHostExecutionBridge is mandatory.
+func (p PlatformInfo) RequiresHostExecutionBridge() bool {
+	return p.InContainer || p.CrossNamespaceRoot || p.RequiresExecutionBridge || isCrossNamespaceHostRoot(p.HostRoot)
 }
 
 // Digest returns a deterministic SHA-256 baseline hash of the platform identity.
@@ -108,6 +136,36 @@ type PlatformDetector struct {
 	InDocker bool
 }
 
+// detectInContainer returns true if the current process appears to be running
+// inside a Linux container namespace (Docker, containerd, Podman, Kubernetes, LXC).
+func detectInContainer() bool {
+	for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
+		if _, err := os.Stat(marker); err == nil {
+			return true
+		}
+	}
+	if strings.TrimSpace(os.Getenv("container")) != "" {
+		return true
+	}
+	if cgroup, err := os.ReadFile("/proc/1/cgroup"); err == nil {
+		lower := strings.ToLower(string(cgroup))
+		for _, tok := range []string{"docker", "containerd", "kubepods", "lxc", "podman"} {
+			if strings.Contains(lower, tok) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isCrossNamespaceHostRoot(hostRoot string) bool {
+	trimmed := strings.TrimSpace(hostRoot)
+	if trimmed == "" || trimmed == "/" {
+		return false
+	}
+	return filepath.ToSlash(filepath.Clean(trimmed)) != "/"
+}
+
 // NewPlatformDetector constructs a detector, defaulting HostRoot to "/host" when mounted,
 // otherwise "/".
 func NewPlatformDetector(hostRoot string) *PlatformDetector {
@@ -115,16 +173,21 @@ func NewPlatformDetector(hostRoot string) *PlatformDetector {
 	if root == "" {
 		if envRoot := strings.TrimSpace(os.Getenv("HOST_ROOT_PATH")); envRoot != "" {
 			root = envRoot
+		} else if envRoot := strings.TrimSpace(os.Getenv("HOST_ROOT")); envRoot != "" {
+			root = envRoot
 		} else if _, err := os.Stat("/host/etc/os-release"); err == nil {
 			root = "/host"
 		} else {
 			root = "/"
 		}
 	}
-	_, dockerErr := os.Stat("/.dockerenv")
+	cleanRoot := filepath.Clean(root)
+	if cleanRoot == "." || cleanRoot == "" {
+		cleanRoot = "/"
+	}
 	return &PlatformDetector{
-		HostRoot: filepath.Clean(root),
-		InDocker: dockerErr == nil,
+		HostRoot: cleanRoot,
+		InDocker: detectInContainer(),
 	}
 }
 
@@ -138,20 +201,28 @@ func (d *PlatformDetector) resolvePath(rel string) string {
 
 // Detect inspects os-release, procfs, and fnOS trim markers to classify the host OS.
 func (d *PlatformDetector) Detect(ctx context.Context) PlatformInfo {
+	inContainer := d.InDocker || detectInContainer()
+	crossNS := isCrossNamespaceHostRoot(d.HostRoot)
 	if ctx != nil && ctx.Err() != nil {
 		return PlatformInfo{
-			OSFamily:          OSFamilyUnknown,
-			PackageManager:    PkgManagerUnknown,
-			UnsupportedReason: ctx.Err().Error(),
-			HostRoot:          d.HostRoot,
+			OSFamily:                OSFamilyUnknown,
+			PackageManager:          PkgManagerUnknown,
+			UnsupportedReason:       ctx.Err().Error(),
+			HostRoot:                d.HostRoot,
+			InContainer:             inContainer,
+			CrossNamespaceRoot:      crossNS,
+			RequiresExecutionBridge: inContainer || crossNS,
 		}
 	}
 
 	info := PlatformInfo{
-		OSFamily:       OSFamilyUnknown,
-		KernelArch:     runtime.GOARCH,
-		PackageManager: PkgManagerUnknown,
-		HostRoot:       d.HostRoot,
+		OSFamily:                OSFamilyUnknown,
+		KernelArch:              runtime.GOARCH,
+		PackageManager:          PkgManagerUnknown,
+		HostRoot:                d.HostRoot,
+		InContainer:             inContainer,
+		CrossNamespaceRoot:      crossNS,
+		RequiresExecutionBridge: inContainer || crossNS,
 	}
 
 	if k, err := os.ReadFile(d.resolvePath("proc/sys/kernel/osrelease")); err == nil {

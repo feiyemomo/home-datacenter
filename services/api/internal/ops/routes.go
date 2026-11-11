@@ -851,6 +851,8 @@ func (h *OpsHandler) ExecuteHostUpdate(c *gin.Context) {
 			statusCode = http.StatusBadRequest
 		case errors.Is(err, hostsec.ErrFnOSUpdateUnsupported),
 			errors.Is(err, hostsec.ErrUnsupportedHostOS),
+			errors.Is(err, hostsec.ErrContainerHostExecutionBoundary),
+			errors.Is(err, hostsec.ErrBridgeBindingInvalid),
 			errors.Is(err, ErrBaselineMismatch),
 			errors.Is(err, hostsec.ErrBaselineDrift),
 			errors.Is(err, ErrProposalAlreadyRunning),
