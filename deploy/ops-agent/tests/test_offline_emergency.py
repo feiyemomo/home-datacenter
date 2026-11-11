@@ -39,7 +39,14 @@ class TestOfflineEmergencyRecoveryFailClosed(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self.tmp_dir.name, "app.db")
         self.mock_sock = "/tmp/nonexistent_test.sock"
         self.token = "valid-long-emergency-token-1234"
-        self.env_patcher = patch.dict(os.environ, {"EMERGENCY_OVERRIDE_TOKEN": self.token})
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "EMERGENCY_OVERRIDE_TOKEN": self.token,
+            },
+        )
         self.env_patcher.start()
 
         self.config = OpsAgentConfig(

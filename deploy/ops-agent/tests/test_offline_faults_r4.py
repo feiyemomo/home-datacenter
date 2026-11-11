@@ -43,7 +43,14 @@ class TestOfflineFaultsR4(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self.tmp_dir.name, "r4_app.db")
         self.mock_sock = os.path.join(self.tmp_dir.name, "missing.sock")
         self.token = "valid-long-emergency-token-123456789"
-        self.env_patcher = patch.dict(os.environ, {"EMERGENCY_OVERRIDE_TOKEN": self.token})
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "EMERGENCY_OVERRIDE_TOKEN": self.token,
+            },
+        )
         self.env_patcher.start()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",

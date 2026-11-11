@@ -142,7 +142,14 @@ class TestR4RestartCountFailClosed(unittest.IsolatedAsyncioTestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp_dir.name, "r4.db")
         self.sock_path = os.path.join(self.tmp_dir.name, "missing.sock")
-        self.env_patcher = patch.dict(os.environ, {"EMERGENCY_OVERRIDE_TOKEN": "valid-long-emergency-token-123456"})
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "EMERGENCY_OVERRIDE_TOKEN": "valid-long-emergency-token-123456",
+            },
+        )
         self.env_patcher.start()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
@@ -224,9 +231,23 @@ class TestR4RestartCountFailClosed(unittest.IsolatedAsyncioTestCase):
 
         os.chmod(self.db_path, stat.S_IREAD)
         self.agent._restart_docker_container = AsyncMock(return_value=True)
-        # Note: Windows chmod 0o444 prevents writing to DB file (readonly error on BEGIN IMMEDIATE)
-        self.assertFalse(self.agent._record_persisted_restart("home-web", self.db_path))
-        res = await self.agent._handle_offline_emergency_restart("home-web", 1, self.sock_path)
+        import contextlib
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            import pathlib
+            import main as ops_main
+
+            def _ro_sqlite(p, *args, **kwargs):
+                uri = f"file:{pathlib.Path(os.path.abspath(p)).as_posix()}?mode=ro"
+                return sqlite3.connect(uri, uri=True, timeout=kwargs.get("timeout", 5.0), isolation_level=None)
+
+            rw_guard = patch.object(ops_main, "open_readwrite_sqlite", side_effect=_ro_sqlite)
+        else:
+            rw_guard = contextlib.nullcontext()
+
+        # Windows / non-root chmod 0o444 blocks DB write; UID 0 containers enforce SQLite URI ?mode=ro
+        with rw_guard:
+            self.assertFalse(self.agent._record_persisted_restart("home-web", self.db_path))
+            res = await self.agent._handle_offline_emergency_restart("home-web", 1, self.sock_path)
         self.assertFalse(res)
         self.agent._restart_docker_container.assert_not_called()
 
@@ -289,6 +310,8 @@ class TestR5BaselineHashHardening(unittest.IsolatedAsyncioTestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp_dir.name, "r5.db")
         init_ops_v4_schema(self.db_path)
+        self.env_patcher = patch.dict(os.environ, {"ENVIRONMENT": "test", "APP_ENV": "test"})
+        self.env_patcher.start()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
             internal_token="t" * 32,
@@ -298,6 +321,7 @@ class TestR5BaselineHashHardening(unittest.IsolatedAsyncioTestCase):
         self.agent = HomeOpsAgent(self.config)
 
     def tearDown(self):
+        self.env_patcher.stop()
         try:
             self.tmp_dir.cleanup()
         except Exception:

@@ -202,7 +202,14 @@ class TestOfflineEmergencyWithLease(unittest.IsolatedAsyncioTestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp_dir.name, "app.db")
         self.token = "valid-emergency-override-token-32-chars"
-        self.env_patcher = patch.dict(os.environ, {"EMERGENCY_OVERRIDE_TOKEN": self.token})
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "EMERGENCY_OVERRIDE_TOKEN": self.token,
+            },
+        )
         self.env_patcher.start()
 
         self._init_healthy_db(self.db_path)

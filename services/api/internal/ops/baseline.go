@@ -139,8 +139,8 @@ func ResolveBaselineComponent(name string) string {
 }
 
 // IsRealBaselineHash reports whether baselineHash is a valid non-placeholder BaselineHash.
-// Container components require "v1:<64-hex>" (or legacy "sha256:<64-hex>"), while "host-os"
-// strictly requires "host-v1:<64-hex>" so container and host baselines never cross-validate.
+// In production (`IsProductionRuntime()`), container components strictly require "v1:<64-hex>"
+// (rejecting legacy "sha256:<64-hex>") and "host-os" strictly requires "host-v1:<64-hex>".
 func IsRealBaselineHash(baselineHash string, component string) bool {
 	trimmed := strings.TrimSpace(baselineHash)
 	if trimmed == "" {
@@ -159,12 +159,26 @@ func IsRealBaselineHash(baselineHash string, component string) bool {
 	if resolved == ComponentHostOS {
 		return hostV1BaselineHashRegex.MatchString(trimmed)
 	}
+	if IsProductionRuntime() {
+		return v1BaselineHashRegex.MatchString(trimmed)
+	}
 	return v1BaselineHashRegex.MatchString(trimmed) || legacySHA256HashRegex.MatchString(trimmed)
 }
 
-// IsRealBaselineHashV1 strictly requires Baseline Protocol v1 ("v1:<64-hex>") and non-placeholder status.
+// IsRealBaselineHashV1 strictly requires Baseline Protocol v1 ("v1:<64-hex>" for containers,
+// or "host-v1:<64-hex>" for "host-os") and non-placeholder status.
 func IsRealBaselineHashV1(baselineHash string, component string) bool {
 	trimmed := strings.TrimSpace(baselineHash)
+	resolved := ResolveBaselineComponent(component)
+	if resolved == "" {
+		resolved = model.CanonicalizeComponent(component)
+	}
+	if resolved == ComponentHostOS {
+		if !hostV1BaselineHashRegex.MatchString(trimmed) {
+			return false
+		}
+		return IsRealBaselineHash(trimmed, component)
+	}
 	if !v1BaselineHashRegex.MatchString(trimmed) {
 		return false
 	}

@@ -342,10 +342,10 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		})
 		return
 	}
-	if IsProductionRuntime() && IsOfflinePlaceholderBaseline(proposal.TargetComponent, proposal.BaselineHash) {
+	if IsProductionRuntime() && (!IsRealBaselineHash(proposal.BaselineHash, proposal.TargetComponent) || IsOfflinePlaceholderBaseline(proposal.TargetComponent, proposal.BaselineHash)) {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":         ErrBaselineMismatch.Error(),
-			"message":       "生产/严格模式下禁止使用离线占位基线指纹通过审批",
+			"message":       "生产/严格模式下禁止使用非 v1 或离线占位基线指纹通过审批",
 			"baseline_hash": proposal.BaselineHash,
 		})
 		return
@@ -493,6 +493,19 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 				res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
 				if err != nil {
 					log.Printf("[ops] synchronous proposal %s execution failed: %v", proposal.ProposalID, err)
+					if errors.Is(err, ErrProposalNotExecutable) ||
+						errors.Is(err, ErrProposalAlreadyRunning) ||
+						errors.Is(err, ErrProposalCASConflict) {
+						var authProp model.OpsProposal
+						_ = h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&authProp).Error
+						c.JSON(http.StatusConflict, gin.H{
+							"error":         err.Error(),
+							"message":       "审批后执行竞争失败：提案状态已由其他请求并发变更",
+							"actual_status": authProp.Status,
+							"proposal":      authProp,
+						})
+						return
+					}
 				} else if res != nil {
 					log.Printf("[ops] synchronous proposal %s execution succeeded: %s", proposal.ProposalID, res.Output)
 				}

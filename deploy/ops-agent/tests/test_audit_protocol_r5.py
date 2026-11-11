@@ -40,14 +40,22 @@ class TestAuditProtocolR5(unittest.IsolatedAsyncioTestCase):
         self.archive_dir = os.path.join(self.tmp_dir.name, "archive")
         init_ops_v5_schema(self.db_path)
 
-        os.environ["OPS_AUDIT_HMAC_KEY_ID"] = "k1"
-        os.environ["OPS_AUDIT_HMAC_KEY"] = "super-secret-audit-signing-key-32bytes-minimum-test"
-        os.environ["OPS_AUDIT_HMAC_KEYS"] = (
-            "k1:super-secret-audit-signing-key-32bytes-minimum-test,"
-            "k2:rotated-secret-audit-signing-key-32bytes-test-v2"
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "OPS_AUDIT_HMAC_KEY_ID": "k1",
+                "OPS_AUDIT_HMAC_KEY": "super-secret-audit-signing-key-32bytes-minimum-test",
+                "OPS_AUDIT_HMAC_KEYS": (
+                    "k1:super-secret-audit-signing-key-32bytes-minimum-test,"
+                    "k2:rotated-secret-audit-signing-key-32bytes-test-v2"
+                ),
+                "OPS_AUDIT_ARCHIVE_DIR": self.archive_dir,
+                "EMERGENCY_OVERRIDE_TOKEN": "emergency-override-strong-secret-token-32bytes",
+            },
         )
-        os.environ["OPS_AUDIT_ARCHIVE_DIR"] = self.archive_dir
-        os.environ["EMERGENCY_OVERRIDE_TOKEN"] = "emergency-override-strong-secret-token-32bytes"
+        self.env_patcher.start()
 
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
@@ -59,6 +67,7 @@ class TestAuditProtocolR5(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         import gc
         gc.collect()
+        self.env_patcher.stop()
         for key in (
             "OPS_AUDIT_HMAC_KEY_ID",
             "OPS_AUDIT_HMAC_KEY",

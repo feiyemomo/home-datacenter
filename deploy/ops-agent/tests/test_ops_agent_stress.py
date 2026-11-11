@@ -15,6 +15,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 # Add deploy/ops-agent to path
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -170,11 +171,14 @@ class TestProposalRollbackAndMaintenanceWindow(unittest.TestCase):
     """Stress tests human approval requirements and low-peak execution."""
 
     def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {"ENVIRONMENT": "test", "APP_ENV": "test"})
+        self.env_patcher.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "proposals_test.db")
         self.mgr = ProposalLifecycleManager(self.db_path)
 
     def tearDown(self):
+        self.env_patcher.stop()
         self.temp_dir.cleanup()
 
     def test_unapproved_proposal_cannot_execute(self):

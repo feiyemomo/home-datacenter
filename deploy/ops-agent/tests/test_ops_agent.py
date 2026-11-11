@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 # Ensure deploy/ops-agent is on path
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -136,11 +137,14 @@ class TestProposalLifecycleManager(unittest.TestCase):
     """Tests the Human-in-the-Loop proposal lifecycle."""
 
     def setUp(self):
+        self.env_patcher = patch.dict(os.environ, {"ENVIRONMENT": "test", "APP_ENV": "test"})
+        self.env_patcher.start()
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "test_app.db")
         self.mgr = ProposalLifecycleManager(self.db_path)
 
     def tearDown(self):
+        self.env_patcher.stop()
         self.temp_dir.cleanup()
 
     def test_proposal_lifecycle_workflow(self):

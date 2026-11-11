@@ -72,10 +72,18 @@ class TestPhase2BaselineAndDockerR5R8(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self.tmp_dir.name, "r5r8.db")
         init_ops_v5_schema(self.db_path)
         self.archive_dir = os.path.join(self.tmp_dir.name, "archive")
-        os.environ["OPS_AUDIT_HMAC_KEY_ID"] = "k1"
-        os.environ["OPS_AUDIT_HMAC_KEY"] = "super-secret-audit-signing-key-32bytes-minimum-test"
-        os.environ["OPS_AUDIT_ARCHIVE_DIR"] = self.archive_dir
-        os.environ["EMERGENCY_OVERRIDE_TOKEN"] = "emergency-override-strong-secret-token-32bytes"
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "OPS_AUDIT_HMAC_KEY_ID": "k1",
+                "OPS_AUDIT_HMAC_KEY": "super-secret-audit-signing-key-32bytes-minimum-test",
+                "OPS_AUDIT_ARCHIVE_DIR": self.archive_dir,
+                "EMERGENCY_OVERRIDE_TOKEN": "emergency-override-strong-secret-token-32bytes",
+            },
+        )
+        self.env_patcher.start()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
             internal_token="t" * 32,
@@ -85,8 +93,7 @@ class TestPhase2BaselineAndDockerR5R8(unittest.IsolatedAsyncioTestCase):
         self.agent = HomeOpsAgent(self.config)
 
     def tearDown(self):
-        for k in ("OPS_AUDIT_HMAC_KEY_ID", "OPS_AUDIT_HMAC_KEY", "OPS_AUDIT_ARCHIVE_DIR", "EMERGENCY_OVERRIDE_TOKEN"):
-            os.environ.pop(k, None)
+        self.env_patcher.stop()
         try:
             self.tmp_dir.cleanup()
         except Exception:
@@ -234,11 +241,19 @@ class TestPhase2LeaseGuardAndAuditR6R7(unittest.IsolatedAsyncioTestCase):
         self.db_path = os.path.join(self.tmp_dir.name, "r6r7.db")
         init_ops_v5_schema(self.db_path)
         self.archive_dir = os.path.join(self.tmp_dir.name, "archive")
-        os.environ["OPS_AUDIT_HMAC_KEY_ID"] = "k1"
-        os.environ["OPS_AUDIT_HMAC_KEY"] = "super-secret-audit-signing-key-32bytes-minimum-test"
-        os.environ["OPS_AUDIT_HMAC_KEYS"] = "k1:super-secret-audit-signing-key-32bytes-minimum-test"
-        os.environ["OPS_AUDIT_ARCHIVE_DIR"] = self.archive_dir
-        os.environ["EMERGENCY_OVERRIDE_TOKEN"] = "emergency-override-strong-secret-token-32bytes"
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "ENVIRONMENT": "test",
+                "APP_ENV": "test",
+                "OPS_AUDIT_HMAC_KEY_ID": "k1",
+                "OPS_AUDIT_HMAC_KEY": "super-secret-audit-signing-key-32bytes-minimum-test",
+                "OPS_AUDIT_HMAC_KEYS": "k1:super-secret-audit-signing-key-32bytes-minimum-test",
+                "OPS_AUDIT_ARCHIVE_DIR": self.archive_dir,
+                "EMERGENCY_OVERRIDE_TOKEN": "emergency-override-strong-secret-token-32bytes",
+            },
+        )
+        self.env_patcher.start()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
             internal_token="t" * 32,
@@ -247,6 +262,7 @@ class TestPhase2LeaseGuardAndAuditR6R7(unittest.IsolatedAsyncioTestCase):
         self.agent = HomeOpsAgent(self.config)
 
     def tearDown(self):
+        self.env_patcher.stop()
         for k in (
             "OPS_AUDIT_HMAC_KEY_ID",
             "OPS_AUDIT_HMAC_KEY",

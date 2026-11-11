@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -607,7 +608,8 @@ const SQLiteMagicHeader = "SQLite format 3\x00"
 
 // CleanSnapshotComponentName sanitizes a component name, enforcing whitelist characters and max 32 bytes length.
 func CleanSnapshotComponentName(raw string) (string, error) {
-	base := filepath.Base(strings.TrimSpace(raw))
+	normalized := strings.ReplaceAll(strings.TrimSpace(raw), "\\", "/")
+	base := path.Base(normalized)
 	if base == "." || base == "/" || base == "\\" || base == "" {
 		return "", fmt.Errorf("invalid component name %q: empty or directory root", raw)
 	}

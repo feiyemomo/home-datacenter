@@ -508,3 +508,134 @@ func TestR7_RoutesPreExecAuditBlocksMutation(t *testing.T) {
 		t.Fatalf("maintenance lock must NOT be acquired when pre-exec audit fails")
 	}
 }
+
+func TestR5_ProductionRejectsLegacySHA256Baseline(t *testing.T) {
+	legacyHash := "sha256:" + strings.Repeat("a", 64)
+	v1Hash := "v1:" + strings.Repeat("b", 64)
+	hostV1Hash := "host-v1:" + strings.Repeat("c", 64)
+
+	// Non-prod retains backward compatibility for legacy sha256 container fixtures
+	if !IsRealBaselineHash(legacyHash, "home-web") {
+		t.Fatalf("expected non-prod IsRealBaselineHash to remain backward-compatible for legacy sha256")
+	}
+	if IsRealBaselineHash(legacyHash, ComponentHostOS) {
+		t.Fatalf("expected host-os to reject sha256 even in non-prod")
+	}
+	if !IsRealBaselineHashV1(hostV1Hash, ComponentHostOS) {
+		t.Fatalf("expected host-v1 to satisfy IsRealBaselineHashV1 for host-os")
+	}
+
+	// Production strictly requires v1:<64hex> (containers) or host-v1:<64hex> (host-os)
+	t.Setenv("OPS_STRICT_BASELINE", "1")
+	if IsRealBaselineHash(legacyHash, "home-web") {
+		t.Fatalf("production runtime must reject legacy sha256 baseline format")
+	}
+	if !IsRealBaselineHash(v1Hash, "home-web") {
+		t.Fatalf("production runtime must accept valid v1 container baseline")
+	}
+	if !IsRealBaselineHash(hostV1Hash, ComponentHostOS) {
+		t.Fatalf("production runtime must accept valid host-v1 baseline for host-os")
+	}
+
+	db := newPhase2TestDB(t)
+	exec := NewOperationExecutor(
+		db, nil, nil, nil,
+		WithBaselineExtractor(func(target string) string { return legacyHash }),
+		WithDockerRunner(func(ctx context.Context, action, container string, params map[string]interface{}) (string, error) {
+			t.Fatalf("dockerRunner must not execute with legacy sha256 baseline in production")
+			return "", nil
+		}),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+	if _, err := exec.Execute(context.Background(), OperationSpec{
+		Action:       ActionDockerRestart,
+		Target:       "home-web",
+		BaselineHash: legacyHash,
+	}); !errors.Is(err, ErrBaselineMismatch) {
+		t.Fatalf("expected ErrBaselineMismatch on Execute with legacy sha256 in production, got %v", err)
+	}
+
+	prop := &model.OpsProposal{
+		ProposalID:      "prop-r11-legacy-sha256",
+		Title:           "Legacy sha256 proposal",
+		TargetComponent: "home-web",
+		ExecutionPlan:   "docker restart home-web",
+		RollbackPlan:    "none",
+		Status:          model.ProposalStatusApproved,
+		BaselineHash:    legacyHash,
+		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
+	}
+	seedTestSignedProposal(t, db, prop)
+	if _, err := exec.ExecuteProposal(context.Background(), prop); !errors.Is(err, ErrBaselineMismatch) {
+		t.Fatalf("expected ErrBaselineMismatch on ExecuteProposal with legacy sha256 in production, got %v", err)
+	}
+
+	gin.SetMode(gin.TestMode)
+	pendingProp := &model.OpsProposal{
+		ProposalID:      "prop-r11-pending-legacy",
+		Title:           "Pending legacy sha256 proposal",
+		TargetComponent: "home-web",
+		ExecutionPlan:   "docker restart home-web",
+		RollbackPlan:    "none",
+		Status:          model.ProposalStatusPending,
+		BaselineHash:    legacyHash,
+		ActionSpec:      `{"action":"docker.restart","target":"home-web"}`,
+	}
+	seedTestSignedProposal(t, db, pendingProp)
+	h := NewOpsHandler(nil, nil, db, nil, nil)
+	h.SetExecutor(exec)
+	router := gin.New()
+	router.POST("/api/v1/ops/proposals/:id/approve", func(c *gin.Context) {
+		c.Set("is_admin", true)
+		c.Set("username", "admin")
+		h.ApproveProposal(c)
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/ops/proposals/prop-r11-pending-legacy/approve", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("expected HTTP 409 rejecting legacy sha256 approval in production, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestR10_NewStrictOpsHandler_FailClosedOnInvalidAuditConfig(t *testing.T) {
+	prevFSM := GetGlobalRecoveryFSM()
+	SetGlobalRecoveryFSM(nil)
+	t.Cleanup(func() { SetGlobalRecoveryFSM(prevFSM) })
+
+	db := newPhase2TestDB(t)
+
+	// 1. Invalid remote store type must fail closed
+	t.Setenv("OPS_AUDIT_REMOTE_TYPE", "bogus-remote")
+	if _, err := NewStrictOpsHandler(nil, nil, db, nil, nil, audit.WithArchiveDir(t.TempDir())); !errors.Is(err, audit.ErrAuditConfigInvalid) {
+		t.Fatalf("expected ErrAuditConfigInvalid for bogus remote type, got %v", err)
+	}
+	t.Setenv("OPS_AUDIT_REMOTE_TYPE", "")
+
+	// 2. Invalid checkpoint period must fail closed
+	t.Setenv("OPS_AUDIT_CHECKPOINT_PERIOD_SEC", "0")
+	if _, err := NewStrictOpsHandler(nil, nil, db, nil, nil, audit.WithArchiveDir(t.TempDir())); !errors.Is(err, audit.ErrAuditConfigInvalid) {
+		t.Fatalf("expected ErrAuditConfigInvalid for zero checkpoint period, got %v", err)
+	}
+	t.Setenv("OPS_AUDIT_CHECKPOINT_PERIOD_SEC", "")
+
+	// 3. Strict remote enabled without configured remote store must fail closed
+	t.Setenv("OPS_AUDIT_STRICT_REMOTE", "1")
+	if _, err := NewStrictOpsHandler(nil, nil, db, nil, nil, audit.WithArchiveDir(t.TempDir())); !errors.Is(err, audit.ErrAuditRemoteRequired) {
+		t.Fatalf("expected ErrAuditRemoteRequired when strict remote enabled without store, got %v", err)
+	}
+	t.Setenv("OPS_AUDIT_STRICT_REMOTE", "")
+
+	// 4. Valid local-only strict construction binds a single shared AgentAuditEngine cleanly
+	h, err := NewStrictOpsHandler(nil, nil, db, nil, nil, audit.WithArchiveDir(t.TempDir()))
+	if err != nil {
+		t.Fatalf("expected valid local-only NewStrictOpsHandler, got %v", err)
+	}
+	t.Cleanup(func() { h.getAuditEngine().Close() })
+
+	execAE := h.GetExecutor().(*DefaultOperationExecutor).GetAuditEngine()
+	if execAE == nil || execAE != h.getAuditEngine() {
+		t.Fatalf("expected NewStrictOpsHandler to bind the exact single AgentAuditEngine to executor")
+	}
+}

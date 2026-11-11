@@ -192,10 +192,18 @@ def is_placeholder_baseline_hash(baseline_hash: str, component: str = "") -> boo
 
 
 def is_real_baseline_hash(baseline_hash: str, component: str = "") -> bool:
-    """Returns True ONLY if baseline_hash is a valid real resource fingerprint (v1:<hex> or legacy sha256:<hex>)."""
+    """
+    Returns True ONLY if baseline_hash is a valid real resource fingerprint.
+    In production (is_production_env() or OPS_STRICT_BASELINE=1), strictly requires
+    Baseline Protocol v1 ('v1:<64-hex>') and rejects legacy 'sha256:<hex>' formats.
+    """
     if component and not resolve_canonical_component(component):
         return False
-    return not is_placeholder_baseline_hash(baseline_hash, component)
+    if is_placeholder_baseline_hash(baseline_hash, component):
+        return False
+    if is_production_env() or os.environ.get("OPS_STRICT_BASELINE", "") == "1":
+        return bool(_V1_BASELINE_HASH_RE.match((baseline_hash or "").strip()))
+    return True
 
 
 def is_real_baseline_hash_v1(baseline_hash: str, component: str = "") -> bool:

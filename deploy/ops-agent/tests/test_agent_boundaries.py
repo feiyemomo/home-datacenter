@@ -36,6 +36,8 @@ class TestAgentBoundaries(unittest.IsolatedAsyncioTestCase):
         self.tmp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.tmp_dir.name, "test_app.db")
         init_ops_v4_schema(self.db_path)
+        self.env_patcher = patch.dict(os.environ, {"ENVIRONMENT": "test", "APP_ENV": "test"})
+        self.env_patcher.start()
         self.config = OpsAgentConfig(
             api_base_url="http://127.0.0.1:8080",
             internal_token="test-internal-token-32-chars-long",
@@ -46,6 +48,7 @@ class TestAgentBoundaries(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         import gc
         gc.collect()
+        self.env_patcher.stop()
         try:
             self.tmp_dir.cleanup()
         except Exception:

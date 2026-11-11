@@ -189,7 +189,7 @@ func TestRound3_CircuitBreaker_PersistenceAndHalfOpen(t *testing.T) {
 
 	fsm1 := NewContainerRecoveryFSM(db, nil, nil)
 	cb1 := fsm1.GetCircuitBreaker()
-	cb1.cooldownDuration = 100 * time.Millisecond
+	cb1.cooldownDuration = 600 * time.Millisecond
 
 	// Record 3 crashes to trip circuit breaker
 	cb1.RecordCrash("home-web")
@@ -202,7 +202,7 @@ func TestRound3_CircuitBreaker_PersistenceAndHalfOpen(t *testing.T) {
 	// Spin up fresh FSM instance to test persistent state
 	fsm2 := NewContainerRecoveryFSM(db, nil, nil)
 	cb2 := fsm2.GetCircuitBreaker()
-	cb2.cooldownDuration = 100 * time.Millisecond
+	cb2.cooldownDuration = 600 * time.Millisecond
 
 	if cb2.GetState("home-web") != CircuitOpen {
 		t.Fatalf("expected persisted circuit breaker state OPEN in fsm2, got: %s", cb2.GetState("home-web"))
@@ -215,7 +215,7 @@ func TestRound3_CircuitBreaker_PersistenceAndHalfOpen(t *testing.T) {
 	}
 
 	// Wait for cooldown to elapse
-	time.Sleep(120 * time.Millisecond)
+	time.Sleep(700 * time.Millisecond)
 
 	// In HALF_OPEN: First probe allowed
 	canRecover, ticket, err := cb2.CanAttemptRecovery("home-web")
