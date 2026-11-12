@@ -11,6 +11,9 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"home-datacenter-api/internal/audit"
+	"home-datacenter-api/internal/model"
 )
 
 const (
@@ -62,6 +65,7 @@ type PersistentHostSSHGuard struct {
 	Runner                   HostExecRunner
 	Bridge                   RestrictedHostExecutionBridge
 	ExternalWatchdog         ExternalWatchdogBackend
+	AuditEngine              *audit.AgentAuditEngine
 	DelegateWatchdogToBridge bool
 	DisableLocalTimer        bool // test hook to simulate immediate API crash after Arm
 	FallbackRecoverFn        func(ctx context.Context, state PersistentSSHGuardState) error
@@ -486,6 +490,48 @@ func (g *PersistentHostSSHGuard) ReconcileExpired(ctx context.Context) (int, err
 		}
 		recoveredCount++
 	}
+
+	// Reconcile and backfill audit events for guards recovered out-of-process while API was offline
+	if g.AuditEngine != nil {
+		for _, ent := range entries {
+			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") || strings.HasSuffix(ent.Name(), ".tmp") {
+				continue
+			}
+			guardID := strings.TrimSuffix(ent.Name(), ".json")
+			st, rErr := g.readState(guardID)
+			if rErr != nil {
+				continue
+			}
+			if st.Status == SSHGuardStatusRecovered || st.Status == SSHGuardStatusRecoveryFailed {
+				syncPath := filepath.Join(g.GuardDir, guardID+".audit_synced")
+				if _, statErr := os.Stat(syncPath); os.IsNotExist(statErr) {
+					eventType := model.AuditEventRollbackCompleted
+					result := "WATCHDOG_RECOVERED"
+					if st.Status == SSHGuardStatusRecoveryFailed {
+						eventType = model.AuditEventRollbackFailed
+						result = "WATCHDOG_RECOVERY_FAILED"
+					}
+					if _, emitErr := g.AuditEngine.EmitEvent(ctx, audit.EmitEventInput{
+						EventType:         eventType,
+						Action:            "host.ssh_watchdog.reconcile",
+						Target:            guardID,
+						Component:         "host-ssh-watchdog",
+						RiskLevel:         model.AuditRiskCritical,
+						ProposalID:        st.ProposalID,
+						ApprovalID:        st.ApprovalID,
+						OperationID:       st.OperationID,
+						FencingGeneration: st.FencingGeneration,
+						Result:            result,
+						DecisionReason:    "offline watchdog recovery reconciled into audit engine",
+						ErrorCode:         st.LastError,
+					}); emitErr == nil {
+						_ = writeFileAtomicFailClosed(syncPath, []byte(now.Format(time.RFC3339Nano)), 0600)
+					}
+				}
+			}
+		}
+	}
+
 	if len(errs) > 0 {
 		return recoveredCount, errors.New(strings.Join(errs, "; "))
 	}
@@ -552,6 +598,30 @@ func (g *PersistentHostSSHGuard) triggerRecovery(ctx context.Context, guardID st
 	}
 	if uErr2 != nil {
 		return uErr2
+	}
+	if g.AuditEngine != nil {
+		eventType := model.AuditEventRollbackCompleted
+		result := "WATCHDOG_RECOVERED"
+		if recErr != nil {
+			eventType = model.AuditEventRollbackFailed
+			result = "WATCHDOG_RECOVERY_FAILED"
+		}
+		if _, emitErr := g.AuditEngine.EmitEvent(ctx, audit.EmitEventInput{
+			EventType:         eventType,
+			Action:            "host.ssh_watchdog.recovery",
+			Target:            guardID,
+			Component:         "host-ssh-watchdog",
+			RiskLevel:         model.AuditRiskCritical,
+			ProposalID:        latest.ProposalID,
+			ApprovalID:        latest.ApprovalID,
+			OperationID:       latest.OperationID,
+			FencingGeneration: latest.FencingGeneration,
+			Result:            result,
+			DecisionReason:    "ssh recovery watchdog executed snapshot restore",
+			ErrorCode:         latest.LastError,
+		}); emitErr == nil {
+			_ = writeFileAtomicFailClosed(filepath.Join(g.GuardDir, guardID+".audit_synced"), []byte(now.Format(time.RFC3339Nano)), 0600)
+		}
 	}
 	return recErr
 }

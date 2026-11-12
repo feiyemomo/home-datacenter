@@ -322,6 +322,11 @@ func NewHMACHostExecutionBridge(cfg HostBridgeConfig) (*HMACHostExecutionBridge,
 	}, nil
 }
 
+func isRequireGrantDefaultTrue() bool {
+	env := strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_GRANT"))
+	return env != "0" && !strings.EqualFold(env, "false")
+}
+
 // NewHMACHostExecutionBridgeFromEnv constructs an authenticated bridge if configured in env,
 // otherwise returns nil so containerized mutations fail closed with ErrContainerHostExecutionBoundary.
 func NewHMACHostExecutionBridgeFromEnv() *HMACHostExecutionBridge {
@@ -350,7 +355,7 @@ func NewHMACHostExecutionBridgeFromEnv() *HMACHostExecutionBridge {
 		KeyID:          keyID,
 		HMACKey:        key,
 		RequireFencing: strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_FENCING")) == "1",
-		RequireGrant:   strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_GRANT")) == "1",
+		RequireGrant:   isRequireGrantDefaultTrue(),
 	})
 	if err != nil {
 		return nil

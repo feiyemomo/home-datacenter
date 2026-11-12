@@ -204,13 +204,17 @@ func NewHostUpdateExecutor(hostRoot, snapshotRoot string, auditEngine *audit.Age
 		bridge = envBridge
 	}
 	grantAuth, grantErr := NewHostGrantAuthorityFromEnv()
-	reqGrant := strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_GRANT")) == "1" || (bridge != nil && bridge.BridgeInfo().RequireGrant)
+	reqGrant := (bridge != nil && bridge.BridgeInfo().RequireGrant)
+	if envRG := strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_GRANT")); envRG != "" {
+		reqGrant = envRG != "0" && !strings.EqualFold(envRG, "false")
+	}
 	guardDir := strings.TrimSpace(os.Getenv("HOST_SSH_WATCHDOG_DIR"))
 	if guardDir == "" {
 		guardDir = filepath.Join(snapshotRoot, "ssh-watchdog")
 	}
 	runner := realHostExecRunner{}
 	sshGuard := NewPersistentHostSSHGuard(guardDir, detector.HostRoot, snapshotRoot, runner, bridge)
+	sshGuard.AuditEngine = auditEngine
 	if bridge != nil && (detectInContainer() || strings.TrimSpace(os.Getenv("HOST_SSH_WATCHDOG_DELEGATE")) == "1") {
 		sshGuard.DelegateWatchdogToBridge = true
 	}
@@ -234,8 +238,8 @@ func NewHostUpdateExecutor(hostRoot, snapshotRoot string, auditEngine *audit.Age
 // SetBridge configures the authenticated RestrictedHostExecutionBridge and updates SSHGuard.
 func (e *HostUpdateExecutor) SetBridge(bridge RestrictedHostExecutionBridge) {
 	e.Bridge = bridge
-	if bridge != nil && bridge.BridgeInfo().RequireGrant {
-		e.RequireExecutionGrant = true
+	if bridge != nil {
+		e.RequireExecutionGrant = bridge.BridgeInfo().RequireGrant
 	}
 	if pg, ok := e.SSHGuard.(*PersistentHostSSHGuard); ok && pg != nil {
 		pg.Bridge = bridge
@@ -569,6 +573,9 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 		HouseholdID:       hhID,
 		ActorID:           actorID,
 	}
+	if authErr := e.AuthorizeMutation(execCtx, platform, binding); authErr != nil {
+		return failAudit("AUTHORIZATION_BOUNDARY_DENIED", authErr)
+	}
 	if e.grantConfigErr != nil {
 		return failAudit("GRANT_CONFIG_ERROR", e.grantConfigErr)
 	}
@@ -605,9 +612,6 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 				}
 			}
 		}
-	}
-	if authErr := e.AuthorizeMutation(execCtx, platform, binding); authErr != nil {
-		return failAudit("AUTHORIZATION_BOUNDARY_DENIED", authErr)
 	}
 
 	// 6. Repository source & GPG signature policy verification

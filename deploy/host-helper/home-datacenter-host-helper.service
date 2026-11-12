@@ -1,0 +1,38 @@
+[Unit]
+Description=Home Datacenter Privileged Host Execution Helper (Fail-Closed Bridge)
+Documentation=https://github.com/feiyemomo/home-datacenter
+After=network.target local-fs.target
+ConditionPathExists=/usr/local/bin/home-datacenter-host-helper
+
+[Service]
+Type=simple
+User=root
+Group=root
+
+# Secure runtime directory created with mode 0750 on tmpfs
+RuntimeDirectory=home-datacenter
+RuntimeDirectoryMode=0750
+
+# Minimum privilege and kernel namespace protections
+ProtectSystem=strict
+ReadWritePaths=/run/home-datacenter /var/lib/home-datacenter/snapshots /etc/ssh
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_KILL
+
+# Secrets passed via systemd environment or credentials file
+EnvironmentFile=-/etc/home-datacenter/host-helper.env
+
+ExecStart=/usr/local/bin/home-datacenter-host-helper \
+    -socket /run/home-datacenter/host-bridge.sock \
+    -snapshot-root /var/lib/home-datacenter/snapshots \
+    -require-grant=true \
+    -require-fencing=true
+
+Restart=always
+RestartSec=3s
+KillMode=process
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -57,6 +57,10 @@ jobs:
         working-directory: services/api
         run: go build ./internal/... ./cmd/...
 
+      - name: Verify host-helper binary build
+        working-directory: services/api
+        run: go build -v ./cmd/host-helper
+
       - name: Cross-compile Linux amd64 binary (on Windows)
         if: runner.os == 'Windows'
         shell: pwsh

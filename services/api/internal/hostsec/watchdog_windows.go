@@ -124,7 +124,7 @@ Move-Item -LiteralPath $tmp -Destination $stateFile -Force
 	go func() {
 		_ = cmd.Wait()
 	}()
-	return fmt.Sprintf("pid:%d", pid), nil
+	return fmt.Sprintf("pid:%d:%s", pid, guardID), nil
 }
 
 func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName string) error {
@@ -132,9 +132,17 @@ func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName stri
 	if u == "" || !strings.HasPrefix(u, "pid:") {
 		return nil
 	}
-	pid, err := strconv.Atoi(strings.TrimPrefix(u, "pid:"))
+	parts := strings.Split(strings.TrimPrefix(u, "pid:"), ":")
+	pid, err := strconv.Atoi(parts[0])
 	if err != nil || pid <= 0 {
 		return fmt.Errorf("invalid detached watchdog unit %q", unitName)
+	}
+	guardID := ""
+	if len(parts) > 1 {
+		guardID = parts[1]
+	}
+	if isProcessRecycledOrDead(pid, guardID) {
+		return nil
 	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
@@ -144,4 +152,17 @@ func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName stri
 		return nil
 	}
 	return nil
+}
+
+func isProcessRecycledOrDead(pid int, guardID string) bool {
+	if pid <= 0 {
+		return true
+	}
+	const processQueryLimitedInfo = 0x1000
+	h, err := syscall.OpenProcess(processQueryLimitedInfo, false, uint32(pid))
+	if err != nil {
+		return true // process does not exist or exited
+	}
+	_ = syscall.CloseHandle(h)
+	return false
 }

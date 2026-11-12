@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"flag"
 	"log"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,16 +21,19 @@ import (
 
 func main() {
 	var (
-		listenAddr   = flag.String("listen", "", "TCP listen address (e.g., 127.0.0.1:8088)")
-		socketPath   = flag.String("socket", "", "UNIX domain socket path (e.g., /run/home-datacenter/host-bridge.sock)")
-		hostRoot     = flag.String("host-root", "/", "Host root filesystem path")
-		snapshotRoot = flag.String("snapshot-root", "/var/lib/home-datacenter/snapshots", "Snapshot storage root directory")
-		keyID        = flag.String("key-id", "bridge-default-key", "HMAC Key ID")
-		hmacKeyHex   = flag.String("hmac-key-hex", "", "Hex-encoded Bridge HMAC Key (min 32 bytes)")
-		grantKeyID   = flag.String("grant-key-id", "", "Grant Authority Key ID")
-		grantKeyHex  = flag.String("grant-hmac-key-hex", "", "Hex-encoded Grant HMAC Key (independent from bridge key)")
-		requireGrant = flag.Bool("require-grant", false, "Require cryptographically signed HostExecutionGrant for mutating operations")
-		requireFence = flag.Bool("require-fencing", true, "Require strictly monotonic fencing generation")
+		listenAddr     = flag.String("listen", "", "TCP listen address (e.g., 127.0.0.1:8088)")
+		socketPath     = flag.String("socket", "", "UNIX domain socket path (e.g., /run/home-datacenter/host-bridge.sock)")
+		socketUID      = flag.Int("socket-uid", -1, "Socket owner UID (-1 to leave unchanged)")
+		socketGID      = flag.Int("socket-gid", -1, "Socket owner GID (-1 to leave unchanged)")
+		hostRoot       = flag.String("host-root", "/", "Host root filesystem path")
+		snapshotRoot   = flag.String("snapshot-root", "/var/lib/home-datacenter/snapshots", "Snapshot storage root directory")
+		keyID          = flag.String("key-id", "bridge-default-key", "HMAC Key ID")
+		hmacKeyHex     = flag.String("hmac-key-hex", "", "Hex-encoded Bridge HMAC Key (min 32 bytes)")
+		grantKeyID     = flag.String("grant-key-id", "", "Grant Authority Key ID")
+		grantKeyHex    = flag.String("grant-hmac-key-hex", "", "Hex-encoded Grant HMAC Key (independent from bridge key)")
+		grantPubKeyHex = flag.String("grant-public-key-hex", "", "Hex-encoded Ed25519 Public Key for grant verification (asymmetric mode)")
+		requireGrant   = flag.Bool("require-grant", true, "Require cryptographically signed HostExecutionGrant for mutating operations (fail-closed)")
+		requireFence   = flag.Bool("require-fencing", true, "Require strictly monotonic fencing generation")
 	)
 	flag.Parse()
 
@@ -52,11 +57,28 @@ func main() {
 	if *grantKeyHex == "" {
 		*grantKeyHex = strings.TrimSpace(os.Getenv("OPS_HOST_GRANT_HMAC_KEY"))
 	}
+	if *grantPubKeyHex == "" {
+		*grantPubKeyHex = strings.TrimSpace(os.Getenv("OPS_HOST_GRANT_PUBLIC_KEY"))
+	}
 	if *grantKeyID == "" {
 		*grantKeyID = strings.TrimSpace(os.Getenv("OPS_HOST_GRANT_KEY_ID"))
 	}
-	if strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_GRANT")) == "1" {
-		*requireGrant = true
+	if envRG := strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_REQUIRE_GRANT")); envRG == "0" || strings.EqualFold(envRG, "false") {
+		*requireGrant = false
+	}
+	if *socketUID < 0 {
+		if uStr := strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_SOCKET_UID")); uStr != "" {
+			if u, err := strconv.Atoi(uStr); err == nil {
+				*socketUID = u
+			}
+		}
+	}
+	if *socketGID < 0 {
+		if gStr := strings.TrimSpace(os.Getenv("OPS_HOST_BRIDGE_SOCKET_GID")); gStr != "" {
+			if g, err := strconv.Atoi(gStr); err == nil {
+				*socketGID = g
+			}
+		}
 	}
 
 	var hmacKey []byte
@@ -86,6 +108,19 @@ func main() {
 		}
 	}
 
+	var grantPubKey ed25519.PublicKey
+	if *grantPubKeyHex != "" {
+		pkBytes, pkErr := hex.DecodeString(*grantPubKeyHex)
+		if pkErr != nil || len(pkBytes) != ed25519.PublicKeySize {
+			log.Fatalf("invalid hex for grant public key (must be %d bytes): %v", ed25519.PublicKeySize, pkErr)
+		}
+		grantPubKey = ed25519.PublicKey(pkBytes)
+	}
+
+	if *requireGrant && len(grantHMACKey) == 0 && len(grantPubKey) == 0 {
+		log.Fatalf("FAIL-CLOSED: require-grant is enabled by default, but no independent grant verification key was provided (-grant-hmac-key-hex or -grant-public-key-hex)")
+	}
+
 	cfg := hostsec.HostBridgeServerConfig{
 		HostRoot:       *hostRoot,
 		SnapshotRoot:   *snapshotRoot,
@@ -95,6 +130,7 @@ func main() {
 		RequireGrant:   *requireGrant,
 		GrantKeyID:     *grantKeyID,
 		GrantHMACKey:   grantHMACKey,
+		GrantPublicKey: grantPubKey,
 	}
 
 	handler, err := hostsec.NewHostBridgeHTTPHandler(cfg)
@@ -110,18 +146,55 @@ func main() {
 
 	var listener net.Listener
 	if *socketPath != "" {
-		sockDir := filepath.Dir(*socketPath)
-		if err := os.MkdirAll(sockDir, 0755); err != nil {
+		sockPathClean := filepath.Clean(*socketPath)
+		sockDir := filepath.Dir(sockPathClean)
+		if err := os.MkdirAll(sockDir, 0750); err != nil {
 			log.Fatalf("create socket directory %q: %v", sockDir, err)
 		}
-		_ = os.Remove(*socketPath)
-		listener, err = net.Listen("unix", *socketPath)
-		if err != nil {
-			log.Fatalf("listen unix %q: %v", *socketPath, err)
+		// Security: verify sockDir is not a symlink
+		if dirInfo, dErr := os.Lstat(sockDir); dErr == nil {
+			if dirInfo.Mode()&os.ModeSymlink != 0 {
+				log.Fatalf("SECURITY VIOLATION: socket directory %q is a symlink", sockDir)
+			}
 		}
-		_ = os.Chmod(*socketPath, 0660)
-		defer os.Remove(*socketPath)
-		log.Printf("Home Datacenter Host Helper listening on unix:%s", *socketPath)
+
+		// Security: inspect existing file at socketPath with Lstat
+		if fi, sErr := os.Lstat(sockPathClean); sErr == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				log.Fatalf("SECURITY VIOLATION: socket path %q is a symlink, refusing to remove or bind", sockPathClean)
+			}
+			if fi.Mode().Type()&os.ModeSocket == 0 {
+				log.Fatalf("SECURITY VIOLATION: socket path %q already exists and is not a socket, refusing to remove or bind", sockPathClean)
+			}
+			if err := os.Remove(sockPathClean); err != nil {
+				log.Fatalf("failed to remove stale socket %q: %v", sockPathClean, err)
+			}
+		}
+
+		restoreUmask := setSocketUmask()
+		listener, err = net.Listen("unix", sockPathClean)
+		restoreUmask()
+		if err != nil {
+			log.Fatalf("listen unix %q: %v", sockPathClean, err)
+		}
+		if err := os.Chmod(sockPathClean, 0660); err != nil {
+			log.Fatalf("chmod 0660 %q: %v", sockPathClean, err)
+		}
+		if *socketUID >= 0 || *socketGID >= 0 {
+			uid := *socketUID
+			gid := *socketGID
+			if uid < 0 {
+				uid = os.Getuid()
+			}
+			if gid < 0 {
+				gid = os.Getgid()
+			}
+			if err := os.Chown(sockPathClean, uid, gid); err != nil {
+				log.Printf("warning: chown %d:%d %q: %v", uid, gid, sockPathClean, err)
+			}
+		}
+		defer os.Remove(sockPathClean)
+		log.Printf("Home Datacenter Host Helper listening on unix:%s (mode 0660)", sockPathClean)
 	} else {
 		listener, err = net.Listen("tcp", *listenAddr)
 		if err != nil {

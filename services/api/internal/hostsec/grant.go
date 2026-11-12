@@ -50,11 +50,59 @@ type HostExecutionGrant struct {
 	BaselineHash      string            `json:"baseline_hash"`
 	FencingGeneration int64             `json:"fencing_generation"`
 	Action            string            `json:"action"`
+	AllowedSteps      []string          `json:"allowed_steps,omitempty"`
+	StepParamDigests  map[string]string `json:"step_param_digests,omitempty"`
 	Packages          []string          `json:"packages,omitempty"`
 	TargetVersions    map[string]string `json:"target_versions,omitempty"`
 	IssuedAtMs        int64             `json:"issued_at_ms"`
 	ExpiresAtMs       int64             `json:"expires_at_ms"`
 	Signature         string            `json:"signature"`
+}
+
+// AllowedUpgradeSubSteps defines the strictly closed set of actions permitted under ActionHostPackageUpgrade.
+var AllowedUpgradeSubSteps = map[HostActionType]bool{
+	HostActionAptCachePolicy: true,
+	HostActionDpkgQuery:      true,
+	HostActionWatchdogArm:    true,
+	HostActionWatchdogDisarm: true,
+	HostActionAptUpgrade:     true,
+	HostActionAptDowngrade:   true,
+	HostActionSSHDTest:       true,
+	HostActionRestoreConfig:  true,
+	HostActionSSHDRestart:    true,
+}
+
+// ComputeStepParamDigest computes a deterministic SHA256 parameter digest for an action request.
+func ComputeStepParamDigest(req HostActionRequest) string {
+	h := sha256.New()
+	switch req.Action {
+	case HostActionAptUpgrade, HostActionAptDowngrade:
+		pkgs := normalizeGrantPackages(req.Packages)
+		tvKeys := make([]string, 0, len(req.TargetVersions))
+		for k := range req.TargetVersions {
+			tvKeys = append(tvKeys, k)
+		}
+		sort.Strings(tvKeys)
+		tvParts := make([]string, 0, len(tvKeys))
+		for _, k := range tvKeys {
+			tvParts = append(tvParts, fmt.Sprintf("%s=%s", k, strings.TrimSpace(req.TargetVersions[k])))
+		}
+		h.Write([]byte(fmt.Sprintf("action=%s|pkgs=%s|tv=%s", req.Action, strings.Join(pkgs, ","), strings.Join(tvParts, ","))))
+	case HostActionAptCachePolicy, HostActionDpkgQuery:
+		pkgs := normalizeGrantPackages(req.Packages)
+		h.Write([]byte(fmt.Sprintf("action=%s|pkgs=%s", req.Action, strings.Join(pkgs, ","))))
+	case HostActionWatchdogArm:
+		h.Write([]byte(fmt.Sprintf("action=%s|snap=%s|guard=%s|timeout=%d", req.Action, strings.TrimSpace(req.SnapshotID), strings.TrimSpace(req.GuardID), req.WatchdogTimeoutMs)))
+	case HostActionWatchdogDisarm:
+		h.Write([]byte(fmt.Sprintf("action=%s|guard=%s", req.Action, strings.TrimSpace(req.GuardID))))
+	case HostActionRestoreConfig:
+		h.Write([]byte(fmt.Sprintf("action=%s|snap=%s", req.Action, strings.TrimSpace(req.SnapshotID))))
+	case HostActionSSHDTest, HostActionSSHDRestart:
+		h.Write([]byte(fmt.Sprintf("action=%s", req.Action)))
+	default:
+		h.Write([]byte(fmt.Sprintf("action=%s", req.Action)))
+	}
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 // HostExecutionGrantIssueRequest describes parameters for issuing a signed HostExecutionGrant.
@@ -67,6 +115,8 @@ type HostExecutionGrantIssueRequest struct {
 	BaselineHash      string
 	FencingGeneration int64
 	Action            string
+	AllowedSteps      []string
+	StepParamDigests  map[string]string
 	Packages          []string
 	TargetVersions    map[string]string
 	TTL               time.Duration
@@ -217,6 +267,7 @@ func (g *HostExecutionGrant) canonicalSignBytes() ([]byte, error) {
 		return nil, ErrExecutionGrantRequired
 	}
 	pkgs := normalizeGrantPackages(g.Packages)
+	allowedSteps := normalizeGrantPackages(g.AllowedSteps)
 	tvKeys := make([]string, 0, len(g.TargetVersions))
 	for k := range g.TargetVersions {
 		tvKeys = append(tvKeys, k)
@@ -230,6 +281,22 @@ func (g *HostExecutionGrant) canonicalSignBytes() ([]byte, error) {
 	for _, k := range tvKeys {
 		tvList = append(tvList, tvPair{Pkg: k, Ver: g.TargetVersions[k]})
 	}
+	sdKeys := make([]string, 0, len(g.StepParamDigests))
+	for k := range g.StepParamDigests {
+		sdKeys = append(sdKeys, k)
+	}
+	sort.Strings(sdKeys)
+	type sdPair struct {
+		Step   string `json:"step"`
+		Digest string `json:"digest"`
+	}
+	var sdList []sdPair
+	if len(sdKeys) > 0 {
+		sdList = make([]sdPair, 0, len(sdKeys))
+		for _, k := range sdKeys {
+			sdList = append(sdList, sdPair{Step: k, Digest: g.StepParamDigests[k]})
+		}
+	}
 	payload := struct {
 		Domain            string   `json:"domain"`
 		GrantID           string   `json:"grant_id"`
@@ -242,6 +309,8 @@ func (g *HostExecutionGrant) canonicalSignBytes() ([]byte, error) {
 		BaselineHash      string   `json:"baseline_hash"`
 		FencingGeneration int64    `json:"fencing_generation"`
 		Action            string   `json:"action"`
+		AllowedSteps      []string `json:"allowed_steps,omitempty"`
+		StepParamDigests  []sdPair `json:"step_param_digests,omitempty"`
 		Packages          []string `json:"packages,omitempty"`
 		TargetVersions    []tvPair `json:"target_versions,omitempty"`
 		IssuedAtMs        int64    `json:"issued_at_ms"`
@@ -258,6 +327,8 @@ func (g *HostExecutionGrant) canonicalSignBytes() ([]byte, error) {
 		BaselineHash:      strings.TrimSpace(g.BaselineHash),
 		FencingGeneration: g.FencingGeneration,
 		Action:            strings.TrimSpace(g.Action),
+		AllowedSteps:      allowedSteps,
+		StepParamDigests:  sdList,
 		Packages:          pkgs,
 		TargetVersions:    tvList,
 		IssuedAtMs:        g.IssuedAtMs,
@@ -330,6 +401,13 @@ func (a *HostGrantAuthority) IssueGrant(req HostExecutionGrantIssueRequest) (*Ho
 			tvCopy[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		}
 	}
+	var sdCopy map[string]string
+	if len(req.StepParamDigests) > 0 {
+		sdCopy = make(map[string]string, len(req.StepParamDigests))
+		for k, v := range req.StepParamDigests {
+			sdCopy[strings.TrimSpace(k)] = strings.TrimSpace(v)
+		}
+	}
 	g := &HostExecutionGrant{
 		GrantID:           grantID,
 		KeyID:             a.KeyID,
@@ -340,6 +418,8 @@ func (a *HostGrantAuthority) IssueGrant(req HostExecutionGrantIssueRequest) (*Ho
 		BaselineHash:      strings.TrimSpace(req.BaselineHash),
 		FencingGeneration: req.FencingGeneration,
 		Action:            strings.TrimSpace(req.Action),
+		AllowedSteps:      normalizeGrantPackages(req.AllowedSteps),
+		StepParamDigests:  sdCopy,
 		Packages:          normalizeGrantPackages(req.Packages),
 		TargetVersions:    tvCopy,
 		IssuedAtMs:        now.UnixMilli(),
@@ -466,11 +546,54 @@ func (a *HostGrantAuthority) VerifyGrant(
 	}
 
 	// Verify authorized action & packages scope
-	if g.Action != ActionHostPackageUpgrade && g.Action != string(req.Action) {
+	if g.Action == ActionHostPackageUpgrade {
+		if !AllowedUpgradeSubSteps[req.Action] {
+			return fmt.Errorf("%w: action %q is not an authorized package upgrade sub-step", ErrExecutionGrantMismatch, req.Action)
+		}
+	} else if g.Action != string(req.Action) {
 		return fmt.Errorf("%w: grant action %q does not authorize %q", ErrExecutionGrantMismatch, g.Action, req.Action)
 	}
 	if !IsAllowedHostAction(req.Action) {
 		return fmt.Errorf("%w: disallowed action %q", ErrExecutionGrantMismatch, req.Action)
+	}
+	if len(g.AllowedSteps) > 0 {
+		allowed := false
+		for _, s := range g.AllowedSteps {
+			if strings.TrimSpace(s) == string(req.Action) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("%w: step %q not in allowed_steps", ErrExecutionGrantMismatch, req.Action)
+		}
+	}
+	if len(g.StepParamDigests) > 0 {
+		if expectedDigest, hasDigest := g.StepParamDigests[string(req.Action)]; hasDigest {
+			actualDigest := ComputeStepParamDigest(req)
+			if actualDigest != expectedDigest {
+				return fmt.Errorf("%w: step digest mismatch for action %s", ErrExecutionGrantMismatch, req.Action)
+			}
+		} else if req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade {
+			return fmt.Errorf("%w: missing required step param digest for mutation action %s", ErrExecutionGrantMismatch, req.Action)
+		}
+	}
+	if g.Action == ActionHostPackageUpgrade {
+		switch req.Action {
+		case HostActionWatchdogArm:
+			if strings.TrimSpace(req.SnapshotID) != g.OperationID && strings.TrimSpace(req.SnapshotID) != "snap-"+g.OperationID {
+				return fmt.Errorf("%w: watchdog_arm snapshot_id %q does not match grant operation_id %q", ErrExecutionGrantMismatch, req.SnapshotID, g.OperationID)
+			}
+		case HostActionRestoreConfig:
+			if strings.TrimSpace(req.SnapshotID) != g.OperationID && strings.TrimSpace(req.SnapshotID) != "snap-"+g.OperationID {
+				return fmt.Errorf("%w: restore_config snapshot_id %q does not match grant operation_id %q", ErrExecutionGrantMismatch, req.SnapshotID, g.OperationID)
+			}
+		}
+	}
+	if req.Action == HostActionWatchdogArm && req.WatchdogTimeoutMs > 0 {
+		if req.WatchdogTimeoutMs < 1000 || req.WatchdogTimeoutMs > 1800000 {
+			return fmt.Errorf("%w: watchdog_arm timeout %d ms out of safe bounds [1000, 1800000]", ErrExecutionGrantMismatch, req.WatchdogTimeoutMs)
+		}
 	}
 	if len(g.Packages) > 0 || req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade || req.Action == HostActionAptCachePolicy || req.Action == HostActionDpkgQuery {
 		allowedSet := make(map[string]bool, len(g.Packages))
@@ -803,6 +926,15 @@ func grantStepKey(grantAction string, req HostActionRequest) string {
 	}
 	switch req.Action {
 	case HostActionAptCachePolicy, HostActionDpkgQuery:
+		pkgs := normalizeGrantPackages(req.Packages)
+		return string(req.Action) + ":" + strings.Join(pkgs, ",")
+	case HostActionWatchdogArm:
+		return string(req.Action) + ":" + strings.TrimSpace(req.GuardID) + ":" + strings.TrimSpace(req.SnapshotID)
+	case HostActionWatchdogDisarm:
+		return string(req.Action) + ":" + strings.TrimSpace(req.GuardID)
+	case HostActionRestoreConfig:
+		return string(req.Action) + ":" + strings.TrimSpace(req.SnapshotID)
+	case HostActionAptUpgrade, HostActionAptDowngrade:
 		pkgs := normalizeGrantPackages(req.Packages)
 		return string(req.Action) + ":" + strings.Join(pkgs, ",")
 	default:

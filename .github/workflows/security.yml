@@ -116,9 +116,14 @@ jobs:
           go-version-file: services/api/go.mod
           cache-dependency-path: services/api/go.sum
 
-      - name: Run govulncheck
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run govulncheck with audited allowlist gate
         working-directory: services/api
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./internal/... ./cmd/...
+        run: python scripts/ci/gate_govulncheck.py
 
       - name: Set up Node.js 20
         uses: actions/setup-node@v4
@@ -129,5 +134,4 @@ jobs:
 
       - name: Run npm production dependency audit
         working-directory: web
-        continue-on-error: true
         run: npm audit --omit=dev --audit-level=high

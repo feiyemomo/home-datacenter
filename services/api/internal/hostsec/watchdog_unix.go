@@ -139,7 +139,7 @@ fi
 	go func() {
 		_ = cmd.Wait()
 	}()
-	return fmt.Sprintf("pid:%d", pid), nil
+	return fmt.Sprintf("pid:%d:%s", pid, guardID), nil
 }
 
 func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName string) error {
@@ -147,14 +147,52 @@ func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName stri
 	if u == "" || !strings.HasPrefix(u, "pid:") {
 		return nil
 	}
-	pid, err := strconv.Atoi(strings.TrimPrefix(u, "pid:"))
+	parts := strings.Split(strings.TrimPrefix(u, "pid:"), ":")
+	pid, err := strconv.Atoi(parts[0])
 	if err != nil || pid <= 0 {
 		return fmt.Errorf("invalid detached watchdog unit %q", unitName)
 	}
+	guardID := ""
+	if len(parts) > 1 {
+		guardID = strings.TrimSpace(parts[1])
+	}
+
+	// PID reuse defense: before sending SIGKILL, verify that the process is actually
+	// the intended watchdog script and not an unrelated recycled OS process.
+	if isProcessRecycledOrDead(pid, guardID) {
+		return nil
+	}
+
 	if pgErr := syscall.Kill(-pid, syscall.SIGKILL); pgErr != nil && !errors.Is(pgErr, syscall.ESRCH) {
 		if pErr := syscall.Kill(pid, syscall.SIGKILL); pErr != nil && !errors.Is(pErr, syscall.ESRCH) {
 			return pErr
 		}
 	}
 	return nil
+}
+
+func isProcessRecycledOrDead(pid int, guardID string) bool {
+	if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+		return true // process already exited
+	}
+	// On Linux, inspect /proc/<pid>/cmdline to ensure the command line corresponds to watchdog
+	cmdlinePath := fmt.Sprintf("/proc/%d/cmdline", pid)
+	data, err := os.ReadFile(cmdlinePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return true // exited between kill(0) and read
+		}
+		// /proc not available (e.g. non-Linux Unix or unmounted procfs), proceed with safe kill
+		return false
+	}
+	cmdline := string(data)
+	if guardID != "" {
+		if !strings.Contains(cmdline, guardID) {
+			// Process PID has been recycled by another command! Refuse to kill it!
+			return true
+		}
+	} else if !strings.Contains(cmdline, "watchdog") || !strings.Contains(cmdline, ".sh") {
+		return true
+	}
+	return false
 }

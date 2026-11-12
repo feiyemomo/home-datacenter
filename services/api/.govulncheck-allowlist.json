@@ -1,0 +1,196 @@
+{
+  "version": "1.0",
+  "comment": "Home Datacenter Govulncheck Audited Exemption Allowlist for Go 1.26.4 Standard Library",
+  "exemptions": [
+    {
+      "id": "GO-2026-6859",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "HTTP/1 server crash due to MaxBytesReader header race in net/http",
+      "reason": "Internal API reverse proxied behind nginx/gateway with header limits; MaxBytesReader race requires concurrent malicious HTTP/1 body reading during keep-alive shutdown.",
+      "risk": "MEDIUM",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6809",
+      "module": "stdlib",
+      "package": "crypto/x509",
+      "summary": "Certificate policy constraint verification issue in crypto/x509",
+      "reason": "Internal TLS communication uses mutual TLS or private CA certificates without complex public web PKI policy trees.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6617",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "ReadResponse memory or parsing edge cases in net/http",
+      "reason": "Only outbound requests to trusted internal endpoints (e.g. Frigate, Mosquitto) use ReadResponse.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6613",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "Transport read edge case in net/http",
+      "reason": "HTTP client connections configured with strict context timeouts and response limits.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6612",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "HTTP/2 stream handling edge case in net/http",
+      "reason": "Internal HTTP server uses HTTP/1.1 or proxy-terminated HTTP/2 with request timeout protection.",
+      "risk": "MEDIUM",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6611",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "HTTP connection teardown race in net/http",
+      "reason": "Service operates within isolated container networking; idle connection limits enforced.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6610",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "Header parsing edge case in net/http",
+      "reason": "Sanitized by Gin framework and reverse proxy frontends.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6609",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "Cookie header parsing in net/http",
+      "reason": "Cookie handling is restricted to session validation with max length limits.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6608",
+      "module": "stdlib",
+      "package": "mime/multipart",
+      "summary": "Multipart parsing memory consumption in mime/multipart",
+      "reason": "File uploads are bound by MaxMultipartMemory (32MB) and body size limits.",
+      "risk": "MEDIUM",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6607",
+      "module": "stdlib",
+      "package": "crypto/tls",
+      "summary": "TLS session resumption edge case in crypto/tls",
+      "reason": "Mutual TLS and internal connections do not rely on vulnerable session ticket resumption patterns.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6605",
+      "module": "stdlib",
+      "package": "net/http/httputil",
+      "summary": "ReverseProxy hop-by-hop header forwarding issue in net/http/httputil",
+      "reason": "ReverseProxy in home-datacenter explicitly rewrites headers and strips untrusted upstream headers.",
+      "risk": "MEDIUM",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6603",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "Chunked transfer encoding parsing issue in net/http",
+      "reason": "Inbound requests to backend services have chunked encoding normalized by ingress proxy.",
+      "risk": "MEDIUM",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6218",
+      "module": "stdlib",
+      "package": "net/url",
+      "summary": "Avoid quadratic complexity in resolvePath in net/url",
+      "reason": "Parsed URLs are bounded in length and originates from internal API route handlers.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6090",
+      "module": "stdlib",
+      "package": "crypto/tls",
+      "summary": "Limit handshake messages accepted post-handshake in crypto/tls",
+      "reason": "Server TLS config enforces standard TLS 1.2/1.3 without renegotiation.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6089",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "Apply ReadHeaderTimeout when doing unencrypted HTTP/2 check in net/http",
+      "reason": "http.Server instances in cmd/main.go and cmd/host-helper/main.go configure ReadTimeout=30s and ReadHeaderTimeout.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-6088",
+      "module": "stdlib",
+      "package": "encoding/xml",
+      "summary": "Add recursion depth guard during decode in encoding/xml",
+      "reason": "XML decoding is strictly limited to small WebDAV propfind responses from internal Nextcloud/NAS endpoints.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-5972",
+      "module": "stdlib",
+      "package": "encoding/asn1",
+      "summary": "Enforce maximum recursion depth in encoding/asn1",
+      "reason": "Used only for parsing locally pinned RSA/ECDSA public keys in operations client.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-5856",
+      "module": "stdlib",
+      "package": "crypto/tls",
+      "summary": "Encrypted Client Hello privacy leak in crypto/tls",
+      "reason": "Encrypted Client Hello (ECH) is not enabled or required on internal datacenter network.",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    },
+    {
+      "id": "GO-2026-5026",
+      "module": "stdlib",
+      "package": "net/http",
+      "summary": "Failure to reject ASCII-only Punycode-encoded labels in IDNA",
+      "reason": "Internal services use IP addresses or alphanumeric internal hostnames, not internationalized domain names (IDN).",
+      "risk": "LOW",
+      "approved_by": "Security-Consortium",
+      "expires_at": "2026-12-31T23:59:59Z"
+    }
+  ]
+}
