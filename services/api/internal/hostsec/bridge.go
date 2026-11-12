@@ -764,6 +764,48 @@ func isGrantAuthRejection(err error) bool {
 		errors.Is(err, ErrExecutionGrantKeyConflict)
 }
 
+func verifyActiveWatchdogForOperation(watchDir, opID string) error {
+	if strings.TrimSpace(watchDir) == "" {
+		return nil
+	}
+	cleanDir := filepath.Clean(watchDir)
+	entries, err := os.ReadDir(cleanDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return errors.New("watchdog directory does not exist")
+		}
+		return err
+	}
+	cleanOp := strings.TrimSpace(opID)
+	foundArmed := false
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") || ent.Name() == "manifest.json" {
+			continue
+		}
+		raw, rErr := os.ReadFile(filepath.Join(cleanDir, ent.Name()))
+		if rErr != nil {
+			continue
+		}
+		var st PersistentSSHGuardState
+		if jErr := json.Unmarshal(raw, &st); jErr == nil {
+			if st.OperationID == cleanOp && st.Status == SSHGuardStatusArmed {
+				if !st.DeadlineAt.IsZero() && time.Now().UTC().After(st.DeadlineAt) {
+					continue
+				}
+				disarmMarker := filepath.Join(cleanDir, st.GuardID+".disarmed")
+				if _, dErr := os.Stat(disarmMarker); os.IsNotExist(dErr) {
+					foundArmed = true
+					break
+				}
+			}
+		}
+	}
+	if !foundArmed {
+		return fmt.Errorf("no active ARMED watchdog found on disk for operation %s", cleanOp)
+	}
+	return nil
+}
+
 func handleBridgeWatchdogAction(ctx context.Context, cfg HostBridgeServerConfig, req HostActionRequest) (HostActionResult, error) {
 	if strings.TrimSpace(cfg.SnapshotRoot) == "" {
 		return HostActionResult{}, errors.New("snapshotRoot is required for host bridge watchdog")
@@ -971,7 +1013,31 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 			return
 		}
 
-		// Persist single-use grant consumption after fencing and platform checks pass
+		if req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade {
+			hasWatchdog := false
+			if req.Grant != nil {
+				for _, s := range req.Grant.AllowedSteps {
+					if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
+						hasWatchdog = true
+						break
+					}
+				}
+			}
+			watchDir := strings.TrimSpace(cfg.WatchdogDir)
+			if watchDir == "" && strings.TrimSpace(cfg.SnapshotRoot) != "" {
+				watchDir = filepath.Join(filepath.Clean(cfg.SnapshotRoot), "ssh-watchdog")
+			}
+			if hasWatchdog && watchDir != "" {
+				if wErr := verifyActiveWatchdogForOperation(watchDir, req.Binding.OperationID); wErr != nil {
+					writeJSON(http.StatusPreconditionFailed, map[string]string{
+						"error": "refusing package mutation without active armed SSH watchdog: " + wErr.Error(),
+					})
+					return
+				}
+			}
+		}
+
+		// Persist single-use grant consumption after fencing, platform, and watchdog checks pass
 		if hasGrantPolicy {
 			if gErr := grantStore.VerifyAndConsume(grantAuthority, cfg.HMACKey, req.Grant, req, cfg.RequireFencing, time.Now().UTC()); gErr != nil {
 				code := http.StatusInternalServerError

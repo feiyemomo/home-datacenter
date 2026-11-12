@@ -121,6 +121,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Run govulncheck gate unit and negative tests
+        working-directory: services/api
+        run: python scripts/ci/test_gate_govulncheck.py
+
       - name: Run govulncheck with audited allowlist gate
         working-directory: services/api
         run: python scripts/ci/gate_govulncheck.py

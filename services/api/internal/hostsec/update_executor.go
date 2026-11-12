@@ -140,6 +140,7 @@ type HostUpdateRequest struct {
 	Packages             []string            `json:"packages"`
 	TargetVersions       map[string]string   `json:"target_versions,omitempty"` // optional pinned versions
 	ExpectedBaselineHash string              `json:"expected_baseline_hash"`
+	WatchdogWindow       time.Duration       `json:"watchdog_window,omitempty"`
 	Timeout              time.Duration       `json:"timeout,omitempty"`
 	SSHProbeAddr         string              `json:"ssh_probe_addr,omitempty"` // default "127.0.0.1:22"
 }
@@ -215,7 +216,7 @@ func NewHostUpdateExecutor(hostRoot, snapshotRoot string, auditEngine *audit.Age
 	runner := realHostExecRunner{}
 	sshGuard := NewPersistentHostSSHGuard(guardDir, detector.HostRoot, snapshotRoot, runner, bridge)
 	sshGuard.AuditEngine = auditEngine
-	if bridge != nil && (detectInContainer() || strings.TrimSpace(os.Getenv("HOST_SSH_WATCHDOG_DELEGATE")) == "1") {
+	if bridge != nil {
 		sshGuard.DelegateWatchdogToBridge = true
 	}
 	return &HostUpdateExecutor{
@@ -243,6 +244,9 @@ func (e *HostUpdateExecutor) SetBridge(bridge RestrictedHostExecutionBridge) {
 	}
 	if pg, ok := e.SSHGuard.(*PersistentHostSSHGuard); ok && pg != nil {
 		pg.Bridge = bridge
+		if bridge != nil {
+			pg.DelegateWatchdogToBridge = true
+		}
 	}
 }
 
@@ -730,7 +734,36 @@ func (e *HostUpdateExecutor) Execute(ctx context.Context, req HostUpdateRequest)
 	// 9. Arm persistent disk-backed SSH-lockout recovery dead-man's-switch if touching SSH/OpenSSL
 	var guardID string
 	if touchesSSH {
-		win := e.SSHRecoveryWindow
+		win := req.WatchdogWindow
+		if win <= 0 {
+			if req.ExecutionGrant != nil && len(req.ExecutionGrant.StepParamDigests) > 0 {
+				armDigest := req.ExecutionGrant.StepParamDigests[string(HostActionWatchdogArm)]
+				if armDigest != "" {
+					testDef := ComputeStepParamDigest(HostActionRequest{
+						Action:            HostActionWatchdogArm,
+						SnapshotID:        snap.SnapshotID,
+						GuardID:           snap.SnapshotID,
+						WatchdogTimeoutMs: DefaultSSHRecoveryWindow.Milliseconds(),
+					})
+					if testDef == armDigest {
+						win = DefaultSSHRecoveryWindow
+					} else if e.SSHRecoveryWindow > 0 {
+						testWin := ComputeStepParamDigest(HostActionRequest{
+							Action:            HostActionWatchdogArm,
+							SnapshotID:        snap.SnapshotID,
+							GuardID:           snap.SnapshotID,
+							WatchdogTimeoutMs: e.SSHRecoveryWindow.Milliseconds(),
+						})
+						if testWin == armDigest {
+							win = e.SSHRecoveryWindow
+						}
+					}
+				}
+			}
+		}
+		if win <= 0 {
+			win = e.SSHRecoveryWindow
+		}
 		if win <= 0 {
 			win = DefaultSSHRecoveryWindow
 		}

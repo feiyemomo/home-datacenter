@@ -17,14 +17,21 @@
 - **Socket Permissions**: `0660` (`rw-rw----`).
 - **Symlink Protection**: Host Helper inspects paths via `os.Lstat`. If the socket directory or socket path is a symlink or non-socket regular file, Host Helper aborts startup immediately (Fail-Closed).
 - **Docker Compose Integration**:
+  To avoid stale inode invalidation when the socket is recreated on host helper restarts, mount the parent directory `/run/home-datacenter` rather than the individual socket file:
   ```yaml
   services:
     api:
       user: "1000:1000"
       group_add:
-        - "998" # GID of homedc-bridge on host
+        - "990" # GID of homedc-bridge on host (matches systemd group)
       volumes:
-        - /run/home-datacenter/host-bridge.sock:/run/home-datacenter/host-bridge.sock:rw
+        - /run/home-datacenter:/run/home-datacenter:rw
+  ```
+
+- **Verification Tool**:
+  Run `check_socket.sh` to audit socket permissions, directory security, and connectivity:
+  ```bash
+  sudo ./deploy/host-helper/check_socket.sh
   ```
 
 ## 4. Building and Installation

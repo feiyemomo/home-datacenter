@@ -7,9 +7,9 @@ ConditionPathExists=/usr/local/bin/home-datacenter-host-helper
 [Service]
 Type=simple
 User=root
-Group=root
+Group=homedc-bridge
 
-# Secure runtime directory created with mode 0750 on tmpfs
+# Secure runtime directory created with mode 0750 on tmpfs owned by root:homedc-bridge
 RuntimeDirectory=home-datacenter
 RuntimeDirectoryMode=0750
 

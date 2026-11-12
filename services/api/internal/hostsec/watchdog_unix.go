@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -163,12 +164,45 @@ func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName stri
 		return nil
 	}
 
-	if pgErr := syscall.Kill(-pid, syscall.SIGKILL); pgErr != nil && !errors.Is(pgErr, syscall.ESRCH) {
-		if pErr := syscall.Kill(pid, syscall.SIGKILL); pErr != nil && !errors.Is(pErr, syscall.ESRCH) {
-			return pErr
+	// 1. Linux pidfd_open / pidfd_send_signal (syscall 434 / 424) eliminates PID reuse TOCTOU race
+	if killedViaPidfd(pid) {
+		return nil
+	}
+
+	// 2. Controlled process group kill only if pgrp matches pid, pgrp != current pgrp, and pgrp > 100
+	if pgrp, pgErr := syscall.Getpgid(pid); pgErr == nil {
+		if pgrp == pid && pgrp != syscall.Getpgrp() && pgrp > 100 {
+			if kErr := syscall.Kill(-pid, syscall.SIGKILL); kErr == nil || errors.Is(kErr, syscall.ESRCH) {
+				return nil
+			}
 		}
 	}
+
+	// 3. Fallback: kill individual verified PID
+	if pErr := syscall.Kill(pid, syscall.SIGKILL); pErr != nil && !errors.Is(pErr, syscall.ESRCH) {
+		return pErr
+	}
 	return nil
+}
+
+const (
+	sysPidfdOpen       = 434
+	sysPidfdSendSignal = 424
+)
+
+func killedViaPidfd(pid int) bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+	// pidfd_open(pid, 0)
+	fd, _, errno := syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0)
+	if errno != 0 {
+		return false
+	}
+	defer syscall.Close(int(fd))
+	// pidfd_send_signal(fd, SIGKILL, nil, 0)
+	_, _, sErrno := syscall.Syscall6(sysPidfdSendSignal, fd, uintptr(syscall.SIGKILL), 0, 0, 0, 0)
+	return sErrno == 0 || errors.Is(sErrno, syscall.ESRCH)
 }
 
 func isProcessRecycledOrDead(pid int, guardID string) bool {

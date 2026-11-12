@@ -151,11 +151,9 @@ func main() {
 		if err := os.MkdirAll(sockDir, 0750); err != nil {
 			log.Fatalf("create socket directory %q: %v", sockDir, err)
 		}
-		// Security: verify sockDir is not a symlink
-		if dirInfo, dErr := os.Lstat(sockDir); dErr == nil {
-			if dirInfo.Mode()&os.ModeSymlink != 0 {
-				log.Fatalf("SECURITY VIOLATION: socket directory %q is a symlink", sockDir)
-			}
+		// Security: full audit of socket directory (ownership, permissions, symlinks)
+		if err := hostsec.AuditSocketDirectory(sockDir); err != nil {
+			log.Fatalf("SECURITY VIOLATION: socket directory %q audit failed: %v", sockDir, err)
 		}
 
 		// Security: inspect existing file at socketPath with Lstat

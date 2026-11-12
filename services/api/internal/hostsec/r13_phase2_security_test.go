@@ -104,6 +104,7 @@ func TestR13_P2_01_GrantFailClosedOnMissingKey(t *testing.T) {
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
 		Action:            ActionHostPackageUpgrade,
+		AllowedSteps:      []string{string(HostActionAptUpgrade)},
 		Packages:          []string{"openssh-server"},
 	})
 	if gErr != nil {
@@ -272,6 +273,7 @@ func TestR13_P2_03_StepLevelConsumptionAndReplayDefense(t *testing.T) {
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
 		Action:            ActionHostPackageUpgrade,
+		AllowedSteps:      []string{string(HostActionAptUpgrade)},
 		Packages:          []string{"openssh-server"},
 	})
 	if err != nil {

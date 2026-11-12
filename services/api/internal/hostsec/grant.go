@@ -37,6 +37,69 @@ var (
 	ErrExecutionGrantKeyConflict = errors.New("host execution grant key must not match bridge transport key")
 )
 
+// GrantStepState represents the lifecycle phase of an Operation governed by an Execution Grant.
+type GrantStepState string
+
+const (
+	GrantStepStateInitial       GrantStepState = "INITIAL"
+	GrantStepStatePreflight     GrantStepState = "PREFLIGHT"
+	GrantStepStateWatchdogArmed GrantStepState = "WATCHDOG_ARMED"
+	GrantStepStateMutated       GrantStepState = "MUTATED"
+	GrantStepStateVerified      GrantStepState = "VERIFIED"
+	GrantStepStateRestored      GrantStepState = "RESTORED"
+	GrantStepStateRestarted     GrantStepState = "RESTARTED"
+	GrantStepStateCompleted     GrantStepState = "COMPLETED"
+)
+
+// AllowedStepTransitions defines valid deterministic state transitions for host package upgrades.
+var AllowedStepTransitions = map[GrantStepState]map[HostActionType]GrantStepState{
+	GrantStepStateInitial: {
+		HostActionDpkgQuery:      GrantStepStatePreflight,
+		HostActionAptCachePolicy: GrantStepStatePreflight,
+		HostActionWatchdogArm:    GrantStepStateWatchdogArmed,
+	},
+	GrantStepStatePreflight: {
+		HostActionDpkgQuery:      GrantStepStatePreflight,
+		HostActionAptCachePolicy: GrantStepStatePreflight,
+		HostActionWatchdogArm:    GrantStepStateWatchdogArmed,
+	},
+	GrantStepStateWatchdogArmed: {
+		HostActionAptUpgrade:     GrantStepStateMutated,
+		HostActionAptDowngrade:   GrantStepStateMutated,
+		HostActionWatchdogDisarm: GrantStepStateCompleted,
+	},
+	GrantStepStateMutated: {
+		HostActionDpkgQuery:      GrantStepStateMutated,
+		HostActionSSHDTest:       GrantStepStateVerified,
+		HostActionRestoreConfig:  GrantStepStateRestored,
+		HostActionAptDowngrade:   GrantStepStateRestored,
+		HostActionWatchdogDisarm: GrantStepStateCompleted,
+	},
+	GrantStepStateVerified: {
+		HostActionDpkgQuery:      GrantStepStateVerified,
+		HostActionSSHDTest:       GrantStepStateVerified,
+		HostActionSSHDRestart:    GrantStepStateRestarted,
+		HostActionWatchdogDisarm: GrantStepStateCompleted,
+		HostActionRestoreConfig:  GrantStepStateRestored,
+		HostActionAptDowngrade:   GrantStepStateRestored,
+	},
+	GrantStepStateRestored: {
+		HostActionDpkgQuery:      GrantStepStateRestored,
+		HostActionSSHDTest:       GrantStepStateRestored,
+		HostActionAptDowngrade:   GrantStepStateRestored,
+		HostActionRestoreConfig:  GrantStepStateRestored,
+		HostActionSSHDRestart:    GrantStepStateRestarted,
+		HostActionWatchdogDisarm: GrantStepStateCompleted,
+	},
+	GrantStepStateRestarted: {
+		HostActionDpkgQuery:      GrantStepStateRestarted,
+		HostActionSSHDTest:       GrantStepStateRestarted,
+		HostActionWatchdogDisarm: GrantStepStateCompleted,
+		HostActionRestoreConfig:  GrantStepStateRestored,
+		HostActionAptDowngrade:   GrantStepStateRestored,
+	},
+}
+
 // HostExecutionGrant is a short-lived, single-operation/single-use cryptographic capability
 // minted by an approval grant authority whose signing key is independent from OPS_HOST_BRIDGE_HMAC_KEY.
 type HostExecutionGrant struct {
@@ -119,6 +182,7 @@ type HostExecutionGrantIssueRequest struct {
 	StepParamDigests  map[string]string
 	Packages          []string
 	TargetVersions    map[string]string
+	WatchdogTimeoutMs int64
 	TTL               time.Duration
 }
 
@@ -364,6 +428,14 @@ func (g *HostExecutionGrant) ValidateFormat(requireFencing bool) error {
 	if strings.TrimSpace(g.Action) == "" {
 		return fmt.Errorf("%w: action is required", ErrExecutionGrantInvalid)
 	}
+	if g.Action == ActionHostPackageUpgrade {
+		if len(g.AllowedSteps) == 0 {
+			return fmt.Errorf("%w: ActionHostPackageUpgrade requires non-empty allowed_steps", ErrExecutionGrantInvalid)
+		}
+		if len(g.StepParamDigests) == 0 {
+			return fmt.Errorf("%w: ActionHostPackageUpgrade requires non-empty step_param_digests", ErrExecutionGrantInvalid)
+		}
+	}
 	if g.IssuedAtMs <= 0 || g.ExpiresAtMs <= g.IssuedAtMs {
 		return fmt.Errorf("%w: invalid grant validity window", ErrExecutionGrantInvalid)
 	}
@@ -401,12 +473,44 @@ func (a *HostGrantAuthority) IssueGrant(req HostExecutionGrantIssueRequest) (*Ho
 			tvCopy[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		}
 	}
+	var allowedSteps []string
+	if len(req.AllowedSteps) > 0 {
+		allowedSteps = normalizeGrantPackages(req.AllowedSteps)
+	} else if req.Action == ActionHostPackageUpgrade && req.AllowedSteps == nil {
+		allowedSteps = []string{
+			string(HostActionAptCachePolicy),
+			string(HostActionDpkgQuery),
+			string(HostActionWatchdogArm),
+			string(HostActionAptUpgrade),
+			string(HostActionSSHDTest),
+			string(HostActionSSHDRestart),
+			string(HostActionWatchdogDisarm),
+			string(HostActionRestoreConfig),
+			string(HostActionAptDowngrade),
+		}
+	}
+
 	var sdCopy map[string]string
 	if len(req.StepParamDigests) > 0 {
 		sdCopy = make(map[string]string, len(req.StepParamDigests))
 		for k, v := range req.StepParamDigests {
 			sdCopy[strings.TrimSpace(k)] = strings.TrimSpace(v)
 		}
+	} else if req.Action == ActionHostPackageUpgrade && req.StepParamDigests == nil {
+		sdCopy = make(map[string]string)
+		sdCopy[string(HostActionAptCachePolicy)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionAptCachePolicy, Packages: req.Packages})
+		sdCopy[string(HostActionDpkgQuery)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionDpkgQuery, Packages: req.Packages})
+		armTimeoutMs := int64(30000)
+		if req.WatchdogTimeoutMs > 0 {
+			armTimeoutMs = req.WatchdogTimeoutMs
+		}
+		sdCopy[string(HostActionWatchdogArm)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionWatchdogArm, SnapshotID: req.OperationID, GuardID: req.OperationID, WatchdogTimeoutMs: armTimeoutMs})
+		sdCopy[string(HostActionAptUpgrade)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionAptUpgrade, Packages: req.Packages, TargetVersions: req.TargetVersions})
+		sdCopy[string(HostActionAptDowngrade)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionAptDowngrade, Packages: req.Packages, TargetVersions: req.TargetVersions})
+		sdCopy[string(HostActionSSHDTest)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionSSHDTest})
+		sdCopy[string(HostActionSSHDRestart)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionSSHDRestart})
+		sdCopy[string(HostActionWatchdogDisarm)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionWatchdogDisarm, GuardID: req.OperationID})
+		sdCopy[string(HostActionRestoreConfig)] = ComputeStepParamDigest(HostActionRequest{Action: HostActionRestoreConfig, SnapshotID: req.OperationID})
 	}
 	g := &HostExecutionGrant{
 		GrantID:           grantID,
@@ -418,7 +522,7 @@ func (a *HostGrantAuthority) IssueGrant(req HostExecutionGrantIssueRequest) (*Ho
 		BaselineHash:      strings.TrimSpace(req.BaselineHash),
 		FencingGeneration: req.FencingGeneration,
 		Action:            strings.TrimSpace(req.Action),
-		AllowedSteps:      normalizeGrantPackages(req.AllowedSteps),
+		AllowedSteps:      allowedSteps,
 		StepParamDigests:  sdCopy,
 		Packages:          normalizeGrantPackages(req.Packages),
 		TargetVersions:    tvCopy,
@@ -556,6 +660,14 @@ func (a *HostGrantAuthority) VerifyGrant(
 	if !IsAllowedHostAction(req.Action) {
 		return fmt.Errorf("%w: disallowed action %q", ErrExecutionGrantMismatch, req.Action)
 	}
+	if g.Action == ActionHostPackageUpgrade {
+		if len(g.AllowedSteps) == 0 {
+			return fmt.Errorf("%w: package upgrade grant requires non-empty allowed_steps", ErrExecutionGrantMismatch)
+		}
+		if len(g.StepParamDigests) == 0 {
+			return fmt.Errorf("%w: package upgrade grant requires non-empty step_param_digests", ErrExecutionGrantMismatch)
+		}
+	}
 	if len(g.AllowedSteps) > 0 {
 		allowed := false
 		for _, s := range g.AllowedSteps {
@@ -568,16 +680,6 @@ func (a *HostGrantAuthority) VerifyGrant(
 			return fmt.Errorf("%w: step %q not in allowed_steps", ErrExecutionGrantMismatch, req.Action)
 		}
 	}
-	if len(g.StepParamDigests) > 0 {
-		if expectedDigest, hasDigest := g.StepParamDigests[string(req.Action)]; hasDigest {
-			actualDigest := ComputeStepParamDigest(req)
-			if actualDigest != expectedDigest {
-				return fmt.Errorf("%w: step digest mismatch for action %s", ErrExecutionGrantMismatch, req.Action)
-			}
-		} else if req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade {
-			return fmt.Errorf("%w: missing required step param digest for mutation action %s", ErrExecutionGrantMismatch, req.Action)
-		}
-	}
 	if g.Action == ActionHostPackageUpgrade {
 		switch req.Action {
 		case HostActionWatchdogArm:
@@ -588,6 +690,16 @@ func (a *HostGrantAuthority) VerifyGrant(
 			if strings.TrimSpace(req.SnapshotID) != g.OperationID && strings.TrimSpace(req.SnapshotID) != "snap-"+g.OperationID {
 				return fmt.Errorf("%w: restore_config snapshot_id %q does not match grant operation_id %q", ErrExecutionGrantMismatch, req.SnapshotID, g.OperationID)
 			}
+		}
+	}
+	if len(g.StepParamDigests) > 0 || g.Action == ActionHostPackageUpgrade {
+		expectedDigest, hasDigest := g.StepParamDigests[string(req.Action)]
+		if !hasDigest {
+			return fmt.Errorf("%w: missing required step param digest for action %s", ErrExecutionGrantMismatch, req.Action)
+		}
+		actualDigest := ComputeStepParamDigest(req)
+		if actualDigest != expectedDigest {
+			return fmt.Errorf("%w: step digest mismatch for action %s", ErrExecutionGrantMismatch, req.Action)
 		}
 	}
 	if req.Action == HostActionWatchdogArm && req.WatchdogTimeoutMs > 0 {
@@ -626,17 +738,31 @@ func (a *HostGrantAuthority) VerifyGrant(
 	return nil
 }
 
+type GrantStepExecutionRecord struct {
+	GrantID           string `json:"grant_id"`
+	OperationID       string `json:"operation_id"`
+	ApprovalID        string `json:"approval_id"`
+	FencingGeneration int64  `json:"fencing_generation"`
+	StepID            string `json:"step_id"`
+	StepParamDigest   string `json:"step_param_digest"`
+	Status            string `json:"status,omitempty"`
+	TimestampMs       int64  `json:"timestamp_ms"`
+}
+
 type grantConsumeRecord struct {
-	GrantID           string           `json:"grant_id"`
-	Action            string           `json:"action"`
-	ProposalID        string           `json:"proposal_id"`
-	ApprovalID        string           `json:"approval_id"`
-	OperationID       string           `json:"operation_id"`
-	ResourceScope     string           `json:"resource_scope"`
-	BaselineHash      string           `json:"baseline_hash"`
-	FencingGeneration int64            `json:"fencing_generation"`
-	ConsumedSteps     map[string]int64 `json:"consumed_steps"`
-	UpdatedAtMs       int64            `json:"updated_at_ms"`
+	GrantID           string                     `json:"grant_id"`
+	Action            string                     `json:"action"`
+	ProposalID        string                     `json:"proposal_id"`
+	ApprovalID        string                     `json:"approval_id"`
+	OperationID       string                     `json:"operation_id"`
+	ResourceScope     string                     `json:"resource_scope"`
+	BaselineHash      string                     `json:"baseline_hash"`
+	FencingGeneration int64                      `json:"fencing_generation"`
+	CurrentState      GrantStepState             `json:"current_state"`
+	History           []GrantStepExecutionRecord `json:"history"`
+	ConsumedSteps     map[string]int64           `json:"consumed_steps"`
+	CreatedAtMs       int64                      `json:"created_at_ms"`
+	UpdatedAtMs       int64                      `json:"updated_at_ms"`
 }
 
 type grantRevocationRecord struct {
@@ -800,11 +926,65 @@ func (s *PersistentGrantStore) CheckGrantUsable(
 			rec.FencingGeneration != g.FencingGeneration {
 			return fmt.Errorf("%w: grant %s cannot be reused across operations", ErrExecutionGrantConsumed, g.GrantID)
 		}
-		stepKey := grantStepKey(g.Action, req)
-		if _, stepUsed := rec.ConsumedSteps[stepKey]; stepUsed {
-			return fmt.Errorf("%w: grant %s step %s already consumed", ErrExecutionGrantConsumed, g.GrantID, stepKey)
+		if isMutatingStep(req.Action) {
+			stepKey := grantStepKey(g.Action, req)
+			if _, stepUsed := rec.ConsumedSteps[stepKey]; stepUsed {
+				return fmt.Errorf("%w: grant %s step %s already consumed", ErrExecutionGrantConsumed, g.GrantID, stepKey)
+			}
 		}
-	} else if !os.IsNotExist(rErr) {
+		if g.Action == ActionHostPackageUpgrade {
+			hasWatchdogInAllowedSteps := false
+			for _, s := range g.AllowedSteps {
+				if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
+					hasWatchdogInAllowedSteps = true
+					break
+				}
+			}
+			curState := rec.CurrentState
+			if curState == "" {
+				curState = GrantStepStateInitial
+			}
+			validTransitions, hasState := AllowedStepTransitions[curState]
+			if !hasState {
+				return fmt.Errorf("%w: operation is in invalid state %s", ErrExecutionGrantMismatch, curState)
+			}
+			if _, valid := validTransitions[req.Action]; !valid {
+				if !hasWatchdogInAllowedSteps && (req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade) && (curState == GrantStepStateInitial || curState == GrantStepStatePreflight) {
+					// Standalone mutation grant without watchdog arm authorized
+				} else {
+					return fmt.Errorf("%w: invalid step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
+				}
+			}
+			if req.Action == HostActionAptUpgrade {
+				if hasWatchdogInAllowedSteps && curState != GrantStepStateWatchdogArmed {
+					return fmt.Errorf("%w: cannot execute mutation %s before watchdog is armed (current state: %s)", ErrExecutionGrantMismatch, req.Action, curState)
+				}
+			}
+			if req.Action == HostActionAptDowngrade {
+				if hasWatchdogInAllowedSteps && (curState != GrantStepStateWatchdogArmed && curState != GrantStepStateMutated && curState != GrantStepStateVerified && curState != GrantStepStateRestored) {
+					return fmt.Errorf("%w: cannot execute rollback mutation %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
+				}
+			}
+		}
+	} else if os.IsNotExist(rErr) {
+		if g.Action == ActionHostPackageUpgrade {
+			hasWatchdogInAllowedSteps := false
+			for _, s := range g.AllowedSteps {
+				if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
+					hasWatchdogInAllowedSteps = true
+					break
+				}
+			}
+			validTransitions := AllowedStepTransitions[GrantStepStateInitial]
+			if _, valid := validTransitions[req.Action]; !valid {
+				if !hasWatchdogInAllowedSteps && (req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade) {
+					// Standalone mutation grant without watchdog arm authorized
+				} else {
+					return fmt.Errorf("%w: invalid initial step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, GrantStepStateInitial)
+				}
+			}
+		}
+	} else {
 		return fmt.Errorf("read grant consumption record %s: %w", g.GrantID, rErr)
 	}
 	unlocked = true
@@ -886,8 +1066,10 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 			rec.FencingGeneration != g.FencingGeneration {
 			return fmt.Errorf("%w: grant %s cannot be reused across operations", ErrExecutionGrantConsumed, g.GrantID)
 		}
-		if _, stepUsed := rec.ConsumedSteps[stepKey]; stepUsed {
-			return fmt.Errorf("%w: grant %s step %s already consumed", ErrExecutionGrantConsumed, g.GrantID, stepKey)
+		if isMutatingStep(req.Action) {
+			if _, stepUsed := rec.ConsumedSteps[stepKey]; stepUsed {
+				return fmt.Errorf("%w: grant %s step %s already consumed", ErrExecutionGrantConsumed, g.GrantID, stepKey)
+			}
 		}
 	} else {
 		rec = grantConsumeRecord{
@@ -899,8 +1081,59 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 			ResourceScope:     resolveGrantResourceScope(g.ResourceScope),
 			BaselineHash:      g.BaselineHash,
 			FencingGeneration: g.FencingGeneration,
+			CurrentState:      GrantStepStateInitial,
 			ConsumedSteps:     make(map[string]int64),
+			CreatedAtMs:       nowMs,
 		}
+	}
+
+	// State machine transition validation for package upgrade operations
+	if g.Action == ActionHostPackageUpgrade {
+		hasWatchdogInAllowedSteps := false
+		for _, s := range g.AllowedSteps {
+			if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
+				hasWatchdogInAllowedSteps = true
+				break
+			}
+		}
+
+		curState := rec.CurrentState
+		if curState == "" {
+			curState = GrantStepStateInitial
+		}
+		validTransitions, hasState := AllowedStepTransitions[curState]
+		if !hasState {
+			return fmt.Errorf("%w: operation is in invalid state %s", ErrExecutionGrantMismatch, curState)
+		}
+		nextState, valid := validTransitions[req.Action]
+		if !valid {
+			if !hasWatchdogInAllowedSteps && (req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade) && (curState == GrantStepStateInitial || curState == GrantStepStatePreflight) {
+				nextState = GrantStepStateMutated
+			} else {
+				return fmt.Errorf("%w: invalid step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
+			}
+		}
+		if req.Action == HostActionAptUpgrade {
+			if hasWatchdogInAllowedSteps && curState != GrantStepStateWatchdogArmed {
+				return fmt.Errorf("%w: cannot execute mutation %s before watchdog is armed (current state: %s)", ErrExecutionGrantMismatch, req.Action, curState)
+			}
+		}
+		if req.Action == HostActionAptDowngrade {
+			if hasWatchdogInAllowedSteps && (curState != GrantStepStateWatchdogArmed && curState != GrantStepStateMutated && curState != GrantStepStateVerified && curState != GrantStepStateRestored) {
+				return fmt.Errorf("%w: cannot execute rollback mutation %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
+			}
+		}
+		rec.CurrentState = nextState
+		rec.History = append(rec.History, GrantStepExecutionRecord{
+			GrantID:           g.GrantID,
+			OperationID:       g.OperationID,
+			ApprovalID:        g.ApprovalID,
+			FencingGeneration: g.FencingGeneration,
+			StepID:            string(req.Action),
+			StepParamDigest:   ComputeStepParamDigest(req),
+			Status:            string(nextState),
+			TimestampMs:       nowMs,
+		})
 	}
 
 	rec.ConsumedSteps[stepKey] = nowMs
@@ -921,23 +1154,15 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 }
 
 func grantStepKey(grantAction string, req HostActionRequest) string {
-	if grantAction != ActionHostPackageUpgrade {
-		return string(req.Action)
-	}
-	switch req.Action {
-	case HostActionAptCachePolicy, HostActionDpkgQuery:
-		pkgs := normalizeGrantPackages(req.Packages)
-		return string(req.Action) + ":" + strings.Join(pkgs, ",")
-	case HostActionWatchdogArm:
-		return string(req.Action) + ":" + strings.TrimSpace(req.GuardID) + ":" + strings.TrimSpace(req.SnapshotID)
-	case HostActionWatchdogDisarm:
-		return string(req.Action) + ":" + strings.TrimSpace(req.GuardID)
-	case HostActionRestoreConfig:
-		return string(req.Action) + ":" + strings.TrimSpace(req.SnapshotID)
-	case HostActionAptUpgrade, HostActionAptDowngrade:
-		pkgs := normalizeGrantPackages(req.Packages)
-		return string(req.Action) + ":" + strings.Join(pkgs, ",")
+	digest := ComputeStepParamDigest(req)
+	return string(req.Action) + ":" + digest
+}
+
+func isMutatingStep(action HostActionType) bool {
+	switch action {
+	case HostActionAptUpgrade, HostActionAptDowngrade, HostActionWatchdogArm, HostActionWatchdogDisarm, HostActionRestoreConfig, HostActionSSHDRestart:
+		return true
 	default:
-		return string(req.Action)
+		return false
 	}
 }

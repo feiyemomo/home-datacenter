@@ -618,6 +618,13 @@ func TestHostUpdateExecutor_SecurityGatesAndRollback(t *testing.T) {
 	case <-time.After(1 * time.Second):
 		t.Fatalf("expected persistent SSH dead-man's-switch recovery guard to fire automatically")
 	}
+	for i := 0; i < 20; i++ {
+		st, _ := guard.LoadState(gID)
+		if st != nil && st.Status == SSHGuardStatusRecovered {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if err := guard.Disarm(gID); err == nil {
 		t.Fatalf("expected Disarm after guard already fired to return error")
 	}

@@ -196,7 +196,10 @@ func (g *PersistentHostSSHGuard) ArmWithBinding(
 	recoverFn func(context.Context) error,
 ) (string, error) {
 	now := time.Now().UTC()
-	guardID := fmt.Sprintf("ssh-guard-%d", now.UnixNano())
+	guardID := strings.TrimSpace(binding.OperationID)
+	if guardID == "" || !reSafeSnapshotID.MatchString(guardID) {
+		guardID = fmt.Sprintf("ssh-guard-%d", now.UnixNano())
+	}
 	return g.armWithGuardID(ctx, guardID, now, snapshotDir, timeout, binding, grant, recoverFn)
 }
 
@@ -504,6 +507,7 @@ func (g *PersistentHostSSHGuard) ReconcileExpired(ctx context.Context) (int, err
 			}
 			if st.Status == SSHGuardStatusRecovered || st.Status == SSHGuardStatusRecoveryFailed {
 				syncPath := filepath.Join(g.GuardDir, guardID+".audit_synced")
+				pendingPath := filepath.Join(g.GuardDir, guardID+".audit_pending")
 				if _, statErr := os.Stat(syncPath); os.IsNotExist(statErr) {
 					eventType := model.AuditEventRollbackCompleted
 					result := "WATCHDOG_RECOVERED"
@@ -511,7 +515,7 @@ func (g *PersistentHostSSHGuard) ReconcileExpired(ctx context.Context) (int, err
 						eventType = model.AuditEventRollbackFailed
 						result = "WATCHDOG_RECOVERY_FAILED"
 					}
-					if _, emitErr := g.AuditEngine.EmitEvent(ctx, audit.EmitEventInput{
+					emitInput := audit.EmitEventInput{
 						EventType:         eventType,
 						Action:            "host.ssh_watchdog.reconcile",
 						Target:            guardID,
@@ -524,8 +528,27 @@ func (g *PersistentHostSSHGuard) ReconcileExpired(ctx context.Context) (int, err
 						Result:            result,
 						DecisionReason:    "offline watchdog recovery reconciled into audit engine",
 						ErrorCode:         st.LastError,
-					}); emitErr == nil {
+					}
+					var emitErr error
+					for attempt := 0; attempt < 3; attempt++ {
+						_, emitErr = g.AuditEngine.EmitEvent(ctx, emitInput)
+						if emitErr == nil {
+							break
+						}
+						time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
+					}
+					if emitErr == nil {
 						_ = writeFileAtomicFailClosed(syncPath, []byte(now.Format(time.RFC3339Nano)), 0600)
+						_ = os.Remove(pendingPath)
+					} else {
+						pendingRecord, _ := json.Marshal(map[string]any{
+							"guard_id":    guardID,
+							"status":      st.Status,
+							"last_error":  emitErr.Error(),
+							"queued_at":   now.Format(time.RFC3339Nano),
+							"retry_count": 3,
+						})
+						_ = writeFileAtomicFailClosed(pendingPath, pendingRecord, 0600)
 					}
 				}
 			}
