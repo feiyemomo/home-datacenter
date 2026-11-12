@@ -45,6 +45,7 @@ function statusTone(status: string): string {
             return "border-amber-500/40 bg-amber-500/15 text-amber-400";
         case "EXECUTION_UNKNOWN":
         case "AUDIT_COMMIT_FAILED":
+        case "ROLLBACK_FAILED":
             return "border-orange-500/50 bg-orange-500/20 text-orange-300";
         default:
             return "border-rose-500/40 bg-rose-500/15 text-rose-400";
@@ -404,6 +405,11 @@ export default function OpsAudit() {
                                     {badge.icon}
                                     {badge.label}
                                 </span>
+                                {(verifyResult?.local_only || remoteStatus?.diff?.local_only || keyStatus?.local_only) && (
+                                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-300">
+                                        LOCAL_ONLY (无远程副本)
+                                    </span>
+                                )}
                                 {remoteStatus?.diff && (
                                     <span
                                         className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium ${remoteStatusTone(
@@ -491,6 +497,39 @@ export default function OpsAudit() {
                             ) : null}
                         </div>
                     </div>
+                    {(verifyResult?.trust_boundaries || remoteStatus?.diff?.trust_boundaries || keyStatus?.trust_boundaries) && (() => {
+                        const tb =
+                            verifyResult?.trust_boundaries ||
+                            remoteStatus?.diff?.trust_boundaries ||
+                            keyStatus?.trust_boundaries;
+                        if (!tb) return null;
+                        return (
+                            <div className="grid grid-cols-1 gap-2 border-t border-[rgb(var(--border)/0.2)] pt-2.5 text-[11px] sm:grid-cols-2 lg:grid-cols-4">
+                                <div className="rounded-md border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-elevated)/0.4)] px-2.5 py-1.5">
+                                    <div className="text-fg-subtle">本地链路 (LocalChain)</div>
+                                    <div className="font-mono text-fg">{tb.local_chain}</div>
+                                </div>
+                                <div className="rounded-md border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-elevated)/0.4)] px-2.5 py-1.5">
+                                    <div className="text-fg-subtle">远程副本 (RemoteStore)</div>
+                                    <div className="font-mono text-fg">
+                                        {tb.remote_store}
+                                        {tb.local_only ? " (LOCAL_ONLY)" : tb.remote_reachable ? " (ONLINE)" : " (OFFLINE)"}
+                                    </div>
+                                </div>
+                                <div className="rounded-md border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-elevated)/0.4)] px-2.5 py-1.5">
+                                    <div className="text-fg-subtle">只增保障 (WORM)</div>
+                                    <div className="font-mono text-fg">{tb.worm_guarantee}</div>
+                                </div>
+                                <div className="rounded-md border border-[rgb(var(--border)/0.3)] bg-[rgb(var(--bg-elevated)/0.4)] px-2.5 py-1.5">
+                                    <div className="text-fg-subtle">密钥隔离 (KeySeparation)</div>
+                                    <div className="font-mono text-fg">
+                                        {tb.private_key_separation}
+                                        {tb.hmac_key_scope ? ` · ${tb.hmac_key_scope}` : ""}
+                                    </div>
+                                </div>
+                            </div>
+                        );
+                    })()}
                     {(verifyResult?.security_boundary || keyStatus?.security_boundary_note) && (
                         <p className="text-[11px] text-fg-subtle">
                             {verifyResult?.security_boundary || keyStatus?.security_boundary_note}
@@ -553,6 +592,7 @@ export default function OpsAudit() {
                         <option value="COMPLETED">已完成 (COMPLETED)</option>
                         <option value="FAILED">失败 (FAILED)</option>
                         <option value="ROLLED_BACK">已回滚 (ROLLED_BACK)</option>
+                        <option value="ROLLBACK_FAILED">回滚失败 (ROLLBACK_FAILED)</option>
                         <option value="BLOCKED">已阻断 (BLOCKED)</option>
                         <option value="EXECUTION_UNKNOWN">结果未知 (EXECUTION_UNKNOWN)</option>
                         <option value="AUDIT_COMMIT_FAILED">审计提交失败 (AUDIT_COMMIT_FAILED)</option>

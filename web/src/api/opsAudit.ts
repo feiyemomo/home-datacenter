@@ -78,6 +78,18 @@ export interface AgentAuditEvent {
     hmac_signature: string;
 }
 
+export interface AuditTrustBoundaries {
+    local_only: boolean;
+    local_chain: string;
+    remote_store: string;
+    remote_reachable: boolean;
+    worm_guarantee: string;
+    private_key_separation: string;
+    hmac_key_scope: string;
+    signing_priv_key_present: boolean;
+    summary: string;
+}
+
 export interface AuditVerifyResult {
     valid: boolean;
     integrity_status: string;
@@ -93,12 +105,14 @@ export interface AuditVerifyResult {
     broken_at_seq?: number;
     failure_reason?: string;
     key_ids_used?: string[];
+    local_only?: boolean;
     remote_store_configured?: boolean;
     remote_store_type?: string;
     remote_sync_status?: string;
     remote_tail_seq?: number;
     remote_tail_hash?: string;
     external_sig_verified?: boolean;
+    trust_boundaries?: AuditTrustBoundaries;
     security_boundary?: string;
     limitation_note: string;
     verified_at: string;
@@ -113,12 +127,15 @@ export interface AuditKeyStatus {
     external_public_key?: string;
     last_rotation_at?: string;
     rotation_count: number;
+    local_only?: boolean;
     remote_store_configured: boolean;
     remote_store_type?: string;
+    trust_boundaries?: AuditTrustBoundaries;
     security_boundary_note: string;
 }
 
 export interface AuditRemoteDiffReport {
+    local_only?: boolean;
     configured: boolean;
     store_type: string;
     endpoint?: string;
@@ -134,6 +151,7 @@ export interface AuditRemoteDiffReport {
     remote_chain_digest?: string;
     pending_events: number;
     external_sig_verified: boolean;
+    trust_boundaries?: AuditTrustBoundaries;
     discrepancies?: string[];
     error?: string;
     checked_at: string;

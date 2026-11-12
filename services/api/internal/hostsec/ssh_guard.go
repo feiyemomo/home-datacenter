@@ -23,27 +23,31 @@ const (
 // PersistentSSHGuardState is written atomically to disk inside GuardDir so SSH dead-man's-switch
 // recovery survives container restarts, API crashes, or helper termination.
 type PersistentSSHGuardState struct {
-	GuardID         string            `json:"guard_id"`
-	OperationID     string            `json:"operation_id,omitempty"`
-	ProposalID      string            `json:"proposal_id,omitempty"`
-	SnapshotID      string            `json:"snapshot_id,omitempty"`
-	SnapshotDir     string            `json:"snapshot_dir"`
-	HostRoot        string            `json:"host_root"`
-	ArmedAt         time.Time         `json:"armed_at"`
-	DeadlineAt      time.Time         `json:"deadline_at"`
-	Packages        []string          `json:"packages,omitempty"`
-	PackageVersions map[string]string `json:"package_versions,omitempty"`
-	CopiedFiles     map[string]string `json:"copied_files,omitempty"`
-	ExternalUnit    string            `json:"external_unit,omitempty"`
-	ScriptPath      string            `json:"script_path,omitempty"`
-	Status          string            `json:"status"`
-	DisarmedAt      *time.Time        `json:"disarmed_at,omitempty"`
-	RecoveredAt     *time.Time        `json:"recovered_at,omitempty"`
-	LastError       string            `json:"last_error,omitempty"`
+	GuardID           string                `json:"guard_id"`
+	OperationID       string                `json:"operation_id,omitempty"`
+	ProposalID        string                `json:"proposal_id,omitempty"`
+	ApprovalID        string                `json:"approval_id,omitempty"`
+	BaselineHash      string                `json:"baseline_hash,omitempty"`
+	FencingGeneration int64                 `json:"fencing_generation,omitempty"`
+	SnapshotID        string                `json:"snapshot_id,omitempty"`
+	SnapshotDir       string                `json:"snapshot_dir"`
+	HostRoot          string                `json:"host_root"`
+	ArmedAt           time.Time             `json:"armed_at"`
+	DeadlineAt        time.Time             `json:"deadline_at"`
+	Packages          []string              `json:"packages,omitempty"`
+	PackageVersions   map[string]string     `json:"package_versions,omitempty"`
+	CopiedFiles       map[string]string     `json:"copied_files,omitempty"`
+	ExternalUnit      string                `json:"external_unit,omitempty"`
+	BridgeDelegated   bool                  `json:"bridge_delegated,omitempty"`
+	ScriptPath        string                `json:"script_path,omitempty"`
+	Status            string                `json:"status"`
+	DisarmedAt        *time.Time            `json:"disarmed_at,omitempty"`
+	RecoveredAt       *time.Time            `json:"recovered_at,omitempty"`
+	LastError         string                `json:"last_error,omitempty"`
 }
 
-// ExternalWatchdogBackend abstracts host-level out-of-process timer scheduling (e.g., systemd-run)
-// so countdown continues even if the Go API container crashes or restarts.
+// ExternalWatchdogBackend abstracts host-level out-of-process timer scheduling (e.g., detached OS process or systemd-run)
+// so countdown continues even if the Go API container crashes or stops.
 type ExternalWatchdogBackend interface {
 	Schedule(ctx context.Context, guardID string, timeout time.Duration, scriptPath string) (unitName string, err error)
 	Cancel(ctx context.Context, unitName string) error
@@ -51,17 +55,22 @@ type ExternalWatchdogBackend interface {
 
 // PersistentHostSSHGuard implements a disk-persisted, crash-survivable SSH dead-man's-switch.
 type PersistentHostSSHGuard struct {
-	GuardDir          string
-	HostRoot          string
-	SnapshotRoot      string
-	Runner            HostExecRunner
-	Bridge            RestrictedHostExecutionBridge
-	ExternalWatchdog  ExternalWatchdogBackend
-	DisableLocalTimer bool // test hook to simulate immediate API crash after Arm
-	FallbackRecoverFn func(ctx context.Context, state PersistentSSHGuardState) error
+	GuardDir                 string
+	HostRoot                 string
+	SnapshotRoot             string
+	Runner                   HostExecRunner
+	Bridge                   RestrictedHostExecutionBridge
+	ExternalWatchdog         ExternalWatchdogBackend
+	DelegateWatchdogToBridge bool
+	DisableLocalTimer        bool // test hook to simulate immediate API crash after Arm
+	FallbackRecoverFn        func(ctx context.Context, state PersistentSSHGuardState) error
 
-	mu     sync.Mutex
-	timers map[string]*time.Timer
+	mu             sync.Mutex
+	timers         map[string]*time.Timer
+	bridgeBindings map[string]struct {
+		binding HostExecutionBinding
+		grant   *HostExecutionGrant
+	}
 }
 
 // NewPersistentHostSSHGuard constructs a disk-backed SSH dead-man's-switch guard.
@@ -80,7 +89,27 @@ func NewPersistentHostSSHGuard(guardDir, hostRoot, snapshotRoot string, runner H
 		Runner:       runner,
 		Bridge:       bridge,
 		timers:       make(map[string]*time.Timer),
+		bridgeBindings: make(map[string]struct {
+			binding HostExecutionBinding
+			grant   *HostExecutionGrant
+		}),
 	}
+}
+
+func (g *PersistentHostSSHGuard) lockFilePath() string {
+	return filepath.Join(g.GuardDir, ".guard.lock")
+}
+
+func (g *PersistentHostSSHGuard) disarmedFlagPath(guardID string) string {
+	return filepath.Join(g.GuardDir, guardID+".disarmed")
+}
+
+func (g *PersistentHostSSHGuard) recoveredTemplatePath(guardID string) string {
+	return filepath.Join(g.GuardDir, guardID+".recovered.tmpl")
+}
+
+func (g *PersistentHostSSHGuard) failedTemplatePath(guardID string) string {
+	return filepath.Join(g.GuardDir, guardID+".failed.tmpl")
 }
 
 func (g *PersistentHostSSHGuard) stateFilePath(guardID string) string {
@@ -99,27 +128,33 @@ func (g *PersistentHostSSHGuard) writeStateAtomic(state PersistentSSHGuardState)
 	if err != nil {
 		return err
 	}
-	target := g.stateFilePath(state.GuardID)
-	tmp := target + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+	return writeFileAtomicFailClosed(g.stateFilePath(state.GuardID), data, 0600)
+}
+
+func (g *PersistentHostSSHGuard) writeStatusTemplates(state PersistentSSHGuardState) error {
+	sentinel := time.Date(1999, 9, 9, 9, 9, 9, 0, time.UTC)
+	recState := state
+	recState.Status = SSHGuardStatusRecovered
+	recState.RecoveredAt = &sentinel
+	recBytes, err := json.MarshalIndent(recState, "", "  ")
 	if err != nil {
 		return err
 	}
-	if _, wErr := f.Write(data); wErr != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return wErr
+	recContent := strings.ReplaceAll(string(recBytes), "1999-09-09T09:09:09Z", "__RECOVERED_AT__")
+	if err := writeFileAtomicFailClosed(g.recoveredTemplatePath(state.GuardID), []byte(recContent), 0600); err != nil {
+		return err
 	}
-	if sErr := f.Sync(); sErr != nil {
-		_ = f.Close()
-		_ = os.Remove(tmp)
-		return sErr
+
+	failState := state
+	failState.Status = SSHGuardStatusRecoveryFailed
+	failState.RecoveredAt = &sentinel
+	failState.LastError = "detached host watchdog recovery command failed"
+	failBytes, err := json.MarshalIndent(failState, "", "  ")
+	if err != nil {
+		return err
 	}
-	if cErr := f.Close(); cErr != nil {
-		_ = os.Remove(tmp)
-		return cErr
-	}
-	return os.Rename(tmp, target)
+	failContent := strings.ReplaceAll(string(failBytes), "1999-09-09T09:09:09Z", "__RECOVERED_AT__")
+	return writeFileAtomicFailClosed(g.failedTemplatePath(state.GuardID), []byte(failContent), 0600)
 }
 
 func (g *PersistentHostSSHGuard) readState(guardID string) (*PersistentSSHGuardState, error) {
@@ -142,28 +177,67 @@ func (g *PersistentHostSSHGuard) Arm(
 	timeout time.Duration,
 	recoverFn func(context.Context) error,
 ) (string, error) {
+	return g.ArmWithBinding(ctx, snapshotDir, timeout, HostExecutionBinding{}, nil, recoverFn)
+}
+
+// ArmWithBinding persists guard metadata, optionally delegates out-of-process watchdog scheduling
+// across RestrictedHostExecutionBridge (surviving API container termination), and arms timers.
+func (g *PersistentHostSSHGuard) ArmWithBinding(
+	ctx context.Context,
+	snapshotDir string,
+	timeout time.Duration,
+	binding HostExecutionBinding,
+	grant *HostExecutionGrant,
+	recoverFn func(context.Context) error,
+) (string, error) {
+	now := time.Now().UTC()
+	guardID := fmt.Sprintf("ssh-guard-%d", now.UnixNano())
+	return g.armWithGuardID(ctx, guardID, now, snapshotDir, timeout, binding, grant, recoverFn)
+}
+
+func (g *PersistentHostSSHGuard) armWithGuardID(
+	ctx context.Context,
+	guardID string,
+	now time.Time,
+	snapshotDir string,
+	timeout time.Duration,
+	binding HostExecutionBinding,
+	grant *HostExecutionGrant,
+	recoverFn func(context.Context) error,
+) (string, error) {
+	if !reSafeSnapshotID.MatchString(strings.TrimSpace(guardID)) {
+		return "", fmt.Errorf("invalid guard_id %q", guardID)
+	}
 	if timeout <= 0 {
 		timeout = DefaultSSHRecoveryWindow
 	}
-	now := time.Now().UTC()
-	guardID := fmt.Sprintf("ssh-guard-%d", now.UnixNano())
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
 	detector := NewPlatformDetector(g.HostRoot)
 
 	state := PersistentSSHGuardState{
-		GuardID:     guardID,
-		SnapshotDir: filepath.Clean(snapshotDir),
-		HostRoot:    detector.HostRoot,
-		ArmedAt:     now,
-		DeadlineAt:  now.Add(timeout),
-		ScriptPath:  g.scriptFilePath(guardID),
-		Status:      SSHGuardStatusArmed,
+		GuardID:           guardID,
+		OperationID:       strings.TrimSpace(binding.OperationID),
+		ProposalID:        strings.TrimSpace(binding.ProposalID),
+		ApprovalID:        strings.TrimSpace(binding.ApprovalID),
+		BaselineHash:      strings.TrimSpace(binding.BaselineHash),
+		FencingGeneration: binding.FencingGeneration,
+		SnapshotDir:       filepath.Clean(snapshotDir),
+		HostRoot:          detector.HostRoot,
+		ArmedAt:           now,
+		DeadlineAt:        now.Add(timeout),
+		ScriptPath:        g.scriptFilePath(guardID),
+		Status:            SSHGuardStatusArmed,
 	}
 
 	if snapshotDir != "" {
 		if mb, err := os.ReadFile(filepath.Join(snapshotDir, "manifest.json")); err == nil {
 			var snap HostUpdateSnapshot
 			if jErr := json.Unmarshal(mb, &snap); jErr == nil {
-				state.OperationID = snap.SnapshotID
+				if state.OperationID == "" {
+					state.OperationID = snap.SnapshotID
+				}
 				state.SnapshotID = snap.SnapshotID
 				state.PackageVersions = snap.PackageVersions
 				state.CopiedFiles = snap.CopiedFiles
@@ -176,9 +250,57 @@ func (g *PersistentHostSSHGuard) Arm(
 		}
 	}
 
+	unlock, lErr := acquireCrossProcessFileLock(g.lockFilePath())
+	if lErr != nil {
+		return "", fmt.Errorf("acquire SSH guard lock: %w", lErr)
+	}
+	if err := removeFileFailClosed(g.disarmedFlagPath(guardID)); err != nil {
+		_ = unlock()
+		return "", fmt.Errorf("clear SSH guard disarmed marker: %w", err)
+	}
 	if err := g.writeRecoveryScript(detector, state); err != nil {
+		_ = unlock()
 		return "", fmt.Errorf("write persistent SSH recovery script: %w", err)
 	}
+	if err := g.writeStatusTemplates(state); err != nil {
+		_ = unlock()
+		return "", fmt.Errorf("write SSH guard state templates: %w", err)
+	}
+	// Persist initial ARMED state BEFORE launching out-of-process watchdog so disk state exists on wakeup.
+	if err := g.writeStateAtomic(state); err != nil {
+		_ = unlock()
+		return "", fmt.Errorf("persist initial SSH guard state: %w", err)
+	}
+	if uErr := unlock(); uErr != nil {
+		return "", fmt.Errorf("release SSH guard lock: %w", uErr)
+	}
+
+	if g.DelegateWatchdogToBridge && g.Bridge != nil && state.SnapshotID != "" {
+		if _, err := g.Bridge.ExecuteTypedAction(ctx, HostActionRequest{
+			Action:            HostActionWatchdogArm,
+			Binding:           binding,
+			Grant:             grant,
+			SnapshotID:        state.SnapshotID,
+			GuardID:           guardID,
+			WatchdogTimeoutMs: timeout.Milliseconds(),
+		}); err != nil {
+			return "", fmt.Errorf("delegate host bridge SSH watchdog arm: %w", err)
+		}
+		state.BridgeDelegated = true
+		g.mu.Lock()
+		if g.bridgeBindings == nil {
+			g.bridgeBindings = make(map[string]struct {
+				binding HostExecutionBinding
+				grant   *HostExecutionGrant
+			})
+		}
+		g.bridgeBindings[guardID] = struct {
+			binding HostExecutionBinding
+			grant   *HostExecutionGrant
+		}{binding: binding, grant: grant}
+		g.mu.Unlock()
+	}
+
 	if g.ExternalWatchdog != nil {
 		unitName, wErr := g.ExternalWatchdog.Schedule(ctx, guardID, timeout, state.ScriptPath)
 		if wErr != nil {
@@ -186,8 +308,20 @@ func (g *PersistentHostSSHGuard) Arm(
 		}
 		state.ExternalUnit = unitName
 	}
-	if err := g.writeStateAtomic(state); err != nil {
-		return "", fmt.Errorf("persist SSH guard state: %w", err)
+
+	if state.BridgeDelegated || state.ExternalUnit != "" {
+		unlock2, lErr2 := acquireCrossProcessFileLock(g.lockFilePath())
+		if lErr2 != nil {
+			return "", fmt.Errorf("acquire SSH guard lock for unit persist: %w", lErr2)
+		}
+		wErr := g.writeStateAtomic(state)
+		uErr := unlock2()
+		if wErr != nil {
+			return "", fmt.Errorf("persist SSH guard unit state: %w", wErr)
+		}
+		if uErr != nil {
+			return "", fmt.Errorf("release SSH guard lock: %w", uErr)
+		}
 	}
 
 	if !g.DisableLocalTimer {
@@ -213,40 +347,90 @@ func (g *PersistentHostSSHGuard) Arm(
 }
 
 // Disarm stops any local/external watchdog and records DISARMED state on disk.
-// Fails if recovery already fired (even in a prior crashed process).
+// Fails if recovery already fired (even in a prior crashed process or detached watchdog).
 func (g *PersistentHostSSHGuard) Disarm(guardID string) error {
 	g.mu.Lock()
 	if t, ok := g.timers[guardID]; ok {
 		t.Stop()
 		delete(g.timers, guardID)
 	}
+	bound, hasBound := g.bridgeBindings[guardID]
+	delete(g.bridgeBindings, guardID)
+	extBackend := g.ExternalWatchdog
+	bridge := g.Bridge
+	g.mu.Unlock()
+
+	unlock, lErr := acquireCrossProcessFileLock(g.lockFilePath())
+	if lErr != nil {
+		return fmt.Errorf("acquire SSH guard lock on disarm: %w", lErr)
+	}
 	st, err := g.readState(guardID)
 	if err != nil {
-		g.mu.Unlock()
-		return nil
+		_ = unlock()
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("read SSH guard state on disarm: %w", err)
 	}
 	if st.Status == SSHGuardStatusRecovered || st.Status == SSHGuardStatusRecoveryFailed {
-		g.mu.Unlock()
+		_ = unlock()
 		return fmt.Errorf("SSH recovery guard %s already triggered rollback (status=%s)", guardID, st.Status)
 	}
 	if st.Status == SSHGuardStatusDisarmed {
-		g.mu.Unlock()
+		_ = unlock()
 		return nil
+	}
+	// Persist .disarmed marker + DISARMED state atomically BEFORE stopping external process
+	if fErr := writeFileAtomicFailClosed(g.disarmedFlagPath(guardID), []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0600); fErr != nil {
+		_ = unlock()
+		return fmt.Errorf("persist SSH guard disarmed marker: %w", fErr)
 	}
 	now := time.Now().UTC()
 	st.Status = SSHGuardStatusDisarmed
 	st.DisarmedAt = &now
 	wErr := g.writeStateAtomic(*st)
 	extUnit := st.ExternalUnit
-	extBackend := g.ExternalWatchdog
-	g.mu.Unlock()
+	bridgeDelegated := st.BridgeDelegated
+	uErr := unlock()
+	if wErr != nil {
+		return wErr
+	}
+	if uErr != nil {
+		return uErr
+	}
 
 	if extUnit != "" && extBackend != nil {
 		cCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
 		_ = extBackend.Cancel(cCtx, extUnit)
+		cancel()
 	}
-	return wErr
+	if bridgeDelegated && bridge != nil {
+		bBinding := bound.binding
+		var bGrant *HostExecutionGrant
+		if hasBound {
+			bGrant = bound.grant
+		} else {
+			bBinding = HostExecutionBinding{
+				ProposalID:        st.ProposalID,
+				ApprovalID:        st.ApprovalID,
+				OperationID:       st.OperationID,
+				BaselineHash:      st.BaselineHash,
+				FencingGeneration: st.FencingGeneration,
+			}
+		}
+		dCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		_, dErr := bridge.ExecuteTypedAction(dCtx, HostActionRequest{
+			Action:  HostActionWatchdogDisarm,
+			Binding: bBinding,
+			Grant:   bGrant,
+			GuardID: guardID,
+		})
+		cancel()
+		if dErr != nil {
+			return dErr
+		}
+	}
+	return nil
 }
 
 // StopLocalTimers stops in-memory timers WITHOUT disarming persisted disk state,
@@ -306,18 +490,22 @@ func (g *PersistentHostSSHGuard) LoadState(guardID string) (*PersistentSSHGuardS
 }
 
 func (g *PersistentHostSSHGuard) triggerRecovery(ctx context.Context, guardID string, liveRecoverFn func(context.Context) error) error {
-	g.mu.Lock()
+	unlock, lErr := acquireCrossProcessFileLock(g.lockFilePath())
+	if lErr != nil {
+		return lErr
+	}
 	st, err := g.readState(guardID)
 	if err != nil {
-		g.mu.Unlock()
+		_ = unlock()
 		return err
 	}
 	if st.Status != SSHGuardStatusArmed {
-		g.mu.Unlock()
-		return nil
+		return unlock()
 	}
 	stateCopy := *st
-	g.mu.Unlock()
+	if uErr := unlock(); uErr != nil {
+		return uErr
+	}
 
 	var recErr error
 	switch {
@@ -329,14 +517,17 @@ func (g *PersistentHostSSHGuard) triggerRecovery(ctx context.Context, guardID st
 		recErr = g.recoverFromPersistedState(ctx, stateCopy)
 	}
 
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	unlock2, lErr2 := acquireCrossProcessFileLock(g.lockFilePath())
+	if lErr2 != nil {
+		return lErr2
+	}
 	latest, lErr := g.readState(guardID)
 	if lErr != nil {
+		_ = unlock2()
 		return lErr
 	}
-	if latest.Status == SSHGuardStatusDisarmed {
-		return nil
+	if latest.Status != SSHGuardStatusArmed {
+		return unlock2()
 	}
 	now := time.Now().UTC()
 	latest.RecoveredAt = &now
@@ -346,8 +537,13 @@ func (g *PersistentHostSSHGuard) triggerRecovery(ctx context.Context, guardID st
 	} else {
 		latest.Status = SSHGuardStatusRecovered
 	}
-	if wErr := g.writeStateAtomic(*latest); wErr != nil {
+	wErr := g.writeStateAtomic(*latest)
+	uErr2 := unlock2()
+	if wErr != nil {
 		return wErr
+	}
+	if uErr2 != nil {
+		return uErr2
 	}
 	return recErr
 }

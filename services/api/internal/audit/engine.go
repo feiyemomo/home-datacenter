@@ -675,7 +675,15 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		synced = *in.Synced
 	}
 
-	paramDigest, paramRedacted := SerializeParams(in.Parameters)
+	paramsInput := mergeLifecycleFields(in.Parameters, nonEmptyPair("decision_reason", CapAndRedactText(strings.TrimSpace(in.DecisionReason), 1024)))
+	beforeInput := mergeLifecycleFields(in.BeforeState, nonEmptyPair("baseline_before_hash", strings.TrimSpace(in.BaselineBeforeHash)))
+	afterInput := mergeLifecycleFields(in.AfterState, nonEmptyPair("baseline_after_hash", strings.TrimSpace(in.BaselineAfterHash)))
+	evidenceInput := in.Evidence
+	if in.RollbackResult != nil {
+		evidenceInput = mergeLifecycleFields(in.Evidence, map[string]any{"rollback_result": in.RollbackResult})
+	}
+
+	paramDigest, paramRedacted := SerializeParams(paramsInput)
 	ev := &model.AgentAuditEvent{
 		StreamID:           model.AuditPrimaryStreamID,
 		AuditID:            auditID,
@@ -697,14 +705,14 @@ func (e *AgentAuditEngine) EmitEvent(ctx context.Context, in EmitEventInput) (*m
 		ApprovalID:         approvalID,
 		OperationID:        operationID,
 		FencingGeneration:  in.FencingGeneration,
-		BeforeState:        SerializeEvidence(in.BeforeState),
-		AfterState:         SerializeEvidence(in.AfterState),
+		BeforeState:        SerializeEvidence(beforeInput),
+		AfterState:         SerializeEvidence(afterInput),
 		ParametersDigest:   paramDigest,
 		ParametersRedacted: paramRedacted,
 		Result:             strings.TrimSpace(in.Result),
 		ErrorCode:          CapAndRedactText(strings.TrimSpace(in.ErrorCode), 256),
 		DurationMs:         in.DurationMs,
-		Evidence:           SerializeEvidence(in.Evidence),
+		Evidence:           SerializeEvidence(evidenceInput),
 		CreatedAt:          now,
 		CreatedAtMs:        nowMs,
 		IsOffline:          in.IsOffline,
@@ -1175,7 +1183,15 @@ func upsertRunProgressConn(conn *sql.Conn, ev *model.AgentAuditEvent, finalStatu
 			runStatus = model.AuditRunStatusCompleted
 			endedAtMs = ev.CreatedAtMs
 		case model.AuditEventRollbackCompleted:
-			runStatus = model.AuditRunStatusRolledBack
+			upperRes := strings.ToUpper(strings.TrimSpace(ev.Result))
+			if upperRes == "ROLLBACK_FAILED" || upperRes == "FAILED" {
+				runStatus = model.AuditRunStatusRollbackFailed
+			} else {
+				runStatus = model.AuditRunStatusRolledBack
+			}
+			endedAtMs = ev.CreatedAtMs
+		case model.AuditEventRollbackFailed:
+			runStatus = model.AuditRunStatusRollbackFailed
 			endedAtMs = ev.CreatedAtMs
 		case model.AuditEventExecutionFailed, model.AuditEventApprovalRejected, model.AuditEventApprovalExpired:
 			runStatus = model.AuditRunStatusFailed
@@ -1237,6 +1253,7 @@ func insertLegacyAuditMirrorConn(conn *sql.Conn, ev *model.AgentAuditEvent, in E
 	if execPayload == "" {
 		execPayload = ev.Evidence
 	}
+	rollbackResultStr := resolveLegacyRollbackResult(ev, in)
 	_, err := conn.ExecContext(context.Background(), `
 		INSERT OR IGNORE INTO structured_ops_audit_logs (
 			event_uuid, household_id, request_id, actor_type, actor_id, actor_name,
@@ -1245,9 +1262,77 @@ func insertLegacyAuditMirrorConn(conn *sql.Conn, ev *model.AgentAuditEvent, in E
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		ev.AuditID, ev.HouseholdID, ev.CorrelationID, ev.ActorType, 0, ev.ActorID,
 		in.LegacyClientIP, targetType, defaultStr(ev.Target, ev.Component), ev.Action, ev.ProposalID, in.LegacyApprover,
-		execPayload, "", boolInt(ev.IsOffline), ev.CreatedAt.UTC(),
+		execPayload, rollbackResultStr, boolInt(ev.IsOffline), ev.CreatedAt.UTC(),
 	)
 	return err
+}
+
+func resolveLegacyRollbackResult(ev *model.AgentAuditEvent, in EmitEventInput) string {
+	if in.RollbackResult != nil {
+		return SerializeEvidence(in.RollbackResult)
+	}
+	upperRes := strings.ToUpper(strings.TrimSpace(ev.Result))
+	isRollback := ev.EventType == model.AuditEventRollbackStarted ||
+		ev.EventType == model.AuditEventRollbackCompleted ||
+		ev.EventType == model.AuditEventRollbackFailed ||
+		strings.HasPrefix(strings.ToLower(strings.TrimSpace(ev.Action)), "rollback.") ||
+		strings.Contains(upperRes, "ROLLBACK") ||
+		strings.Contains(upperRes, "ROLLED_BACK")
+	if !isRollback {
+		return ""
+	}
+	if ev.AfterState != "" {
+		return ev.AfterState
+	}
+	if ev.Evidence != "" {
+		return ev.Evidence
+	}
+	if upperRes != "" {
+		return CapAndRedactText(strings.TrimSpace(ev.Result), 512)
+	}
+	return ev.ErrorCode
+}
+
+func nonEmptyPair(key, val string) map[string]any {
+	if val == "" {
+		return nil
+	}
+	return map[string]any{key: val}
+}
+
+func mergeLifecycleFields(base any, extras map[string]any) any {
+	if len(extras) == 0 {
+		return base
+	}
+	if base == nil {
+		return extras
+	}
+	merged := make(map[string]any, len(extras)+4)
+	if directMap, ok := base.(map[string]any); ok {
+		for k, v := range directMap {
+			merged[k] = v
+		}
+		for k, v := range extras {
+			if _, exists := merged[k]; !exists {
+				merged[k] = v
+			}
+		}
+		return merged
+	}
+	raw, err := json.Marshal(base)
+	if err == nil && json.Unmarshal(raw, &merged) == nil && len(merged) > 0 {
+		for k, v := range extras {
+			if _, exists := merged[k]; !exists {
+				merged[k] = v
+			}
+		}
+		return merged
+	}
+	out := map[string]any{"payload": base}
+	for k, v := range extras {
+		out[k] = v
+	}
+	return out
 }
 
 func defaultStr(v, fallback string) string {

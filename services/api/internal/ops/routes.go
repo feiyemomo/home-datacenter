@@ -841,6 +841,13 @@ func (h *OpsHandler) ExecuteHostUpdate(c *gin.Context) {
 		switch {
 		case errors.Is(err, ErrProposalUnauthorized),
 			errors.Is(err, hostsec.ErrApprovalRequired),
+			errors.Is(err, hostsec.ErrExecutionGrantRequired),
+			errors.Is(err, hostsec.ErrExecutionGrantInvalid),
+			errors.Is(err, hostsec.ErrExecutionGrantExpired),
+			errors.Is(err, hostsec.ErrExecutionGrantRevoked),
+			errors.Is(err, hostsec.ErrExecutionGrantConsumed),
+			errors.Is(err, hostsec.ErrExecutionGrantMismatch),
+			errors.Is(err, hostsec.ErrExecutionGrantKeyConflict),
 			errors.Is(err, ErrApprovalDigestMismatch):
 			statusCode = http.StatusForbidden
 		case errors.Is(err, ErrInvalidSpec),

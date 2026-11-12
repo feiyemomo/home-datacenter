@@ -46,6 +46,60 @@ func (e *AgentAuditEngine) activeExternalSignerAndVerifier() (ExternalCheckpoint
 	return signer, verifier
 }
 
+func (e *AgentAuditEngine) computeTrustBoundaries(localChainBoundary string, remoteReachable bool) AuditTrustBoundaries {
+	if strings.TrimSpace(localChainBoundary) == "" {
+		localChainBoundary = LocalChainBoundaryUnverifiable
+	}
+	signer, verifier := e.activeExternalSignerAndVerifier()
+	hasRemote := e != nil && e.remoteStore != nil
+	remoteBoundary := RemoteStatusLocalOnly
+	wormBoundary := WORMGuaranteeNoneLocalOnly
+	if hasRemote {
+		switch strings.ToLower(strings.TrimSpace(e.remoteStore.Type())) {
+		case "file-worm", "worm", "file":
+			remoteBoundary = "FILE_WORM"
+			wormBoundary = WORMGuaranteeHostPathAppendOnly
+		case "http-append", "http", "s3-proxy":
+			remoteBoundary = "HTTP_APPEND"
+			wormBoundary = WORMGuaranteeRemoteAppendProxy
+		default:
+			remoteBoundary = strings.ToUpper(strings.TrimSpace(e.remoteStore.Type()))
+			wormBoundary = WORMGuaranteeRemoteAppendProxy
+		}
+	}
+
+	keySep := KeySepHMACCoResidentEnvOnly
+	if signer != nil {
+		keySep = KeySepEd25519PrivCoResident
+	} else if verifier != nil {
+		keySep = KeySepEd25519VerifyOnlySeparated
+	}
+
+	b := AuditTrustBoundaries{
+		LocalOnly:             !hasRemote,
+		LocalChain:            localChainBoundary,
+		RemoteStore:           remoteBoundary,
+		RemoteReachable:       hasRemote && remoteReachable,
+		WORMGuarantee:         wormBoundary,
+		PrivateKeySeparation:  keySep,
+		HMACKeyScope:          HMACKeyScopeCoResident,
+		SigningPrivKeyPresent: signer != nil,
+	}
+	switch {
+	case !hasRemote:
+		b.Summary = "LOCAL_ONLY: Local SQLite SHA-256 chain & HMAC triggers exist only on this host; WORM=NONE_LOCAL_ONLY; HMAC/signing material on fnOS root cannot protect against whole-DB rollback or local key extraction."
+	case b.RemoteStore == "FILE_WORM" && keySep == KeySepEd25519VerifyOnlySeparated:
+		b.Summary = "FILE_WORM + VERIFY_ONLY_PUB_SEPARATED: App-level append-only directory (host-path WORM unless backed by immutable external mount); API holds only Ed25519 public verifier."
+	case b.RemoteStore == "FILE_WORM":
+		b.Summary = "FILE_WORM: App-level append-only directory (" + keySep + "); provides host-path rollback detection but requires off-host mount or hardware WORM to resist fnOS root tampering."
+	case keySep == KeySepEd25519VerifyOnlySeparated:
+		b.Summary = "HTTP_APPEND + VERIFY_ONLY_PUB_SEPARATED: Off-host network append store with full Ed25519 private-key isolation from API runtime."
+	default:
+		b.Summary = fmt.Sprintf("%s + %s: Remote replica detects fnOS tail truncation/rollback; HMAC env remains %s.", b.RemoteStore, keySep, HMACKeyScopeCoResident)
+	}
+	return b
+}
+
 func (e *AgentAuditEngine) saveRemoteSyncState(state *model.AgentAuditRemoteSyncState) error {
 	if e == nil || e.db == nil {
 		return ErrAuditCommitFailed
@@ -118,12 +172,12 @@ func (e *AgentAuditEngine) GetRemoteSyncState(streamID string) (*model.AgentAudi
 			SyncStatus:      status,
 		}, nil
 	}
-	if st.SyncStatus == "" || st.SyncStatus == "DISABLED" {
-		if e.remoteStore == nil {
-			st.SyncStatus = RemoteStatusLocalOnly
-		} else {
-			st.SyncStatus = RemoteStatusPendingSync
-		}
+	if e.remoteStore == nil {
+		st.RemoteStoreType = "none"
+		st.RemoteEndpoint = ""
+		st.SyncStatus = RemoteStatusLocalOnly
+	} else if st.SyncStatus == "" || st.SyncStatus == "DISABLED" || st.SyncStatus == RemoteStatusLocalOnly {
+		st.SyncStatus = RemoteStatusPendingSync
 	}
 	return &st, nil
 }
@@ -323,22 +377,27 @@ func (e *AgentAuditEngine) CompareWithRemote(ctx context.Context, streamID strin
 		streamID = model.AuditPrimaryStreamID
 	}
 	rep := RemoteDiffReport{
-		StoreType: "none",
-		Status:    RemoteStatusLocalOnly,
-		CheckedAt: FormatRFC3339Ms(e.nowUTC()),
+		LocalOnly:       e == nil || e.remoteStore == nil,
+		StoreType:       "none",
+		Status:          RemoteStatusLocalOnly,
+		TrustBoundaries: e.computeTrustBoundaries(LocalChainBoundaryUnverifiable, false),
+		CheckedAt:       FormatRFC3339Ms(e.nowUTC()),
 	}
 	if e == nil || e.db == nil {
 		rep.Error = "audit database unavailable"
 		return rep
 	}
 
+	localBoundary := LocalChainBoundaryIntact
 	var localTail model.AgentAuditEvent
 	if qErr := e.db.Where("stream_id = ?", streamID).Order("seq DESC").First(&localTail).Error; qErr != nil && !errors.Is(qErr, gorm.ErrRecordNotFound) {
 		rep.Error = redact.SensitiveString(qErr.Error())
+		rep.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryUnverifiable, false)
 		return rep
 	}
 	rep.LocalTailSeq = localTail.Seq
 	rep.LocalTailHash = localTail.EntryHash
+	rep.TrustBoundaries = e.computeTrustBoundaries(localBoundary, false)
 
 	var localCPs []model.AgentAuditCheckpoint
 	if qErr := e.db.Where("stream_id = ?", streamID).Order("to_seq ASC").Find(&localCPs).Error; qErr != nil {
@@ -356,6 +415,7 @@ func (e *AgentAuditEngine) CompareWithRemote(ctx context.Context, streamID strin
 	if e.remoteStore == nil {
 		return rep
 	}
+	rep.LocalOnly = false
 	rep.Configured = true
 	rep.StoreType = e.remoteStore.Type()
 	rep.Endpoint = e.remoteStore.EndpointDisplay()
@@ -371,6 +431,7 @@ func (e *AgentAuditEngine) CompareWithRemote(ctx context.Context, streamID strin
 		rep.Reachable = false
 		rep.Status = RemoteStatusUnreachable
 		rep.Error = redact.SensitiveString(err.Error())
+		rep.TrustBoundaries = e.computeTrustBoundaries(localBoundary, false)
 		return rep
 	}
 	remoteCPs, cpErr := e.remoteStore.FetchCheckpoints(ctx, streamID)
@@ -378,10 +439,12 @@ func (e *AgentAuditEngine) CompareWithRemote(ctx context.Context, streamID strin
 		rep.Reachable = false
 		rep.Status = RemoteStatusUnreachable
 		rep.Error = redact.SensitiveString(cpErr.Error())
+		rep.TrustBoundaries = e.computeTrustBoundaries(localBoundary, false)
 		return rep
 	}
 
 	rep.Reachable = true
+	rep.TrustBoundaries = e.computeTrustBoundaries(localBoundary, true)
 	rep.RemoteTailSeq = remoteTail.TailSeq
 	rep.RemoteTailHash = remoteTail.TailEntryHash
 	rep.RemoteCheckpointID = remoteTail.LastCheckpointID
@@ -599,6 +662,8 @@ func (e *AgentAuditEngine) GetKeyStatus() AuditKeyStatus {
 		}
 	}
 
+	status.LocalOnly = !status.RemoteStoreConfigured
+	status.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryIntact, false)
 	status.SecurityBoundaryNote = buildSecurityBoundaryNote(
 		status.RemoteStoreConfigured,
 		false,
@@ -608,6 +673,7 @@ func (e *AgentAuditEngine) GetKeyStatus() AuditKeyStatus {
 	)
 	if e != nil && e.remoteStore != nil {
 		rep := e.CompareWithRemote(context.Background(), model.AuditPrimaryStreamID)
+		status.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryIntact, rep.Reachable)
 		status.SecurityBoundaryNote = buildSecurityBoundaryNote(
 			true,
 			rep.Reachable,

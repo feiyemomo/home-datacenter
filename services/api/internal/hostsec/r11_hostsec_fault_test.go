@@ -474,18 +474,23 @@ func TestR11_FI_06_ConcurrentHostUpdateAndFencingRejection(t *testing.T) {
 
 	// 2. Concurrent executions over shared executor/bridge/audit DB must be race-free.
 	const workers = 6
+	wProps := make([]*model.OpsProposal, workers)
+	for i := 0; i < workers; i++ {
+		wProp := makeSignedHostUpdateProposal(t, []string{"openssh-server"})
+		wProp.ProposalID = fmt.Sprintf("prop-hostupd-race-%d", i)
+		wProp.BaselineHash = baseHash
+		wProp.ApprovalDigest, _ = model.ComputeProposalApprovalDigest(wProp)
+		wProps[i] = wProp
+	}
 	var wg sync.WaitGroup
 	var okCount atomic.Int32
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
-		go func(idx int) {
+		go func(idx int, wProp *model.OpsProposal) {
 			defer wg.Done()
-			wProp := makeSignedHostUpdateProposal(t, []string{"openssh-server"})
-			wProp.ProposalID = fmt.Sprintf("prop-hostupd-race-%d", idx)
-			wProp.BaselineHash = baseHash
-			wProp.ApprovalDigest, _ = model.ComputeProposalApprovalDigest(wProp)
 			res, execErr := exec.Execute(context.Background(), HostUpdateRequest{
 				Proposal:             wProp,
+				ResourceScope:        fmt.Sprintf("host-os-worker-%d", idx),
 				FencingGeneration:    int64(idx + 1),
 				Packages:             []string{"openssh-server"},
 				ExpectedBaselineHash: baseHash,
@@ -493,7 +498,7 @@ func TestR11_FI_06_ConcurrentHostUpdateAndFencingRejection(t *testing.T) {
 			if execErr == nil && res != nil && res.Verified {
 				okCount.Add(1)
 			}
-		}(i)
+		}(i, wProps[i])
 	}
 	wg.Wait()
 	if okCount.Load() != workers {

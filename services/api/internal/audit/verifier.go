@@ -45,9 +45,14 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 	if streamID == "" {
 		streamID = model.AuditPrimaryStreamID
 	}
+	remoteConfigured := e != nil && e.remoteStore != nil
 	res := VerifyResult{
 		StreamID:         streamID,
-		SecurityBoundary: buildSecurityBoundaryNote(e != nil && e.remoteStore != nil, false, false, false, false),
+		LocalOnly:        !remoteConfigured,
+		RemoteStoreType:  "none",
+		RemoteSyncStatus: RemoteStatusLocalOnly,
+		TrustBoundaries:  e.computeTrustBoundaries(LocalChainBoundaryUnverifiable, false),
+		SecurityBoundary: buildSecurityBoundaryNote(remoteConfigured, false, false, false, false),
 		LimitationNote:   localNASLimitationNote,
 		VerifiedAt:       FormatRFC3339Ms(e.nowUTC()),
 	}
@@ -63,7 +68,9 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 	if e.remoteStore != nil {
 		res.RemoteStoreConfigured = true
 		res.RemoteStoreType = e.remoteStore.Type()
+		res.RemoteSyncStatus = RemoteStatusPendingSync
 	}
+	res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryUnverifiable, false)
 	res.SecurityBoundary = buildSecurityBoundaryNote(e.remoteStore != nil, false, false, extVerifier != nil, false)
 
 	_, ring, err := ResolveAuditHMACKeyring()
@@ -332,16 +339,20 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 		return res
 	}
 
+	remoteReachable := false
 	if verifyRemote {
 		rep := e.CompareWithRemote(context.Background(), streamID)
+		remoteReachable = rep.Reachable
 		res.RemoteStoreConfigured = rep.Configured
 		res.RemoteStoreType = rep.StoreType
 		res.RemoteSyncStatus = rep.Status
 		res.RemoteTailSeq = rep.RemoteTailSeq
 		res.RemoteTailHash = rep.RemoteTailHash
+		res.LocalOnly = rep.LocalOnly
 		if rep.ExternalSigVerified {
 			res.ExternalSigVerified = true
 		}
+		res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryIntact, rep.Reachable)
 		res.SecurityBoundary = buildSecurityBoundaryNote(
 			rep.Configured,
 			rep.Reachable,
@@ -371,10 +382,12 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 			res.FailureReason = strings.Join(rep.Discrepancies, "; ")
 			return res
 		}
+	} else {
+		res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryIntact, false)
 	}
 
 	res.Valid = true
-	if res.RemoteStoreConfigured && res.RemoteSyncStatus == RemoteStatusInSync {
+	if res.RemoteStoreConfigured && res.RemoteSyncStatus == RemoteStatusInSync && remoteReachable {
 		res.IntegrityStatus = IntegrityVerifiedAgainstRemote
 	} else if res.CheckedCheckpoints > 0 || res.LastCheckpointID != "" {
 		res.IntegrityStatus = IntegrityVerifiedAgainstCheckpoint
@@ -386,10 +399,16 @@ func (e *AgentAuditEngine) VerifyChain(req VerifyRequest) VerifyResult {
 
 // VerifyRunChain verifies triggers, hashes, predecessor links, HMACs, and covering checkpoints for a household-scoped run_id.
 func (e *AgentAuditEngine) VerifyRunChain(runID string, householdID uint) VerifyResult {
+	remoteConfigured := e != nil && e.remoteStore != nil
 	res := VerifyResult{
-		StreamID:       model.AuditPrimaryStreamID,
-		LimitationNote: localNASLimitationNote,
-		VerifiedAt:     FormatRFC3339Ms(e.nowUTC()),
+		StreamID:         model.AuditPrimaryStreamID,
+		LocalOnly:        !remoteConfigured,
+		RemoteStoreType:  "none",
+		RemoteSyncStatus: RemoteStatusLocalOnly,
+		TrustBoundaries:  e.computeTrustBoundaries(LocalChainBoundaryUnverifiable, false),
+		SecurityBoundary: buildSecurityBoundaryNote(remoteConfigured, false, false, false, false),
+		LimitationNote:   localNASLimitationNote,
+		VerifiedAt:       FormatRFC3339Ms(e.nowUTC()),
 	}
 	if e == nil || e.db == nil || strings.TrimSpace(runID) == "" || householdID == 0 {
 		res.IntegrityStatus = IntegrityUnverifiable
@@ -471,8 +490,10 @@ func (e *AgentAuditEngine) VerifyRunChain(runID string, householdID uint) Verify
 
 	_, extVerifier := e.activeExternalSignerAndVerifier()
 	if e.remoteStore != nil {
+		res.LocalOnly = false
 		res.RemoteStoreConfigured = true
 		res.RemoteStoreType = e.remoteStore.Type()
+		res.RemoteSyncStatus = RemoteStatusPendingSync
 	}
 
 	var cps []model.AgentAuditCheckpoint
@@ -484,6 +505,7 @@ func (e *AgentAuditEngine) VerifyRunChain(runID string, householdID uint) Verify
 			res.IntegrityStatus = IntegrityHMACInvalid
 			res.BrokenAtSeq = cp.ToSeq
 			res.FailureReason = fmt.Sprintf("checkpoint %s HMAC invalid", cp.CheckpointID)
+			res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryBroken, false)
 			return res
 		}
 		if extVerifier != nil {
@@ -491,6 +513,7 @@ func (e *AgentAuditEngine) VerifyRunChain(runID string, householdID uint) Verify
 				res.IntegrityStatus = IntegrityHMACInvalid
 				res.BrokenAtSeq = cp.ToSeq
 				res.FailureReason = fmt.Sprintf("checkpoint %s external asymmetric signature invalid", cp.CheckpointID)
+				res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryBroken, false)
 				return res
 			}
 		}
@@ -499,9 +522,35 @@ func (e *AgentAuditEngine) VerifyRunChain(runID string, householdID uint) Verify
 		res.LastCheckpointSeq = cp.ToSeq
 	}
 	res.ExternalSigVerified = allExtSigsOK
-	res.SecurityBoundary = buildSecurityBoundaryNote(res.RemoteStoreConfigured, false, false, extVerifier != nil, res.ExternalSigVerified)
+	if e.remoteStore != nil {
+		rep := e.CompareWithRemote(context.Background(), model.AuditPrimaryStreamID)
+		res.RemoteSyncStatus = rep.Status
+		res.RemoteTailSeq = rep.RemoteTailSeq
+		res.RemoteTailHash = rep.RemoteTailHash
+		if rep.ExternalSigVerified {
+			res.ExternalSigVerified = true
+		}
+		res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryIntact, rep.Reachable)
+		res.SecurityBoundary = buildSecurityBoundaryNote(true, rep.Reachable, rep.Status == RemoteStatusInSync, extVerifier != nil, res.ExternalSigVerified)
+		switch rep.Status {
+		case RemoteStatusDBRollback, RemoteStatusChainDiverged, RemoteStatusTailTruncated, RemoteStatusCheckpointMismatch:
+			res.Valid = false
+			res.IntegrityStatus = rep.Status
+			res.FailureReason = strings.Join(rep.Discrepancies, "; ")
+			return res
+		}
+	} else {
+		res.LocalOnly = true
+		res.RemoteStoreConfigured = false
+		res.RemoteStoreType = "none"
+		res.RemoteSyncStatus = RemoteStatusLocalOnly
+		res.TrustBoundaries = e.computeTrustBoundaries(LocalChainBoundaryIntact, false)
+		res.SecurityBoundary = buildSecurityBoundaryNote(false, false, false, extVerifier != nil, res.ExternalSigVerified)
+	}
 	res.Valid = true
-	if res.CheckedCheckpoints > 0 {
+	if res.RemoteStoreConfigured && res.RemoteSyncStatus == RemoteStatusInSync {
+		res.IntegrityStatus = IntegrityVerifiedAgainstRemote
+	} else if res.CheckedCheckpoints > 0 {
 		res.IntegrityStatus = IntegrityVerifiedAgainstCheckpoint
 	} else {
 		res.IntegrityStatus = IntegrityChainIntactLocalOnly

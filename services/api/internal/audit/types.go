@@ -65,6 +65,36 @@ const (
 	RemoteStatusCheckpointMismatch = "CHECKPOINT_MISMATCH"
 )
 
+// Explicit 4-axis audit trust boundary constants.
+const (
+	LocalChainBoundaryIntact       = "INTACT_LOCAL_SQLITE"
+	LocalChainBoundaryBroken       = "BROKEN_LOCAL_CHAIN"
+	LocalChainBoundaryUnverifiable = "UNVERIFIABLE"
+
+	WORMGuaranteeNoneLocalOnly      = "NONE_LOCAL_ONLY"
+	WORMGuaranteeHostPathAppendOnly = "HOST_PATH_APPEND_ONLY"
+	WORMGuaranteeRemoteAppendProxy  = "REMOTE_APPEND_PROXY"
+
+	KeySepHMACCoResidentEnvOnly      = "UNCONFIGURED_HMAC_ONLY"
+	KeySepEd25519PrivCoResident      = "PRIV_KEY_CO_RESIDENT"
+	KeySepEd25519VerifyOnlySeparated = "VERIFY_ONLY_PUB_SEPARATED"
+
+	HMACKeyScopeCoResident = "CO_RESIDENT_API_ENV"
+)
+
+// AuditTrustBoundaries clarifies exact cryptographic and storage boundaries without false trust claims.
+type AuditTrustBoundaries struct {
+	LocalOnly             bool   `json:"local_only"`
+	LocalChain            string `json:"local_chain"`
+	RemoteStore           string `json:"remote_store"`
+	RemoteReachable       bool   `json:"remote_reachable"`
+	WORMGuarantee         string `json:"worm_guarantee"`
+	PrivateKeySeparation  string `json:"private_key_separation"`
+	HMACKeyScope          string `json:"hmac_key_scope"`
+	SigningPrivKeyPresent bool   `json:"signing_priv_key_present"`
+	Summary               string `json:"summary"`
+}
+
 var (
 	// ErrAuditCommitFailed indicates persistent audit commit failure blocking further mutation.
 	ErrAuditCommitFailed = errors.New("AUDIT_COMMIT_FAILED: failed to commit mandatory audit record")
@@ -162,13 +192,17 @@ type EmitEventInput struct {
 	RiskLevel         string
 	PolicyVersion     string
 	ProposalID        string
-	ApprovalID        string
-	OperationID       string
-	FencingGeneration int64
-	BeforeState       interface{}
-	AfterState        interface{}
-	Parameters        interface{}
-	Result            string
+	ApprovalID         string
+	OperationID        string
+	FencingGeneration  int64
+	DecisionReason     string
+	BaselineBeforeHash string
+	BaselineAfterHash  string
+	BeforeState        interface{}
+	AfterState         interface{}
+	Parameters         interface{}
+	RollbackResult     interface{}
+	Result             string
 	ErrorCode         string
 	DurationMs        int64
 	Evidence          interface{}
@@ -316,16 +350,18 @@ type VerifyResult struct {
 	TriggersIntact        bool     `json:"triggers_intact"`
 	BrokenAtSeq           uint64   `json:"broken_at_seq,omitempty"`
 	FailureReason         string   `json:"failure_reason,omitempty"`
-	KeyIDsUsed            []string `json:"key_ids_used,omitempty"`
-	RemoteStoreConfigured bool     `json:"remote_store_configured"`
-	RemoteStoreType       string   `json:"remote_store_type,omitempty"`
-	RemoteSyncStatus      string   `json:"remote_sync_status,omitempty"`
-	RemoteTailSeq         uint64   `json:"remote_tail_seq,omitempty"`
-	RemoteTailHash        string   `json:"remote_tail_hash,omitempty"`
-	ExternalSigVerified   bool     `json:"external_sig_verified"`
-	SecurityBoundary      string   `json:"security_boundary"`
-	LimitationNote        string   `json:"limitation_note"`
-	VerifiedAt            string   `json:"verified_at"`
+	KeyIDsUsed            []string             `json:"key_ids_used,omitempty"`
+	LocalOnly             bool                 `json:"local_only"`
+	RemoteStoreConfigured bool                 `json:"remote_store_configured"`
+	RemoteStoreType       string               `json:"remote_store_type,omitempty"`
+	RemoteSyncStatus      string               `json:"remote_sync_status,omitempty"`
+	RemoteTailSeq         uint64               `json:"remote_tail_seq,omitempty"`
+	RemoteTailHash        string               `json:"remote_tail_hash,omitempty"`
+	ExternalSigVerified   bool                 `json:"external_sig_verified"`
+	TrustBoundaries       AuditTrustBoundaries `json:"trust_boundaries"`
+	SecurityBoundary      string               `json:"security_boundary"`
+	LimitationNote        string               `json:"limitation_note"`
+	VerifiedAt            string               `json:"verified_at"`
 }
 
 // RemoteTailState summarizes the highest contiguous state recorded on the external remote store.
@@ -342,39 +378,43 @@ type RemoteTailState struct {
 
 // RemoteDiffReport compares local SQLite audit ledger state against an external append-only/WORM store.
 type RemoteDiffReport struct {
-	Configured          bool     `json:"configured"`
-	StoreType           string   `json:"store_type"`
-	Endpoint            string   `json:"endpoint,omitempty"`
-	Reachable           bool     `json:"reachable"`
-	Status              string   `json:"status"`
-	LocalTailSeq        uint64   `json:"local_tail_seq"`
-	LocalTailHash       string   `json:"local_tail_hash,omitempty"`
-	LocalCheckpointSeq  uint64   `json:"local_checkpoint_seq"`
-	RemoteTailSeq       uint64   `json:"remote_tail_seq"`
-	RemoteTailHash      string   `json:"remote_tail_hash,omitempty"`
-	RemoteCheckpointID  string   `json:"remote_checkpoint_id,omitempty"`
-	RemoteCheckpointSeq uint64   `json:"remote_checkpoint_seq"`
-	RemoteChainDigest   string   `json:"remote_chain_digest,omitempty"`
-	PendingEvents       uint64   `json:"pending_events"`
-	ExternalSigVerified bool     `json:"external_sig_verified"`
-	Discrepancies       []string `json:"discrepancies,omitempty"`
-	Error               string   `json:"error,omitempty"`
-	CheckedAt           string   `json:"checked_at"`
+	LocalOnly           bool                 `json:"local_only"`
+	Configured          bool                 `json:"configured"`
+	StoreType           string               `json:"store_type"`
+	Endpoint            string               `json:"endpoint,omitempty"`
+	Reachable           bool                 `json:"reachable"`
+	Status              string               `json:"status"`
+	LocalTailSeq        uint64               `json:"local_tail_seq"`
+	LocalTailHash       string               `json:"local_tail_hash,omitempty"`
+	LocalCheckpointSeq  uint64               `json:"local_checkpoint_seq"`
+	RemoteTailSeq       uint64               `json:"remote_tail_seq"`
+	RemoteTailHash      string               `json:"remote_tail_hash,omitempty"`
+	RemoteCheckpointID  string               `json:"remote_checkpoint_id,omitempty"`
+	RemoteCheckpointSeq uint64               `json:"remote_checkpoint_seq"`
+	RemoteChainDigest   string               `json:"remote_chain_digest,omitempty"`
+	PendingEvents       uint64               `json:"pending_events"`
+	ExternalSigVerified bool                 `json:"external_sig_verified"`
+	TrustBoundaries     AuditTrustBoundaries `json:"trust_boundaries"`
+	Discrepancies       []string             `json:"discrepancies,omitempty"`
+	Error               string               `json:"error,omitempty"`
+	CheckedAt           string               `json:"checked_at"`
 }
 
 // AuditKeyStatus exposes non-secret key lifecycle, rotation history, and fnOS root-attacker boundary info.
 type AuditKeyStatus struct {
-	ActiveKeyID           string   `json:"active_key_id"`
-	ConfiguredKeyIDs      []string `json:"configured_key_ids"`
-	HistoricalKeyIDs      []string `json:"historical_key_ids"`
-	ExternalSigAlg        string   `json:"external_sig_alg,omitempty"`
-	ExternalKeyID         string   `json:"external_key_id,omitempty"`
-	ExternalPublicKey     string   `json:"external_public_key,omitempty"`
-	LastRotationAt        string   `json:"last_rotation_at,omitempty"`
-	RotationCount         int64    `json:"rotation_count"`
-	RemoteStoreConfigured bool     `json:"remote_store_configured"`
-	RemoteStoreType       string   `json:"remote_store_type,omitempty"`
-	SecurityBoundaryNote  string   `json:"security_boundary_note"`
+	ActiveKeyID           string               `json:"active_key_id"`
+	ConfiguredKeyIDs      []string             `json:"configured_key_ids"`
+	HistoricalKeyIDs      []string             `json:"historical_key_ids"`
+	ExternalSigAlg        string               `json:"external_sig_alg,omitempty"`
+	ExternalKeyID         string               `json:"external_key_id,omitempty"`
+	ExternalPublicKey     string               `json:"external_public_key,omitempty"`
+	LastRotationAt        string               `json:"last_rotation_at,omitempty"`
+	RotationCount         int64                `json:"rotation_count"`
+	LocalOnly             bool                 `json:"local_only"`
+	RemoteStoreConfigured bool                 `json:"remote_store_configured"`
+	RemoteStoreType       string               `json:"remote_store_type,omitempty"`
+	TrustBoundaries       AuditTrustBoundaries `json:"trust_boundaries"`
+	SecurityBoundaryNote  string               `json:"security_boundary_note"`
 }
 
 // RunDetail bundles the run header, ordered event timeline, and chain verification result.
