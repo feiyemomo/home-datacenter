@@ -56,6 +56,8 @@ func (b *DetachedProcessWatchdogBackend) Schedule(_ context.Context, guardID str
 	lockFile := filepath.Join(guardDir, ".guard.lock")
 	watchdogScript := filepath.Join(guardDir, guardID+"-watchdog.sh")
 
+	recLog := filepath.Join(guardDir, guardID+"-recovery.log")
+
 	// Intentionally detached from request ctx so caller cancellation/exit never aborts countdown.
 	scriptBody := fmt.Sprintf(`#!/bin/sh
 set -eu
@@ -68,7 +70,7 @@ run_guarded() {
     exit 0
   fi
   NOW_UTC="$(date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ 2>/dev/null || echo '1970-01-01T00:00:00Z')"
-  if /bin/sh '%s' >/dev/null 2>&1; then
+  if /bin/sh '%s' >>'%s' 2>&1; then
     if [ -f '%s' ]; then
       exit 0
     fi
@@ -99,6 +101,7 @@ fi
 		shellEscapeSingle(disarmedFlag),
 		shellEscapeSingle(stateFile),
 		shellEscapeSingle(scriptPath),
+		shellEscapeSingle(recLog),
 		shellEscapeSingle(disarmedFlag),
 		shellEscapeSingle(recTmpl),
 		shellEscapeSingle(recTmpl),

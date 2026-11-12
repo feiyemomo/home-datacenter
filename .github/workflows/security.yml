@@ -60,8 +60,8 @@ jobs:
 
       - name: Forbid CGO sqlite driver (must use pure-Go glebarez/sqlite)
         run: |
-          if grep -rn "gorm.io/driver/sqlite" services/api/; then
-            echo "ERROR: gorm.io/driver/sqlite requires CGO and is forbidden."
+          if git grep -n "gorm.io/driver/sqlite" -- "services/api/*.go" "services/api/**/*.go" "services/api/go.mod"; then
+            echo "ERROR: gorm.io/driver/sqlite requires CGO and is forbidden in Go source files and go.mod."
             exit 1
           fi
 

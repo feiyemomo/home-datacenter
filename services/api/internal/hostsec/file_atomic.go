@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -73,9 +74,24 @@ func writeFileAtomicFailClosed(targetPath string, data []byte, perm os.FileMode)
 		cleanupTmp()
 		return rErr
 	}
-	if d, dErr := os.Open(parentDir); dErr == nil {
-		_ = d.Sync()
-		_ = d.Close()
+	// Directory fsync to ensure directory entry durability across crashes.
+	// On POSIX systems, directory sync is strictly required. On Windows,
+	// syncing directory handles is not supported by the kernel and returns an error.
+	if d, dErr := os.Open(parentDir); dErr != nil {
+		if runtime.GOOS != "windows" {
+			return fmt.Errorf("failed to open parent directory for sync: %w", dErr)
+		}
+	} else {
+		sErr := d.Sync()
+		cErr := d.Close()
+		if runtime.GOOS != "windows" {
+			if sErr != nil {
+				return fmt.Errorf("failed to sync parent directory: %w", sErr)
+			}
+			if cErr != nil {
+				return fmt.Errorf("failed to close parent directory: %w", cErr)
+			}
+		}
 	}
 	return nil
 }

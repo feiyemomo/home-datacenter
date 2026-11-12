@@ -2617,10 +2617,40 @@ func (e *DefaultOperationExecutor) executeHostPackageUpgrade(ctx context.Context
 		fencingGen = guard.Grant.FencingGeneration
 	}
 
+	opID, _ := spec.Params["operation_id"].(string)
+	if opID == "" {
+		opID = proposal.ProposalID
+	}
+
+	var executionGrant *hostsec.HostExecutionGrant
+	if hue.GrantAuthority != nil {
+		gReq := hostsec.HostExecutionGrantIssueRequest{
+			ProposalID:        proposal.ProposalID,
+			ApprovalID:        proposal.ApprovalDigest,
+			OperationID:       opID,
+			BaselineHash:      expectedBaseline,
+			FencingGeneration: fencingGen,
+			Action:            string(hostsec.HostActionAptUpgrade),
+			Packages:          pkgs,
+			TargetVersions:    targetVersions,
+			TTL:               timeout,
+		}
+		if gReq.TTL <= 0 {
+			gReq.TTL = 15 * time.Minute
+		}
+		issuedGrant, gErr := hue.GrantAuthority.IssueGrant(gReq)
+		if gErr != nil && hue.RequireExecutionGrant {
+			return "", fmt.Errorf("issue host execution grant: %w", gErr)
+		}
+		executionGrant = issuedGrant
+	}
+
 	res, err := hue.Execute(ctx, hostsec.HostUpdateRequest{
 		Proposal:             proposal,
 		ApprovalID:           proposal.ApprovalDigest,
+		OperationID:          opID,
 		FencingGeneration:    fencingGen,
+		ExecutionGrant:       executionGrant,
 		Packages:             pkgs,
 		TargetVersions:       targetVersions,
 		ExpectedBaselineHash: expectedBaseline,

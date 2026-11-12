@@ -39,6 +39,7 @@ type PersistentSSHGuardState struct {
 	CopiedFiles       map[string]string     `json:"copied_files,omitempty"`
 	ExternalUnit      string                `json:"external_unit,omitempty"`
 	BridgeDelegated   bool                  `json:"bridge_delegated,omitempty"`
+	Grant             *HostExecutionGrant   `json:"grant,omitempty"`
 	ScriptPath        string                `json:"script_path,omitempty"`
 	Status            string                `json:"status"`
 	DisarmedAt        *time.Time            `json:"disarmed_at,omitempty"`
@@ -287,6 +288,7 @@ func (g *PersistentHostSSHGuard) armWithGuardID(
 			return "", fmt.Errorf("delegate host bridge SSH watchdog arm: %w", err)
 		}
 		state.BridgeDelegated = true
+		state.Grant = grant
 		g.mu.Lock()
 		if g.bridgeBindings == nil {
 			g.bridgeBindings = make(map[string]struct {
@@ -415,6 +417,7 @@ func (g *PersistentHostSSHGuard) Disarm(guardID string) error {
 		if hasBound {
 			bGrant = bound.grant
 		} else {
+			bGrant = st.Grant
 			bBinding = HostExecutionBinding{
 				ProposalID:        st.ProposalID,
 				ApprovalID:        st.ApprovalID,
@@ -560,14 +563,22 @@ func (g *PersistentHostSSHGuard) recoverFromPersistedState(ctx context.Context, 
 	// Restore SSH files from snapshot backup paths on disk
 	if g.Bridge != nil && st.SnapshotID != "" && st.OperationID != "" {
 		binding := HostExecutionBinding{
-			ProposalID:  st.ProposalID,
-			ApprovalID:  "persistent-ssh-guard",
-			OperationID: st.OperationID,
-			BaselineHash: "host-v1:guard",
+			ProposalID:        st.ProposalID,
+			ApprovalID:        st.ApprovalID,
+			OperationID:       st.OperationID,
+			BaselineHash:      st.BaselineHash,
+			FencingGeneration: st.FencingGeneration,
+		}
+		if binding.ApprovalID == "" {
+			binding.ApprovalID = "persistent-ssh-guard"
+		}
+		if binding.BaselineHash == "" {
+			binding.BaselineHash = "host-v1:guard"
 		}
 		if _, err := g.Bridge.ExecuteTypedAction(ctx, HostActionRequest{
 			Action:     HostActionRestoreConfig,
 			Binding:    binding,
+			Grant:      st.Grant,
 			SnapshotID: st.SnapshotID,
 		}); err != nil {
 			errs = append(errs, err.Error())
@@ -575,6 +586,7 @@ func (g *PersistentHostSSHGuard) recoverFromPersistedState(ctx context.Context, 
 		if _, err := g.Bridge.ExecuteTypedAction(ctx, HostActionRequest{
 			Action:  HostActionSSHDRestart,
 			Binding: binding,
+			Grant:   st.Grant,
 		}); err != nil {
 			errs = append(errs, err.Error())
 		}
@@ -618,11 +630,15 @@ func (g *PersistentHostSSHGuard) writeRecoveryScript(detector *PlatformDetector,
 	}
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\nset -eu\n")
+	var targetSSHDConfig string
 	for rel, backupPath := range st.CopiedFiles {
 		if !isAllowedRestoreRelPath(rel) {
 			continue
 		}
 		dst := detector.resolvePath(rel)
+		if rel == "etc/ssh/sshd_config" {
+			targetSSHDConfig = dst
+		}
 		b.WriteString(fmt.Sprintf("if [ -f '%s' ]; then mkdir -p '%s' && cp -f '%s' '%s'; fi\n",
 			shellEscapeSingle(backupPath),
 			shellEscapeSingle(filepath.Dir(dst)),
@@ -630,8 +646,12 @@ func (g *PersistentHostSSHGuard) writeRecoveryScript(detector *PlatformDetector,
 			shellEscapeSingle(dst),
 		))
 	}
-	b.WriteString("if command -v sshd >/dev/null 2>&1; then sshd -t; fi\n")
-	b.WriteString("if command -v systemctl >/dev/null 2>&1; then systemctl restart ssh || systemctl restart sshd || true; fi\n")
+	if targetSSHDConfig != "" {
+		b.WriteString(fmt.Sprintf("if command -v sshd >/dev/null 2>&1; then sshd -t -f '%s'; fi\n", shellEscapeSingle(targetSSHDConfig)))
+	} else {
+		b.WriteString("if command -v sshd >/dev/null 2>&1; then sshd -t; fi\n")
+	}
+	b.WriteString("if command -v systemctl >/dev/null 2>&1; then systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; fi\n")
 	return os.WriteFile(st.ScriptPath, []byte(b.String()), 0700)
 }
 
