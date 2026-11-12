@@ -314,6 +314,11 @@ func (g *PersistentHostSSHGuard) armWithGuardID(
 		if lErr2 != nil {
 			return "", fmt.Errorf("acquire SSH guard lock for unit persist: %w", lErr2)
 		}
+		if latest, rErr := g.readState(guardID); rErr == nil && latest != nil {
+			if state.ExternalUnit == "" && latest.ExternalUnit != "" {
+				state.ExternalUnit = latest.ExternalUnit
+			}
+		}
 		wErr := g.writeStateAtomic(state)
 		uErr := unlock2()
 		if wErr != nil {

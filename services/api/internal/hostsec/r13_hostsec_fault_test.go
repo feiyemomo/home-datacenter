@@ -1134,3 +1134,300 @@ func TestR13_FI_08_WatchdogRestartBeforeDeadlineDisarmPreventsRollback(t *testin
 		t.Fatalf("expected 0 reconciled expired guards after Disarm, got cnt=%d err=%v", cnt, rErr)
 	}
 }
+
+func TestR13_FI_09_QAReviewRegressions(t *testing.T) {
+	bridgeKey, grantKey := r13TestBridgeKeys()
+	grantAuth, err := NewHostGrantAuthority(HostGrantAuthorityConfig{
+		KeyID:         "grant-k1",
+		HMACKey:       grantKey,
+		BridgeHMACKey: bridgeKey,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Pinned TargetVersions on grant MUST reject requests omitting req.TargetVersions (403)
+	// and MUST NOT consume the grant on failed probes.
+	debRoot := writeHostFixture(t, false)
+	snapRoot := t.TempDir()
+	runner := &mockHostExecRunner{
+		handlers: map[string]func(args []string) (string, string, error){
+			"apt-cache": func(_ []string) (string, string, error) {
+				return "openssh-server:\n  Installed: 1:9.2p1-2+deb12u3\n  Candidate: 1:9.2p1-2+deb12u4\n", "", nil
+			},
+			"dpkg-query": func(_ []string) (string, string, error) {
+				return "install ok installed\t1:9.2p1-2+deb12u4\n", "", nil
+			},
+		},
+	}
+	h, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
+		HostRoot:       debRoot,
+		SnapshotRoot:   snapRoot,
+		KeyID:          "bridge-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: true,
+		RequireGrant:   true,
+		GrantKeyID:     "grant-k1",
+		GrantHMACKey:   grantKey,
+		Runner:         runner,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	base := "host-v1:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	binding := HostExecutionBinding{
+		ProposalID: "prop-tv", ApprovalID: "apv-tv", OperationID: "op-tv",
+		ResourceScope: "host-os", BaselineHash: base, FencingGeneration: 1,
+	}
+	pinnedGrant, err := grantAuth.IssueGrant(HostExecutionGrantIssueRequest{
+		ProposalID:        binding.ProposalID,
+		ApprovalID:        binding.ApprovalID,
+		OperationID:       binding.OperationID,
+		ResourceScope:     binding.ResourceScope,
+		BaselineHash:      binding.BaselineHash,
+		FencingGeneration: binding.FencingGeneration,
+		Action:            string(HostActionAptUpgrade),
+		Packages:          []string{"openssh-server"},
+		TargetVersions:    map[string]string{"openssh-server": "1:9.2p1-2+deb12u4"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	codeOmit, bodyOmit := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "n-tv-omit", HostActionRequest{
+		Action:   HostActionAptUpgrade,
+		Binding:  binding,
+		Packages: []string{"openssh-server"},
+		Grant:    pinnedGrant,
+	})
+	if codeOmit != http.StatusForbidden {
+		t.Fatalf("expected 403 when req omits pinned target_versions, got %d (%s)", codeOmit, string(bodyOmit))
+	}
+
+	codeMismatch, bodyMismatch := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "n-tv-mismatch", HostActionRequest{
+		Action:         HostActionAptUpgrade,
+		Binding:        binding,
+		Packages:       []string{"openssh-server"},
+		TargetVersions: map[string]string{"openssh-server": "1:9.2p1-2+deb12u3"},
+		Grant:          pinnedGrant,
+	})
+	if codeMismatch != http.StatusForbidden {
+		t.Fatalf("expected 403 when req mismatches pinned target_versions, got %d (%s)", codeMismatch, string(bodyMismatch))
+	}
+
+	if len(runner.calls) != 0 {
+		t.Fatalf("expected 0 runner calls after rejected target_versions probes, got %v", runner.calls)
+	}
+
+	codeMatch, bodyMatch := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "n-tv-match", HostActionRequest{
+		Action:         HostActionAptUpgrade,
+		Binding:        binding,
+		Packages:       []string{"openssh-server"},
+		TargetVersions: map[string]string{"openssh-server": "1:9.2p1-2+deb12u4"},
+		Grant:          pinnedGrant,
+	})
+	if codeMatch != http.StatusOK {
+		t.Fatalf("expected 200 with exact pinned target_versions after rejected probes, got %d (%s)", codeMatch, string(bodyMatch))
+	}
+
+	// 2. Shared GuardDir == WatchdogDir preserves bridge-written ExternalUnit PID on ArmWithBinding.
+	debRoot2 := writeHostFixture(t, false)
+	snapRoot2 := t.TempDir()
+	snapDir2 := filepath.Join(snapRoot2, "snap-shared-wd")
+	backupSSH2 := filepath.Join(snapDir2, "etc/ssh/sshd_config")
+	if err := os.MkdirAll(filepath.Dir(backupSSH2), 0700); err != nil {
+		t.Fatal(err)
+	}
+	origSSH := "Port 22\nPermitRootLogin no\n"
+	if err := os.WriteFile(backupSSH2, []byte(origSSH), 0600); err != nil {
+		t.Fatal(err)
+	}
+	mb2, _ := json.Marshal(HostUpdateSnapshot{
+		SnapshotID:      "snap-shared-wd",
+		SnapshotDir:     snapDir2,
+		PackageVersions: map[string]string{"openssh-server": "1:9.2p1-2+deb12u3"},
+		CopiedFiles:     map[string]string{"etc/ssh/sshd_config": backupSSH2},
+	})
+	if err := os.WriteFile(filepath.Join(snapDir2, "manifest.json"), mb2, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	bh2, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
+		HostRoot:       debRoot2,
+		SnapshotRoot:   snapRoot2,
+		KeyID:          "bridge-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: true,
+		Runner:         &mockHostExecRunner{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv2 := httptest.NewServer(bh2)
+	defer srv2.Close()
+
+	bridgeClient2, err := NewHMACHostExecutionBridge(HostBridgeConfig{
+		Endpoint:       srv2.URL,
+		KeyID:          "bridge-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sharedWatchdogDir := filepath.Join(snapRoot2, "ssh-watchdog")
+	sharedGuard := NewPersistentHostSSHGuard(sharedWatchdogDir, debRoot2, snapRoot2, nil, bridgeClient2)
+	sharedGuard.DisableLocalTimer = true
+	sharedGuard.DelegateWatchdogToBridge = true
+
+	timeout := 900 * time.Millisecond
+	if runtime.GOOS == "windows" {
+		timeout = 2200 * time.Millisecond
+	}
+	gID2, err := sharedGuard.ArmWithBinding(context.Background(), snapDir2, timeout, HostExecutionBinding{
+		ProposalID: "prop-shared", ApprovalID: "apv-shared", OperationID: "op-shared",
+		BaselineHash: base, FencingGeneration: 1,
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("shared-dir ArmWithBinding failed: %v", err)
+	}
+	st2, err := sharedGuard.LoadState(gID2)
+	if err != nil {
+		t.Fatalf("LoadState(%s) failed: %v", gID2, err)
+	}
+	if !st2.BridgeDelegated || !strings.HasPrefix(st2.ExternalUnit, "pid:") {
+		t.Fatalf("expected BridgeDelegated=true and ExternalUnit=pid:..., got %+v", st2)
+	}
+	if err := sharedGuard.Disarm(gID2); err != nil {
+		t.Fatalf("Disarm(%s) failed: %v", gID2, err)
+	}
+
+	// 3. fnOS bridge rejects HostActionWatchdogArm/Disarm BEFORE grant consumption & guard creation.
+	fnosRoot := writeHostFixture(t, true)
+	fnosSnapRoot := t.TempDir()
+	fnosGrantDir := filepath.Join(fnosSnapRoot, "grant-store")
+	fnosHandler, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
+		HostRoot:       fnosRoot,
+		SnapshotRoot:   fnosSnapRoot,
+		GrantDir:       fnosGrantDir,
+		KeyID:          "bridge-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: true,
+		RequireGrant:   true,
+		GrantKeyID:     "grant-k1",
+		GrantHMACKey:   grantKey,
+		Runner:         &mockHostExecRunner{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fnosSrv := httptest.NewServer(fnosHandler)
+	defer fnosSrv.Close()
+
+	fnosBinding := HostExecutionBinding{
+		ProposalID: "prop-fnos-wd", ApprovalID: "apv-fnos-wd", OperationID: "op-fnos-wd",
+		ResourceScope: "host-os", BaselineHash: base, FencingGeneration: 1,
+	}
+	fnosGrant, err := grantAuth.IssueGrant(HostExecutionGrantIssueRequest{
+		ProposalID:        fnosBinding.ProposalID,
+		ApprovalID:        fnosBinding.ApprovalID,
+		OperationID:       fnosBinding.OperationID,
+		ResourceScope:     fnosBinding.ResourceScope,
+		BaselineHash:      fnosBinding.BaselineHash,
+		FencingGeneration: fnosBinding.FencingGeneration,
+		Action:            string(HostActionWatchdogArm),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeFnArm, bodyFnArm := sendRawBridgeRequest(t, fnosSrv.URL, "bridge-k1", bridgeKey, "n-fnos-wd-arm", HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           fnosBinding,
+		GuardID:           "guard-fnos-1",
+		SnapshotID:        "snap-unused",
+		WatchdogTimeoutMs: 30000,
+		Grant:             fnosGrant,
+	})
+	if codeFnArm != http.StatusConflict || !strings.Contains(string(bodyFnArm), "fnOS") {
+		t.Fatalf("expected 409 Conflict mentioning fnOS on watchdog_arm, got %d (%s)", codeFnArm, string(bodyFnArm))
+	}
+	if _, statErr := os.Stat(filepath.Join(fnosSnapRoot, "ssh-watchdog", "guard-fnos-1.json")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("expected no guard state file created on fnOS block, got statErr=%v", statErr)
+	}
+
+	// Prove fnosGrant was NOT consumed by the blocked fnOS request by verifying a non-fnOS bridge
+	// sharing the same GrantDir can still authorize and consume fnosGrant!
+	debSnapRoot3 := t.TempDir()
+	debSnapID := "snap-after-fnos"
+	debSnapDir := filepath.Join(debSnapRoot3, debSnapID)
+	if err := os.MkdirAll(filepath.Join(debSnapDir, "etc/ssh"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(debSnapDir, "etc/ssh/sshd_config"), []byte(origSSH), 0600); err != nil {
+		t.Fatal(err)
+	}
+	debMB, _ := json.Marshal(HostUpdateSnapshot{
+		SnapshotID:  debSnapID,
+		SnapshotDir: debSnapDir,
+		CopiedFiles: map[string]string{"etc/ssh/sshd_config": filepath.Join(debSnapDir, "etc/ssh/sshd_config")},
+	})
+	if err := os.WriteFile(filepath.Join(debSnapDir, "manifest.json"), debMB, 0600); err != nil {
+		t.Fatal(err)
+	}
+	debHandler, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
+		HostRoot:       debRoot2,
+		SnapshotRoot:   debSnapRoot3,
+		GrantDir:       fnosGrantDir,
+		KeyID:          "bridge-k1",
+		HMACKey:        bridgeKey,
+		RequireFencing: true,
+		RequireGrant:   true,
+		GrantKeyID:     "grant-k1",
+		GrantHMACKey:   grantKey,
+		Runner:         &mockHostExecRunner{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	debSrv := httptest.NewServer(debHandler)
+	defer debSrv.Close()
+
+	codeDebArm, bodyDebArm := sendRawBridgeRequest(t, debSrv.URL, "bridge-k1", bridgeKey, "n-deb-reuse-fnos-grant", HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           fnosBinding,
+		GuardID:           "guard-deb-after-fnos",
+		SnapshotID:        debSnapID,
+		WatchdogTimeoutMs: int64(timeout / time.Millisecond),
+		Grant:             fnosGrant,
+	})
+	if codeDebArm != http.StatusOK {
+		t.Fatalf("expected fnOS-rejected grant to remain unconsumed and succeed on Debian bridge (200), got %d (%s)", codeDebArm, string(bodyDebArm))
+	}
+	_ = NewPersistentHostSSHGuard(filepath.Join(debSnapRoot3, "ssh-watchdog"), debRoot2, debSnapRoot3, nil, nil).Disarm("guard-deb-after-fnos")
+
+	fnosDisarmGrant, err := grantAuth.IssueGrant(HostExecutionGrantIssueRequest{
+		ProposalID:        fnosBinding.ProposalID,
+		ApprovalID:        fnosBinding.ApprovalID,
+		OperationID:       fnosBinding.OperationID,
+		ResourceScope:     fnosBinding.ResourceScope,
+		BaselineHash:      fnosBinding.BaselineHash,
+		FencingGeneration: fnosBinding.FencingGeneration,
+		Action:            string(HostActionWatchdogDisarm),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	codeFnDisarm, bodyFnDisarm := sendRawBridgeRequest(t, fnosSrv.URL, "bridge-k1", bridgeKey, "n-fnos-wd-disarm", HostActionRequest{
+		Action:  HostActionWatchdogDisarm,
+		Binding: fnosBinding,
+		GuardID: "guard-fnos-1",
+		Grant:   fnosDisarmGrant,
+	})
+	if codeFnDisarm != http.StatusConflict || !strings.Contains(string(bodyFnDisarm), "fnOS") {
+		t.Fatalf("expected 409 Conflict mentioning fnOS on watchdog_disarm, got %d (%s)", codeFnDisarm, string(bodyFnDisarm))
+	}
+}

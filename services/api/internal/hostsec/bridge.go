@@ -958,7 +958,15 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 			}
 		}
 
-		// Persist single-use grant consumption after fencing checks pass
+		// 3. Independent local host platform policy enforcement (fnOS strictly read-only, no bypass)
+		// Enforced BEFORE watchdog arm/disarm and BEFORE typed command dispatch.
+		plat := detector.Detect(r.Context())
+		if polErr := plat.HostUpdatePolicyError(); polErr != nil {
+			writeJSON(http.StatusConflict, map[string]string{"error": polErr.Error()})
+			return
+		}
+
+		// Persist single-use grant consumption after fencing and platform checks pass
 		if hasGrantPolicy {
 			if gErr := grantStore.VerifyAndConsume(grantAuthority, cfg.HMACKey, req.Grant, req, cfg.RequireFencing, time.Now().UTC()); gErr != nil {
 				code := http.StatusInternalServerError
@@ -984,13 +992,6 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 			}
 			res.Success = true
 			writeJSON(http.StatusOK, res)
-			return
-		}
-
-		// 3. Independent local host platform policy enforcement (fnOS strictly read-only, no bypass)
-		plat := detector.Detect(r.Context())
-		if polErr := plat.HostUpdatePolicyError(); polErr != nil {
-			writeJSON(http.StatusConflict, map[string]string{"error": polErr.Error()})
 			return
 		}
 

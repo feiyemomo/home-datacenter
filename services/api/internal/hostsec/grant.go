@@ -484,9 +484,18 @@ func (a *HostGrantAuthority) VerifyGrant(
 			}
 		}
 		if req.Action == HostActionAptUpgrade && len(g.TargetVersions) > 0 {
+			for _, rp := range req.Packages {
+				cp := strings.TrimSpace(rp)
+				if pinned := strings.TrimSpace(g.TargetVersions[cp]); pinned != "" {
+					if strings.TrimSpace(req.TargetVersions[cp]) != pinned {
+						return fmt.Errorf("%w: target_version mismatch or missing pin for package %s", ErrExecutionGrantMismatch, cp)
+					}
+				}
+			}
 			for pkg, tv := range req.TargetVersions {
-				if g.TargetVersions[strings.TrimSpace(pkg)] != strings.TrimSpace(tv) {
-					return fmt.Errorf("%w: target_version mismatch for package %s", ErrExecutionGrantMismatch, pkg)
+				cp := strings.TrimSpace(pkg)
+				if !allowedSet[cp] || strings.TrimSpace(g.TargetVersions[cp]) != strings.TrimSpace(tv) {
+					return fmt.Errorf("%w: target_version mismatch for package %s", ErrExecutionGrantMismatch, cp)
 				}
 			}
 		}

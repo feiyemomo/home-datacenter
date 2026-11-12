@@ -29,17 +29,20 @@ func writeFileAtomicFailClosed(targetPath string, data []byte, perm os.FileMode)
 	cleanTarget := filepath.Clean(targetPath)
 	parentDir := filepath.Dir(cleanTarget)
 	baseName := filepath.Base(cleanTarget)
-	tmpFile, err := os.OpenFile(
-		filepath.Join(parentDir, fmt.Sprintf(".%s.tmp.%d", baseName, os.Getpid())),
-		os.O_CREATE|os.O_WRONLY|os.O_TRUNC,
-		perm,
-	)
+	tmpFile, err := os.CreateTemp(parentDir, fmt.Sprintf(".%s.tmp.*", baseName))
 	if err != nil {
 		return err
 	}
 	tmpPath := tmpFile.Name()
 	cleanupTmp := func() {
 		_ = os.Remove(tmpPath)
+	}
+	if perm != 0 && perm != 0600 {
+		if chErr := tmpFile.Chmod(perm); chErr != nil {
+			_ = tmpFile.Close()
+			cleanupTmp()
+			return chErr
+		}
 	}
 
 	written := 0
