@@ -867,9 +867,11 @@ func (h *OpsHandler) ComputeFingerprint(component string) string {
 		return defExec.ExtractBaseline(canonical).Hash
 	}
 
-	sockPath := "/var/run/docker.sock"
+	sockPath := ""
 	if h.fallback != nil && strings.TrimSpace(h.fallback.dockerSocket) != "" {
 		sockPath = h.fallback.dockerSocket
+	} else if h.client == nil || strings.TrimSpace(h.client.baseURL) == "" {
+		sockPath = "/var/run/docker.sock"
 	}
 	tempExec := &DefaultOperationExecutor{
 		db:           h.db,

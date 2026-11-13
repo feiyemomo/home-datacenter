@@ -256,9 +256,8 @@ type DefaultOperationExecutor struct {
 	client   *OnePanelClient
 	fallback *HostFallbackProvider
 
-	dockerSocket       string
-	customDockerSocket bool
-	probeTimeout       time.Duration
+	dockerSocket  string
+	probeTimeout  time.Duration
 	probeInterval time.Duration
 
 	healthCheckFn     func(ctx context.Context, target string) error
@@ -396,7 +395,6 @@ func WithProbeInterval(d time.Duration) ExecutorOption {
 func WithDockerSocket(path string) ExecutorOption {
 	return func(e *DefaultOperationExecutor) {
 		e.dockerSocket = path
-		e.customDockerSocket = true
 	}
 }
 
@@ -567,6 +565,15 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
+	// 2. Fallback to 1Panel container list when Docker socket is unavailable (e.g., remote 1Panel host or Windows mock tests)
+	var clientSucceeded bool
+	var clientTimedOut bool
+	clientConfigured := e.client != nil && strings.TrimSpace(e.client.baseURL) != "" &&
+		!(strings.TrimSpace(e.client.baseURL) == "http://172.18.0.1:10000" &&
+			strings.TrimSpace(e.client.username) == "" &&
+			strings.TrimSpace(e.client.password) == "" &&
+			strings.TrimSpace(e.client.psession) == "")
+
 	// 1. Prefer direct Docker socket /containers/{name}/json inspect (authoritative 20-field R8 posture + digest)
 	sockPath := e.dockerSocket
 	if sockPath == "" && e.fallback != nil {
@@ -575,12 +582,7 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 	if sockPath != "" {
 		if _, statErr := os.Stat(sockPath); statErr == nil {
 			inspectData, insErr := inspectContainerViaDockerSocket(ctx, sockPath, canonical)
-			if insErr != nil {
-				if IsProductionRuntime() || e.customDockerSocket {
-					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed: %v", insErr)}
-				}
-				// In non-production with default socket where containers are not present on host, fall through to 1Panel or offline placeholder.
-			} else {
+			if insErr == nil {
 				comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectData)
 				if cErr != nil {
 					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
@@ -601,18 +603,16 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 					Source:          "docker_socket",
 					IsPlaceholder:   false,
 				}
+			} else if errors.Is(insErr, ErrBaselineAmbiguousContainer) {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: insErr.Error()}
+			} else if sockPath != "/var/run/docker.sock" {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket failed: %v", insErr)}
+			} else if IsProductionRuntime() && !clientConfigured {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed: %v", insErr)}
 			}
+			// In non-production or when 1Panel is configured, fall through if container not on local docker socket.
 		}
 	}
-
-	// 2. Fallback to 1Panel container list when Docker socket is unavailable (e.g., remote 1Panel host or Windows mock tests)
-	var clientSucceeded bool
-	var clientTimedOut bool
-	clientConfigured := e.client != nil && strings.TrimSpace(e.client.baseURL) != "" &&
-		!(strings.TrimSpace(e.client.baseURL) == "http://172.18.0.1:10000" &&
-			strings.TrimSpace(e.client.username) == "" &&
-			strings.TrimSpace(e.client.password) == "" &&
-			strings.TrimSpace(e.client.psession) == "")
 	if clientConfigured {
 		containers, lErr := e.client.ListContainers(ctx)
 		if lErr == nil {
@@ -2692,11 +2692,14 @@ func (e *DefaultOperationExecutor) executeDockerRestart(ctx context.Context, can
 
 	// Deterministic channel selection: prefer direct Docker socket when accessible (lowest latency,
 	// atomic fencing before write), otherwise 1Panel OpenAPI if configured.
-	if _, statErr := os.Stat(e.dockerSocket); statErr == nil {
-		if err := executeDockerSocketRestart(ctx, e.dockerSocket, containerName); err != nil {
-			return "", err
+	if strings.TrimSpace(e.dockerSocket) != "" {
+		if _, statErr := os.Stat(e.dockerSocket); statErr == nil {
+			if err := executeDockerSocketRestart(ctx, e.dockerSocket, containerName); err == nil {
+				return fmt.Sprintf("container %s restarted via direct Docker socket", containerName), nil
+			} else if e.client == nil || strings.TrimSpace(e.client.baseURL) == "" {
+				return "", err
+			}
 		}
-		return fmt.Sprintf("container %s restarted via direct Docker socket", containerName), nil
 	}
 
 	if e.client != nil && strings.TrimSpace(e.client.baseURL) != "" {

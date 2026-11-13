@@ -366,6 +366,7 @@ func TestOpsHandlerEndpoints(t *testing.T) {
 	// Mock health probe in unit test harness since no live home-web listener exists on :8086
 	handler.SetExecutor(NewOperationExecutor(
 		db, bus, client, fallback,
+		WithDockerSocket(""),
 		WithBaselineExtractor(handler.ComputeFingerprint),
 		WithHealthChecker(func(context.Context, string) error { return nil }),
 	))
