@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -448,12 +449,17 @@ func (b *HMACHostExecutionBridge) ExecuteTypedAction(ctx context.Context, req Ho
 	return out.HostActionResult, nil
 }
 
-func computeBridgeRequestSignature(key []byte, method, path, ts, nonce string, body []byte) string {
+// ComputeBridgeRequestSignature computes canonical HMAC-SHA256 signature for bridge HTTP requests.
+func ComputeBridgeRequestSignature(key []byte, method, path, ts, nonce string, body []byte) string {
 	bodySum := sha256.Sum256(body)
 	canonical := method + "\n" + path + "\n" + ts + "\n" + nonce + "\n" + hex.EncodeToString(bodySum[:])
 	mac := hmac.New(sha256.New, key)
 	_, _ = mac.Write([]byte(canonical))
 	return hex.EncodeToString(mac.Sum(nil))
+}
+
+func computeBridgeRequestSignature(key []byte, method, path, ts, nonce string, body []byte) string {
+	return ComputeBridgeRequestSignature(key, method, path, ts, nonce, body)
 }
 
 // HostBridgeServerConfig configures the host-side restricted execution bridge handler.
@@ -764,46 +770,68 @@ func isGrantAuthRejection(err error) bool {
 		errors.Is(err, ErrExecutionGrantKeyConflict)
 }
 
-func verifyActiveWatchdogForOperation(watchDir, opID string) error {
+func verifyActiveWatchdogForOperation(watchDir, opID string) (int, string, error) {
 	if strings.TrimSpace(watchDir) == "" {
-		return nil
+		return 0, "", errors.New("watchdog directory not configured")
 	}
 	cleanDir := filepath.Clean(watchDir)
 	entries, err := os.ReadDir(cleanDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return errors.New("watchdog directory does not exist")
+			return 0, "", errors.New("watchdog directory does not exist")
 		}
-		return err
+		return 0, "", err
 	}
 	cleanOp := strings.TrimSpace(opID)
 	foundArmed := false
+	activePID := 0
+	activeGuardID := ""
 	for _, ent := range entries {
 		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") || ent.Name() == "manifest.json" {
 			continue
 		}
-		raw, rErr := os.ReadFile(filepath.Join(cleanDir, ent.Name()))
+		stateFile := filepath.Join(cleanDir, ent.Name())
+		if fi, lErr := os.Lstat(stateFile); lErr == nil {
+			if fi.Mode()&os.ModeSymlink != 0 {
+				continue // symlink state file rejected
+			}
+			if runtime.GOOS != "windows" && fi.Mode().Perm()&0002 != 0 {
+				continue // world-writable state file rejected
+			}
+		}
+		raw, rErr := os.ReadFile(stateFile)
 		if rErr != nil {
 			continue
 		}
 		var st PersistentSSHGuardState
 		if jErr := json.Unmarshal(raw, &st); jErr == nil {
 			if st.OperationID == cleanOp && st.Status == SSHGuardStatusArmed {
-				if !st.DeadlineAt.IsZero() && time.Now().UTC().After(st.DeadlineAt) {
+				if st.DeadlineAt.IsZero() || time.Now().UTC().After(st.DeadlineAt) {
 					continue
 				}
 				disarmMarker := filepath.Join(cleanDir, st.GuardID+".disarmed")
-				if _, dErr := os.Stat(disarmMarker); os.IsNotExist(dErr) {
-					foundArmed = true
-					break
+				if _, dErr := os.Stat(disarmMarker); !os.IsNotExist(dErr) {
+					continue
 				}
+				if strings.HasPrefix(st.ExternalUnit, "pid:") {
+					parts := strings.Split(strings.TrimPrefix(st.ExternalUnit, "pid:"), ":")
+					if pid, pErr := strconv.Atoi(parts[0]); pErr == nil && pid > 0 {
+						if isProcessRecycledOrDead(pid, st.GuardID) {
+							continue // watchdog process dead or recycled
+						}
+						activePID = pid
+					}
+				}
+				activeGuardID = st.GuardID
+				foundArmed = true
+				break
 			}
 		}
 	}
 	if !foundArmed {
-		return fmt.Errorf("no active ARMED watchdog found on disk for operation %s", cleanOp)
+		return 0, "", fmt.Errorf("no active ARMED watchdog found on disk for operation %s", cleanOp)
 	}
-	return nil
+	return activePID, activeGuardID, nil
 }
 
 func handleBridgeWatchdogAction(ctx context.Context, cfg HostBridgeServerConfig, req HostActionRequest) (HostActionResult, error) {
@@ -1013,27 +1041,42 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 			return
 		}
 
-		if req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade {
-			hasWatchdog := false
-			if req.Grant != nil {
+		var activeWatchdogPID int
+		var activeGuardID string
+		if cfg.RequireGrant || req.Grant != nil {
+			if req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade {
+				if req.Grant == nil {
+					writeJSON(http.StatusForbidden, map[string]string{"error": "execution grant is strictly required for package mutations"})
+					return
+				}
+				hasWatchdog := false
 				for _, s := range req.Grant.AllowedSteps {
 					if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
 						hasWatchdog = true
 						break
 					}
 				}
-			}
-			watchDir := strings.TrimSpace(cfg.WatchdogDir)
-			if watchDir == "" && strings.TrimSpace(cfg.SnapshotRoot) != "" {
-				watchDir = filepath.Join(filepath.Clean(cfg.SnapshotRoot), "ssh-watchdog")
-			}
-			if hasWatchdog && watchDir != "" {
-				if wErr := verifyActiveWatchdogForOperation(watchDir, req.Binding.OperationID); wErr != nil {
+				if !hasWatchdog {
+					writeJSON(http.StatusForbidden, map[string]string{"error": "package mutations strictly require watchdog arming in grant allowed_steps"})
+					return
+				}
+				watchDir := strings.TrimSpace(cfg.WatchdogDir)
+				if watchDir == "" && strings.TrimSpace(cfg.SnapshotRoot) != "" {
+					watchDir = filepath.Join(filepath.Clean(cfg.SnapshotRoot), "ssh-watchdog")
+				}
+				if watchDir == "" {
+					writeJSON(http.StatusPreconditionFailed, map[string]string{"error": "watchdog directory not configured; refusing unguarded package mutation"})
+					return
+				}
+				wPID, gID, wErr := verifyActiveWatchdogForOperation(watchDir, req.Binding.OperationID)
+				if wErr != nil {
 					writeJSON(http.StatusPreconditionFailed, map[string]string{
 						"error": "refusing package mutation without active armed SSH watchdog: " + wErr.Error(),
 					})
 					return
 				}
+				activeWatchdogPID = wPID
+				activeGuardID = gID
 			}
 		}
 
@@ -1052,6 +1095,9 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 		if req.Action == HostActionWatchdogArm || req.Action == HostActionWatchdogDisarm {
 			res, wErr := handleBridgeWatchdogAction(r.Context(), cfg, req)
 			if wErr != nil {
+				if req.Grant != nil && grantStore != nil {
+					_ = grantStore.MarkExecutionStatus(req.Grant.GrantID, GrantExecutionStatusFailed)
+				}
 				res.Success = false
 				res.ExitError = wErr.Error()
 				writeJSON(http.StatusInternalServerError, map[string]any{
@@ -1066,9 +1112,40 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 			return
 		}
 
-		// 4. Execute strictly typed action (never arbitrary argv or shell)
-		res, execErr := dispatchTypedBridgeAction(r.Context(), cfg.Runner, detector, cfg.SnapshotRoot, req)
+		// 4. Execute strictly typed action with Sentinel monitoring to prevent unmonitored execution
+		execCtx, cancelExec := context.WithCancel(r.Context())
+		defer cancelExec()
+
+		if activeWatchdogPID > 0 {
+			stopSentinel := make(chan struct{})
+			defer close(stopSentinel)
+			go func() {
+				ticker := time.NewTicker(50 * time.Millisecond)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-stopSentinel:
+						return
+					case <-execCtx.Done():
+						return
+					case <-ticker.C:
+						if isProcessRecycledOrDead(activeWatchdogPID, activeGuardID) {
+							// Watchdog process died unexpectedly during mutation! Abort execution immediately!
+							cancelExec()
+							return
+						}
+					}
+				}
+			}()
+		}
+
+		res, execErr := dispatchTypedBridgeAction(execCtx, cfg.Runner, detector, cfg.SnapshotRoot, req)
 		if execErr != nil {
+			if execCtx.Err() != nil && grantStore != nil && req.Grant != nil {
+				_ = grantStore.MarkExecutionStatus(req.Grant.GrantID, GrantExecutionStatusRecoveryRequired)
+			} else if grantStore != nil && req.Grant != nil {
+				_ = grantStore.MarkExecutionStatus(req.Grant.GrantID, GrantExecutionStatusFailed)
+			}
 			res.Success = false
 			res.ExitError = execErr.Error()
 			writeJSON(http.StatusInternalServerError, map[string]any{

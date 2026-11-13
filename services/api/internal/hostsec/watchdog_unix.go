@@ -126,7 +126,7 @@ fi
 	if openErr != nil {
 		return "", openErr
 	}
-	cmd := exec.Command("/bin/sh", watchdogScript)
+	cmd := exec.Command("/bin/sh", watchdogScript, "--guard-id", guardID)
 	cmd.Stdin = devNull
 	cmd.Stdout = devNull
 	cmd.Stderr = devNull
@@ -165,8 +165,13 @@ func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName stri
 	}
 
 	// 1. Linux pidfd_open / pidfd_send_signal (syscall 434 / 424) eliminates PID reuse TOCTOU race
-	if killedViaPidfd(pid) {
+	killed, pidfdErr := killedViaPidfd(pid)
+	if killed {
 		return nil
+	}
+	if pidfdErr != nil && !errors.Is(pidfdErr, syscall.ENOSYS) {
+		// Specific error (EPERM, EINVAL, etc.): do NOT blindly fallback to PID kill!
+		return fmt.Errorf("pidfd termination failed (%w); refusing blind PID fallback", pidfdErr)
 	}
 
 	// 2. Controlled process group kill only if pgrp matches pid, pgrp != current pgrp, and pgrp > 100
@@ -190,19 +195,31 @@ const (
 	sysPidfdSendSignal = 424
 )
 
-func killedViaPidfd(pid int) bool {
+func killedViaPidfd(pid int) (bool, error) {
 	if runtime.GOOS != "linux" {
-		return false
+		return false, syscall.ENOSYS
 	}
 	// pidfd_open(pid, 0)
 	fd, _, errno := syscall.Syscall(sysPidfdOpen, uintptr(pid), 0, 0)
 	if errno != 0 {
-		return false
+		if errno == syscall.ESRCH {
+			return true, nil
+		}
+		if errno == syscall.ENOSYS {
+			return false, syscall.ENOSYS
+		}
+		return false, errno
 	}
 	defer syscall.Close(int(fd))
 	// pidfd_send_signal(fd, SIGKILL, nil, 0)
 	_, _, sErrno := syscall.Syscall6(sysPidfdSendSignal, fd, uintptr(syscall.SIGKILL), 0, 0, 0, 0)
-	return sErrno == 0 || errors.Is(sErrno, syscall.ESRCH)
+	if sErrno == 0 || errors.Is(sErrno, syscall.ESRCH) {
+		return true, nil
+	}
+	if sErrno == syscall.EPERM {
+		return false, syscall.EPERM
+	}
+	return false, sErrno
 }
 
 func isProcessRecycledOrDead(pid int, guardID string) bool {

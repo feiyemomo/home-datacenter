@@ -40,36 +40,48 @@ def parse_govulncheck_json_stream(stream_text: str):
                 fnd = obj["finding"]
                 osv_id = fnd.get("osv")
                 traces = fnd.get("trace", [])
-                has_root_trace = any(
-                    t.get("module") == "home-datacenter-api" or
-                    (t.get("package", "").startswith("home-datacenter-api/"))
-                    for t in traces
-                )
-                if osv_id and (has_root_trace or not traces):
-                    modules = set()
-                    packages = set()
-                    symbols = set()
-                    for t in traces:
-                        m = t.get("module")
-                        p = t.get("package", "")
-                        f = t.get("function")
-                        # Separate vulnerable module/package from our root application callers
-                        if m and m != "home-datacenter-api":
-                            modules.add(m)
-                        if p and not p.startswith("home-datacenter-api"):
-                            packages.add(p)
-                        if f:
-                            symbols.add(f)
-                    if osv_id not in active_findings:
-                        active_findings[osv_id] = {
-                            "modules": set(),
-                            "packages": set(),
-                            "symbols": set(),
-                            "fixed_version": fnd.get("fixed_version", ""),
-                        }
-                    active_findings[osv_id]["modules"].update(modules)
-                    active_findings[osv_id]["packages"].update(packages)
-                    active_findings[osv_id]["symbols"].update(symbols)
+                if not traces:
+                    # Vulnerabilities without trace cannot be assumed safe; flag as missing_trace
+                    if osv_id:
+                        if osv_id not in active_findings:
+                            active_findings[osv_id] = {
+                                "modules": {"missing_trace"},
+                                "packages": set(),
+                                "symbols": set(),
+                                "fixed_version": fnd.get("fixed_version", ""),
+                            }
+                else:
+                    has_root_trace = any(
+                        t.get("module") == "home-datacenter-api" or
+                        (t.get("package", "").startswith("home-datacenter-api/"))
+                        for t in traces
+                    )
+                    if osv_id and has_root_trace:
+                        modules = set()
+                        packages = set()
+                        symbols = set()
+                        # In govulncheck protocol, traces[0] is the vulnerable leaf frame
+                        if traces and len(traces) > 0:
+                            leaf_mod = traces[0].get("module")
+                            if leaf_mod and leaf_mod != "home-datacenter-api":
+                                modules.add(leaf_mod)
+                        for t in traces:
+                            p = t.get("package", "")
+                            f = t.get("function")
+                            if p and not p.startswith("home-datacenter-api"):
+                                packages.add(p)
+                            if f:
+                                symbols.add(f)
+                        if osv_id not in active_findings:
+                            active_findings[osv_id] = {
+                                "modules": set(),
+                                "packages": set(),
+                                "symbols": set(),
+                                "fixed_version": fnd.get("fixed_version", ""),
+                            }
+                        active_findings[osv_id]["modules"].update(modules)
+                        active_findings[osv_id]["packages"].update(packages)
+                        active_findings[osv_id]["symbols"].update(symbols)
         else:
             # Lines not starting with '{' should only be pure textual build logs (e.g. "go: downloading...")
             # If they contain JSON delimiter braces, it indicates a corrupted or broken JSON fragment
@@ -93,19 +105,47 @@ def verify_govulncheck(allowlist_path: str, raw_output: str) -> tuple[bool, list
     with open(allowlist_path, "r", encoding="utf-8") as f:
         allowlist_data = json.load(f)
 
-    exemptions = {item["id"]: item for item in allowlist_data.get("exemptions", [])}
+    raw_exemptions = allowlist_data.get("exemptions", [])
+    exemptions = {}
+    seen_ids = set()
     now = datetime.datetime.now(datetime.timezone.utc)
 
-    # Validate expiration of all entries in allowlist
-    for osv_id, item in exemptions.items():
+    # Validate schema, mandatory fields, anti-duplicate, and expiration for all entries
+    for item in raw_exemptions:
+        osv_id = item.get("id")
+        if not osv_id or not str(osv_id).strip():
+            return False, ["Allowlist exemption entry missing required 'id'"], []
+        if osv_id in seen_ids:
+            return False, [f"Duplicate exemption ID in allowlist: {osv_id}"], []
+        seen_ids.add(osv_id)
+
+        for req_field in ("module", "package", "reason", "risk", "approved_by", "expires_at"):
+            val = item.get(req_field)
+            if not val or not str(val).strip():
+                return False, [f"Allowlist exemption for {osv_id} missing required field '{req_field}'"], []
+
+        risk_val = item.get("risk")
+        if risk_val not in ("LOW", "MEDIUM", "HIGH", "CRITICAL"):
+            return False, [f"Allowlist exemption for {osv_id} has invalid risk '{risk_val}'"], []
+
+        # Strict UTC ISO 8601 validation (must end in 'Z')
         exp_str = item.get("expires_at", "")
-        if exp_str:
-            try:
-                exp_dt = datetime.datetime.fromisoformat(exp_str.replace("Z", "+00:00"))
-                if now > exp_dt:
-                    return False, [f"Allowlist exemption for {osv_id} expired at {exp_str}!"], []
-            except ValueError as e:
-                return False, [f"Invalid expiration format for {osv_id}: {e}"], []
+        if not exp_str.endswith("Z"):
+            return False, [f"Allowlist exemption for {osv_id} expiration must be UTC ISO 8601 ending with 'Z': {exp_str}"], []
+        try:
+            exp_dt = datetime.datetime.fromisoformat(exp_str[:-1] + "+00:00")
+            if now > exp_dt:
+                return False, [f"Allowlist exemption for {osv_id} expired at {exp_str}!"], []
+        except ValueError as e:
+            return False, [f"Invalid expiration format for {osv_id}: {e}"], []
+
+        # Anti-spoofing: stdlib packages cannot have third-party module prefixes
+        if item.get("module") == "stdlib":
+            pkg = item.get("package", "")
+            if "." in pkg.split("/")[0] or pkg.startswith("github.com") or pkg.startswith("golang.org/x/"):
+                return False, [f"Spoofed stdlib exemption for {osv_id}: package {pkg} is a third-party dependency"], []
+
+        exemptions[osv_id] = item
 
     try:
         active_findings = parse_govulncheck_json_stream(raw_output)

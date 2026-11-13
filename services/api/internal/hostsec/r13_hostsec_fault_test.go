@@ -586,9 +586,17 @@ func TestR13_FI_05_GrantSixDimBindingTamperRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	snapRoot := t.TempDir()
+	watchDir := filepath.Join(snapRoot, "ssh-watchdog")
+	grantDir := filepath.Join(snapRoot, "grant-store")
+	_ = os.MkdirAll(watchDir, 0700)
+	_ = os.MkdirAll(grantDir, 0700)
+
 	h, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
 		HostRoot:       debRoot,
-		SnapshotRoot:   t.TempDir(),
+		SnapshotRoot:   snapRoot,
+		WatchdogDir:    watchDir,
+		GrantDir:       grantDir,
 		KeyID:          "bridge-k1",
 		HMACKey:        bridgeKey,
 		RequireFencing: true,
@@ -612,6 +620,19 @@ func TestR13_FI_05_GrantSixDimBindingTamperRejected(t *testing.T) {
 		BaselineHash:      base,
 		FencingGeneration: 3,
 	}
+
+	createTestSnapshotManifest(t, snapRoot, validBinding.OperationID)
+	st := PersistentSSHGuardState{
+		GuardID:      validBinding.OperationID,
+		OperationID:  validBinding.OperationID,
+		Status:       SSHGuardStatusArmed,
+		ArmedAt:      time.Now().UTC(),
+		DeadlineAt:   time.Now().UTC().Add(10 * time.Minute),
+		ExternalUnit: fmt.Sprintf("pid:%d:%s", os.Getpid(), validBinding.OperationID),
+	}
+	sRaw, _ := json.Marshal(st)
+	_ = os.WriteFile(filepath.Join(watchDir, validBinding.OperationID+".json"), sRaw, 0600)
+
 	grant, err := grantAuth.IssueGrant(HostExecutionGrantIssueRequest{
 		ProposalID:        validBinding.ProposalID,
 		ApprovalID:        validBinding.ApprovalID,
@@ -619,11 +640,25 @@ func TestR13_FI_05_GrantSixDimBindingTamperRejected(t *testing.T) {
 		ResourceScope:     validBinding.ResourceScope,
 		BaselineHash:      validBinding.BaselineHash,
 		FencingGeneration: validBinding.FencingGeneration,
-		Action:            string(HostActionAptUpgrade),
+		Action:            ActionHostPackageUpgrade,
 		Packages:          []string{"openssh-server"},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// Arm watchdog step through bridge to advance grant state machine to WATCHDOG_ARMED
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           validBinding,
+		GuardID:           validBinding.OperationID,
+		SnapshotID:        validBinding.OperationID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             grant,
+	}
+	codeArm, bodyArm := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "n-arm-step", armReq)
+	if codeArm != http.StatusOK {
+		t.Fatalf("arm watchdog step failed: %d (%s)", codeArm, string(bodyArm))
 	}
 
 	tamperedCases := []struct {
@@ -1150,6 +1185,11 @@ func TestR13_FI_09_QAReviewRegressions(t *testing.T) {
 	// and MUST NOT consume the grant on failed probes.
 	debRoot := writeHostFixture(t, false)
 	snapRoot := t.TempDir()
+	watchDir := filepath.Join(snapRoot, "ssh-watchdog")
+	grantDir := filepath.Join(snapRoot, "grant-store")
+	_ = os.MkdirAll(watchDir, 0700)
+	_ = os.MkdirAll(grantDir, 0700)
+
 	runner := &mockHostExecRunner{
 		handlers: map[string]func(args []string) (string, string, error){
 			"apt-cache": func(_ []string) (string, string, error) {
@@ -1163,6 +1203,8 @@ func TestR13_FI_09_QAReviewRegressions(t *testing.T) {
 	h, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
 		HostRoot:       debRoot,
 		SnapshotRoot:   snapRoot,
+		WatchdogDir:    watchDir,
+		GrantDir:       grantDir,
 		KeyID:          "bridge-k1",
 		HMACKey:        bridgeKey,
 		RequireFencing: true,
@@ -1182,6 +1224,19 @@ func TestR13_FI_09_QAReviewRegressions(t *testing.T) {
 		ProposalID: "prop-tv", ApprovalID: "apv-tv", OperationID: "op-tv",
 		ResourceScope: "host-os", BaselineHash: base, FencingGeneration: 1,
 	}
+
+	createTestSnapshotManifest(t, snapRoot, binding.OperationID)
+	st := PersistentSSHGuardState{
+		GuardID:      binding.OperationID,
+		OperationID:  binding.OperationID,
+		Status:       SSHGuardStatusArmed,
+		ArmedAt:      time.Now().UTC(),
+		DeadlineAt:   time.Now().UTC().Add(10 * time.Minute),
+		ExternalUnit: fmt.Sprintf("pid:%d:%s", os.Getpid(), binding.OperationID),
+	}
+	sRaw, _ := json.Marshal(st)
+	_ = os.WriteFile(filepath.Join(watchDir, binding.OperationID+".json"), sRaw, 0600)
+
 	pinnedGrant, err := grantAuth.IssueGrant(HostExecutionGrantIssueRequest{
 		ProposalID:        binding.ProposalID,
 		ApprovalID:        binding.ApprovalID,
@@ -1189,12 +1244,26 @@ func TestR13_FI_09_QAReviewRegressions(t *testing.T) {
 		ResourceScope:     binding.ResourceScope,
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
-		Action:            string(HostActionAptUpgrade),
+		Action:            ActionHostPackageUpgrade,
 		Packages:          []string{"openssh-server"},
 		TargetVersions:    map[string]string{"openssh-server": "1:9.2p1-2+deb12u4"},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// Arm watchdog step to advance grant state machine to WATCHDOG_ARMED
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           binding,
+		GuardID:           binding.OperationID,
+		SnapshotID:        binding.OperationID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             pinnedGrant,
+	}
+	codeArm, bodyArm := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "n-tv-arm", armReq)
+	if codeArm != http.StatusOK {
+		t.Fatalf("arm watchdog step failed: %d (%s)", codeArm, string(bodyArm))
 	}
 
 	codeOmit, bodyOmit := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "n-tv-omit", HostActionRequest{

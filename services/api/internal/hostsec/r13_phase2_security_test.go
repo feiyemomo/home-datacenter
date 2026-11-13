@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -96,6 +97,23 @@ func TestR13_P2_01_GrantFailClosedOnMissingKey(t *testing.T) {
 		t.Fatalf("create grant authority: %v", aErr)
 	}
 
+	grantDir := filepath.Join(snapRoot, "grant-store")
+	watchDir := filepath.Join(snapRoot, "ssh-watchdog")
+	_ = os.MkdirAll(grantDir, 0700)
+	_ = os.MkdirAll(watchDir, 0700)
+
+	createTestSnapshotManifest(t, snapRoot, binding.OperationID)
+	st := PersistentSSHGuardState{
+		GuardID:      binding.OperationID,
+		OperationID:  binding.OperationID,
+		Status:       SSHGuardStatusArmed,
+		ArmedAt:      time.Now().UTC(),
+		DeadlineAt:   time.Now().UTC().Add(10 * time.Minute),
+		ExternalUnit: fmt.Sprintf("pid:%d:%s", os.Getpid(), binding.OperationID),
+	}
+	sRaw, _ := json.Marshal(st)
+	_ = os.WriteFile(filepath.Join(watchDir, binding.OperationID+".json"), sRaw, 0600)
+
 	grant, gErr := auth.IssueGrant(HostExecutionGrantIssueRequest{
 		ProposalID:        binding.ProposalID,
 		ApprovalID:        binding.ApprovalID,
@@ -104,7 +122,6 @@ func TestR13_P2_01_GrantFailClosedOnMissingKey(t *testing.T) {
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
 		Action:            ActionHostPackageUpgrade,
-		AllowedSteps:      []string{string(HostActionAptUpgrade)},
 		Packages:          []string{"openssh-server"},
 	})
 	if gErr != nil {
@@ -115,6 +132,8 @@ func TestR13_P2_01_GrantFailClosedOnMissingKey(t *testing.T) {
 	handler2, _ := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
 		HostRoot:       debRoot,
 		SnapshotRoot:   snapRoot,
+		WatchdogDir:    watchDir,
+		GrantDir:       grantDir,
 		KeyID:          "bridge-k1",
 		HMACKey:        bridgeKey,
 		RequireGrant:   true,
@@ -125,6 +144,20 @@ func TestR13_P2_01_GrantFailClosedOnMissingKey(t *testing.T) {
 	})
 	srv2 := httptest.NewServer(handler2)
 	defer srv2.Close()
+
+	// Arm watchdog step through bridge to transition state machine to WATCHDOG_ARMED
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           binding,
+		GuardID:           binding.OperationID,
+		SnapshotID:        binding.OperationID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             grant,
+	}
+	codeArm, bodyArm := sendRawBridgeRequest(t, srv2.URL, "bridge-k1", bridgeKey, "nonce-p2-arm", armReq)
+	if codeArm != http.StatusOK {
+		t.Fatalf("arm watchdog step failed: %d (%s)", codeArm, string(bodyArm))
+	}
 
 	code2, body2 := sendRawBridgeRequest(t, srv2.URL, "bridge-k1", bridgeKey, "nonce-p2-2", HostActionRequest{
 		Action:   HostActionAptUpgrade,
@@ -170,6 +203,22 @@ func TestR13_P2_02_StepDigestsAndAllowedStepsTamper(t *testing.T) {
 	}
 	canonicalDigest := ComputeStepParamDigest(upgradeReq)
 
+	watchDir := t.TempDir()
+	createTestSnapshotManifest(t, snapRoot, binding.OperationID)
+	st := PersistentSSHGuardState{
+		GuardID:      binding.OperationID,
+		OperationID:  binding.OperationID,
+		Status:       SSHGuardStatusArmed,
+		ArmedAt:      time.Now().UTC(),
+		DeadlineAt:   time.Now().UTC().Add(10 * time.Minute),
+		ExternalUnit: fmt.Sprintf("pid:%d:%s", os.Getpid(), binding.OperationID),
+	}
+	sRaw, _ := json.Marshal(st)
+	_ = os.WriteFile(filepath.Join(watchDir, binding.OperationID+".json"), sRaw, 0600)
+
+	armDigest := ComputeStepParamDigest(HostActionRequest{Action: HostActionWatchdogArm, Binding: binding, GuardID: binding.OperationID, SnapshotID: binding.OperationID, WatchdogTimeoutMs: 30000})
+	disarmDigest := ComputeStepParamDigest(HostActionRequest{Action: HostActionWatchdogDisarm, Binding: binding, GuardID: binding.OperationID})
+
 	grant, err := auth.IssueGrant(HostExecutionGrantIssueRequest{
 		ProposalID:        binding.ProposalID,
 		ApprovalID:        binding.ApprovalID,
@@ -178,9 +227,11 @@ func TestR13_P2_02_StepDigestsAndAllowedStepsTamper(t *testing.T) {
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
 		Action:            ActionHostPackageUpgrade,
-		AllowedSteps:      []string{string(HostActionAptCachePolicy), string(HostActionAptUpgrade)},
+		AllowedSteps:      []string{string(HostActionWatchdogArm), string(HostActionAptCachePolicy), string(HostActionAptUpgrade), string(HostActionWatchdogDisarm)},
 		StepParamDigests: map[string]string{
-			string(HostActionAptUpgrade): canonicalDigest,
+			string(HostActionWatchdogArm):    armDigest,
+			string(HostActionAptUpgrade):     canonicalDigest,
+			string(HostActionWatchdogDisarm): disarmDigest,
 		},
 		Packages:       []string{"openssh-server"},
 		TargetVersions: map[string]string{"openssh-server": "1:9.2p1-2+deb12u4"},
@@ -189,10 +240,15 @@ func TestR13_P2_02_StepDigestsAndAllowedStepsTamper(t *testing.T) {
 		t.Fatalf("issue grant: %v", err)
 	}
 
+	grantDir := filepath.Join(snapRoot, "grant-store")
+	_ = os.MkdirAll(grantDir, 0700)
+
 	mockRunner := &mockHostExecRunner{}
 	handler, _ := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
 		HostRoot:       debRoot,
 		SnapshotRoot:   snapRoot,
+		WatchdogDir:    watchDir,
+		GrantDir:       grantDir,
 		KeyID:          "bridge-k1",
 		HMACKey:        bridgeKey,
 		RequireGrant:   true,
@@ -203,6 +259,20 @@ func TestR13_P2_02_StepDigestsAndAllowedStepsTamper(t *testing.T) {
 	})
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
+
+	// Arm watchdog step to transition state to WATCHDOG_ARMED
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           binding,
+		GuardID:           binding.OperationID,
+		SnapshotID:        binding.OperationID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             grant,
+	}
+	codeArm, bodyArm := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "nonce-p2-t0-arm", armReq)
+	if codeArm != http.StatusOK {
+		t.Fatalf("arm watchdog step failed: %d (%s)", codeArm, string(bodyArm))
+	}
 
 	// 1. Call unpermitted step: ssh.service_restart is NOT in AllowedSteps
 	codeDisallowed, bodyDisallowed := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "nonce-p2-t1", HostActionRequest{
@@ -265,6 +335,19 @@ func TestR13_P2_03_StepLevelConsumptionAndReplayDefense(t *testing.T) {
 		FencingGeneration: 1,
 	}
 
+	watchDir := t.TempDir()
+	createTestSnapshotManifest(t, snapRoot, binding.OperationID)
+	st := PersistentSSHGuardState{
+		GuardID:      binding.OperationID,
+		OperationID:  binding.OperationID,
+		Status:       SSHGuardStatusArmed,
+		ArmedAt:      time.Now().UTC(),
+		DeadlineAt:   time.Now().UTC().Add(10 * time.Minute),
+		ExternalUnit: fmt.Sprintf("pid:%d:%s", os.Getpid(), binding.OperationID),
+	}
+	sRaw, _ := json.Marshal(st)
+	_ = os.WriteFile(filepath.Join(watchDir, binding.OperationID+".json"), sRaw, 0600)
+
 	grant, err := auth.IssueGrant(HostExecutionGrantIssueRequest{
 		ProposalID:        binding.ProposalID,
 		ApprovalID:        binding.ApprovalID,
@@ -273,17 +356,21 @@ func TestR13_P2_03_StepLevelConsumptionAndReplayDefense(t *testing.T) {
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
 		Action:            ActionHostPackageUpgrade,
-		AllowedSteps:      []string{string(HostActionAptUpgrade)},
 		Packages:          []string{"openssh-server"},
 	})
 	if err != nil {
 		t.Fatalf("issue grant: %v", err)
 	}
 
+	grantDir := filepath.Join(snapRoot, "grant-store")
+	_ = os.MkdirAll(grantDir, 0700)
+
 	mockRunner := &mockHostExecRunner{}
 	handler, _ := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
 		HostRoot:       debRoot,
 		SnapshotRoot:   snapRoot,
+		WatchdogDir:    watchDir,
+		GrantDir:       grantDir,
 		KeyID:          "bridge-k1",
 		HMACKey:        bridgeKey,
 		RequireGrant:   true,
@@ -294,6 +381,20 @@ func TestR13_P2_03_StepLevelConsumptionAndReplayDefense(t *testing.T) {
 	})
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
+
+	// Arm watchdog step to transition state to WATCHDOG_ARMED
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           binding,
+		GuardID:           binding.OperationID,
+		SnapshotID:        binding.OperationID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             grant,
+	}
+	codeArm, bodyArm := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "nonce-p2-t0-arm", armReq)
+	if codeArm != http.StatusOK {
+		t.Fatalf("arm watchdog step failed: %d (%s)", codeArm, string(bodyArm))
+	}
 
 	// 1. Consume apt.upgrade once -> 200 OK
 	code1, _ := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "nonce-c1", HostActionRequest{

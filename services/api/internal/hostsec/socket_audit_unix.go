@@ -5,6 +5,7 @@ package hostsec
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -28,7 +29,7 @@ func AuditSocketDirectory(dir string) error {
 	if perm&0002 != 0 {
 		return fmt.Errorf("socket directory %q is world-writable (mode %04o)", dir, perm)
 	}
-	if perm > 0755 {
+	if perm&^os.FileMode(0755) != 0 {
 		return fmt.Errorf("socket directory %q has unsafe permissions %04o (must be <= 0755, recommended 0750)", dir, perm)
 	}
 	if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
@@ -36,6 +37,29 @@ func AuditSocketDirectory(dir string) error {
 		if stat.Uid != 0 && stat.Uid != currentUID {
 			return fmt.Errorf("socket directory %q owner UID %d untrusted (must be root (0) or helper process UID %d)", dir, stat.Uid, currentUID)
 		}
+	}
+	return nil
+}
+
+// AuditSocketAncestry verifies the entire directory ancestry of sockPath:
+// every ancestor directory up to root / must exist, be a directory, not be a symlink,
+// not be world-writable, and be owned by root or the current process UID.
+func AuditSocketAncestry(sockPath string) error {
+	absPath, err := filepath.Abs(sockPath)
+	if err != nil {
+		return fmt.Errorf("resolve absolute path for %q: %w", sockPath, err)
+	}
+	dir := filepath.Dir(absPath)
+
+	for {
+		if err := AuditSocketDirectory(dir); err != nil {
+			return fmt.Errorf("ancestor directory %q failed audit: %w", dir, err)
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
 	}
 	return nil
 }

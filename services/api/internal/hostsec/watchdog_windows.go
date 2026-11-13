@@ -158,11 +158,32 @@ func isProcessRecycledOrDead(pid int, guardID string) bool {
 	if pid <= 0 {
 		return true
 	}
-	const processQueryLimitedInfo = 0x1000
-	h, err := syscall.OpenProcess(processQueryLimitedInfo, false, uint32(pid))
+	const (
+		processQueryLimitedInfo = 0x1000
+		synchronize             = 0x00100000
+		waitObject0             = 0x00000000
+	)
+	h, err := syscall.OpenProcess(processQueryLimitedInfo|synchronize, false, uint32(pid))
 	if err != nil {
 		return true // process does not exist or exited
 	}
-	_ = syscall.CloseHandle(h)
+	defer syscall.CloseHandle(h)
+
+	// Zero-overhead check if process has already terminated
+	event, waitErr := syscall.WaitForSingleObject(h, 0)
+	if waitErr == nil && event == waitObject0 {
+		return true // Process has terminated!
+	}
+
+	if guardID != "" {
+		cmd := exec.Command("powershell.exe", "-NoProfile", "-NonInteractive", "-Command", fmt.Sprintf(`(Get-CimInstance Win32_Process -Filter "ProcessId = %d").CommandLine`, pid))
+		out, cErr := cmd.Output()
+		if cErr != nil {
+			return false
+		}
+		if !strings.Contains(string(out), guardID) {
+			return true // process exists but cmdline does not contain guardID -> recycled!
+		}
+	}
 	return false
 }

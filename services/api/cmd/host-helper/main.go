@@ -151,9 +151,9 @@ func main() {
 		if err := os.MkdirAll(sockDir, 0750); err != nil {
 			log.Fatalf("create socket directory %q: %v", sockDir, err)
 		}
-		// Security: full audit of socket directory (ownership, permissions, symlinks)
-		if err := hostsec.AuditSocketDirectory(sockDir); err != nil {
-			log.Fatalf("SECURITY VIOLATION: socket directory %q audit failed: %v", sockDir, err)
+		// Security: full audit of socket directory ancestry (ownership, permissions, symlinks)
+		if err := hostsec.AuditSocketAncestry(sockPathClean); err != nil {
+			log.Fatalf("SECURITY VIOLATION: socket ancestry %q audit failed: %v", sockPathClean, err)
 		}
 
 		// Security: inspect existing file at socketPath with Lstat

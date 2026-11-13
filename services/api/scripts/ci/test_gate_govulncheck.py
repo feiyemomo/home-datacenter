@@ -25,6 +25,7 @@ class TestGateGovulncheck(unittest.TestCase):
                     "summary": "HTTP/1 server crash test",
                     "reason": "Audited and tested",
                     "risk": "MEDIUM",
+                    "approved_by": "Security-Consortium",
                     "expires_at": "2030-01-01T00:00:00Z"
                 },
                 {
@@ -34,6 +35,7 @@ class TestGateGovulncheck(unittest.TestCase):
                     "summary": "Third party vuln attempting bypass",
                     "reason": "Invalid attempt",
                     "risk": "HIGH",
+                    "approved_by": "Security-Consortium",
                     "expires_at": "2030-01-01T00:00:00Z"
                 }
             ]
@@ -167,6 +169,7 @@ class TestGateGovulncheck(unittest.TestCase):
                         "summary": "Expired vuln",
                         "reason": "Old",
                         "risk": "LOW",
+                        "approved_by": "Security-Consortium",
                         "expires_at": "2020-01-01T00:00:00Z"
                     }
                 ]
@@ -184,6 +187,109 @@ class TestGateGovulncheck(unittest.TestCase):
         success, violations, _ = verify_govulncheck(expired_allowlist_path, raw)
         self.assertFalse(success)
         self.assertTrue(any("expired" in v for v in violations))
+
+    def test_duplicate_exemption_id_fails_closed(self):
+        dup_allowlist_path = os.path.join(self.temp_dir.name, "dup.json")
+        with open(dup_allowlist_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "exemptions": [
+                    {
+                        "id": "GO-2026-1111",
+                        "module": "stdlib",
+                        "package": "net/http",
+                        "reason": "Test 1",
+                        "risk": "LOW",
+                        "approved_by": "sec",
+                        "expires_at": "2030-01-01T00:00:00Z"
+                    },
+                    {
+                        "id": "GO-2026-1111",
+                        "module": "stdlib",
+                        "package": "net/http",
+                        "reason": "Test 2 dup",
+                        "risk": "LOW",
+                        "approved_by": "sec",
+                        "expires_at": "2030-01-01T00:00:00Z"
+                    }
+                ]
+            }, f)
+        success, violations, _ = verify_govulncheck(dup_allowlist_path, '{"finding":{"osv":"GO-2026-1111"}}')
+        self.assertFalse(success)
+        self.assertTrue(any("Duplicate exemption ID" in v for v in violations))
+
+    def test_missing_required_field_fails_closed(self):
+        bad_path = os.path.join(self.temp_dir.name, "missing_field.json")
+        with open(bad_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "exemptions": [
+                    {
+                        "id": "GO-2026-2222",
+                        "module": "stdlib",
+                        "package": "net/http",
+                        "reason": "", # empty reason
+                        "risk": "LOW",
+                        "approved_by": "sec",
+                        "expires_at": "2030-01-01T00:00:00Z"
+                    }
+                ]
+            }, f)
+        success, violations, _ = verify_govulncheck(bad_path, '{"finding":{"osv":"GO-2026-2222"}}')
+        self.assertFalse(success)
+        self.assertTrue(any("missing required field" in v for v in violations))
+
+    def test_non_utc_expiration_fails_closed(self):
+        bad_path = os.path.join(self.temp_dir.name, "non_utc.json")
+        with open(bad_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "exemptions": [
+                    {
+                        "id": "GO-2026-3333",
+                        "module": "stdlib",
+                        "package": "net/http",
+                        "reason": "Valid reason",
+                        "risk": "LOW",
+                        "approved_by": "sec",
+                        "expires_at": "2030-01-01T00:00:00+08:00" # Not ending in Z
+                    }
+                ]
+            }, f)
+        success, violations, _ = verify_govulncheck(bad_path, '{"finding":{"osv":"GO-2026-3333"}}')
+        self.assertFalse(success)
+        self.assertTrue(any("must be UTC ISO 8601 ending with 'Z'" in v for v in violations))
+
+    def test_spoofed_stdlib_package_fails_closed(self):
+        bad_path = os.path.join(self.temp_dir.name, "spoof.json")
+        with open(bad_path, "w", encoding="utf-8") as f:
+            json.dump({
+                "version": "1.0",
+                "exemptions": [
+                    {
+                        "id": "GO-2026-4444",
+                        "module": "stdlib",
+                        "package": "github.com/gin-gonic/gin", # spoofed 3rd party in stdlib module
+                        "reason": "Sneaky attempt",
+                        "risk": "HIGH",
+                        "approved_by": "sec",
+                        "expires_at": "2030-01-01T00:00:00Z"
+                    }
+                ]
+            }, f)
+        success, violations, _ = verify_govulncheck(bad_path, '{"finding":{"osv":"GO-2026-4444"}}')
+        self.assertFalse(success)
+        self.assertTrue(any("Spoofed stdlib exemption" in v for v in violations))
+
+    def test_traceless_finding_fails_closed(self):
+        raw = json.dumps({
+            "finding": {
+                "osv": "GO-2026-9999-NOTRACE"
+            }
+        })
+        success, violations, _ = verify_govulncheck(self.allowlist_path, raw)
+        self.assertFalse(success)
+        self.assertTrue(any("UNAUTHORIZED VULNERABILITY IN 3RD-PARTY MODULE" in v for v in violations))
 
 
 if __name__ == "__main__":

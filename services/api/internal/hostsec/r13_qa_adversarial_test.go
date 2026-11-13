@@ -227,9 +227,25 @@ func TestR13_FI_12B_ConcurrentGrantFencingNonceRace(t *testing.T) {
 		},
 	}
 
+	watchDir := t.TempDir()
+	grantDir := t.TempDir()
+	createTestSnapshotManifest(t, snapRoot, "op-race-single")
+	st := PersistentSSHGuardState{
+		GuardID:      "op-race-single",
+		OperationID:  "op-race-single",
+		Status:       SSHGuardStatusArmed,
+		ArmedAt:      time.Now().UTC(),
+		DeadlineAt:   time.Now().UTC().Add(10 * time.Minute),
+		ExternalUnit: fmt.Sprintf("pid:%d:op-race-single", os.Getpid()),
+	}
+	sRaw, _ := json.Marshal(st)
+	_ = os.WriteFile(filepath.Join(watchDir, "op-race-single.json"), sRaw, 0600)
+
 	h, err := NewHostBridgeHTTPHandler(HostBridgeServerConfig{
 		HostRoot:       debRoot,
 		SnapshotRoot:   snapRoot,
+		WatchdogDir:    watchDir,
+		GrantDir:       grantDir,
 		KeyID:          "bridge-k1",
 		HMACKey:        bridgeKey,
 		RequireFencing: true,
@@ -256,11 +272,25 @@ func TestR13_FI_12B_ConcurrentGrantFencingNonceRace(t *testing.T) {
 		ResourceScope:     binding.ResourceScope,
 		BaselineHash:      binding.BaselineHash,
 		FencingGeneration: binding.FencingGeneration,
-		Action:            string(HostActionAptUpgrade),
+		Action:            ActionHostPackageUpgrade,
 		Packages:          []string{"openssh-server"},
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	// Arm watchdog step to advance grant state machine to WATCHDOG_ARMED
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Binding:           binding,
+		GuardID:           binding.OperationID,
+		SnapshotID:        binding.OperationID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             singleGrant,
+	}
+	codeArm, bodyArm := sendRawBridgeRequest(t, srv.URL, "bridge-k1", bridgeKey, "nonce-race-arm", armReq)
+	if codeArm != http.StatusOK {
+		t.Fatalf("arm watchdog step failed: %d (%s)", codeArm, string(bodyArm))
 	}
 
 	const workers = 12

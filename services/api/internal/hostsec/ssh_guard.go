@@ -495,61 +495,71 @@ func (g *PersistentHostSSHGuard) ReconcileExpired(ctx context.Context) (int, err
 	}
 
 	// Reconcile and backfill audit events for guards recovered out-of-process while API was offline
-	if g.AuditEngine != nil {
-		for _, ent := range entries {
-			if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") || strings.HasSuffix(ent.Name(), ".tmp") {
-				continue
-			}
-			guardID := strings.TrimSuffix(ent.Name(), ".json")
-			st, rErr := g.readState(guardID)
-			if rErr != nil {
-				continue
-			}
-			if st.Status == SSHGuardStatusRecovered || st.Status == SSHGuardStatusRecoveryFailed {
-				syncPath := filepath.Join(g.GuardDir, guardID+".audit_synced")
-				pendingPath := filepath.Join(g.GuardDir, guardID+".audit_pending")
-				if _, statErr := os.Stat(syncPath); os.IsNotExist(statErr) {
-					eventType := model.AuditEventRollbackCompleted
-					result := "WATCHDOG_RECOVERED"
-					if st.Status == SSHGuardStatusRecoveryFailed {
-						eventType = model.AuditEventRollbackFailed
-						result = "WATCHDOG_RECOVERY_FAILED"
-					}
-					emitInput := audit.EmitEventInput{
-						EventType:         eventType,
-						Action:            "host.ssh_watchdog.reconcile",
-						Target:            guardID,
-						Component:         "host-ssh-watchdog",
-						RiskLevel:         model.AuditRiskCritical,
-						ProposalID:        st.ProposalID,
-						ApprovalID:        st.ApprovalID,
-						OperationID:       st.OperationID,
-						FencingGeneration: st.FencingGeneration,
-						Result:            result,
-						DecisionReason:    "offline watchdog recovery reconciled into audit engine",
-						ErrorCode:         st.LastError,
-					}
-					var emitErr error
-					for attempt := 0; attempt < 3; attempt++ {
-						_, emitErr = g.AuditEngine.EmitEvent(ctx, emitInput)
-						if emitErr == nil {
-							break
-						}
-						time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
-					}
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") || strings.HasSuffix(ent.Name(), ".tmp") {
+			continue
+		}
+		guardID := strings.TrimSuffix(ent.Name(), ".json")
+		st, rErr := g.readState(guardID)
+		if rErr != nil {
+			continue
+		}
+		if st.Status == SSHGuardStatusRecovered || st.Status == SSHGuardStatusRecoveryFailed {
+			syncPath := filepath.Join(g.GuardDir, guardID+".audit_synced")
+			pendingPath := filepath.Join(g.GuardDir, guardID+".audit_pending")
+			if _, statErr := os.Stat(syncPath); os.IsNotExist(statErr) {
+				if g.AuditEngine == nil {
+					pendingRecord, _ := json.Marshal(map[string]any{
+						"guard_id":    guardID,
+						"status":      st.Status,
+						"last_error":  "audit engine offline",
+						"queued_at":   now.Format(time.RFC3339Nano),
+						"retry_count": 0,
+					})
+					_ = writeFileAtomicFailClosed(pendingPath, pendingRecord, 0600)
+					continue
+				}
+
+				eventType := model.AuditEventRollbackCompleted
+				result := "WATCHDOG_RECOVERED"
+				if st.Status == SSHGuardStatusRecoveryFailed {
+					eventType = model.AuditEventRollbackFailed
+					result = "WATCHDOG_RECOVERY_FAILED"
+				}
+				emitInput := audit.EmitEventInput{
+					EventType:         eventType,
+					Action:            "host.ssh_watchdog.reconcile",
+					Target:            guardID,
+					Component:         "host-ssh-watchdog",
+					RiskLevel:         model.AuditRiskCritical,
+					ProposalID:        st.ProposalID,
+					ApprovalID:        st.ApprovalID,
+					OperationID:       st.OperationID,
+					FencingGeneration: st.FencingGeneration,
+					Result:            result,
+					DecisionReason:    "offline watchdog recovery reconciled into audit engine",
+					ErrorCode:         st.LastError,
+				}
+				var emitErr error
+				for attempt := 0; attempt < 3; attempt++ {
+					_, emitErr = g.AuditEngine.EmitEvent(ctx, emitInput)
 					if emitErr == nil {
-						_ = writeFileAtomicFailClosed(syncPath, []byte(now.Format(time.RFC3339Nano)), 0600)
-						_ = os.Remove(pendingPath)
-					} else {
-						pendingRecord, _ := json.Marshal(map[string]any{
-							"guard_id":    guardID,
-							"status":      st.Status,
-							"last_error":  emitErr.Error(),
-							"queued_at":   now.Format(time.RFC3339Nano),
-							"retry_count": 3,
-						})
-						_ = writeFileAtomicFailClosed(pendingPath, pendingRecord, 0600)
+						break
 					}
+					time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
+				}
+				if emitErr == nil {
+					_ = writeFileAtomicFailClosed(syncPath, []byte(now.Format(time.RFC3339Nano)), 0600)
+					_ = os.Remove(pendingPath)
+				} else {
+					pendingRecord, _ := json.Marshal(map[string]any{
+						"guard_id":    guardID,
+						"status":      st.Status,
+						"last_error":  emitErr.Error(),
+						"queued_at":   now.Format(time.RFC3339Nano),
+						"retry_count": 3,
+					})
+					_ = writeFileAtomicFailClosed(pendingPath, pendingRecord, 0600)
 				}
 			}
 		}

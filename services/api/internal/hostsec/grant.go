@@ -435,6 +435,19 @@ func (g *HostExecutionGrant) ValidateFormat(requireFencing bool) error {
 		if len(g.StepParamDigests) == 0 {
 			return fmt.Errorf("%w: ActionHostPackageUpgrade requires non-empty step_param_digests", ErrExecutionGrantInvalid)
 		}
+		hasArm := false
+		hasDisarm := false
+		for _, s := range g.AllowedSteps {
+			if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
+				hasArm = true
+			}
+			if strings.TrimSpace(s) == string(HostActionWatchdogDisarm) {
+				hasDisarm = true
+			}
+		}
+		if !hasArm || !hasDisarm {
+			return fmt.Errorf("%w: ActionHostPackageUpgrade strictly requires watchdog arm and disarm in allowed_steps", ErrExecutionGrantInvalid)
+		}
 	}
 	if g.IssuedAtMs <= 0 || g.ExpiresAtMs <= g.IssuedAtMs {
 		return fmt.Errorf("%w: invalid grant validity window", ErrExecutionGrantInvalid)
@@ -749,6 +762,14 @@ type GrantStepExecutionRecord struct {
 	TimestampMs       int64  `json:"timestamp_ms"`
 }
 
+const (
+	GrantExecutionStatusAuthorized       = "AUTHORIZED"
+	GrantExecutionStatusExecuting        = "EXECUTING"
+	GrantExecutionStatusSucceeded        = "SUCCEEDED"
+	GrantExecutionStatusFailed           = "FAILED"
+	GrantExecutionStatusRecoveryRequired = "RECOVERY_REQUIRED"
+)
+
 type grantConsumeRecord struct {
 	GrantID           string                     `json:"grant_id"`
 	Action            string                     `json:"action"`
@@ -759,6 +780,7 @@ type grantConsumeRecord struct {
 	BaselineHash      string                     `json:"baseline_hash"`
 	FencingGeneration int64                      `json:"fencing_generation"`
 	CurrentState      GrantStepState             `json:"current_state"`
+	ExecutionStatus   string                     `json:"execution_status,omitempty"`
 	History           []GrantStepExecutionRecord `json:"history"`
 	ConsumedSteps     map[string]int64           `json:"consumed_steps"`
 	CreatedAtMs       int64                      `json:"created_at_ms"`
@@ -933,13 +955,6 @@ func (s *PersistentGrantStore) CheckGrantUsable(
 			}
 		}
 		if g.Action == ActionHostPackageUpgrade {
-			hasWatchdogInAllowedSteps := false
-			for _, s := range g.AllowedSteps {
-				if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
-					hasWatchdogInAllowedSteps = true
-					break
-				}
-			}
 			curState := rec.CurrentState
 			if curState == "" {
 				curState = GrantStepStateInitial
@@ -949,39 +964,24 @@ func (s *PersistentGrantStore) CheckGrantUsable(
 				return fmt.Errorf("%w: operation is in invalid state %s", ErrExecutionGrantMismatch, curState)
 			}
 			if _, valid := validTransitions[req.Action]; !valid {
-				if !hasWatchdogInAllowedSteps && (req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade) && (curState == GrantStepStateInitial || curState == GrantStepStatePreflight) {
-					// Standalone mutation grant without watchdog arm authorized
-				} else {
-					return fmt.Errorf("%w: invalid step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
-				}
+				return fmt.Errorf("%w: invalid step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
 			}
 			if req.Action == HostActionAptUpgrade {
-				if hasWatchdogInAllowedSteps && curState != GrantStepStateWatchdogArmed {
+				if curState != GrantStepStateWatchdogArmed {
 					return fmt.Errorf("%w: cannot execute mutation %s before watchdog is armed (current state: %s)", ErrExecutionGrantMismatch, req.Action, curState)
 				}
 			}
 			if req.Action == HostActionAptDowngrade {
-				if hasWatchdogInAllowedSteps && (curState != GrantStepStateWatchdogArmed && curState != GrantStepStateMutated && curState != GrantStepStateVerified && curState != GrantStepStateRestored) {
+				if curState != GrantStepStateWatchdogArmed && curState != GrantStepStateMutated && curState != GrantStepStateVerified && curState != GrantStepStateRestored {
 					return fmt.Errorf("%w: cannot execute rollback mutation %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
 				}
 			}
 		}
 	} else if os.IsNotExist(rErr) {
 		if g.Action == ActionHostPackageUpgrade {
-			hasWatchdogInAllowedSteps := false
-			for _, s := range g.AllowedSteps {
-				if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
-					hasWatchdogInAllowedSteps = true
-					break
-				}
-			}
 			validTransitions := AllowedStepTransitions[GrantStepStateInitial]
 			if _, valid := validTransitions[req.Action]; !valid {
-				if !hasWatchdogInAllowedSteps && (req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade) {
-					// Standalone mutation grant without watchdog arm authorized
-				} else {
-					return fmt.Errorf("%w: invalid initial step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, GrantStepStateInitial)
-				}
+				return fmt.Errorf("%w: invalid initial step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, GrantStepStateInitial)
 			}
 		}
 	} else {
@@ -1082,6 +1082,7 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 			BaselineHash:      g.BaselineHash,
 			FencingGeneration: g.FencingGeneration,
 			CurrentState:      GrantStepStateInitial,
+			ExecutionStatus:   GrantExecutionStatusAuthorized,
 			ConsumedSteps:     make(map[string]int64),
 			CreatedAtMs:       nowMs,
 		}
@@ -1089,14 +1090,6 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 
 	// State machine transition validation for package upgrade operations
 	if g.Action == ActionHostPackageUpgrade {
-		hasWatchdogInAllowedSteps := false
-		for _, s := range g.AllowedSteps {
-			if strings.TrimSpace(s) == string(HostActionWatchdogArm) {
-				hasWatchdogInAllowedSteps = true
-				break
-			}
-		}
-
 		curState := rec.CurrentState
 		if curState == "" {
 			curState = GrantStepStateInitial
@@ -1107,21 +1100,22 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 		}
 		nextState, valid := validTransitions[req.Action]
 		if !valid {
-			if !hasWatchdogInAllowedSteps && (req.Action == HostActionAptUpgrade || req.Action == HostActionAptDowngrade) && (curState == GrantStepStateInitial || curState == GrantStepStatePreflight) {
-				nextState = GrantStepStateMutated
-			} else {
-				return fmt.Errorf("%w: invalid step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
-			}
+			return fmt.Errorf("%w: invalid step transition: cannot execute %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
 		}
 		if req.Action == HostActionAptUpgrade {
-			if hasWatchdogInAllowedSteps && curState != GrantStepStateWatchdogArmed {
+			if curState != GrantStepStateWatchdogArmed {
 				return fmt.Errorf("%w: cannot execute mutation %s before watchdog is armed (current state: %s)", ErrExecutionGrantMismatch, req.Action, curState)
 			}
+			rec.ExecutionStatus = GrantExecutionStatusExecuting
 		}
 		if req.Action == HostActionAptDowngrade {
-			if hasWatchdogInAllowedSteps && (curState != GrantStepStateWatchdogArmed && curState != GrantStepStateMutated && curState != GrantStepStateVerified && curState != GrantStepStateRestored) {
+			if curState != GrantStepStateWatchdogArmed && curState != GrantStepStateMutated && curState != GrantStepStateVerified && curState != GrantStepStateRestored {
 				return fmt.Errorf("%w: cannot execute rollback mutation %s from state %s", ErrExecutionGrantMismatch, req.Action, curState)
 			}
+			rec.ExecutionStatus = GrantExecutionStatusExecuting
+		}
+		if req.Action == HostActionWatchdogDisarm {
+			rec.ExecutionStatus = GrantExecutionStatusSucceeded
 		}
 		rec.CurrentState = nextState
 		rec.History = append(rec.History, GrantStepExecutionRecord{
@@ -1151,6 +1145,65 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 	}
 	unlocked = true
 	return nil
+}
+
+// MarkExecutionStatus records the operational outcome (EXECUTING, SUCCEEDED, FAILED, RECOVERY_REQUIRED)
+// to ensure execution transaction consistency.
+func (s *PersistentGrantStore) MarkExecutionStatus(grantID string, status string) error {
+	if s == nil || strings.TrimSpace(grantID) == "" {
+		return nil
+	}
+	key, err := grantDiskKey(grantID)
+	if err != nil {
+		return err
+	}
+	consumePath := filepath.Join(s.GrantDir, key+".consumed")
+
+	unlock, lErr := acquireCrossProcessFileLock(filepath.Join(s.GrantDir, ".grant.lock"))
+	if lErr != nil {
+		return fmt.Errorf("acquire grant store lock: %w", lErr)
+	}
+	defer func() {
+		_ = unlock()
+	}()
+
+	raw, err := os.ReadFile(consumePath)
+	if err != nil {
+		return err
+	}
+	var rec grantConsumeRecord
+	if jErr := json.Unmarshal(raw, &rec); jErr != nil {
+		return jErr
+	}
+	rec.ExecutionStatus = status
+	rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+	encoded, mErr := json.Marshal(rec)
+	if mErr != nil {
+		return mErr
+	}
+	return writeFileAtomicFailClosed(consumePath, encoded, 0600)
+}
+
+// GetGrantRecord retrieves the consumption state record for a given grantID.
+func (s *PersistentGrantStore) GetGrantRecord(grantID string) (*grantConsumeRecord, error) {
+	if s == nil || strings.TrimSpace(grantID) == "" {
+		return nil, errors.New("grantStore or grantID is empty")
+	}
+	key, err := grantDiskKey(grantID)
+	if err != nil {
+		return nil, err
+	}
+	consumePath := filepath.Join(s.GrantDir, key+".consumed")
+
+	raw, err := os.ReadFile(consumePath)
+	if err != nil {
+		return nil, err
+	}
+	var rec grantConsumeRecord
+	if jErr := json.Unmarshal(raw, &rec); jErr != nil {
+		return nil, jErr
+	}
+	return &rec, nil
 }
 
 func grantStepKey(grantAction string, req HostActionRequest) string {
