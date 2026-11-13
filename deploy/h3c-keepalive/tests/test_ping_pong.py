@@ -240,8 +240,8 @@ class TestPingPongRelay(unittest.TestCase):
 
 
 class TestMainIntegrationAndSanitization(unittest.TestCase):
-    def test_get_sanitized_state_hides_nas_ssh(self):
-        """get_sanitized_state() must strip nas_ssh while keeping home_a, home_b, webrtc_test."""
+    def test_get_sanitized_state(self):
+        """get_sanitized_state() must return clean state dictionary with remainingSeconds."""
         with main.state_lock:
             main.tunnel_state["activeApp"] = "home_b"
             main.tunnel_state["externalAddr"] = "154.8.195.220:41234"
@@ -250,15 +250,13 @@ class TestMainIntegrationAndSanitization(unittest.TestCase):
                 "home_a": {"status": "ESTABLISHED", "externalAddr": "154.8.195.220:40001"},
                 "home_b": {"status": "ESTABLISHED", "externalAddr": "154.8.195.220:41234"},
                 "home": {"status": "ESTABLISHED", "externalAddr": "154.8.195.220:41234"},
-                "webrtc_test": {"status": "ESTABLISHED", "externalAddr": "154.8.195.220:40002"},
-                "nas_ssh": {"status": "ESTABLISHED", "externalAddr": "154.8.195.220:22222"}
+                "webrtc_test": {"status": "ESTABLISHED", "externalAddr": "154.8.195.220:40002"}
             }
 
         sanitized = main.get_sanitized_state()
         self.assertIn("home_a", sanitized["tunnels"])
         self.assertIn("home_b", sanitized["tunnels"])
         self.assertIn("webrtc_test", sanitized["tunnels"])
-        self.assertNotIn("nas_ssh", sanitized["tunnels"])
         self.assertEqual(sanitized["activeApp"], "home_b")
         self.assertEqual(sanitized["externalAddr"], "154.8.195.220:41234")
 

@@ -294,7 +294,7 @@ class H3CClient:
     def ensure_active_tunnel(self, app_name="home", min_remaining_minutes=25, internal_ip=None):
         """
         Ensures a standalone tunnel for app_name is active with at least min_remaining_minutes.
-        Used for non-ping-pong tunnels (such as webrtc_test and nas_ssh).
+        Used for non-ping-pong tunnels (such as webrtc_test).
         """
         existing = self.get_established_tunnel(app_name)
         now_utc = datetime.now(timezone.utc)

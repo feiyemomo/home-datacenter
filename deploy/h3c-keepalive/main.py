@@ -382,7 +382,7 @@ def run_check(force_renew=False):
     """
     Executes a comprehensive health check:
       1. Ping-pong relay step for primary web traffic (home_a 8088 / home_b 8089).
-      2. Ensures secondary tunnels (webrtc_test, nas_ssh).
+      2. Ensures secondary tunnels (webrtc_test).
       3. Synchronizes WebRTC candidates to Frigate dynamically without restart.
     """
     logger.info(f"Running tunnel health check (force_renew={force_renew})...")
@@ -424,7 +424,7 @@ def run_check(force_renew=False):
     except Exception as e:
         logger.error(f"Error evaluating ping-pong relay: {e}", exc_info=True)
 
-    # 2. Check other auxiliary tunnels (e.g. webrtc_test, nas_ssh)
+    # 2. Check other auxiliary tunnels (e.g. webrtc_test)
     min_min = 180 if force_renew else MIN_REMAINING_MINUTES
     for app in H3C_APP_NAMES:
         if app in ("home", PING_PONG_APP_A, PING_PONG_APP_B):
@@ -455,14 +455,6 @@ def run_check(force_renew=False):
                 except Exception as ex:
                     logger.warning(f"Failed to write webrtc_url.txt: {ex}")
                 sync_webrtc_to_frigate(res.get("externalAddr"))
-
-            if app == "nas_ssh" and res.get("externalAddr"):
-                try:
-                    os.makedirs(DATA_DIR, exist_ok=True)
-                    with open(os.path.join(DATA_DIR, "ssh_url.txt"), "w", encoding="utf-8") as f:
-                        f.write(res.get("externalAddr"))
-                except Exception as ex:
-                    logger.warning(f"Failed to write ssh_url.txt: {ex}")
         except Exception as e:
             logger.error(f"Error checking auxiliary tunnel '{app}': {e}", exc_info=True)
             all_tunnels[app] = {"status": "error", "error": str(e)}
@@ -493,11 +485,6 @@ def run_check(force_renew=False):
 def get_sanitized_state():
     with state_lock:
         state_copy = dict(tunnel_state)
-        if "tunnels" in state_copy and isinstance(state_copy["tunnels"], dict):
-            # Sanitize external view: omit "nas_ssh", keep "home_a", "home_b", "home", and "webrtc_test"
-            state_copy["tunnels"] = {
-                k: v for k, v in state_copy["tunnels"].items() if k != "nas_ssh"
-            }
         if state_copy.get("pendingRetire"):
             now = time.time()
             rem = max(0.0, state_copy["pendingRetire"]["retireAt"] - now)
