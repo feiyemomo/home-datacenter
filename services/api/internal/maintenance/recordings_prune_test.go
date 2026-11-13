@@ -50,8 +50,10 @@ func TestPruneOldestRecordings(t *testing.T) {
 	_, _ = db.Exec("INSERT INTO recordings VALUES ('r2', ?)", p2)
 	_, _ = db.Exec("INSERT INTO recordings VALUES ('r3', ?)", p3)
 
-	// Test 1: Prune targetReclaim = 1500 bytes (should prune hours 13 and 14)
-	res, err := PruneOldestRecordings(recordingsRoot, dbPath, 1500, 10)
+	// Test 1: Prune targetReclaim = sz1 + 1 (should prune hour 13 and require hour 14)
+	sz1, _, _ := dirSize(filepath.Join(recordingsRoot, "2026-10-18", "13"))
+	targetReclaim := sz1 + 1
+	res, err := PruneOldestRecordings(recordingsRoot, dbPath, targetReclaim, 10)
 	if err != nil {
 		t.Fatalf("prune failed: %v", err)
 	}
@@ -59,8 +61,8 @@ func TestPruneOldestRecordings(t *testing.T) {
 	if res.PrunedHours != 2 {
 		t.Errorf("expected 2 pruned hours, got %d", res.PrunedHours)
 	}
-	if res.ReclaimedBytes < 2000 {
-		t.Errorf("expected at least 2000 reclaimed bytes, got %d", res.ReclaimedBytes)
+	if res.ReclaimedBytes <= sz1 {
+		t.Errorf("expected at least %d reclaimed bytes, got %d", sz1+1, res.ReclaimedBytes)
 	}
 
 	// 2026-10-18/13 and 14 should no longer exist

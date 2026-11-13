@@ -131,6 +131,7 @@ func main() {
 		GrantKeyID:     *grantKeyID,
 		GrantHMACKey:   grantHMACKey,
 		GrantPublicKey: grantPubKey,
+		Runner:         hostsec.NewRealHostExecRunner(),
 	}
 
 	handler, err := hostsec.NewHostBridgeHTTPHandler(cfg)
@@ -164,6 +165,12 @@ func main() {
 			if fi.Mode().Type()&os.ModeSocket == 0 {
 				log.Fatalf("SECURITY VIOLATION: socket path %q already exists and is not a socket, refusing to remove or bind", sockPathClean)
 			}
+			// Probe if another instance is actively listening on this socket
+			conn, cErr := net.DialTimeout("unix", sockPathClean, 200*time.Millisecond)
+			if cErr == nil {
+				_ = conn.Close()
+				log.Fatalf("REFUSED: another host-helper is already actively listening on socket %q", sockPathClean)
+			}
 			if err := os.Remove(sockPathClean); err != nil {
 				log.Fatalf("failed to remove stale socket %q: %v", sockPathClean, err)
 			}
@@ -190,6 +197,16 @@ func main() {
 			if err := os.Chown(sockPathClean, uid, gid); err != nil {
 				log.Printf("warning: chown %d:%d %q: %v", uid, gid, sockPathClean, err)
 			}
+		}
+
+		// Security: post-bind anti-TOCTOU validation and ancestry re-audit
+		if postFi, postErr := os.Lstat(sockPathClean); postErr != nil {
+			log.Fatalf("post-bind lstat socket %q failed: %v", sockPathClean, postErr)
+		} else if postFi.Mode()&os.ModeSymlink != 0 || postFi.Mode().Type()&os.ModeSocket == 0 {
+			log.Fatalf("SECURITY VIOLATION: post-bind socket %q is invalid or symlink hijacked", sockPathClean)
+		}
+		if err := hostsec.AuditSocketAncestry(sockPathClean); err != nil {
+			log.Fatalf("SECURITY VIOLATION: post-bind socket ancestry %q audit failed: %v", sockPathClean, err)
 		}
 		defer os.Remove(sockPathClean)
 		log.Printf("Home Datacenter Host Helper listening on unix:%s (mode 0660)", sockPathClean)

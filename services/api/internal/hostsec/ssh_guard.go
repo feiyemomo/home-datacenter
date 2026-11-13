@@ -750,11 +750,11 @@ func (g *PersistentHostSSHGuard) writeRecoveryScript(detector *PlatformDetector,
 		))
 	}
 	if targetSSHDConfig != "" {
-		b.WriteString(fmt.Sprintf("if command -v sshd >/dev/null 2>&1; then sshd -t -f '%s'; fi\n", shellEscapeSingle(targetSSHDConfig)))
+		b.WriteString(fmt.Sprintf("if [ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] && command -v sshd >/dev/null 2>&1; then sshd -t -f '%s' 2>/dev/null || true; fi\n", shellEscapeSingle(targetSSHDConfig)))
 	} else {
-		b.WriteString("if command -v sshd >/dev/null 2>&1; then sshd -t; fi\n")
+		b.WriteString("if [ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] && command -v sshd >/dev/null 2>&1; then sshd -t 2>/dev/null || true; fi\n")
 	}
-	b.WriteString("if command -v systemctl >/dev/null 2>&1; then systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; fi\n")
+	b.WriteString("if [ \"$(id -u 2>/dev/null || echo 1)\" -eq 0 ] && command -v systemctl >/dev/null 2>&1; then systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true; fi\n")
 	return os.WriteFile(st.ScriptPath, []byte(b.String()), 0700)
 }
 

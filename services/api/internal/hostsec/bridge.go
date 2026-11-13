@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -813,23 +814,29 @@ func verifyActiveWatchdogForOperation(watchDir, opID string) (int, string, error
 				if _, dErr := os.Stat(disarmMarker); !os.IsNotExist(dErr) {
 					continue
 				}
-				if strings.HasPrefix(st.ExternalUnit, "pid:") {
-					parts := strings.Split(strings.TrimPrefix(st.ExternalUnit, "pid:"), ":")
-					if pid, pErr := strconv.Atoi(parts[0]); pErr == nil && pid > 0 {
-						if isProcessRecycledOrDead(pid, st.GuardID) {
-							continue // watchdog process dead or recycled
-						}
-						activePID = pid
-					}
+				if !strings.HasPrefix(st.ExternalUnit, "pid:") {
+					continue // unsupported backend unit type: fail closed
 				}
+				parts := strings.Split(strings.TrimPrefix(st.ExternalUnit, "pid:"), ":")
+				if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+					continue // malformed ExternalUnit
+				}
+				pid, pErr := strconv.Atoi(parts[0])
+				if pErr != nil || pid <= 0 {
+					continue // invalid or negative PID
+				}
+				if isProcessRecycledOrDead(pid, st.GuardID) {
+					continue // watchdog process dead or recycled
+				}
+				activePID = pid
 				activeGuardID = st.GuardID
 				foundArmed = true
 				break
 			}
 		}
 	}
-	if !foundArmed {
-		return 0, "", fmt.Errorf("no active ARMED watchdog found on disk for operation %s", cleanOp)
+	if !foundArmed || activePID <= 0 {
+		return 0, "", fmt.Errorf("no active ARMED watchdog found (or not alive) on disk for operation %s", cleanOp)
 	}
 	return activePID, activeGuardID, nil
 }
@@ -882,9 +889,6 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 	}
 	if strings.TrimSpace(cfg.KeyID) == "" {
 		cfg.KeyID = "bridge-k1"
-	}
-	if cfg.Runner == nil {
-		cfg.Runner = realHostExecRunner{}
 	}
 	if len(cfg.AllowedPkgs) == 0 {
 		cfg.AllowedPkgs = AllowedHostPackages
@@ -1107,12 +1111,16 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 				})
 				return
 			}
+			if req.Action == HostActionWatchdogDisarm && req.Grant != nil && grantStore != nil {
+				_ = grantStore.MarkExecutionStatus(req.Grant.GrantID, GrantExecutionStatusSucceeded)
+			}
 			res.Success = true
 			writeJSON(http.StatusOK, res)
 			return
 		}
 
 		// 4. Execute strictly typed action with Sentinel monitoring to prevent unmonitored execution
+		var watchdogDied atomic.Bool
 		execCtx, cancelExec := context.WithCancel(r.Context())
 		defer cancelExec()
 
@@ -1131,6 +1139,7 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 					case <-ticker.C:
 						if isProcessRecycledOrDead(activeWatchdogPID, activeGuardID) {
 							// Watchdog process died unexpectedly during mutation! Abort execution immediately!
+							watchdogDied.Store(true)
 							cancelExec()
 							return
 						}
@@ -1140,10 +1149,26 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 		}
 
 		res, execErr := dispatchTypedBridgeAction(execCtx, cfg.Runner, detector, cfg.SnapshotRoot, req)
-		if execErr != nil {
-			if execCtx.Err() != nil && grantStore != nil && req.Grant != nil {
+
+		// Race window protection: check if watchdog died during mutation even if dispatch returned
+		if activeWatchdogPID > 0 && (watchdogDied.Load() || isProcessRecycledOrDead(activeWatchdogPID, activeGuardID)) {
+			if grantStore != nil && req.Grant != nil {
 				_ = grantStore.MarkExecutionStatus(req.Grant.GrantID, GrantExecutionStatusRecoveryRequired)
-			} else if grantStore != nil && req.Grant != nil {
+			}
+			res.Success = false
+			res.ExitError = "watchdog terminated unexpectedly during mutation window: recovery required"
+			writeJSON(http.StatusInternalServerError, map[string]any{
+				"success":    false,
+				"stdout":     res.Stdout,
+				"stderr":     res.Stderr,
+				"exit_error": res.ExitError,
+				"error":      "watchdog terminated unexpectedly during mutation window: recovery required",
+			})
+			return
+		}
+
+		if execErr != nil {
+			if grantStore != nil && req.Grant != nil {
 				_ = grantStore.MarkExecutionStatus(req.Grant.GrantID, GrantExecutionStatusFailed)
 			}
 			res.Success = false
@@ -1157,6 +1182,7 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 			})
 			return
 		}
+
 		res.Success = true
 		writeJSON(http.StatusOK, res)
 	}), nil
@@ -1169,6 +1195,9 @@ func dispatchTypedBridgeAction(
 	snapshotRoot string,
 	req HostActionRequest,
 ) (HostActionResult, error) {
+	if runner == nil {
+		return HostActionResult{Success: false, ExitError: "host exec runner is nil: fail closed"}, fmt.Errorf("host exec runner is nil: fail closed")
+	}
 	switch req.Action {
 	case HostActionAptCachePolicy:
 		if len(req.Packages) != 1 {
@@ -1201,6 +1230,9 @@ func dispatchTypedBridgeAction(
 		args := []string{
 			"install", "-y", "--allow-downgrades",
 			"-o", "Acquire::AllowInsecureRepositories=false",
+			"-o", "Acquire::AllowDowngradeToInsecureRepositories=false",
+			"-o", "Dpkg::Options::=--force-confdef",
+			"-o", "Dpkg::Options::=--force-confold",
 			"--",
 		}
 		for _, rawPkg := range req.Packages {
@@ -1289,7 +1321,7 @@ func restoreSSHConfigsFromSnapshotID(detector *PlatformDetector, snapshotRoot, s
 		if mkErr := os.MkdirAll(filepath.Dir(dst), 0755); mkErr != nil {
 			return HostActionResult{}, mkErr
 		}
-		if wErr := os.WriteFile(dst, data, 0644); wErr != nil {
+		if wErr := writeFileAtomicFailClosed(dst, data, 0644); wErr != nil {
 			return HostActionResult{}, wErr
 		}
 		restored = append(restored, rel)

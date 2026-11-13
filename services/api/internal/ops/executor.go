@@ -256,8 +256,9 @@ type DefaultOperationExecutor struct {
 	client   *OnePanelClient
 	fallback *HostFallbackProvider
 
-	dockerSocket  string
-	probeTimeout  time.Duration
+	dockerSocket       string
+	customDockerSocket bool
+	probeTimeout       time.Duration
 	probeInterval time.Duration
 
 	healthCheckFn     func(ctx context.Context, target string) error
@@ -395,6 +396,7 @@ func WithProbeInterval(d time.Duration) ExecutorOption {
 func WithDockerSocket(path string) ExecutorOption {
 	return func(e *DefaultOperationExecutor) {
 		e.dockerSocket = path
+		e.customDockerSocket = true
 	}
 }
 
@@ -462,7 +464,12 @@ func IsProductionRuntime() bool {
 		}
 	}
 	if !testing.Testing() {
-		if _, err := os.Stat("/.dockerenv"); err == nil {
+		for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
+			if _, err := os.Stat(marker); err == nil {
+				return true
+			}
+		}
+		if v := strings.TrimSpace(os.Getenv("container")); v != "" {
 			return true
 		}
 	}
@@ -569,27 +576,31 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 		if _, statErr := os.Stat(sockPath); statErr == nil {
 			inspectData, insErr := inspectContainerViaDockerSocket(ctx, sockPath, canonical)
 			if insErr != nil {
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed: %v", insErr)}
-			}
-			comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectData)
-			if cErr != nil {
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
-			}
-			return BaselineInfo{
-				Hash:            comp.Hash,
-				ProtocolVersion: BaselineProtocolVersion,
-				Canonical:       canonical,
-				ContainerID:     comp.Document.Identity.ContainerID,
-				Image:           comp.Document.Identity.ImageReference,
-				State:           comp.Document.State.ContainerState,
-				CreatedAt:       comp.Document.State.CreatedAt,
-				IdentityHash:    comp.IdentityHash,
-				SecurityHash:    comp.SecurityHash,
-				StateHash:       comp.StateHash,
-				Identity:        &comp.Document.Identity,
-				Security:        &comp.Document.Security,
-				Source:          "docker_socket",
-				IsPlaceholder:   false,
+				if IsProductionRuntime() || e.customDockerSocket {
+					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed: %v", insErr)}
+				}
+				// In non-production with default socket where containers are not present on host, fall through to 1Panel or offline placeholder.
+			} else {
+				comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectData)
+				if cErr != nil {
+					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
+				}
+				return BaselineInfo{
+					Hash:            comp.Hash,
+					ProtocolVersion: BaselineProtocolVersion,
+					Canonical:       canonical,
+					ContainerID:     comp.Document.Identity.ContainerID,
+					Image:           comp.Document.Identity.ImageReference,
+					State:           comp.Document.State.ContainerState,
+					CreatedAt:       comp.Document.State.CreatedAt,
+					IdentityHash:    comp.IdentityHash,
+					SecurityHash:    comp.SecurityHash,
+					StateHash:       comp.StateHash,
+					Identity:        &comp.Document.Identity,
+					Security:        &comp.Document.Security,
+					Source:          "docker_socket",
+					IsPlaceholder:   false,
+				}
 			}
 		}
 	}
@@ -3040,7 +3051,12 @@ func inDockerEnv() bool {
 		return true
 	}
 	if !testing.Testing() {
-		if _, err := os.Stat("/.dockerenv"); err == nil {
+		for _, marker := range []string{"/.dockerenv", "/run/.containerenv"} {
+			if _, err := os.Stat(marker); err == nil {
+				return true
+			}
+		}
+		if v := strings.TrimSpace(os.Getenv("container")); v != "" {
 			return true
 		}
 	}

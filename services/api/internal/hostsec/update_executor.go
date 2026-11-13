@@ -94,6 +94,12 @@ type HostExecRunner interface {
 	Run(ctx context.Context, env []string, name string, args ...string) (stdout string, stderr string, err error)
 }
 
+// NewRealHostExecRunner constructs the default OS-level HostExecRunner that dispatches
+// strictly allowlisted commands on the host (outside container boundary).
+func NewRealHostExecRunner() HostExecRunner {
+	return realHostExecRunner{}
+}
+
 type realHostExecRunner struct{}
 
 func (realHostExecRunner) Run(ctx context.Context, env []string, name string, args ...string) (string, string, error) {
@@ -112,6 +118,7 @@ func (realHostExecRunner) Run(ctx context.Context, env []string, name string, ar
 		return "", "", fmt.Errorf("host update runner refused non-allowlisted binary: %s", base)
 	}
 	cmd := exec.CommandContext(ctx, base, args...)
+	cmd.WaitDelay = 2 * time.Second
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}

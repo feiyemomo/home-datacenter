@@ -222,6 +222,12 @@ func killedViaPidfd(pid int) (bool, error) {
 	return false, sErrno
 }
 
+// IsProcessRecycledOrDead inspects whether the given PID is dead or has been recycled
+// by an unrelated OS process.
+func IsProcessRecycledOrDead(pid int, guardID string) bool {
+	return isProcessRecycledOrDead(pid, guardID)
+}
+
 func isProcessRecycledOrDead(pid int, guardID string) bool {
 	if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
 		return true // process already exited

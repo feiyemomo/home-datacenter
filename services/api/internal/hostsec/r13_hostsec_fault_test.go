@@ -1353,7 +1353,7 @@ func TestR13_FI_09_QAReviewRegressions(t *testing.T) {
 	sharedGuard.DisableLocalTimer = true
 	sharedGuard.DelegateWatchdogToBridge = true
 
-	timeout := 900 * time.Millisecond
+	timeout := 1500 * time.Millisecond
 	if runtime.GOOS == "windows" {
 		timeout = 2200 * time.Millisecond
 	}

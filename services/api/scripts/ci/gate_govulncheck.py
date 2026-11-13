@@ -14,79 +14,99 @@ import sys
 
 def parse_govulncheck_json_stream(stream_text: str):
     """
-    Parses a multiline JSON stream output by govulncheck -format json.
+    Parses a multiline or multi-record JSON stream output by govulncheck -format json.
     Fails closed if the stream is empty, truncated, or contains malformed JSON.
     Returns a dict mapping OSV ID -> finding details.
     """
     if not stream_text or not stream_text.strip():
         raise ValueError("FAIL-CLOSED: Govulncheck output stream is empty")
 
-    lines = stream_text.strip().splitlines()
+    decoder = json.JSONDecoder()
     active_findings = {}
     parsed_any = False
+    idx = 0
+    length = len(stream_text)
 
-    for line_num, line in enumerate(lines, 1):
-        line_str = line.strip()
-        if not line_str:
+    while idx < length:
+        # Skip leading whitespace
+        while idx < length and stream_text[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+
+        # Check if this is a non-JSON log line (e.g., 'go: downloading...')
+        if stream_text[idx] != '{':
+            end_line = stream_text.find('\n', idx)
+            if end_line == -1:
+                end_line = length
+            non_json_line = stream_text[idx:end_line].strip()
+            # If the non-JSON line contains unexpected JSON braces, it's corrupted
+            if '{' in non_json_line or '}' in non_json_line:
+                raise ValueError(f"FAIL-CLOSED: Corrupted JSON fragment in stream: {non_json_line}")
+            idx = end_line + 1
             continue
-        if line_str.startswith('{'):
-            try:
-                obj = json.loads(line_str)
-            except json.JSONDecodeError as err:
-                raise ValueError(f"FAIL-CLOSED: Malformed or truncated JSON on line {line_num}: {err}") from err
 
-            parsed_any = True
-            if "finding" in obj:
-                fnd = obj["finding"]
-                osv_id = fnd.get("osv")
-                traces = fnd.get("trace", [])
-                if not traces:
-                    # Vulnerabilities without trace cannot be assumed safe; flag as missing_trace
-                    if osv_id:
-                        if osv_id not in active_findings:
-                            active_findings[osv_id] = {
-                                "modules": {"missing_trace"},
-                                "packages": set(),
-                                "symbols": set(),
-                                "fixed_version": fnd.get("fixed_version", ""),
-                            }
-                else:
-                    has_root_trace = any(
-                        t.get("module") == "home-datacenter-api" or
-                        (t.get("package", "").startswith("home-datacenter-api/"))
-                        for t in traces
-                    )
-                    if osv_id and has_root_trace:
-                        modules = set()
-                        packages = set()
-                        symbols = set()
-                        # In govulncheck protocol, traces[0] is the vulnerable leaf frame
-                        if traces and len(traces) > 0:
-                            leaf_mod = traces[0].get("module")
-                            if leaf_mod and leaf_mod != "home-datacenter-api":
-                                modules.add(leaf_mod)
-                        for t in traces:
-                            p = t.get("package", "")
-                            f = t.get("function")
-                            if p and not p.startswith("home-datacenter-api"):
-                                packages.add(p)
-                            if f:
-                                symbols.add(f)
-                        if osv_id not in active_findings:
-                            active_findings[osv_id] = {
-                                "modules": set(),
-                                "packages": set(),
-                                "symbols": set(),
-                                "fixed_version": fnd.get("fixed_version", ""),
-                            }
-                        active_findings[osv_id]["modules"].update(modules)
-                        active_findings[osv_id]["packages"].update(packages)
-                        active_findings[osv_id]["symbols"].update(symbols)
-        else:
-            # Lines not starting with '{' should only be pure textual build logs (e.g. "go: downloading...")
-            # If they contain JSON delimiter braces, it indicates a corrupted or broken JSON fragment
-            if '{' in line_str or '}' in line_str:
-                raise ValueError(f"FAIL-CLOSED: Corrupted JSON fragment on line {line_num}: {line_str}")
+        # Parse JSON object starting at idx
+        try:
+            obj, next_idx = decoder.raw_decode(stream_text, idx)
+        except json.JSONDecodeError as err:
+            raise ValueError(f"FAIL-CLOSED: Malformed or truncated JSON in stream at position {idx}: {err}") from err
+
+        idx = next_idx
+        parsed_any = True
+
+        if isinstance(obj, dict) and "finding" in obj:
+            fnd = obj["finding"]
+            osv_id = fnd.get("osv")
+            traces = fnd.get("trace", [])
+            if not traces:
+                # Vulnerabilities without trace cannot be assumed safe; flag as missing_trace
+                if osv_id:
+                    if osv_id not in active_findings:
+                        active_findings[osv_id] = {
+                            "modules": {"missing_trace"},
+                            "packages": set(),
+                            "symbols": set(),
+                            "fixed_version": fnd.get("fixed_version", ""),
+                        }
+            else:
+                has_call_trace = any(t.get("function") for t in traces)
+                has_root_trace = any(
+                    t.get("module") == "home-datacenter-api" or
+                    (t.get("package", "").startswith("home-datacenter-api/"))
+                    for t in traces
+                )
+
+                leaf_mod = traces[0].get("module", "")
+                if not leaf_mod and traces[0].get("package", ""):
+                    pkg_root = traces[0].get("package", "").split("/")[0]
+                    leaf_mod = "stdlib" if "." not in pkg_root else traces[0].get("package", "")
+
+                is_third_party = leaf_mod and leaf_mod != "stdlib" and leaf_mod != "home-datacenter-api"
+
+                if is_third_party or (has_call_trace and has_root_trace):
+                    modules = set()
+                    packages = set()
+                    symbols = set()
+                    if leaf_mod and leaf_mod != "home-datacenter-api":
+                        modules.add(leaf_mod)
+                    for t in traces:
+                        p = t.get("package", "")
+                        f = t.get("function")
+                        if p and not p.startswith("home-datacenter-api"):
+                            packages.add(p)
+                        if f:
+                            symbols.add(f)
+                    if osv_id not in active_findings:
+                        active_findings[osv_id] = {
+                            "modules": set(),
+                            "packages": set(),
+                            "symbols": set(),
+                            "fixed_version": fnd.get("fixed_version", ""),
+                        }
+                    active_findings[osv_id]["modules"].update(modules)
+                    active_findings[osv_id]["packages"].update(packages)
+                    active_findings[osv_id]["symbols"].update(symbols)
 
     if not parsed_any:
         raise ValueError("FAIL-CLOSED: No valid JSON records found in govulncheck output")
@@ -104,6 +124,9 @@ def verify_govulncheck(allowlist_path: str, raw_output: str) -> tuple[bool, list
 
     with open(allowlist_path, "r", encoding="utf-8") as f:
         allowlist_data = json.load(f)
+
+    if not isinstance(allowlist_data, dict):
+        return False, ["Allowlist root must be a JSON object containing 'exemptions' list"], []
 
     raw_exemptions = allowlist_data.get("exemptions", [])
     exemptions = {}
@@ -178,7 +201,7 @@ def verify_govulncheck(allowlist_path: str, raw_output: str) -> tuple[bool, list
 
         # Package validation
         ex_pkg = exemption.get("package")
-        if ex_pkg and ex_pkg not in details["packages"]:
+        if ex_pkg and ex_pkg not in details["packages"] and not any(p.startswith(ex_pkg + "/") or ex_pkg.startswith(p + "/") for p in details["packages"]):
             violations.append(
                 f"PACKAGE MISMATCH FOR EXEMPTION: {osv_id} expected {ex_pkg} but found {sorted(list(details['packages']))}"
             )
@@ -204,7 +227,7 @@ def main():
     else:
         cmd = ["go", "run", "golang.org/x/vuln/cmd/govulncheck@latest", "-format", "json", "./internal/...", "./cmd/..."]
         print(f"Executing: {' '.join(cmd)}")
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
         raw_output = proc.stdout
         if proc.returncode not in (0, 3):
             print(f"ERROR: govulncheck execution failed (exit code {proc.returncode}):\n{proc.stderr}", file=sys.stderr)

@@ -154,6 +154,12 @@ func (b *DetachedProcessWatchdogBackend) Cancel(_ context.Context, unitName stri
 	return nil
 }
 
+// IsProcessRecycledOrDead inspects whether the given PID is dead or has been recycled
+// by an unrelated OS process.
+func IsProcessRecycledOrDead(pid int, guardID string) bool {
+	return isProcessRecycledOrDead(pid, guardID)
+}
+
 func isProcessRecycledOrDead(pid int, guardID string) bool {
 	if pid <= 0 {
 		return true

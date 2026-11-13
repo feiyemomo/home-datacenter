@@ -742,6 +742,153 @@ func TestR13_P4_TC18_SimultaneousRestartSafeRecovery(t *testing.T) {
 	}
 }
 
+// TestR13_P4_TC19_RecoveryRequiredPermitsRollbackOnly verifies that a Grant in RECOVERY_REQUIRED
+// strictly rejects further mutations (apt.upgrade, watchdog_disarm) while explicitly permitting
+// emergency rollback steps (ssh.restore_config, ssh.service_restart, apt.downgrade).
+func TestR13_P4_TC19_RecoveryRequiredPermitsRollbackOnly(t *testing.T) {
+	grantDir := t.TempDir()
+	grantStore, err := NewPersistentGrantStore(grantDir)
+	if err != nil {
+		t.Fatalf("NewPersistentGrantStore failed: %v", err)
+	}
+	grantAuth, err := NewHostGrantAuthority(HostGrantAuthorityConfig{
+		KeyID:   "grant-k1",
+		HMACKey: []byte("grant-hmac-key-thirty-two-bytes-minimum-for-test!"),
+	})
+	if err != nil {
+		t.Fatalf("NewHostGrantAuthority failed: %v", err)
+	}
+
+	opID := "op-rec-req-19"
+	propID := "prop-19"
+	apprID := "appr-19"
+	baseHash := "host-v1:1111111111111111111111111111111111111111111111111111111111111111"
+	fencingGen := int64(19)
+
+	grant, err := grantAuth.IssueGrant(HostExecutionGrantIssueRequest{
+		Action:            ActionHostPackageUpgrade,
+		ProposalID:        propID,
+		ApprovalID:        apprID,
+		OperationID:       opID,
+		ResourceScope:     "host-os",
+		BaselineHash:      baseHash,
+		FencingGeneration: fencingGen,
+		Packages:          []string{"openssh-server"},
+		TargetVersions:    map[string]string{"openssh-server": "1:9.0"},
+	})
+	if err != nil {
+		t.Fatalf("SignGrant failed: %v", err)
+	}
+
+	// 1. Initial arm step
+	armReq := HostActionRequest{
+		Action:            HostActionWatchdogArm,
+		Packages:          []string{"openssh-server"},
+		SnapshotID:        opID,
+		GuardID:           opID,
+		WatchdogTimeoutMs: 30000,
+		Grant:             grant,
+		Binding: HostExecutionBinding{
+			ProposalID:        propID,
+			ApprovalID:        apprID,
+			OperationID:       opID,
+			ResourceScope:     "host-os",
+			BaselineHash:      baseHash,
+			FencingGeneration: fencingGen,
+		},
+	}
+	if err := grantStore.VerifyAndConsume(grantAuth, []byte("diff-bridge-key-32-bytes-test-xyz!"), grant, armReq, true, time.Now().UTC()); err != nil {
+		t.Fatalf("arm VerifyAndConsume failed: %v", err)
+	}
+
+	// 2. Put grant in RECOVERY_REQUIRED status
+	if err := grantStore.MarkExecutionStatus(grant.GrantID, GrantExecutionStatusRecoveryRequired); err != nil {
+		t.Fatalf("MarkExecutionStatus RECOVERY_REQUIRED failed: %v", err)
+	}
+
+	// 3. Attempting forward mutation (apt.upgrade) must be blocked in CheckGrantUsable and VerifyAndConsume
+	upgradeReq := HostActionRequest{
+		Action:   HostActionAptUpgrade,
+		Packages: []string{"openssh-server"},
+		Grant:    grant,
+		Binding: HostExecutionBinding{
+			ProposalID:        propID,
+			ApprovalID:        apprID,
+			OperationID:       opID,
+			ResourceScope:     "host-os",
+			BaselineHash:      baseHash,
+			FencingGeneration: fencingGen,
+		},
+	}
+	if chkErr := grantStore.CheckGrantUsable(grantAuth, []byte("diff-bridge-key-32-bytes-test-xyz!"), grant, upgradeReq, true, time.Now().UTC()); chkErr == nil {
+		t.Fatalf("expected CheckGrantUsable to block mutation when in RECOVERY_REQUIRED, got nil")
+	}
+	if cErr := grantStore.VerifyAndConsume(grantAuth, []byte("diff-bridge-key-32-bytes-test-xyz!"), grant, upgradeReq, true, time.Now().UTC()); cErr == nil {
+		t.Fatalf("expected VerifyAndConsume to block mutation when in RECOVERY_REQUIRED, got nil")
+	}
+
+	// 4. Attempting watchdog disarm must also be blocked
+	disarmReq := HostActionRequest{
+		Action:   HostActionWatchdogDisarm,
+		Packages: []string{"openssh-server"},
+		Grant:    grant,
+		Binding: HostExecutionBinding{
+			ProposalID:        propID,
+			ApprovalID:        apprID,
+			OperationID:       opID,
+			ResourceScope:     "host-os",
+			BaselineHash:      baseHash,
+			FencingGeneration: fencingGen,
+		},
+	}
+	if chkErr := grantStore.CheckGrantUsable(grantAuth, []byte("diff-bridge-key-32-bytes-test-xyz!"), grant, disarmReq, true, time.Now().UTC()); chkErr == nil {
+		t.Fatalf("expected CheckGrantUsable to block disarm when in RECOVERY_REQUIRED, got nil")
+	}
+
+	// 5. Emergency recovery action (restore_config) MUST be permitted
+	restoreReq := HostActionRequest{
+		Action:     HostActionRestoreConfig,
+		Packages:   []string{"openssh-server"},
+		SnapshotID: opID,
+		Grant:      grant,
+		Binding: HostExecutionBinding{
+			ProposalID:        propID,
+			ApprovalID:        apprID,
+			OperationID:       opID,
+			ResourceScope:     "host-os",
+			BaselineHash:      baseHash,
+			FencingGeneration: fencingGen,
+		},
+	}
+	if chkErr := grantStore.CheckGrantUsable(grantAuth, []byte("diff-bridge-key-32-bytes-test-xyz!"), grant, restoreReq, true, time.Now().UTC()); chkErr != nil {
+		t.Fatalf("CheckGrantUsable failed on restore_config in RECOVERY_REQUIRED: %v", chkErr)
+	}
+	if cErr := grantStore.VerifyAndConsume(grantAuth, []byte("diff-bridge-key-32-bytes-test-xyz!"), grant, restoreReq, true, time.Now().UTC()); cErr != nil {
+		t.Fatalf("VerifyAndConsume failed on restore_config in RECOVERY_REQUIRED: %v", cErr)
+	}
+
+	// 6. Terminal status cannot be overwritten by SUCCEEDED or FAILED
+	if err := grantStore.MarkExecutionStatus(grant.GrantID, GrantExecutionStatusSucceeded); err == nil {
+		t.Fatalf("expected error when attempting to overwrite RECOVERY_REQUIRED with SUCCEEDED")
+	}
+	if err := grantStore.MarkExecutionStatus(grant.GrantID, GrantExecutionStatusFailed); err == nil {
+		t.Fatalf("expected error when attempting to overwrite RECOVERY_REQUIRED with FAILED")
+	}
+
+	// 7. Succeeded terminal state cannot be overwritten by FAILED
+	grant2ID := "grant-succ-terminal"
+	g2Rec := grantConsumeRecord{
+		GrantID:         grant2ID,
+		ExecutionStatus: GrantExecutionStatusSucceeded,
+	}
+	g2Raw, _ := json.Marshal(g2Rec)
+	g2Key, _ := grantDiskKey(grant2ID)
+	_ = os.WriteFile(filepath.Join(grantDir, g2Key+".consumed"), g2Raw, 0600)
+	if err := grantStore.MarkExecutionStatus(grant2ID, GrantExecutionStatusFailed); err == nil {
+		t.Fatalf("expected error when attempting to overwrite SUCCEEDED with FAILED")
+	}
+}
+
 func execCommandHelper(name string, args ...string) *exec.Cmd {
 	return exec.Command(name, args...)
 }

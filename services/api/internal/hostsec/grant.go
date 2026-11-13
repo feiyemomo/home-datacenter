@@ -66,6 +66,8 @@ var AllowedStepTransitions = map[GrantStepState]map[HostActionType]GrantStepStat
 	GrantStepStateWatchdogArmed: {
 		HostActionAptUpgrade:     GrantStepStateMutated,
 		HostActionAptDowngrade:   GrantStepStateMutated,
+		HostActionRestoreConfig:  GrantStepStateRestored,
+		HostActionSSHDRestart:    GrantStepStateRestarted,
 		HostActionWatchdogDisarm: GrantStepStateCompleted,
 	},
 	GrantStepStateMutated: {
@@ -938,6 +940,11 @@ func (s *PersistentGrantStore) CheckGrantUsable(
 		if uErr := json.Unmarshal(raw, &rec); uErr != nil {
 			return fmt.Errorf("corrupted grant consumption record for %s: %w", g.GrantID, uErr)
 		}
+		if rec.ExecutionStatus == GrantExecutionStatusRecoveryRequired {
+			if req.Action != HostActionRestoreConfig && req.Action != HostActionSSHDRestart && req.Action != HostActionAptDowngrade {
+				return fmt.Errorf("%w: grant %s is in terminal RECOVERY_REQUIRED state", ErrExecutionGrantMismatch, g.GrantID)
+			}
+		}
 		if g.Action != ActionHostPackageUpgrade {
 			return fmt.Errorf("%w: single-use grant %s already consumed", ErrExecutionGrantConsumed, g.GrantID)
 		}
@@ -1055,6 +1062,11 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 	stepKey := grantStepKey(g.Action, req)
 
 	if exists {
+		if rec.ExecutionStatus == GrantExecutionStatusRecoveryRequired {
+			if req.Action != HostActionRestoreConfig && req.Action != HostActionSSHDRestart && req.Action != HostActionAptDowngrade {
+				return fmt.Errorf("%w: grant %s is in terminal RECOVERY_REQUIRED state", ErrExecutionGrantMismatch, g.GrantID)
+			}
+		}
 		// Single-action grants are strictly 1-RPC only; replays are rejected immediately.
 		if g.Action != ActionHostPackageUpgrade {
 			return fmt.Errorf("%w: single-use grant %s already consumed", ErrExecutionGrantConsumed, g.GrantID)
@@ -1115,7 +1127,7 @@ func (s *PersistentGrantStore) VerifyAndConsume(
 			rec.ExecutionStatus = GrantExecutionStatusExecuting
 		}
 		if req.Action == HostActionWatchdogDisarm {
-			rec.ExecutionStatus = GrantExecutionStatusSucceeded
+			rec.ExecutionStatus = GrantExecutionStatusExecuting
 		}
 		rec.CurrentState = nextState
 		rec.History = append(rec.History, GrantStepExecutionRecord{
@@ -1174,6 +1186,9 @@ func (s *PersistentGrantStore) MarkExecutionStatus(grantID string, status string
 	var rec grantConsumeRecord
 	if jErr := json.Unmarshal(raw, &rec); jErr != nil {
 		return jErr
+	}
+	if (rec.ExecutionStatus == GrantExecutionStatusRecoveryRequired || rec.ExecutionStatus == GrantExecutionStatusSucceeded) && status != rec.ExecutionStatus {
+		return fmt.Errorf("cannot overwrite terminal grant status %s with %s", rec.ExecutionStatus, status)
 	}
 	rec.ExecutionStatus = status
 	rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
