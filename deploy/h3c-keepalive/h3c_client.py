@@ -150,15 +150,51 @@ class H3CClient:
         logger.info(f"Delete response: {res}")
         return res
 
-    def create_tunnel(self, app_info, valid_time=3, internal_port=None, app_name=None):
+    def update_app_internal_ip(self, app_info, new_ip):
+        """Updates the registered application's internalIp on H3C Oasis Cloud."""
+        current_ip = app_info.get("internalIp")
+        if current_ip == new_ip:
+            return True
+        logger.info(f"Updating H3C Oasis app '{app_info.get('tunnelAppName')}' internalIp: {current_ip} -> {new_ip}...")
+        payload = dict(app_info)
+        payload["userName"] = self.username
+        payload["internalIp"] = new_ip
+        try:
+            res = self._request("/v3/ace/oasis/tunnelmgr/tunnelapp/appupdate", method="POST", data=payload)
+            if res and res.get("code") == 0:
+                logger.info(f"Successfully updated internalIp for '{app_info.get('tunnelAppName')}' to {new_ip}")
+                app_info["internalIp"] = new_ip
+                return True
+            logger.warning(f"Failed to update internalIp for '{app_info.get('tunnelAppName')}': {res}")
+        except Exception as e:
+            logger.error(f"Error calling appupdate for '{app_info.get('tunnelAppName')}': {e}")
+        return False
+
+    def create_tunnel(self, app_info, valid_time=3, internal_port=None, app_name=None, internal_ip=None):
         """Creates/starts a tunnel for a registered app."""
         target_port = internal_port if internal_port is not None else app_info.get("internalPort", 8088)
         target_name = app_name if app_name is not None else app_info.get("tunnelAppName", "home")
+
+        # Authoritative internal IP priority:
+        # 1. Explicit internal_ip from detector/caller
+        # 2. Configured NAS_LAN_IP env var (if not 'auto')
+        # 3. Existing app_info internalIp
+        # 4. Resilient fallback default
+        env_ip = os.environ.get("NAS_LAN_IP", "").strip()
+        if env_ip.lower() == "auto":
+            env_ip = ""
+
+        target_ip = internal_ip or env_ip or app_info.get("internalIp") or "192.168.31.233"
+
+        # Auto-heal Oasis registered app config if diverging from actual IP
+        if app_info.get("internalIp") and app_info.get("internalIp") != target_ip:
+            self.update_app_internal_ip(app_info, target_ip)
+
         payload = {
             "userName": self.username,
             "projectId": str(app_info["projectId"]),
             "projectName": app_info.get("projectName", "home"),
-            "internalIp": app_info.get("internalIp") or os.environ.get("NAS_LAN_IP") or "192.168.31.234",
+            "internalIp": target_ip,
             "internalPort": int(target_port),
             "proxyType": app_info.get("proxyType", "HTTP"),
             "tunnelAppId": app_info["tunnelAppId"],
@@ -223,7 +259,7 @@ class H3CClient:
                 }
         return None
 
-    def create_and_wait_tunnel(self, app_name, internal_port=8088, project_id="10233048", valid_time=3, timeout_sec=30):
+    def create_and_wait_tunnel(self, app_name, internal_port=8088, project_id="10233048", valid_time=3, timeout_sec=30, internal_ip=None):
         """
         Creates a tunnel without destroying any other tunnel and waits until ESTABLISHED.
         Returns the established tunnel dictionary.
@@ -236,7 +272,8 @@ class H3CClient:
             app_info,
             valid_time=valid_time,
             internal_port=internal_port,
-            app_name=app_name
+            app_name=app_name,
+            internal_ip=internal_ip
         )
         status_data = self.wait_for_tunnel(new_tunnel_id, timeout_sec=timeout_sec)
 
@@ -254,7 +291,7 @@ class H3CClient:
             "status": status_data.get("tunnelStatus")
         }
 
-    def ensure_active_tunnel(self, app_name="home", min_remaining_minutes=25):
+    def ensure_active_tunnel(self, app_name="home", min_remaining_minutes=25, internal_ip=None):
         """
         Ensures a standalone tunnel for app_name is active with at least min_remaining_minutes.
         Used for non-ping-pong tunnels (such as webrtc_test and nas_ssh).
@@ -282,7 +319,7 @@ class H3CClient:
             except Exception as e:
                 logger.warning(f"Could not delete old tunnel {existing_id}: {e}")
 
-        new_tunnel_id = self.create_tunnel(app_info, valid_time=3)
+        new_tunnel_id = self.create_tunnel(app_info, valid_time=3, internal_ip=internal_ip)
         status_data = self.wait_for_tunnel(new_tunnel_id)
         close_time = self.parse_iso_time(status_data.get("closeTime"))
         remaining_min = (close_time - now_utc).total_seconds() / 60.0 if close_time else 180.0
@@ -317,7 +354,7 @@ class PingPongRelay:
       4. On next rotation cycle, symmetrically alternate back to the other tunnel.
     """
     def __init__(self, client, app_a="home_a", port_a=8088, app_b="home_b", port_b=8089,
-                 min_remaining_minutes=25, overlap_seconds=60, project_id="10233048"):
+                 min_remaining_minutes=25, overlap_seconds=60, project_id="10233048", get_lan_ip_func=None):
         self.client = client
         self.app_a = app_a
         self.port_a = port_a
@@ -326,6 +363,7 @@ class PingPongRelay:
         self.min_remaining_minutes = min_remaining_minutes
         self.overlap_seconds = overlap_seconds
         self.project_id = project_id
+        self.get_lan_ip_func = get_lan_ip_func
 
         self.active_app = None       # "home_a" or "home_b"
         self.active_tunnel = None    # dict of active tunnel details
@@ -426,13 +464,16 @@ class PingPongRelay:
                 current_active = None
                 current_app = None
 
+            target_lan_ip = self.get_lan_ip_func() if self.get_lan_ip_func else None
+
             # Scenario A: Neither tunnel is established -> Cold start
             if not current_active:
                 logger.info(f"[PingPong] No active tunnel found for {self.app_a} or {self.app_b}. Initializing {self.app_a} (port {self.port_a})...")
                 new_tun = self.client.create_and_wait_tunnel(
                     self.app_a,
                     internal_port=self.port_a,
-                    project_id=self.project_id
+                    project_id=self.project_id,
+                    internal_ip=target_lan_ip
                 )
                 self.active_app = self.app_a
                 self.active_tunnel = new_tun
@@ -455,7 +496,8 @@ class PingPongRelay:
                 new_tun = self.client.create_and_wait_tunnel(
                     target_app,
                     internal_port=target_port,
-                    project_id=self.project_id
+                    project_id=self.project_id,
+                    internal_ip=target_lan_ip
                 )
             except Exception as e:
                 logger.error(f"[PingPong] Failed to establish alternate peer tunnel '{target_app}': {e}", exc_info=True)

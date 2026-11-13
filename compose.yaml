@@ -682,6 +682,7 @@ services:
       - ALL
     volumes:
       - ./data/h3c:/data/h3c
+      - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
       - TZ=Asia/Shanghai
       - H3C_USERNAME=${H3C_USERNAME}
@@ -696,7 +697,7 @@ services:
       - CHECK_INTERVAL=60
       - MIN_REMAINING_MINUTES=25
       - HTTP_PORT=8087
-      - NAS_LAN_IP=${NAS_LAN_IP:-192.168.31.234}
+      - NAS_LAN_IP=${NAS_LAN_IP:-192.168.31.233}
       - DATA_DIR=/data/h3c
     networks:
       home-net:

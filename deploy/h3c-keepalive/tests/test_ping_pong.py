@@ -28,7 +28,7 @@ class MockH3CClient:
                 return dict(t)
         return None
 
-    def create_and_wait_tunnel(self, app_name, internal_port=8088, project_id="10233048", valid_time=3, timeout_sec=30):
+    def create_and_wait_tunnel(self, app_name, internal_port=8088, project_id="10233048", valid_time=3, timeout_sec=30, internal_ip=None, **kwargs):
         if self.create_fail:
             raise RuntimeError(f"Simulated network timeout creating tunnel for {app_name}")
         
@@ -38,6 +38,7 @@ class MockH3CClient:
             "tunnelId": tun_id,
             "appName": app_name,
             "internalPort": internal_port,
+            "internalIp": internal_ip or "192.168.31.233",
             "externalAddr": f"154.8.195.220:{30000 + internal_port}",
             "closeTime": close_iso,
             "remainingMinutes": 180.0,
@@ -288,6 +289,100 @@ class TestMainIntegrationAndSanitization(unittest.TestCase):
                 any("restart" in str(part) for part in cmd),
                 f"docker_exec_frigate was violently called with restart: {cmd}"
             )
+
+
+class TestLANIPDetection(unittest.TestCase):
+    def test_tier1_explicit_env(self):
+        with patch.dict(os.environ, {"NAS_LAN_IP": "192.168.31.200"}):
+            ip = main.detect_nas_lan_ip()
+            self.assertEqual(ip, "192.168.31.200")
+
+    def test_tier1_auto_env_falls_through(self):
+        with patch.dict(os.environ, {"NAS_LAN_IP": "auto"}):
+            ip = main.detect_nas_lan_ip()
+            self.assertNotEqual(ip, "auto")
+            self.assertTrue(ip.startswith("192.168.") or ip.startswith("10."))
+
+    @patch("urllib.request.urlopen")
+    def test_tier3_frigate_candidates(self, mock_urlopen):
+        with patch.dict(os.environ, {"NAS_LAN_IP": ""}), \
+             patch("os.path.exists", return_value=False):
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b'{"go2rtc":{"webrtc":{"candidates":["127.0.0.1:8555", "192.168.31.233:8555", "100.90.67.71:8555"]}}}'
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_urlopen.return_value = mock_resp
+
+            ip = main.detect_nas_lan_ip()
+            self.assertEqual(ip, "192.168.31.233")
+
+
+class TestCircuitBreaker(unittest.TestCase):
+    def test_backoff_and_circuit_tripping(self):
+        cb = main.TunnelCircuitBreaker(name="test", max_consecutive_failures=3, base_cooldown=10, max_cooling=60)
+        self.assertTrue(cb.can_failover())
+
+        t0 = 1000.0
+        with patch("time.time", return_value=t0):
+            cb.record_failure()
+            self.assertEqual(cb.consecutive_failures, 1)
+            # Cooling for base_cooldown = 10s
+            self.assertFalse(cb.can_failover())
+
+        # After 11s, can failover again
+        with patch("time.time", return_value=t0 + 11.0):
+            self.assertTrue(cb.can_failover())
+            cb.record_failure()
+            self.assertEqual(cb.consecutive_failures, 2)
+            # Cooling for 20s
+            self.assertFalse(cb.can_failover())
+
+        # After 32s, third failure trips circuit breaker into max_cooling (60s)
+        with patch("time.time", return_value=t0 + 32.0):
+            self.assertTrue(cb.can_failover())
+            cb.record_failure()
+            self.assertEqual(cb.consecutive_failures, 3)
+            self.assertFalse(cb.can_failover())
+
+        # During 60s cooling, must remain tripped
+        with patch("time.time", return_value=t0 + 70.0):
+            self.assertFalse(cb.can_failover())
+
+        # On recovery probe success
+        cb.record_success()
+        self.assertEqual(cb.consecutive_failures, 0)
+        self.assertTrue(cb.can_failover())
+
+
+class TestAppUpdateOasisSync(unittest.TestCase):
+    def test_create_tunnel_auto_syncs_oasis_when_ip_diverges(self):
+        client = H3CClient("test_user", "test_pass")
+        client._request = MagicMock()
+        client._request.return_value = {"code": 0, "msg": "ok", "data": {"tunnelId": "tun_123"}}
+
+        app_info = {
+            "projectId": "10233048",
+            "projectName": "home",
+            "tunnelAppId": "app_999",
+            "tunnelAppName": "home",
+            "internalIp": "192.168.31.234",  # Old IP
+            "internalPort": 8088,
+            "proxyType": "HTTP"
+        }
+
+        # Call create_tunnel with new internal_ip 192.168.31.233
+        tun_id = client.create_tunnel(app_info, internal_ip="192.168.31.233")
+        self.assertEqual(tun_id, "tun_123")
+
+        # Verify appupdate was called to correct Oasis cloud config
+        update_calls = [
+            c for c in client._request.call_args_list
+            if "/v3/ace/oasis/tunnelmgr/tunnelapp/appupdate" in str(c)
+        ]
+        self.assertEqual(len(update_calls), 1)
+        update_payload = update_calls[0][1]["data"]
+        self.assertEqual(update_payload["internalIp"], "192.168.31.233")
+        self.assertEqual(app_info["internalIp"], "192.168.31.233")
 
 
 if __name__ == "__main__":

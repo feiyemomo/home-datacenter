@@ -3,6 +3,7 @@ import http.server
 import json
 import logging
 import os
+import re
 import socket
 import sys
 import threading
@@ -36,6 +37,111 @@ PING_PONG_PORT_A = int(os.environ.get("PING_PONG_PORT_A", "8088"))
 PING_PONG_APP_B = os.environ.get("PING_PONG_APP_B", "home_b")
 PING_PONG_PORT_B = int(os.environ.get("PING_PONG_PORT_B", "8089"))
 
+def detect_nas_lan_ip(client_inst=None, project_id="10233048"):
+    """
+    Discovers current authoritative NAS LAN IPv4 address via multi-tier fallback:
+      Tier 1: Explicit env var NAS_LAN_IP (if valid and not 'auto')
+      Tier 2: Shared host file (DATA_DIR/host_lan_ip.txt)
+      Tier 3: Frigate /api/config go2rtc candidate inspection
+      Tier 4: Cross-correlation with other H3C apps in Oasis (e.g. 'ssh' app)
+      Tier 5: Fallback default (192.168.31.233)
+    """
+    # Tier 1: Explicit env
+    env_ip = os.environ.get("NAS_LAN_IP", "").strip()
+    if env_ip and env_ip.lower() != "auto":
+        return env_ip
+
+    # Tier 2: File on disk
+    file_path = os.path.join(DATA_DIR, "host_lan_ip.txt")
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                f_ip = f.read().strip()
+                if f_ip and re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", f_ip):
+                    return f_ip
+        except Exception as e:
+            logger.debug(f"Could not read {file_path}: {e}")
+
+    # Tier 3: Frigate /api/config candidates
+    try:
+        req = urllib.request.Request(f"{FRIGATE_URL}/api/config")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            cfg = json.loads(resp.read().decode())
+            candidates = cfg.get("go2rtc", {}).get("webrtc", {}).get("candidates", [])
+            for c in reversed(candidates):
+                clean = c.split(":")[0] if ":" in c else c
+                if clean.startswith("192.168.") or clean.startswith("10.") or (clean.startswith("172.") and not clean.startswith("172.18.") and not clean.startswith("172.17.")):
+                    if not clean.startswith("100."):  # Exclude Tailscale
+                        return clean
+    except Exception as e:
+        logger.debug(f"Tier 3 IP detection from Frigate failed: {e}")
+
+    # Tier 4: Oasis other apps correlation (e.g. 'ssh' app)
+    if client_inst:
+        try:
+            apps = client_inst.get_apps(project_id)
+            for a in apps:
+                if a.get("tunnelAppName") == "ssh" and a.get("internalIp"):
+                    s_ip = a.get("internalIp")
+                    if s_ip.startswith("192.168.") or s_ip.startswith("10."):
+                        return s_ip
+        except Exception as e:
+            logger.debug(f"Tier 4 IP detection from Oasis failed: {e}")
+
+    # Tier 5: Fallback default
+    return "192.168.31.233"
+
+class TunnelCircuitBreaker:
+    """
+    Prevents API churn, infinite failover loops, and rapid port drift by enforcing
+    exponential backoff and circuit breaking when reachability fails consecutively.
+    """
+    def __init__(self, name="primary", max_consecutive_failures=3, base_cooldown=60, max_cooling=300):
+        self.name = name
+        self.max_failures = max_consecutive_failures
+        self.base_cooldown = base_cooldown
+        self.max_cooling = max_cooling
+        self.consecutive_failures = 0
+        self.cooling_until = 0
+        self.lock = threading.Lock()
+
+    def can_failover(self):
+        with self.lock:
+            now = time.time()
+            if now < self.cooling_until:
+                rem = int(self.cooling_until - now)
+                logger.warning(
+                    f"[CircuitBreaker:{self.name}] Cooldown active ({rem}s remaining). "
+                    f"Suppressed failover to prevent H3C API rate limiting and port drift."
+                )
+                return False
+            return True
+
+    def record_success(self):
+        with self.lock:
+            if self.consecutive_failures > 0:
+                logger.info(f"[CircuitBreaker:{self.name}] Probe succeeded. Resetting failure counter (was {self.consecutive_failures}).")
+            self.consecutive_failures = 0
+            self.cooling_until = 0
+
+    def record_failure(self):
+        with self.lock:
+            self.consecutive_failures += 1
+            now = time.time()
+            if self.consecutive_failures >= self.max_failures:
+                self.cooling_until = now + self.max_cooling
+                logger.error(
+                    f"[CircuitBreaker:{self.name}] Tripped! {self.consecutive_failures} consecutive failovers failed. "
+                    f"Entering {self.max_cooling}s cooling period. Tunnel churn paused."
+                )
+            else:
+                backoff = min(self.max_cooling, self.base_cooldown * (2 ** (self.consecutive_failures - 1)))
+                self.cooling_until = now + backoff
+                logger.warning(
+                    f"[CircuitBreaker:{self.name}] Recorded failure #{self.consecutive_failures}. "
+                    f"Cooldown backoff set to {backoff}s."
+                )
+
 client = H3CClient(H3C_USERNAME, H3C_PASSWORD)
 ping_pong_relay = PingPongRelay(
     client=client,
@@ -44,8 +150,12 @@ ping_pong_relay = PingPongRelay(
     app_b=PING_PONG_APP_B,
     port_b=PING_PONG_PORT_B,
     min_remaining_minutes=MIN_REMAINING_MINUTES,
-    overlap_seconds=OVERLAP_SECONDS
+    overlap_seconds=OVERLAP_SECONDS,
+    get_lan_ip_func=lambda: detect_nas_lan_ip(client_inst=client)
 )
+
+primary_breaker = TunnelCircuitBreaker(name="primary")
+aux_breakers = {}
 
 # Global thread-safe tunnel state
 state_lock = threading.Lock()
@@ -59,6 +169,7 @@ tunnel_state = {
     "pendingRetire": None,
     "lastChecked": "",
     "error": None,
+    "lanIp": "192.168.31.233",
     "tunnels": {}
 }
 
@@ -91,7 +202,7 @@ def docker_exec_frigate(cmd):
         logger.warning(f"docker_exec_frigate failed for {cmd}: {e}")
         return None
 
-def check_addr_reachable(addr, default_port=80):
+def check_addr_reachable_once(addr, default_port=80, timeout=3.0):
     if not addr:
         return False
     try:
@@ -99,7 +210,7 @@ def check_addr_reachable(addr, default_port=80):
         if lower.startswith("http://") or lower.startswith("https://"):
             req = urllib.request.Request(addr.strip(), headers={"User-Agent": "H3C-Probe/1.0"})
             try:
-                with urllib.request.urlopen(req, timeout=3.0) as resp:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     return resp.status < 500
             except urllib.error.HTTPError as e:
                 # 4xx client errors (401/403/404) mean the server and tunnel are alive; only 5xx is failure
@@ -112,11 +223,25 @@ def check_addr_reachable(addr, default_port=80):
             else:
                 host = clean
                 port = default_port
-            with socket.create_connection((host, port), timeout=3.0):
+            with socket.create_connection((host, port), timeout=timeout):
                 return True
     except Exception as e:
-        logger.warning(f"Reachability check for {addr} failed: {e}")
+        logger.debug(f"Reachability probe attempt for {addr} failed: {e}")
         return False
+
+def check_addr_reachable(addr, default_port=80, retries=3, retry_delay=1.0):
+    """
+    Debounced reachability probe. Requires all retries to fail before marking unreachable.
+    """
+    if not addr:
+        return False
+    for attempt in range(1, retries + 1):
+        if check_addr_reachable_once(addr, default_port=default_port):
+            return True
+        if attempt < retries:
+            time.sleep(retry_delay)
+    logger.warning(f"Reachability check for {addr} failed after {retries} attempts.")
+    return False
 
 last_synced_webrtc_addr = None
 
@@ -196,8 +321,10 @@ def sync_webrtc_to_frigate(external_addr):
     except Exception as e:
         logger.warning(f"Could not sync WebRTC candidate: {e}")
 
-def update_state(primary_data, all_tunnels=None, pending_retire=None, active_app=None, error=None):
+def update_state(primary_data, all_tunnels=None, pending_retire=None, active_app=None, error=None, lan_ip=None):
     with state_lock:
+        if lan_ip:
+            tunnel_state["lanIp"] = lan_ip
         if all_tunnels:
             tunnel_state["tunnels"] = all_tunnels
         if not primary_data:
@@ -260,6 +387,8 @@ def run_check(force_renew=False):
     """
     logger.info(f"Running tunnel health check (force_renew={force_renew})...")
     all_tunnels = {}
+    effective_lan_ip = detect_nas_lan_ip(client_inst=client)
+    logger.info(f"Detected authoritative NAS LAN IP: {effective_lan_ip}")
 
     # 1. Primary HTTP Ping-Pong Relay Step
     primary_res = None
@@ -268,8 +397,14 @@ def run_check(force_renew=False):
         primary_res, pending_retire_info = ping_pong_relay.step(force_renew=force_renew)
         if primary_res and primary_res.get("externalAddr") and not force_renew:
             if not check_addr_reachable(primary_res.get("externalAddr")):
-                logger.warning(f"Active tunnel '{ping_pong_relay.active_app}' ({primary_res.get('externalAddr')}) unreachable via TCP! Forcing failover...")
-                primary_res, pending_retire_info = ping_pong_relay.step(force_renew=True)
+                if primary_breaker.can_failover():
+                    logger.warning(f"Active tunnel '{ping_pong_relay.active_app}' ({primary_res.get('externalAddr')}) unreachable! Forcing failover...")
+                    primary_breaker.record_failure()
+                    primary_res, pending_retire_info = ping_pong_relay.step(force_renew=True)
+                else:
+                    logger.warning(f"Active tunnel '{ping_pong_relay.active_app}' unreachable, but failover suppressed by circuit breaker.")
+            else:
+                primary_breaker.record_success()
         
         if primary_res:
             active_app = ping_pong_relay.active_app
@@ -296,11 +431,19 @@ def run_check(force_renew=False):
             continue
         try:
             logger.info(f"Checking auxiliary H3C tunnel status for '{app}' (force_renew={force_renew})...")
-            res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=min_min)
+            res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=min_min, internal_ip=effective_lan_ip)
             if res.get("externalAddr") and not force_renew:
                 if not check_addr_reachable(res.get("externalAddr")):
-                    logger.warning(f"Tunnel '{app}' ({res.get('externalAddr')}) unreachable! Forcing recreation...")
-                    res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=180)
+                    breaker = aux_breakers.setdefault(app, TunnelCircuitBreaker(name=app))
+                    if breaker.can_failover():
+                        logger.warning(f"Tunnel '{app}' ({res.get('externalAddr')}) unreachable! Forcing recreation...")
+                        breaker.record_failure()
+                        res = client.ensure_active_tunnel(app_name=app, min_remaining_minutes=180, internal_ip=effective_lan_ip)
+                    else:
+                        logger.warning(f"Tunnel '{app}' unreachable, but recreation suppressed by circuit breaker.")
+                else:
+                    if app in aux_breakers:
+                        aux_breakers[app].record_success()
             all_tunnels[app] = res
             logger.info(f"Auxiliary tunnel '{app}': {res.get('externalAddr')} (remaining {res.get('remainingMinutes', 0):.1f}m)")
 
@@ -342,7 +485,8 @@ def run_check(force_renew=False):
         all_tunnels=all_tunnels,
         pending_retire=formatted_retire,
         active_app=ping_pong_relay.active_app,
-        error=None if primary_res else "Primary ping-pong relay is not established"
+        error=None if primary_res else "Primary ping-pong relay is not established",
+        lan_ip=effective_lan_ip
     )
     return primary_res
 
