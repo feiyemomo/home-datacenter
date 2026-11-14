@@ -418,3 +418,47 @@ func ReportTrackerToSink(ctx context.Context, tracker *StageTracker) {
 	}
 }
 
+// GetTrackerSinkFromContext returns the tracker sink if present in ctx.
+func GetTrackerSinkFromContext(ctx context.Context) func(*StageTracker) {
+	if ctx == nil {
+		return nil
+	}
+	if v := ctx.Value(trackerSinkKey{}); v != nil {
+		if sink, ok := v.(func(*StageTracker)); ok {
+			return sink
+		}
+	}
+	return nil
+}
+
+// DeriveRecoveryContext creates an isolated context for recovery operations that:
+// 1. Decouples from parent context cancellation/deadlines, preventing mid-rollback abortion
+//    if the original client context timed out or was cancelled.
+// 2. Preserves and re-binds the active LeaseGuard, FencingGeneration, and OperationID.
+// 3. Imposes a dedicated, bounded timeout budget (defaulting to 30s if timeout <= 0).
+func DeriveRecoveryContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	var base context.Context
+	if parent != nil {
+		base = context.WithoutCancel(parent)
+	} else {
+		base = context.Background()
+	}
+
+	if parent != nil {
+		if guard := RecoveryLeaseFromContext(parent); guard != nil {
+			base = WithRecoveryLease(base, guard)
+		}
+		if opID := OperationIDFromContext(parent); opID != "" {
+			base = WithOperationID(base, opID)
+		}
+		// NOTE: Recovery operations maintain their own scoped recovery trackers
+		// and MUST NOT overwrite the primary mutation's activeTracker via sink.
+	}
+
+	return context.WithTimeout(base, timeout)
+}
+
+

@@ -463,6 +463,10 @@ func TestDockerRecreate_AtomicRollbackOnFailure(t *testing.T) {
 		path := r.URL.Path
 
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "new-container-12345"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Id":"new-container-12345","State":{"Running":true,"Status":"running"}}`))
+
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/containers/home-web/json"):
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
@@ -577,9 +581,14 @@ func TestDockerRecreate_SuccessAndOldContainerPruned(t *testing.T) {
 		path := r.URL.Path
 
 		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "new-container-12345"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"Id":"new-container-12345","State":{"Running":true,"Status":"running"}}`))
+
 		case r.Method == http.MethodGet && strings.HasPrefix(path, "/containers/home-web/json"):
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte(`{
+				"Id": "old-backup-container-id-12345",
 				"Config": {
 					"Image": "feiyemomo/home-web:v1.18.0",
 					"Env": ["PORT=80"],
@@ -608,7 +617,7 @@ func TestDockerRecreate_SuccessAndOldContainerPruned(t *testing.T) {
 		case r.Method == http.MethodPost && strings.Contains(path, "/start"):
 			w.WriteHeader(http.StatusNoContent)
 
-		case r.Method == http.MethodDelete && strings.Contains(path, "home-web_bak_"):
+		case r.Method == http.MethodDelete && (strings.Contains(path, "home-web_bak_") || strings.Contains(path, "old-backup-container-id-12345")):
 			w.WriteHeader(http.StatusNoContent)
 
 		default:
@@ -639,7 +648,7 @@ func TestDockerRecreate_SuccessAndOldContainerPruned(t *testing.T) {
 
 	hasBackupDelete := false
 	for _, call := range callLog {
-		if strings.Contains(call, "DELETE /containers/home-web_bak_") {
+		if strings.Contains(call, "DELETE /containers/home-web_bak_") || strings.Contains(call, "DELETE /containers/old-backup-container-id-12345") {
 			hasBackupDelete = true
 			break
 		}
