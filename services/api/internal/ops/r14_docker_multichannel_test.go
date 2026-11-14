@@ -1593,8 +1593,7 @@ func TestR142_Reconciliation_AutoResolve_WhenNewContainerHealthy(t *testing.T) {
 			deleteCalled = true
 			w.WriteHeader(http.StatusNoContent)
 		default:
-			w.WriteHeader(http.StatusOK)
-			_, _ = w.Write([]byte(`{}`))
+			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
@@ -1793,6 +1792,476 @@ func TestR142_Recovery_FencingGenerationStale_AbortsRollback(t *testing.T) {
 		t.Fatalf("CRITICAL SECURITY VIOLATION: Docker socket was called despite expired lease!")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// R14.2 Deep Hardening & Ambiguous Cutoff Tests
+// ---------------------------------------------------------------------------
+
+// TestR142_Rollback_CandidateDelete_Timeout_HaltsRollback verifies that when candidate container
+// DELETE encounters a network timeout, rollback immediately cuts off and refuses to execute
+// safe backup restore (preventing dual-container 409 collisions and volume corruption).
+func TestR142_Rollback_CandidateDelete_Timeout_HaltsRollback(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	faultServer := newLowLevelFaultServer(t, LLFaultHangAfterRequestLine)
+	defer faultServer.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + faultServer.addr),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	candID := "cafe111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+	err := exec.executeVerifiedCandidateRollback(
+		ctx,
+		"tcp://"+faultServer.addr,
+		"home-frigate",
+		"home-frigate_bak",
+		candID,
+		errors.New("simulated initial recreate error"),
+	)
+
+	if err == nil {
+		t.Fatalf("expected error on candidate delete timeout, got nil")
+	}
+	if !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected error to wrap ErrExecutionAmbiguous, got: %v", err)
+	}
+
+	// Verify an unresolved reconciliation task was persisted
+	recs, dbErr := GetPendingReconciliations(db)
+	if dbErr != nil || len(recs) == 0 {
+		t.Fatalf("expected reconciliation record to be persisted in DB, got: %v (err: %v)", recs, dbErr)
+	}
+	if recs[0].CandidateContainerID != candID {
+		t.Fatalf("expected record candidate ID %s, got: %s", candID, recs[0].CandidateContainerID)
+	}
+}
+
+// TestR142_Rollback_CandidateDelete_TCP_RST_HaltsRollback verifies that when candidate container
+// DELETE encounters a TCP RST, rollback cuts off and halts without touching backup.
+func TestR142_Rollback_CandidateDelete_TCP_RST_HaltsRollback(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	faultServer := newLowLevelFaultServer(t, LLFaultRSTAfterHeaders)
+	defer faultServer.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + faultServer.addr),
+	)
+
+	candID := "cafe111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+	err := exec.executeVerifiedCandidateRollback(
+		context.Background(),
+		"tcp://"+faultServer.addr,
+		"home-frigate",
+		"home-frigate_bak",
+		candID,
+		errors.New("simulated start error"),
+	)
+
+	if err == nil {
+		t.Fatalf("expected error on candidate delete TCP RST, got nil")
+	}
+	if !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected error to wrap ErrExecutionAmbiguous, got: %v", err)
+	}
+
+	recs, dbErr := GetPendingReconciliations(db)
+	if dbErr != nil || len(recs) == 0 {
+		t.Fatalf("expected reconciliation record to be persisted in DB, got: %v (err: %v)", recs, dbErr)
+	}
+}
+
+// TestR142_Rollback_CandidateDelete_HTTP500_HaltsRollback verifies that when candidate container
+// DELETE returns HTTP 500, rollback halts immediately and persists a pending reconciliation record.
+func TestR142_Rollback_CandidateDelete_HTTP500_HaltsRollback(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	faultServer := newLowLevelFaultServer(t, LLFaultHTTP500)
+	defer faultServer.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + faultServer.addr),
+	)
+
+	candID := "cafe111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+	err := exec.executeVerifiedCandidateRollback(
+		context.Background(),
+		"tcp://"+faultServer.addr,
+		"home-frigate",
+		"home-frigate_bak",
+		candID,
+		errors.New("simulated inspect error"),
+	)
+
+	if err == nil {
+		t.Fatalf("expected error on candidate delete HTTP 500, got nil")
+	}
+	if !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected error to wrap ErrExecutionAmbiguous, got: %v", err)
+	}
+
+	recs, dbErr := GetPendingReconciliations(db)
+	if dbErr != nil || len(recs) == 0 {
+		t.Fatalf("expected reconciliation record to be persisted in DB, got: %v (err: %v)", recs, dbErr)
+	}
+}
+
+// TestR142_Reconciliation_PersistenceFailure_ReturnsError_NoSilentDegradation verifies that
+// RecordReconciliation returns an error when DB persistence fails and DOES NOT silently mask it.
+func TestR142_Reconciliation_PersistenceFailure_ReturnsError_NoSilentDegradation(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+	sqlDB, err := db.DB()
+	if err != nil {
+		t.Fatalf("failed to get sqlDB: %v", err)
+	}
+	_ = sqlDB.Close() // Close the underlying connection to force save failure
+
+	rec := &OpsReconciliationRecord{
+		ID:          "rec-persist-fail-test",
+		OperationID: "op-fail-1",
+		Component:   "frigate",
+		Action:      ActionDockerRecreate,
+		State:       ReconciliationStatePending,
+	}
+
+	saveErr := RecordReconciliation(db, rec)
+	if saveErr == nil {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: RecordReconciliation silently swallowed DB failure and returned nil!")
+	}
+	if !strings.Contains(saveErr.Error(), "failed to persist reconciliation record to database") &&
+		!strings.Contains(saveErr.Error(), "failed to automigrate") {
+		t.Fatalf("expected DB persistence error message, got: %v", saveErr)
+	}
+}
+
+// TestR142_Reconciliation_TriState_InspectAmbiguous_FailsClosed verifies that when
+// inspecting Candidate or Backup returns UNKNOWN (e.g. 500 or timeout), ReconcileOperation
+// strictly fails closed to MANUAL_APPROVAL and NEVER deletes any container.
+func TestR142_Reconciliation_TriState_InspectAmbiguous_FailsClosed(t *testing.T) {
+	t.Parallel()
+
+	candidateID := "cafe111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+	backupID := "dead111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+
+	t.Run("CandidateInspect_500_FailsClosed", func(t *testing.T) {
+		t.Parallel()
+		db := setupR14TestDB(t)
+		deleteCalled := false
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(path, candidateID):
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"daemon inspect failure"}`))
+			case r.Method == http.MethodGet && strings.Contains(path, backupID):
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Name":"/home-frigate_bak","State":{"Running":false}}`, backupID)))
+			case r.Method == http.MethodDelete:
+				deleteCalled = true
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		rec := &OpsReconciliationRecord{
+			ID:                   "rec-cand-unknown",
+			OperationID:          "op-cand-unknown",
+			Component:            "frigate",
+			Action:               ActionDockerRecreate,
+			FailedStage:          "recreate.remove_backup",
+			CandidateContainerID: candidateID,
+			BackupContainerID:    backupID,
+			State:                ReconciliationStatePending,
+		}
+		_ = RecordReconciliation(db, rec)
+
+		exec := NewOperationExecutor(db, eventbus.New(), nil, nil, WithDockerSocket("tcp://"+server.Listener.Addr().String()))
+		res, err := exec.ReconcileOperation(context.Background(), rec.ID)
+		if err != nil {
+			t.Fatalf("unexpected error from ReconcileOperation: %v", err)
+		}
+		if res.FinalState != ReconciliationStateManualApproval {
+			t.Fatalf("expected state MANUAL_APPROVAL when candidate presence is UNKNOWN, got: %s", res.FinalState)
+		}
+		if deleteCalled {
+			t.Fatalf("CRITICAL SECURITY VIOLATION: DELETE was called on container despite UNKNOWN candidate state!")
+		}
+	})
+
+	t.Run("BackupInspect_500_FailsClosed", func(t *testing.T) {
+		t.Parallel()
+		db := setupR14TestDB(t)
+		deleteCalled := false
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(path, candidateID):
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Name":"/home-frigate","State":{"Running":true}}`, candidateID)))
+			case r.Method == http.MethodGet && strings.Contains(path, backupID):
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"transient backup inspect error"}`))
+			case r.Method == http.MethodDelete:
+				deleteCalled = true
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		rec := &OpsReconciliationRecord{
+			ID:                   "rec-backup-unknown",
+			OperationID:          "op-backup-unknown",
+			Component:            "frigate",
+			Action:               ActionDockerRecreate,
+			FailedStage:          "recreate.remove_backup",
+			CandidateContainerID: candidateID,
+			BackupContainerID:    backupID,
+			State:                ReconciliationStatePending,
+		}
+		_ = RecordReconciliation(db, rec)
+
+		exec := NewOperationExecutor(db, eventbus.New(), nil, nil, WithDockerSocket("tcp://"+server.Listener.Addr().String()))
+		res, err := exec.ReconcileOperation(context.Background(), rec.ID)
+		if err != nil {
+			t.Fatalf("unexpected error from ReconcileOperation: %v", err)
+		}
+		if res.FinalState != ReconciliationStateManualApproval {
+			t.Fatalf("expected state MANUAL_APPROVAL when backup presence is UNKNOWN, got: %s", res.FinalState)
+		}
+		if deleteCalled {
+			t.Fatalf("CRITICAL SECURITY VIOLATION: DELETE was called on container despite UNKNOWN backup state!")
+		}
+	})
+}
+
+// TestR142_Reconciliation_HealthCheck_ControlsBackupPurge verifies that ReconcileOperation
+// performs a live business health check before purging a backup container. If the business probe
+// fails, it retains the backup container and escalates to MANUAL_APPROVAL.
+func TestR142_Reconciliation_HealthCheck_ControlsBackupPurge(t *testing.T) {
+	t.Parallel()
+
+	candidateID := "cafe111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+	backupID := "dead111122223333444455556666777788889999aaaabbbbccccddddeeeeffff"
+
+	t.Run("HealthCheckFails_RetainsBackupAndEscalates", func(t *testing.T) {
+		t.Parallel()
+		db := setupR14TestDB(t)
+		deleteCalled := false
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(path, candidateID):
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Name":"/home-frigate","State":{"Running":true}}`, candidateID)))
+			case r.Method == http.MethodGet && strings.Contains(path, backupID):
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Name":"/home-frigate_bak","State":{"Running":false}}`, backupID)))
+			case r.Method == http.MethodDelete:
+				deleteCalled = true
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		rec := &OpsReconciliationRecord{
+			ID:                   "rec-hc-fail",
+			OperationID:          "op-hc-fail",
+			Component:            "frigate",
+			Action:               ActionDockerRecreate,
+			FailedStage:          "recreate.remove_backup",
+			CandidateContainerID: candidateID,
+			BackupContainerID:    backupID,
+			State:                ReconciliationStatePending,
+		}
+		_ = RecordReconciliation(db, rec)
+
+		exec := NewOperationExecutor(
+			db,
+			eventbus.New(),
+			nil,
+			nil,
+			WithDockerSocket("tcp://"+server.Listener.Addr().String()),
+			WithHealthChecker(func(ctx context.Context, target string) error {
+				return errors.New("business health probe returned 503 Service Unavailable")
+			}),
+		)
+
+		res, err := exec.ReconcileOperation(context.Background(), rec.ID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res.FinalState != ReconciliationStateManualApproval {
+			t.Fatalf("expected state MANUAL_APPROVAL when health check fails, got: %s", res.FinalState)
+		}
+		if deleteCalled {
+			t.Fatalf("CRITICAL SECURITY VIOLATION: Backup was deleted even though business health probe failed!")
+		}
+	})
+
+	t.Run("HealthCheckPasses_SafelyPurgesBackup", func(t *testing.T) {
+		t.Parallel()
+		db := setupR14TestDB(t)
+		deleteCalled := false
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			path := r.URL.Path
+			switch {
+			case r.Method == http.MethodGet && strings.Contains(path, candidateID):
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Name":"/home-frigate","State":{"Running":true}}`, candidateID)))
+			case r.Method == http.MethodGet && strings.Contains(path, backupID):
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Name":"/home-frigate_bak","State":{"Running":false}}`, backupID)))
+			case r.Method == http.MethodDelete && strings.Contains(path, backupID):
+				deleteCalled = true
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		defer server.Close()
+
+		rec := &OpsReconciliationRecord{
+			ID:                   "rec-hc-pass",
+			OperationID:          "op-hc-pass",
+			Component:            "frigate",
+			Action:               ActionDockerRecreate,
+			FailedStage:          "recreate.remove_backup",
+			CandidateContainerID: candidateID,
+			BackupContainerID:    backupID,
+			State:                ReconciliationStatePending,
+		}
+		_ = RecordReconciliation(db, rec)
+
+		exec := NewOperationExecutor(
+			db,
+			eventbus.New(),
+			nil,
+			nil,
+			WithDockerSocket("tcp://"+server.Listener.Addr().String()),
+			WithHealthChecker(func(ctx context.Context, target string) error {
+				return nil // Healthy
+			}),
+		)
+
+		res, err := exec.ReconcileOperation(context.Background(), rec.ID)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if res.FinalState != ReconciliationStateResolved {
+			t.Fatalf("expected state RESOLVED when health check passes, got: %s", res.FinalState)
+		}
+		if !deleteCalled {
+			t.Fatalf("expected backup to be purged when health check passes, but delete was not called")
+		}
+	})
+}
+
+// TestR142_Recreate_Stage6_ProtectionBranches_AllRecordReconciliation verifies that
+// every protective branch in Stage 6 (refusing to delete backup) records an OpsReconciliationRecord.
+func TestR142_Recreate_Stage6_ProtectionBranches_AllRecordReconciliation(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	origID := "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0001"
+	candID := "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0002"
+
+	var candInspectCount atomic.Int64
+	// Mock server that returns 500 when verifying candidate container in Stage 6
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		switch {
+		case r.Method == http.MethodGet && strings.HasPrefix(path, "/containers/home-frigate/json"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Config":{"Image":"frigate:v1"},"State":{"Running":true}}`, origID)))
+		case r.Method == http.MethodPost && strings.Contains(path, "/stop"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.HasPrefix(path, "/images/create"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"download complete"}`))
+		case r.Method == http.MethodPost && path == "/containers/create":
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q}`, candID)))
+		case r.Method == http.MethodPost && strings.Contains(path, candID) && strings.Contains(path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodGet && strings.Contains(path, candID):
+			c := candInspectCount.Add(1)
+			if c == 1 {
+				// Stage 5 verify inspect: candidate verified running
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"State":{"Running":true,"Status":"running"}}`, candID)))
+			} else {
+				// Stage 6 candidate safety re-check: transient 500 error
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"candidate verification transient error"}`))
+			}
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://"+server.Listener.Addr().String()),
+	)
+
+	mgr := NewRecoveryLeaseManager(db)
+	leaseCtx, guard, err := AcquireLeaseGuard(context.Background(), mgr, "home-frigate", "agent-r142", 10*time.Second, db, nil)
+	if err != nil {
+		t.Fatalf("failed to acquire lease: %v", err)
+	}
+	defer guard.Release(db, nil)
+
+	_, recErr := exec.executeDockerSocketRecreate(leaseCtx, "tcp://"+server.Listener.Addr().String(), "home-frigate", "frigate:v2")
+	if recErr != nil {
+		t.Fatalf("executeDockerSocketRecreate failed unexpectedly: %v", recErr)
+	}
+
+	// Verify that a reconciliation task was recorded in DB for the candidate verification failure
+	recs, dbErr := GetPendingReconciliations(db)
+	if dbErr != nil || len(recs) == 0 {
+		t.Fatalf("expected pending reconciliation record for Stage 6 candidate verification error, got: %v", dbErr)
+	}
+	if !strings.Contains(recs[0].FailedStage, "candidate_verify") {
+		t.Fatalf("expected FailedStage to reference candidate_verify, got: %s", recs[0].FailedStage)
+	}
+}
+
 
 
 

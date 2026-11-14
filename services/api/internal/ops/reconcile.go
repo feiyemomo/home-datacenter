@@ -73,12 +73,15 @@ func RecordReconciliation(db *gorm.DB, rec *OpsReconciliationRecord) error {
 	rec.UpdatedAtMs = nowMs
 
 	if db != nil {
-		_ = db.AutoMigrate(&OpsReconciliationRecord{})
-		if err := db.Save(rec).Error; err != nil {
-			log.Printf("[reconcile] db save failed, falling back to memory: %v", err)
-		} else {
-			return nil
+		if err := db.AutoMigrate(&OpsReconciliationRecord{}); err != nil {
+			log.Printf("[reconcile] db automigrate failed: %v", err)
+			return fmt.Errorf("failed to automigrate reconciliation record table: %w", err)
 		}
+		if err := db.Save(rec).Error; err != nil {
+			log.Printf("[reconcile] db save failed: %v", err)
+			return fmt.Errorf("failed to persist reconciliation record to database: %w", err)
+		}
+		return nil
 	}
 
 	memReconciliationMu.Lock()
@@ -138,32 +141,51 @@ type ReconcileResult struct {
 	Error           string              `json:"error,omitempty"`
 }
 
-// 3-Way Docker Container Inspect State
-type containerPresence struct {
-	exists  bool
-	running bool
-	id      string
-	name    string
-	status  string
+// PresenceState represents the 3-state Docker container inspect outcome (R14.2).
+type PresenceState string
+
+const (
+	PresencePresent PresenceState = "PRESENT"
+	PresenceAbsent  PresenceState = "ABSENT"
+	PresenceUnknown PresenceState = "UNKNOWN"
+)
+
+// ContainerPresence models the tri-state presence and health of a container in Docker (R14.2).
+type ContainerPresence struct {
+	State   PresenceState
+	Running bool
+	ID      string
+	Name    string
+	Status  string
+	Err     error
 }
 
-func inspectContainerForReconcile(ctx context.Context, client *http.Client, target string) containerPresence {
+func inspectContainerForReconcile(ctx context.Context, client *http.Client, target string) ContainerPresence {
 	if target == "" {
-		return containerPresence{exists: false}
+		return ContainerPresence{State: PresenceAbsent}
 	}
 	u := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(target))
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
-		return containerPresence{exists: false}
+		return ContainerPresence{State: PresenceUnknown, Err: err}
 	}
 	resp, err := client.Do(req)
 	if err != nil {
-		return containerPresence{exists: false}
+		return ContainerPresence{State: PresenceUnknown, Err: err}
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return containerPresence{exists: false}
+
+	if resp.StatusCode == http.StatusNotFound {
+		return ContainerPresence{State: PresenceAbsent}
 	}
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		return ContainerPresence{
+			State: PresenceUnknown,
+			Err:   fmt.Errorf("inspect %s returned status %d: %s", target, resp.StatusCode, string(b)),
+		}
+	}
+
 	var data struct {
 		ID    string `json:"Id"`
 		Name  string `json:"Name"`
@@ -173,21 +195,29 @@ func inspectContainerForReconcile(ctx context.Context, client *http.Client, targ
 		} `json:"State"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil || data.ID == "" {
-		return containerPresence{exists: false}
+		return ContainerPresence{
+			State: PresenceUnknown,
+			Err:   fmt.Errorf("failed to decode inspect response for %s: %v", target, err),
+		}
 	}
-	return containerPresence{
-		exists:  true,
-		running: data.State.Running,
-		id:      data.ID,
-		name:    strings.TrimPrefix(data.Name, "/"),
-		status:  data.State.Status,
+	return ContainerPresence{
+		State:   PresencePresent,
+		Running: data.State.Running,
+		ID:      data.ID,
+		Name:    strings.TrimPrefix(data.Name, "/"),
+		Status:  data.State.Status,
 	}
 }
 
 // ReconcileOperation performs a safe 3-way reconciliation on an ambiguous record.
 // Strictly adheres to the fail-closed boundaries:
-// 1. If candidate is running and healthy while backup is stopped/exited: safe to remove backup and resolve.
-// 2. If dual-active (both running), or conflict, or candidate is broken: escalates to MANUAL_APPROVAL.
+// 1. Inspect Candidate, Backup, and Named container using Tri-State Presence (PRESENT, ABSENT, UNKNOWN).
+// 2. If any target is UNKNOWN, fail-closed and escalate to MANUAL_APPROVAL without mutating any container.
+// 3. If Candidate is PRESENT and running, and Backup is stopped/ABSENT:
+//    - Perform live business health check probe via e.healthCheckFn (if configured).
+//    - If health probe fails: escalate to MANUAL_APPROVAL and retain backup container.
+//    - If health probe passes (or none configured): safely delete stopped backup container and mark RESOLVED.
+// 4. Dual-active, broken candidate, or identity collision escalates to MANUAL_APPROVAL.
 func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID string) (*ReconcileResult, error) {
 	var rec *OpsReconciliationRecord
 	if e.db != nil {
@@ -223,16 +253,54 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 	backupPres := inspectContainerForReconcile(ctx, client, rec.BackupContainerID)
 	namedPres := inspectContainerForReconcile(ctx, client, rec.Component)
 
-	discState := fmt.Sprintf("cand(id:%s,run:%v); backup(id:%s,run:%v); named(id:%s,run:%v)",
-		candPres.id, candPres.running, backupPres.id, backupPres.running, namedPres.id, namedPres.running)
+	discState := fmt.Sprintf("cand(id:%s,state:%s,run:%v); backup(id:%s,state:%s,run:%v); named(id:%s,state:%s,run:%v)",
+		candPres.ID, candPres.State, candPres.Running,
+		backupPres.ID, backupPres.State, backupPres.Running,
+		namedPres.ID, namedPres.State, namedPres.Running)
 	rec.DiscoveredState = discState
 
-	// Case A: Safe Auto-Resolve (New Candidate is running and serving, Backup container exists and is stopped)
-	// Requires named container to either not exist yet or point directly to the running candidate.
-	if candPres.exists && candPres.running && (!backupPres.exists || (backupPres.exists && !backupPres.running)) && (!namedPres.exists || namedPres.id == candPres.id) {
-		// Clean up the stopped backup if it still exists
-		if backupPres.exists && isValidDockerContainerID(backupPres.id) && backupPres.id != candPres.id {
-			delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(backupPres.id))
+	// Strict Fail-Closed: If any inspect returned UNKNOWN, never touch any container and escalate to MANUAL_APPROVAL
+	if candPres.State == PresenceUnknown || backupPres.State == PresenceUnknown || namedPres.State == PresenceUnknown {
+		rec.State = ReconciliationStateManualApproval
+		rec.ResolutionPlan = fmt.Sprintf("ambiguous inspect discovery (cand: %s, backup: %s, named: %s); fail-closed to manual approval",
+			candPres.State, backupPres.State, namedPres.State)
+		rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+		_ = RecordReconciliation(e.db, rec)
+		return &ReconcileResult{
+			RecordID:        rec.ID,
+			ActionTaken:     "ESCALATED_MANUAL_APPROVAL",
+			FinalState:      ReconciliationStateManualApproval,
+			DiscoveredState: discState,
+			Error:           "ambiguous container presence state detected during inspect",
+		}, nil
+	}
+
+	// Case A: Safe Candidate Verification (Candidate PRESENT and running, Backup is ABSENT or stopped)
+	// Requires named container to either be ABSENT or match the Candidate ID.
+	if candPres.State == PresencePresent && candPres.Running &&
+		(backupPres.State == PresenceAbsent || (backupPres.State == PresencePresent && !backupPres.Running)) &&
+		(namedPres.State == PresenceAbsent || (namedPres.State == PresencePresent && namedPres.ID == candPres.ID)) {
+
+		// Requirement 5: Live business health check before purging backup
+		if e.healthCheckFn != nil {
+			if hcErr := e.healthCheckFn(ctx, rec.Component); hcErr != nil {
+				rec.State = ReconciliationStateManualApproval
+				rec.ResolutionPlan = fmt.Sprintf("candidate container running but business health check failed: %v; retaining backup for manual recovery", hcErr)
+				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+				_ = RecordReconciliation(e.db, rec)
+				return &ReconcileResult{
+					RecordID:        rec.ID,
+					ActionTaken:     "HEALTH_CHECK_FAILED_ESCALATED",
+					FinalState:      ReconciliationStateManualApproval,
+					DiscoveredState: discState,
+					Error:           fmt.Sprintf("candidate business health check failed: %v", hcErr),
+				}, nil
+			}
+		}
+
+		// Clean up the stopped backup if it is PRESENT
+		if backupPres.State == PresencePresent && isValidDockerContainerID(backupPres.ID) && backupPres.ID != candPres.ID {
+			delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(backupPres.ID))
 			delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
 			if err != nil {
 				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; failed to prepare backup purge request: %v", err)
@@ -243,6 +311,7 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 					ActionTaken:     "PURGE_FAILED_PENDING",
 					FinalState:      rec.State,
 					DiscoveredState: discState,
+					Error:           err.Error(),
 				}, fmt.Errorf("prepare delete backup request failed: %w", err)
 			}
 			dResp, dErr := client.Do(delReq)
@@ -255,6 +324,7 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 					ActionTaken:     "PURGE_FAILED_PENDING",
 					FinalState:      rec.State,
 					DiscoveredState: discState,
+					Error:           dErr.Error(),
 				}, fmt.Errorf("delete backup container failed: %w", dErr)
 			}
 			defer dResp.Body.Close()
@@ -268,11 +338,13 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 					ActionTaken:     "PURGE_FAILED_PENDING",
 					FinalState:      rec.State,
 					DiscoveredState: discState,
+					Error:           fmt.Sprintf("status %d: %s", dResp.StatusCode, string(b)),
 				}, fmt.Errorf("delete backup returned unexpected status %d", dResp.StatusCode)
 			}
 		}
+
 		rec.State = ReconciliationStateResolved
-		rec.ResolutionPlan = "candidate verified running; orphan backup safely purged"
+		rec.ResolutionPlan = "candidate verified running and business healthy; orphan backup safely purged"
 		rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
 		_ = RecordReconciliation(e.db, rec)
 		return &ReconcileResult{
@@ -283,7 +355,7 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 		}, nil
 	}
 
-	// Case B: Escalation to Manual Approval (Dual-Running, or Candidate not running, or ambiguous identity)
+	// Case B: Escalation to Manual Approval (Dual-Running, Candidate not running, or conflicting identity)
 	rec.State = ReconciliationStateManualApproval
 	rec.ResolutionPlan = "dual running or broken candidate detected; requiring manual operator inspection"
 	rec.UpdatedAtMs = time.Now().UTC().UnixMilli()

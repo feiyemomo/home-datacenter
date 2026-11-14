@@ -3888,7 +3888,7 @@ func (e *DefaultOperationExecutor) recordReconciliationTask(
 	opID, component, action, stage, attemptID string,
 	backupID, backupName, candidateID string,
 	cause error,
-) {
+) error {
 	var fGen int64
 	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
 		fGen = guard.Grant.FencingGeneration
@@ -3914,7 +3914,11 @@ func (e *DefaultOperationExecutor) recordReconciliationTask(
 		CreatedAtMs:          time.Now().UTC().UnixMilli(),
 		UpdatedAtMs:          time.Now().UTC().UnixMilli(),
 	}
-	_ = RecordReconciliation(e.db, rec)
+	err := RecordReconciliation(e.db, rec)
+	if err != nil {
+		log.Printf("[executor] CRITICAL: failed to persist reconciliation task: %v", err)
+	}
+	return err
 }
 
 // executeSafeBackupRestore restores the renamed backup container back to its original name and starts it.
@@ -3949,6 +3953,8 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 	trackerRenameCtx := WithStageTracker(rbCtx, trackerRename)
 	if err := verifyContextLeaseBeforeSocket(trackerRenameCtx); err != nil {
 		trackerRename.RecordFailure(err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_rename", trackerRename.AttemptID(), "", backupName, "", err)
 		return fmt.Errorf("backup restore rename aborted by lease guard: %w", err)
 	}
 
@@ -3956,17 +3962,24 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 	renameReq, err := http.NewRequestWithContext(trackerRename.BindHTTPTrace(trackerRenameCtx), http.MethodPost, renameURL, nil)
 	if err != nil {
 		trackerRename.RecordFailure(err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_rename", trackerRename.AttemptID(), "", backupName, "", err)
 		return fmt.Errorf("backup restore failed to create rename request: %w (cause: %v)", err, triggerCause)
 	}
 	renameResp, err := client.Do(renameReq)
 	if err != nil {
 		trackerRename.RecordFailure(err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_rename", trackerRename.AttemptID(), "", backupName, "", err)
 		return fmt.Errorf("backup restore failed at rename (err: %v); manual reconciliation required (cause: %v)", err, triggerCause)
 	}
 	defer renameResp.Body.Close()
 	renameBody, _ := io.ReadAll(renameResp.Body)
 	trackerRename.RecordResponse(renameResp.StatusCode, nil)
 	if renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK {
+		rErr := fmt.Errorf("HTTP %d: %s", renameResp.StatusCode, string(renameBody))
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_rename", trackerRename.AttemptID(), "", backupName, "", rErr)
 		return fmt.Errorf("backup restore failed at rename (HTTP %d, body: %s); manual reconciliation required (cause: %v)", renameResp.StatusCode, string(renameBody), triggerCause)
 	}
 
@@ -3979,6 +3992,8 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 	trackerStartCtx := WithStageTracker(rbCtx, trackerStart)
 	if err := verifyContextLeaseBeforeSocket(trackerStartCtx); err != nil {
 		trackerStart.RecordFailure(err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_start", trackerStart.AttemptID(), "", backupName, "", err)
 		return fmt.Errorf("backup restore start aborted by lease guard: %w", err)
 	}
 
@@ -3986,17 +4001,24 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 	startReq, err := http.NewRequestWithContext(trackerStart.BindHTTPTrace(trackerStartCtx), http.MethodPost, startURL, nil)
 	if err != nil {
 		trackerStart.RecordFailure(err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_start", trackerStart.AttemptID(), "", backupName, "", err)
 		return fmt.Errorf("backup restore failed to create start request: %w (cause: %v)", err, triggerCause)
 	}
 	startResp, err := client.Do(startReq)
 	if err != nil {
 		trackerStart.RecordFailure(err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_start", trackerStart.AttemptID(), "", backupName, "", err)
 		return fmt.Errorf("backup restore failed at start (err: %v); manual reconciliation required (cause: %v)", err, triggerCause)
 	}
 	defer startResp.Body.Close()
 	startBody, _ := io.ReadAll(startResp.Body)
 	trackerStart.RecordResponse(startResp.StatusCode, nil)
 	if startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK && startResp.StatusCode != http.StatusNotModified {
+		sErr := fmt.Errorf("HTTP %d: %s", startResp.StatusCode, string(startBody))
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_start", trackerStart.AttemptID(), "", backupName, "", sErr)
 		return fmt.Errorf("backup restore failed at start (HTTP %d, body: %s); manual reconciliation required (cause: %v)", startResp.StatusCode, string(startBody), triggerCause)
 	}
 
@@ -4013,6 +4035,9 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 			status = insResp.StatusCode
 			_ = insResp.Body.Close()
 		}
+		insErr := fmt.Errorf("inspect HTTP %d: %v", status, err)
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_inspect", fmt.Sprintf("att-ins-%d", time.Now().UTC().UnixNano()), "", backupName, "", insErr)
 		return fmt.Errorf("backup restore inspect failed (HTTP %d, err: %v); manual reconciliation required", status, err)
 	}
 	defer insResp.Body.Close()
@@ -4022,6 +4047,9 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 		} `json:"State"`
 	}
 	if err := json.NewDecoder(insResp.Body).Decode(&stateCheck); err != nil || !stateCheck.State.Running {
+		notRunErr := errors.New("restored container is NOT running")
+		_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+			"restore_backup_not_running", fmt.Sprintf("att-run-%d", time.Now().UTC().UnixNano()), "", backupName, "", notRunErr)
 		return fmt.Errorf("restored original container is NOT running; manual reconciliation required")
 	}
 
@@ -4031,6 +4059,8 @@ func (e *DefaultOperationExecutor) executeSafeBackupRestore(
 
 // executeVerifiedCandidateRollback deletes the failed candidate container STRICTLY BY CONTAINER ID
 // (never by containerName), then restores and starts the backup container.
+// Ambiguous Cutoff: If candidate DELETE fails or returns an ambiguous/unknown outcome (network error,
+// timeout, RST, 5xx), backup restore is STRICTLY FORBIDDEN to avoid 409 conflicts and volume split-brain!
 func (e *DefaultOperationExecutor) executeVerifiedCandidateRollback(
 	ctx context.Context,
 	sockPath string,
@@ -4063,18 +4093,46 @@ func (e *DefaultOperationExecutor) executeVerifiedCandidateRollback(
 		trackerCandDelCtx := WithStageTracker(rbCtx, trackerCandDel)
 		if err := verifyContextLeaseBeforeSocket(trackerCandDelCtx); err != nil {
 			trackerCandDel.RecordFailure(err)
+			_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, err)
 			return fmt.Errorf("rollback candidate delete aborted by lease guard: %w", err)
 		}
 
 		delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(candidateContainerID))
 		delReq, err := http.NewRequestWithContext(trackerCandDel.BindHTTPTrace(trackerCandDelCtx), http.MethodDelete, delURL, nil)
-		if err == nil {
-			if dResp, dErr := client.Do(delReq); dErr == nil {
-				trackerCandDel.RecordResponse(dResp.StatusCode, nil)
-				_ = dResp.Body.Close()
-			} else {
-				trackerCandDel.RecordFailure(dErr)
-			}
+		if err != nil {
+			trackerCandDel.RecordFailure(err)
+			_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, err)
+			return fmt.Errorf("failed to create candidate delete request: %w (cause: %v)", err, triggerCause)
+		}
+
+		dResp, dErr := client.Do(delReq)
+		if dErr != nil {
+			trackerCandDel.RecordFailure(dErr)
+			_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, dErr)
+			return fmt.Errorf("%w: candidate container delete returned network/timeout error %v; restore aborted to prevent 409 conflict/volume corruption (original cause: %v)",
+				ErrExecutionAmbiguous, dErr, triggerCause)
+		}
+		defer dResp.Body.Close()
+		dBody, _ := io.ReadAll(dResp.Body)
+		trackerCandDel.RecordResponse(dResp.StatusCode, nil)
+
+		if trackerCandDel.Category() == OutcomeDispatchedUnknown {
+			ambErr := fmt.Errorf("candidate delete outcome ambiguous (status %d: %s)", dResp.StatusCode, string(dBody))
+			_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, ambErr)
+			return fmt.Errorf("%w: candidate container delete status %d (%s) is ambiguous; restore aborted to prevent 409 conflict/volume corruption (original cause: %v)",
+				ErrExecutionAmbiguous, dResp.StatusCode, string(dBody), triggerCause)
+		}
+
+		if dResp.StatusCode != http.StatusNoContent && dResp.StatusCode != http.StatusOK && dResp.StatusCode != http.StatusNotFound {
+			statusErr := fmt.Errorf("candidate delete failed with HTTP status %d: %s", dResp.StatusCode, string(dBody))
+			_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, statusErr)
+			return fmt.Errorf("%w: candidate container delete failed (status %d: %s); restore aborted to prevent dual-container split (original cause: %v)",
+				ErrExecutionAmbiguous, dResp.StatusCode, string(dBody), triggerCause)
 		}
 	}
 
@@ -4106,10 +4164,19 @@ func executeVerifiedRollback(
 		return fmt.Errorf("rollback aborted before stage 1 delete: %w", err)
 	}
 	// Stage 1: Clean up failed candidate container if present
-	delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", containerName)
-	delReq, _ := http.NewRequestWithContext(rbCtx, http.MethodDelete, delURL, nil)
-	if dResp, err := client.Do(delReq); err == nil {
-		_ = dResp.Body.Close()
+	delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(containerName))
+	delReq, err := http.NewRequestWithContext(rbCtx, http.MethodDelete, delURL, nil)
+	if err != nil {
+		return fmt.Errorf("rollback failed at candidate delete request creation: %w (cause: %v)", err, triggerCause)
+	}
+	dResp, err := client.Do(delReq)
+	if err != nil {
+		return fmt.Errorf("%w: rollback stage 1 candidate delete returned network/timeout error: %v (cause: %v)", ErrExecutionAmbiguous, err, triggerCause)
+	}
+	defer dResp.Body.Close()
+	if dResp.StatusCode != http.StatusNoContent && dResp.StatusCode != http.StatusOK && dResp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(dResp.Body)
+		return fmt.Errorf("%w: rollback stage 1 candidate delete failed (HTTP %d: %s); aborting restore to prevent conflict (cause: %v)", ErrExecutionAmbiguous, dResp.StatusCode, string(b), triggerCause)
 	}
 
 	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
@@ -4552,6 +4619,9 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	// 6. Success! New container is verified running. Remove old backup container. (Stage: recreate.remove_backup)
 	if backupContainerID == "" || candidateContainerID == "" || backupContainerID == candidateContainerID || backupContainerID != inspectData.ID || backupName == containerName {
 		log.Printf("[executor] security guard: refusing to remove backup container due to identity collision (backupID: %s, candidateID: %s, backupName: %s, containerName: %s)", backupContainerID, candidateContainerID, backupName, containerName)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.identity_guard",
+			fmt.Sprintf("att-guard-%d", time.Now().UTC().UnixNano()), backupContainerID, backupName, candidateContainerID,
+			fmt.Errorf("identity collision guard: backupID=%s, candidateID=%s, backupName=%s", backupContainerID, candidateContainerID, backupName))
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept due to safety identity guard)", containerName, targetImage, backupName), nil
 	}
 
@@ -4560,16 +4630,22 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	chkCandReq, err := http.NewRequestWithContext(ctx, http.MethodGet, chkCandURL, nil)
 	if err != nil {
 		log.Printf("[executor] safety guard: failed to build candidate verification request: %v; keeping backup %s", err, backupName)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.candidate_verify_build",
+			fmt.Sprintf("att-verify-req-%d", time.Now().UTC().UnixNano()), backupContainerID, backupName, candidateContainerID, err)
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate verification request error)", containerName, targetImage, backupName), nil
 	}
 	chkResp, chkErr := client.Do(chkCandReq)
 	if chkErr != nil {
 		log.Printf("[executor] safety guard: candidate verification request error: %v; keeping backup %s", chkErr, backupName)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.candidate_verify_net",
+			fmt.Sprintf("att-verify-net-%d", time.Now().UTC().UnixNano()), backupContainerID, backupName, candidateContainerID, chkErr)
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate verification error)", containerName, targetImage, backupName), nil
 	}
 	defer chkResp.Body.Close()
 	if chkResp.StatusCode != http.StatusOK {
 		log.Printf("[executor] safety guard: candidate verification returned status %d; keeping backup %s", chkResp.StatusCode, backupName)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.candidate_verify_status",
+			fmt.Sprintf("att-verify-status-%d", time.Now().UTC().UnixNano()), backupContainerID, backupName, candidateContainerID, fmt.Errorf("candidate verification returned HTTP %d", chkResp.StatusCode))
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate verification status %d)", containerName, targetImage, backupName, chkResp.StatusCode), nil
 	}
 	var chkData struct {
@@ -4580,10 +4656,14 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	}
 	if err := json.NewDecoder(chkResp.Body).Decode(&chkData); err != nil {
 		log.Printf("[executor] safety guard: failed to decode candidate verification response: %v; keeping backup %s", err, backupName)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.candidate_verify_decode",
+			fmt.Sprintf("att-verify-decode-%d", time.Now().UTC().UnixNano()), backupContainerID, backupName, candidateContainerID, err)
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate decode error)", containerName, targetImage, backupName), nil
 	}
 	if !chkData.State.Running || chkData.ID != candidateContainerID {
 		log.Printf("[executor] safety violation: candidate container %s is not running or ID mismatch (%s vs %s); refusing backup removal", containerName, chkData.ID, candidateContainerID)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.candidate_verify_mismatch",
+			fmt.Sprintf("att-verify-mismatch-%d", time.Now().UTC().UnixNano()), backupContainerID, backupName, candidateContainerID, fmt.Errorf("candidate Running=%v, ID=%s (expected %s)", chkData.State.Running, chkData.ID, candidateContainerID))
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate container check failed)", containerName, targetImage, backupName), nil
 	}
 
@@ -4597,6 +4677,8 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	if err := verifyContextLeaseBeforeSocket(trackerBackupDelCtx); err != nil {
 		trackerBackupDel.RecordFailure(err)
 		log.Printf("[executor] lease guard blocked backup removal for %s: %v", backupName, err)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.lease_expired",
+			trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, err)
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept due to lease expiry)", containerName, targetImage, backupName), nil
 	}
 
@@ -4604,13 +4686,15 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	delBackupReq, err := http.NewRequestWithContext(trackerBackupDel.BindHTTPTrace(trackerBackupDelCtx), http.MethodDelete, delBackupURL, nil)
 	if err != nil {
 		trackerBackupDel.RecordFailure(err)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.req_build",
+			trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, err)
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: %v)", containerName, targetImage, backupName, err), nil
 	}
 
 	dBResp, dBErr := client.Do(delBackupReq)
 	if dBErr != nil {
 		trackerBackupDel.RecordFailure(dBErr)
-		e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup", trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, dBErr)
+		_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup", trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, dBErr)
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s cleanup ambiguous; reconciliation queued: %v)", containerName, targetImage, backupName, dBErr), nil
 	}
 	defer dBResp.Body.Close()
@@ -4621,7 +4705,7 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup removed)", containerName, targetImage), nil
 	}
 
-	e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup", trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, fmt.Errorf("status %d: %s", dBResp.StatusCode, string(dBody)))
+	_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup", trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, fmt.Errorf("status %d: %s", dBResp.StatusCode, string(dBody)))
 	return fmt.Sprintf("container %s recreated successfully with image %s (backup %s cleanup failed with status %d; reconciliation queued)", containerName, targetImage, backupName, dBResp.StatusCode), nil
 }
 
