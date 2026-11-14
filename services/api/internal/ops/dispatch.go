@@ -456,6 +456,7 @@ func DeriveRecoveryContext(parent context.Context, timeout time.Duration) (conte
 		}
 		// NOTE: Recovery operations maintain their own scoped recovery trackers
 		// and MUST NOT overwrite the primary mutation's activeTracker via sink.
+		base = WithTrackerSink(base, nil)
 	}
 
 	return context.WithTimeout(base, timeout)

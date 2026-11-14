@@ -4096,7 +4096,7 @@ func executeVerifiedRollback(
 	canonical string,
 	triggerCause error,
 ) error {
-	rbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	rbCtx, cancel := DeriveRecoveryContext(ctx, 30*time.Second)
 	defer cancel()
 
 	log.Printf("[executor] initiating 5-stage verified rollback for %s (backup: %s, cause: %v)",
@@ -4336,8 +4336,13 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	if renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK {
 		if trackerRename.Category() == OutcomeFailedConfirmed {
 			// Rename confirmed failed (e.g. 400 or 404). Original container still named containerName.
+			rbCtx, rbCancel := DeriveRecoveryContext(ctx, 30*time.Second)
+			defer rbCancel()
+			if err := verifyContextLeaseBeforeSocket(rbCtx); err != nil {
+				return "", fmt.Errorf("recreate rename restart aborted by lease guard: %w", err)
+			}
 			startOrigURL := fmt.Sprintf("http://localhost/containers/%s/start", url.PathEscape(containerName))
-			sReq, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, startOrigURL, nil)
+			sReq, _ := http.NewRequestWithContext(rbCtx, http.MethodPost, startOrigURL, nil)
 			if sResp, sErr := client.Do(sReq); sErr == nil {
 				_ = sResp.Body.Close()
 			}
@@ -4355,7 +4360,7 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	trackerCreateCtx := WithStageTracker(ctx, trackerCreate)
 	if err := verifyContextLeaseBeforeSocket(trackerCreateCtx); err != nil {
 		trackerCreate.RecordFailure(err)
-		rbErr := e.executeSafeBackupRestore(context.Background(), sockPath, containerName, backupName, err)
+		rbErr := e.executeSafeBackupRestore(ctx, sockPath, containerName, backupName, err)
 		if rbErr != nil {
 			return "", fmt.Errorf("recreate aborted before create (%v) and backup restore failed: %w", err, rbErr)
 		}
@@ -4401,7 +4406,7 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 			return "", fmt.Errorf("%w: recreate container create ambiguous for %s (%v; attempt: %s)", ErrExecutionAmbiguous, containerName, err, trackerCreate.AttemptID())
 		}
 		// If request was never dispatched:
-		rbErr := e.executeSafeBackupRestore(context.Background(), sockPath, containerName, backupName, err)
+		rbErr := e.executeSafeBackupRestore(ctx, sockPath, containerName, backupName, err)
 		if rbErr != nil {
 			return "", fmt.Errorf("recreate create failed (%v) and backup restore failed: %w", err, rbErr)
 		}
@@ -4550,25 +4555,36 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept due to safety identity guard)", containerName, targetImage, backupName), nil
 	}
 
-	// Verify candidate container is still in place and running
+	// Verify candidate container is still in place and running (Strict Fail-Closed)
 	chkCandURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(candidateContainerID))
-	chkCandReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, chkCandURL, nil)
-	if chkResp, chkErr := client.Do(chkCandReq); chkErr == nil {
-		defer chkResp.Body.Close()
-		if chkResp.StatusCode == http.StatusOK {
-			var chkData struct {
-				ID    string `json:"Id"`
-				State struct {
-					Running bool `json:"Running"`
-				} `json:"State"`
-			}
-			if err := json.NewDecoder(chkResp.Body).Decode(&chkData); err == nil {
-				if !chkData.State.Running || chkData.ID != candidateContainerID {
-					log.Printf("[executor] safety violation: candidate container %s is not running or ID mismatch (%s vs %s); refusing backup removal", containerName, chkData.ID, candidateContainerID)
-					return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate container check failed)", containerName, targetImage, backupName), nil
-				}
-			}
-		}
+	chkCandReq, err := http.NewRequestWithContext(ctx, http.MethodGet, chkCandURL, nil)
+	if err != nil {
+		log.Printf("[executor] safety guard: failed to build candidate verification request: %v; keeping backup %s", err, backupName)
+		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate verification request error)", containerName, targetImage, backupName), nil
+	}
+	chkResp, chkErr := client.Do(chkCandReq)
+	if chkErr != nil {
+		log.Printf("[executor] safety guard: candidate verification request error: %v; keeping backup %s", chkErr, backupName)
+		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate verification error)", containerName, targetImage, backupName), nil
+	}
+	defer chkResp.Body.Close()
+	if chkResp.StatusCode != http.StatusOK {
+		log.Printf("[executor] safety guard: candidate verification returned status %d; keeping backup %s", chkResp.StatusCode, backupName)
+		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate verification status %d)", containerName, targetImage, backupName, chkResp.StatusCode), nil
+	}
+	var chkData struct {
+		ID    string `json:"Id"`
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(chkResp.Body).Decode(&chkData); err != nil {
+		log.Printf("[executor] safety guard: failed to decode candidate verification response: %v; keeping backup %s", err, backupName)
+		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate decode error)", containerName, targetImage, backupName), nil
+	}
+	if !chkData.State.Running || chkData.ID != candidateContainerID {
+		log.Printf("[executor] safety violation: candidate container %s is not running or ID mismatch (%s vs %s); refusing backup removal", containerName, chkData.ID, candidateContainerID)
+		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept: candidate container check failed)", containerName, targetImage, backupName), nil
 	}
 
 	trackerBackupDel := NewStageTracker("docker_socket", ActionDockerRecreate+".cleanup_backup", containerName)

@@ -546,7 +546,7 @@ func TestR5_BaselineHashStrictValidationAndPlaceholderDistinction(t *testing.T) 
 			case "live":
 				items = []onePanelContainerItem{
 					{
-						ContainerID: "cid-frigate-real",
+						ContainerID: "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0001",
 						Name:        "/home-frigate",
 						State:       "running",
 						Status:      "Up 1 hour",
@@ -557,7 +557,7 @@ func TestR5_BaselineHashStrictValidationAndPlaceholderDistinction(t *testing.T) 
 			case "unknown_state":
 				items = []onePanelContainerItem{
 					{
-						ContainerID: "cid-frigate-unk",
+						ContainerID: "111122223333444455556666777788889999aaaabbbbccccddddeeeeffff0002",
 						Name:        "/home-frigate",
 						State:       "unknown",
 						Image:       "ghcr.io/blakeblackshear/frigate:0.14.1",

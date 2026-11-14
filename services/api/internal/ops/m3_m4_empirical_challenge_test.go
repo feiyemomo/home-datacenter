@@ -188,7 +188,7 @@ func TestChallengeEmpirical_ComputeFingerprint(t *testing.T) {
 	t.Run("Live 1Panel State and Drift Sensitivity", func(t *testing.T) {
 		var mu sync.Mutex
 		containerData := onePanelContainerItem{
-			ContainerID: "cid-12345",
+			ContainerID: "c1d00000000000000000000000012345",
 			Name:        "/home-web",
 			State:       "running",
 			Status:      "Up 3 hours",
@@ -318,7 +318,7 @@ func TestChallengeEmpirical_AntiTOCTOU_DriftDetection(t *testing.T) {
 
 	var mu sync.Mutex
 	containerData := onePanelContainerItem{
-		ContainerID: "cid-web-01",
+		ContainerID: "c1d00000000000000000000000000001",
 		Name:        "/home-web",
 		State:       "running",
 		Image:       "home-web:v1.0.0",
@@ -506,8 +506,8 @@ func TestChallengeEmpirical_ProposalStatusForgeryAttack(t *testing.T) {
 	fastServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		items := []onePanelContainerItem{
-			{ContainerID: "cid-web", Name: "/home-web", State: "running", Status: "Up", Image: "home-web:v1.0.0", Created: "2026-11-01T00:00:00Z"},
-			{ContainerID: "cid-api", Name: "/home-api", State: "running", Status: "Up", Image: "home-api:v1.0.0", Created: "2026-11-01T00:00:00Z"},
+			{ContainerID: "c1d00000000000000000000000000002", Name: "/home-web", State: "running", Status: "Up", Image: "home-web:v1.0.0", Created: "2026-11-01T00:00:00Z"},
+			{ContainerID: "c1d00000000000000000000000000003", Name: "/home-api", State: "running", Status: "Up", Image: "home-api:v1.0.0", Created: "2026-11-01T00:00:00Z"},
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"code":    200,

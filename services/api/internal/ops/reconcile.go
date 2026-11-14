@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -171,7 +172,7 @@ func inspectContainerForReconcile(ctx context.Context, client *http.Client, targ
 			Status  string `json:"Status"`
 		} `json:"State"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil || data.ID == "" {
 		return containerPresence{exists: false}
 	}
 	return containerPresence{
@@ -227,13 +228,47 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 	rec.DiscoveredState = discState
 
 	// Case A: Safe Auto-Resolve (New Candidate is running and serving, Backup container exists and is stopped)
-	if candPres.exists && candPres.running && (!backupPres.exists || (backupPres.exists && !backupPres.running)) {
+	// Requires named container to either not exist yet or point directly to the running candidate.
+	if candPres.exists && candPres.running && (!backupPres.exists || (backupPres.exists && !backupPres.running)) && (!namedPres.exists || namedPres.id == candPres.id) {
 		// Clean up the stopped backup if it still exists
 		if backupPres.exists && isValidDockerContainerID(backupPres.id) && backupPres.id != candPres.id {
 			delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(backupPres.id))
-			delReq, _ := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
-			if dResp, err := client.Do(delReq); err == nil {
-				_ = dResp.Body.Close()
+			delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
+			if err != nil {
+				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; failed to prepare backup purge request: %v", err)
+				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+				_ = RecordReconciliation(e.db, rec)
+				return &ReconcileResult{
+					RecordID:        rec.ID,
+					ActionTaken:     "PURGE_FAILED_PENDING",
+					FinalState:      rec.State,
+					DiscoveredState: discState,
+				}, fmt.Errorf("prepare delete backup request failed: %w", err)
+			}
+			dResp, dErr := client.Do(delReq)
+			if dErr != nil {
+				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; backup purge network error: %v", dErr)
+				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+				_ = RecordReconciliation(e.db, rec)
+				return &ReconcileResult{
+					RecordID:        rec.ID,
+					ActionTaken:     "PURGE_FAILED_PENDING",
+					FinalState:      rec.State,
+					DiscoveredState: discState,
+				}, fmt.Errorf("delete backup container failed: %w", dErr)
+			}
+			defer dResp.Body.Close()
+			if dResp.StatusCode != http.StatusNoContent && dResp.StatusCode != http.StatusOK && dResp.StatusCode != http.StatusNotFound {
+				b, _ := io.ReadAll(dResp.Body)
+				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; backup purge returned status %d: %s", dResp.StatusCode, string(b))
+				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+				_ = RecordReconciliation(e.db, rec)
+				return &ReconcileResult{
+					RecordID:        rec.ID,
+					ActionTaken:     "PURGE_FAILED_PENDING",
+					FinalState:      rec.State,
+					DiscoveredState: discState,
+				}, fmt.Errorf("delete backup returned unexpected status %d", dResp.StatusCode)
 			}
 		}
 		rec.State = ReconciliationStateResolved
