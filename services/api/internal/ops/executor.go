@@ -277,6 +277,7 @@ type DefaultOperationExecutor struct {
 	hostUpdateExec  *hostsec.HostUpdateExecutor
 	componentLocks  sync.Map // canonical string -> *sync.Mutex
 	mu              sync.RWMutex
+	dockerDialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
 // SetAuditEngine attaches a unified AgentAuditEngine to the executor.
@@ -402,6 +403,34 @@ func WithDockerSocket(path string) ExecutorOption {
 	return func(e *DefaultOperationExecutor) {
 		e.dockerSocket = path
 	}
+}
+
+// WithDockerDialContext overrides low-level socket dialing for isolated testing and mock integration.
+func WithDockerDialContext(dialFn func(ctx context.Context, network, addr string) (net.Conn, error)) ExecutorOption {
+	return func(e *DefaultOperationExecutor) {
+		e.dockerDialContext = dialFn
+	}
+}
+
+func isDockerSocketAccessible(sockPath string) bool {
+	if sockPath == "" {
+		return false
+	}
+	if strings.HasPrefix(sockPath, "tcp://") {
+		return true
+	}
+	_, err := os.Stat(sockPath)
+	return err == nil
+}
+
+func (e *DefaultOperationExecutor) dialDocker(ctx context.Context, sockPath string) (net.Conn, error) {
+	if e != nil && e.dockerDialContext != nil {
+		return e.dockerDialContext(ctx, "unix", sockPath)
+	}
+	if strings.HasPrefix(sockPath, "tcp://") {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", strings.TrimPrefix(sockPath, "tcp://"))
+	}
+	return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
 }
 
 func WithHealthChecker(fn func(ctx context.Context, target string) error) ExecutorOption {
@@ -585,49 +614,51 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 	if sockPath == "" && e.fallback != nil {
 		sockPath = e.fallback.dockerSocket
 	}
-	if sockPath != "" {
-		if _, statErr := os.Stat(sockPath); statErr == nil {
-			inspectData, insErr := inspectContainerViaDockerSocket(ctx, sockPath, canonical)
-			if insErr == nil {
-				comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectData)
-				if cErr != nil {
-					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
-				}
-				return BaselineInfo{
-					Hash:            comp.Hash,
-					ProtocolVersion: BaselineProtocolVersion,
-					Canonical:       canonical,
-					ContainerID:     comp.Document.Identity.ContainerID,
-					Image:           comp.Document.Identity.ImageReference,
-					State:           comp.Document.State.ContainerState,
-					CreatedAt:       comp.Document.State.CreatedAt,
-					IdentityHash:    comp.IdentityHash,
-					SecurityHash:    comp.SecurityHash,
-					StateHash:       comp.StateHash,
-					Identity:        &comp.Document.Identity,
-					Security:        &comp.Document.Security,
-					Source:          "docker_socket",
-					IsPlaceholder:   false,
-				}
-			} else if errors.Is(insErr, ErrBaselineAmbiguousContainer) {
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: insErr.Error()}
-			} else if errors.Is(insErr, context.DeadlineExceeded) ||
-				errors.Is(ctx.Err(), context.DeadlineExceeded) ||
-				isAmbiguousExecutionError(insErr, ctx.Err()) {
-				// Socket transport / timeout error: FAIL CLOSED. Never fall through on network failure.
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket transport error: %v", insErr)}
-			} else if sockPath != "/var/run/docker.sock" {
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket failed: %v", insErr)}
-			} else if IsProductionRuntime() {
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed on authoritative socket: %v", insErr)}
-			} else if !strings.Contains(insErr.Error(), "not found in docker") {
-				// In non-production, only fall through if the container was genuinely not found on local docker daemon.
-				// Any other socket/inspection error fails closed.
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect error: %v", insErr)}
+
+	if sockPath != "" && isDockerSocketAccessible(sockPath) {
+		inspectData, insErr := inspectContainerViaDockerSocket(ctx, sockPath, canonical)
+		if insErr == nil {
+			comp, cErr := ComputeContainerBaselineFromInspect(canonical, inspectData)
+			if cErr != nil {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: cErr.Error()}
 			}
-			// In non-production or when 1Panel is configured, fall through if container not on local docker socket.
+			return BaselineInfo{
+				Hash:            comp.Hash,
+				ProtocolVersion: BaselineProtocolVersion,
+				Canonical:       canonical,
+				ContainerID:     comp.Document.Identity.ContainerID,
+				Image:           comp.Document.Identity.ImageReference,
+				State:           comp.Document.State.ContainerState,
+				CreatedAt:       comp.Document.State.CreatedAt,
+				IdentityHash:    comp.IdentityHash,
+				SecurityHash:    comp.SecurityHash,
+				StateHash:       comp.StateHash,
+				Identity:        &comp.Document.Identity,
+				Security:        &comp.Document.Security,
+				Source:          "docker_socket",
+				IsPlaceholder:   false,
+			}
+		} else if errors.Is(insErr, ErrBaselineAmbiguousContainer) {
+			return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: insErr.Error()}
+		} else if errors.Is(insErr, context.DeadlineExceeded) ||
+			errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+			isAmbiguousExecutionError(insErr, ctx.Err()) {
+			// Socket transport / timeout error: FAIL CLOSED. Never fall through on network failure.
+			return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket transport error: %v", insErr)}
+		} else if sockPath != "/var/run/docker.sock" {
+			return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket failed: %v", insErr)}
+		} else if IsProductionRuntime() {
+			return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed on authoritative socket: %v", insErr)}
+		} else if !strings.Contains(insErr.Error(), "not found in docker") {
+			// In non-production, only fall through if the container was genuinely not found on local docker daemon.
+			// Any other socket/inspection error fails closed.
+			return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect error: %v", insErr)}
 		}
+		// In non-production or when 1Panel is configured, fall through if container not on local docker socket.
+	} else if IsProductionRuntime() && sockPath != "" && sockPath != "/var/run/docker.sock" {
+		return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("authoritative docker socket %s unavailable in production runtime", sockPath)}
 	}
+
 	if clientConfigured {
 		containers, lErr := e.client.ListContainers(ctx)
 		if lErr == nil {
@@ -864,7 +895,7 @@ func isComponentLockHeld(ctx context.Context, canonical string) bool {
 
 func isMutatingContainerAction(action string) bool {
 	switch strings.ToLower(strings.TrimSpace(action)) {
-	case ActionDockerRestart, ActionDockerRecreate, ActionDockerUpdateImage, ActionDockerExec, ActionWAFReload,
+	case ActionDockerRestart, ActionDockerRecreate, ActionDockerUpdateImage, ActionDockerExec, ActionWAFReload, ActionCachePurge,
 		"restart", "docker_restart", "container_recreate":
 		return true
 	default:
@@ -891,17 +922,12 @@ func isValidDockerContainerID(cid string) bool {
 	if strings.ContainsAny(cid, " \t\r\n:/\\") {
 		return false
 	}
-	if len(cid) < 4 || len(cid) > 64 {
+	if len(cid) < 12 || len(cid) > 64 {
 		return false
 	}
-	if IsProductionRuntime() || os.Getenv("OPS_REQUIRE_HEX_CID") == "1" {
-		if len(cid) < 12 {
+	for _, r := range cid {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
 			return false
-		}
-		for _, r := range cid {
-			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
-				return false
-			}
 		}
 	}
 	return true
@@ -937,6 +963,7 @@ func isAmbiguousExecutionError(err error, ctxErr error) bool {
 func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSpec) (*ExecutionResult, error) {
 	startTime := time.Now()
 	opID := GenerateOperationID("exec")
+	ctx = WithOperationID(ctx, opID)
 	ae := e.GetAuditEngine()
 
 	if spec.TimeoutSec > 0 {
@@ -1301,7 +1328,8 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	})
 	out, err := e.dispatchAction(dispatchCtx, spec, canonical)
 	if err != nil {
-		if isAmbiguousExecutionError(err, ctx.Err()) || (activeTracker != nil && (activeTracker.IsDispatched() || activeTracker.Category() == OutcomeDispatchedUnknown)) {
+		isConfirmedFail := activeTracker != nil && activeTracker.Category() == OutcomeFailedConfirmed
+		if !isConfirmedFail && (isAmbiguousExecutionError(err, ctx.Err()) || (activeTracker != nil && (activeTracker.Category() == OutcomeDispatchedUnknown || (activeTracker.IsDispatched() && isAmbiguousExecutionError(err, ctx.Err()))))) {
 			GlobalSecurityMetrics.IncExecutionUnknown()
 			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
 				OperationID: opID,
@@ -1319,6 +1347,9 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				chName = activeTracker.Channel()
 				stg = activeTracker.Stage()
 				outc = activeTracker.Category()
+				if isAmbiguousExecutionError(err, ctx.Err()) {
+					outc = OutcomeDispatchedUnknown
+				}
 			}
 			var unkAuditErr error
 			if ae != nil {
@@ -1455,16 +1486,31 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			err = errors.Join(err, histErr)
 		}
 
+		failOutcome := OutcomeNotDispatched
+		failAttID := ""
+		failChannel := ""
+		failStage := StageCompleted
+		if activeTracker != nil {
+			failOutcome = activeTracker.Category()
+			failAttID = activeTracker.AttemptID()
+			failChannel = activeTracker.Channel()
+			failStage = activeTracker.Stage()
+		}
 		return &ExecutionResult{
-			Success:      false,
-			Action:       spec.Action,
-			Target:       canonical,
-			Output:       redact.SensitiveString(out),
-			BaselineHash: effectiveBaselineHash,
-			DurationMs:   duration,
-			RolledBack:   rolledBack,
-			Error:        errDetails,
-			ExecutedAt:   startTime,
+			Success:           false,
+			Action:            spec.Action,
+			Target:            canonical,
+			Output:            redact.SensitiveString(out),
+			BaselineHash:      effectiveBaselineHash,
+			DurationMs:        duration,
+			RolledBack:        rolledBack,
+			Error:             errDetails,
+			ExecutedAt:        startTime,
+			Outcome:           failOutcome,
+			AttemptID:         failAttID,
+			ExecutionChannel:  failChannel,
+			DispatchStage:     failStage,
+			FencingGeneration: fencingGen,
 		}, err
 	}
 
@@ -1631,16 +1677,31 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 			probeErr = errors.Join(probeErr, histErr)
 		}
 
+		probeOutcome := OutcomeExecuted
+		probeAttID := ""
+		probeChannel := ""
+		probeStage := StageCompleted
+		if activeTracker != nil {
+			probeOutcome = activeTracker.Category()
+			probeAttID = activeTracker.AttemptID()
+			probeChannel = activeTracker.Channel()
+			probeStage = activeTracker.Stage()
+		}
 		return &ExecutionResult{
-			Success:      false,
-			Action:       spec.Action,
-			Target:       canonical,
-			Output:       redact.SensitiveString(out),
-			BaselineHash: effectiveBaselineHash,
-			DurationMs:   duration,
-			RolledBack:   spec.RollbackSpec != nil && rbErr == nil,
-			Error:        errDetails,
-			ExecutedAt:   startTime,
+			Success:           false,
+			Action:            spec.Action,
+			Target:            canonical,
+			Output:            redact.SensitiveString(out),
+			BaselineHash:      effectiveBaselineHash,
+			DurationMs:        duration,
+			RolledBack:        spec.RollbackSpec != nil && rbErr == nil,
+			Error:             errDetails,
+			ExecutedAt:        startTime,
+			Outcome:           probeOutcome,
+			AttemptID:         probeAttID,
+			ExecutionChannel:  probeChannel,
+			DispatchStage:     probeStage,
+			FencingGeneration: fencingGen,
 		}, probeErr
 	}
 
@@ -2779,41 +2840,49 @@ func (e *DefaultOperationExecutor) executeDockerRestart(ctx context.Context, can
 	}
 
 	// Channel 1: Prefer direct Docker socket when accessible
-	if strings.TrimSpace(e.dockerSocket) != "" {
-		if _, statErr := os.Stat(e.dockerSocket); statErr == nil {
-			tracker := NewStageTracker("docker_socket", ActionDockerRestart, containerName)
-			trackerCtx := WithStageTracker(ctx, tracker)
-			err := executeDockerSocketRestart(trackerCtx, e.dockerSocket, containerName, tracker)
-			if err == nil {
-				return fmt.Sprintf("container %s restarted via direct Docker socket (attempt: %s)", containerName, tracker.AttemptID()), nil
-			}
-
-			// Point-of-no-return check: if request was dispatched, timeout occurred, or daemon returned error after dispatch,
-			// STRICTLY FAIL-CLOSED: absolutely NO fallback to 1Panel or HostFallback!
-			if tracker.IsDispatched() || tracker.Category() == OutcomeDispatchedUnknown || isAmbiguousExecutionError(err, ctx.Err()) {
-				return "", fmt.Errorf("%w: docker socket restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
-					ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
-			}
-
-			// If daemon confirmed container does not exist (404) or parameter rejected, fail confirmed (no blind fallback)
-			if tracker.Category() == OutcomeFailedConfirmed {
-				return "", fmt.Errorf("docker socket restart failed (confirmed): %w", err)
-			}
-
-			// Only if NOT_DISPATCHED (e.g. dial refused before sending any byte) and 1Panel is not available:
-			if e.client == nil || strings.TrimSpace(e.client.baseURL) == "" {
-				return "", err
-			}
-			// Only when OutcomeNotDispatched is guaranteed, allow fallback to Channel 2 below.
+	if strings.TrimSpace(e.dockerSocket) != "" && isDockerSocketAccessible(e.dockerSocket) {
+		tracker := NewStageTracker("docker_socket", ActionDockerRestart, containerName)
+		if opID := OperationIDFromContext(ctx); opID != "" {
+			tracker.SetOperationID(opID)
 		}
+		trackerCtx := WithStageTracker(ctx, tracker)
+		err := e.executeDockerSocketRestart(trackerCtx, e.dockerSocket, containerName, tracker)
+		if err == nil {
+			return fmt.Sprintf("container %s restarted via direct Docker socket (attempt: %s)", containerName, tracker.AttemptID()), nil
+		}
+
+		// Priority 1: Confirmed negative outcome (404 Not Found, 400 Bad Parameter)
+		// Container definitively does not exist on daemon; no mutation was applied.
+		if tracker.Category() == OutcomeFailedConfirmed {
+			return "", fmt.Errorf("docker socket restart failed (confirmed): %w", err)
+		}
+
+		// Priority 2: Dispatched with ambiguous outcome (timeout, RST, 500, lost response)
+		// STRICT FAIL-CLOSED: absolutely NO fallback to 1Panel or HostFallback!
+		if tracker.Category() == OutcomeDispatchedUnknown || (tracker.IsDispatched() && isAmbiguousExecutionError(err, ctx.Err())) {
+			return "", fmt.Errorf("%w: docker socket restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
+				ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
+		}
+
+		// Only if NOT_DISPATCHED (e.g. dial refused before sending any byte) and 1Panel is not available:
+		if e.client == nil || strings.TrimSpace(e.client.baseURL) == "" {
+			return "", err
+		}
+		// Only when OutcomeNotDispatched is guaranteed, allow fallback to Channel 2 below.
 	}
 
 	// Channel 2: 1Panel API (only reached when Channel 1 was NOT_DISPATCHED)
 	if e.client != nil && strings.TrimSpace(e.client.baseURL) != "" {
 		tracker := NewStageTracker("1panel_api", ActionDockerRestart, containerName)
+		if opID := OperationIDFromContext(ctx); opID != "" {
+			tracker.SetOperationID(opID)
+		}
 		trackerCtx := WithStageTracker(ctx, tracker)
 		if err := e.client.RestartContainer(trackerCtx, containerName); err != nil {
-			if tracker.IsDispatched() || tracker.Category() == OutcomeDispatchedUnknown || isAmbiguousExecutionError(err, ctx.Err()) {
+			if tracker.Category() == OutcomeFailedConfirmed {
+				return "", fmt.Errorf("1panel restart failed (confirmed): %w", err)
+			}
+			if tracker.Category() == OutcomeDispatchedUnknown || (tracker.IsDispatched() && isAmbiguousExecutionError(err, ctx.Err())) {
 				return "", fmt.Errorf("%w: 1panel restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
 					ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
 			}
@@ -2825,9 +2894,15 @@ func (e *DefaultOperationExecutor) executeDockerRestart(ctx context.Context, can
 	// Channel 3: HostFallback (only reached when Channel 1 & 2 were NOT_DISPATCHED)
 	if e.fallback != nil {
 		tracker := NewStageTracker("host_fallback", ActionDockerRestart, containerName)
+		if opID := OperationIDFromContext(ctx); opID != "" {
+			tracker.SetOperationID(opID)
+		}
 		trackerCtx := WithStageTracker(ctx, tracker)
 		if err := e.fallback.RestartContainerFallback(trackerCtx, containerName); err != nil {
-			if tracker.IsDispatched() || tracker.Category() == OutcomeDispatchedUnknown || isAmbiguousExecutionError(err, ctx.Err()) {
+			if tracker.Category() == OutcomeFailedConfirmed {
+				return "", fmt.Errorf("host fallback restart failed (confirmed): %w", err)
+			}
+			if tracker.Category() == OutcomeDispatchedUnknown || (tracker.IsDispatched() && isAmbiguousExecutionError(err, ctx.Err())) {
 				return "", fmt.Errorf("%w: host fallback restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
 					ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
 			}
@@ -2855,11 +2930,11 @@ func (e *DefaultOperationExecutor) executeDockerRecreate(ctx context.Context, ca
 		}
 	}
 
-	if _, err := os.Stat(e.dockerSocket); err != nil {
-		return "", fmt.Errorf("docker socket not accessible for container recreation: %w", err)
+	if e.dockerSocket == "" || !isDockerSocketAccessible(e.dockerSocket) {
+		return "", fmt.Errorf("docker socket not accessible for container recreation: %s", e.dockerSocket)
 	}
 
-	return executeDockerSocketRecreate(ctx, e.dockerSocket, containerName, image)
+	return e.executeDockerSocketRecreate(ctx, e.dockerSocket, containerName, image)
 }
 
 // executeCachePurge clears specific system caches or builder caches safely.
@@ -2876,35 +2951,67 @@ func (e *DefaultOperationExecutor) executeCachePurge(ctx context.Context, params
 	switch cacheType {
 	case "docker_builder", "docker_build":
 		// Docker builder prune via socket
-		if _, err := os.Stat(e.dockerSocket); err != nil {
-			return "", fmt.Errorf("docker socket not accessible for builder cache purge: %w", err)
+		if e.dockerSocket == "" || !isDockerSocketAccessible(e.dockerSocket) {
+			return "", fmt.Errorf("docker socket not accessible for builder cache purge: %s", e.dockerSocket)
 		}
+		tracker := NewStageTracker("docker_socket", ActionCachePurge, "docker_builder")
+		tracker.SetParentStep("cache.purge.builder")
+		if opID := OperationIDFromContext(ctx); opID != "" {
+			tracker.SetOperationID(opID)
+		}
+		trackerCtx := WithStageTracker(ctx, tracker)
+		if err := verifyContextLeaseBeforeSocket(trackerCtx); err != nil {
+			tracker.RecordFailure(err)
+			return "", err
+		}
+
 		tr := &http.Transport{
 			DisableKeepAlives: true,
-			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-				return (&net.Dialer{}).DialContext(ctx, "unix", e.dockerSocket)
+			DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+				tracker.MarkStage(StageDialing)
+				conn, err := e.dialDocker(dCtx, e.dockerSocket)
+				if err != nil {
+					tracker.RecordFailure(err)
+					return nil, err
+				}
+				tracker.MarkStage(StageConnected)
+				return conn, nil
 			},
 		}
 		defer tr.CloseIdleConnections()
 		client := &http.Client{Transport: tr, Timeout: 30 * time.Second}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://localhost/build/prune", nil)
+		req, err := http.NewRequestWithContext(tracker.BindHTTPTrace(trackerCtx), http.MethodPost, "http://localhost/build/prune", nil)
 		if err != nil {
+			tracker.RecordFailure(err)
 			return "", fmt.Errorf("failed to build prune request: %w", err)
 		}
 		resp, err := client.Do(req)
 		if err != nil {
+			tracker.RecordFailure(err)
+			if tracker.Category() == OutcomeDispatchedUnknown || (tracker.IsDispatched() && isAmbiguousExecutionError(err, trackerCtx.Err())) {
+				return "", fmt.Errorf("%w: builder cache prune ambiguous (%v; attempt: %s)", ErrExecutionAmbiguous, err, tracker.AttemptID())
+			}
 			return "", fmt.Errorf("failed to prune docker builder cache: %w", err)
 		}
 		defer resp.Body.Close()
+
+		b, rErr := io.ReadAll(resp.Body)
+		if rErr != nil {
+			tracker.RecordResponse(resp.StatusCode, rErr)
+			return "", fmt.Errorf("%w: reading prune response failed: %v", ErrExecutionAmbiguous, rErr)
+		}
+		tracker.RecordResponse(resp.StatusCode, nil)
 		if resp.StatusCode != http.StatusOK {
-			b, _ := io.ReadAll(resp.Body)
-			return "", fmt.Errorf("docker build prune returned status %d: %s", resp.StatusCode, string(b))
+			if tracker.Category() == OutcomeFailedConfirmed {
+				return "", fmt.Errorf("builder cache purge failed (status %d): %s", resp.StatusCode, string(b))
+			}
+			return "", fmt.Errorf("%w: builder cache purge returned %d: %s", ErrExecutionAmbiguous, resp.StatusCode, string(b))
 		}
 		var pruneResult struct {
 			SpaceReclaimed int64    `json:"SpaceReclaimed"`
 			CachesDeleted  []string `json:"CachesDeleted"`
 		}
-		_ = json.NewDecoder(resp.Body).Decode(&pruneResult)
+		_ = json.Unmarshal(b, &pruneResult)
 		return fmt.Sprintf("docker build cache pruned successfully, reclaimed %d bytes (%d caches deleted)", pruneResult.SpaceReclaimed, len(pruneResult.CachesDeleted)), nil
 
 	case "transcode_temp", "video_cache":
@@ -3027,7 +3134,7 @@ func (e *DefaultOperationExecutor) executeDockerExec(ctx context.Context, canoni
 		return "", fmt.Errorf("%w: command %v is not in the approved whitelist for %s", ErrActionNotSupported, cmd, canonical)
 	}
 
-	return executeDockerSocketExecOutput(ctx, e.dockerSocket, containerName, cmd)
+	return e.executeDockerSocketExecOutput(ctx, e.dockerSocket, containerName, cmd)
 }
 
 // executeWAFReload triggers OpenResty configuration reload without bare shell.
@@ -3039,7 +3146,7 @@ func (e *DefaultOperationExecutor) executeWAFReload(ctx context.Context) (string
 
 	// Execute `nginx -s reload` directly via Docker Unix socket
 	cmd := []string{"nginx", "-s", "reload"}
-	err := executeDockerSocketExec(ctx, e.dockerSocket, containerName, cmd)
+	err := e.executeDockerSocketExec(ctx, e.dockerSocket, containerName, cmd)
 	if err != nil {
 		return "", fmt.Errorf("openresty reload failed: %w", err)
 	}
@@ -3513,25 +3620,29 @@ func verifyContextLeaseBeforeSocket(ctx context.Context) error {
 }
 
 // executeDockerSocketRestart issues a container restart via Docker Unix Socket HTTP API with stage tracking.
-func executeDockerSocketRestart(ctx context.Context, sockPath, containerName string, tracker *StageTracker) error {
+func (e *DefaultOperationExecutor) executeDockerSocketRestart(ctx context.Context, sockPath, containerName string, tracker *StageTracker) error {
 	if tracker == nil {
 		tracker = NewStageTracker("docker_socket", ActionDockerRestart, containerName)
+		if opID := OperationIDFromContext(ctx); opID != "" {
+			tracker.SetOperationID(opID)
+		}
 	}
 	tracker.MarkStage(StagePreCheck)
 	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
 		tracker.RecordFailure(err)
 		return err
 	}
-	if _, err := os.Stat(sockPath); err != nil {
+	if sockPath == "" || !isDockerSocketAccessible(sockPath) {
+		err := fmt.Errorf("docker socket not accessible: %s", sockPath)
 		tracker.RecordFailure(err)
-		return fmt.Errorf("docker socket not accessible: %w", err)
+		return err
 	}
 
 	tr := &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(dCtx context.Context, network, addr string) (net.Conn, error) {
 			tracker.MarkStage(StageDialing)
-			conn, err := (&net.Dialer{}).DialContext(dCtx, "unix", sockPath)
+			conn, err := e.dialDocker(dCtx, sockPath)
 			if err != nil {
 				tracker.RecordFailure(err)
 				return nil, err
@@ -3574,88 +3685,139 @@ func executeDockerSocketRestart(ctx context.Context, sockPath, containerName str
 }
 
 // executeDockerSocketExec issues a command execution in a container via Docker Unix Socket HTTP API without shell.
-func executeDockerSocketExec(ctx context.Context, sockPath, containerName string, cmd []string) error {
-	_, err := executeDockerSocketExecOutput(ctx, sockPath, containerName, cmd)
+func (e *DefaultOperationExecutor) executeDockerSocketExec(ctx context.Context, sockPath, containerName string, cmd []string) error {
+	_, err := e.executeDockerSocketExecOutput(ctx, sockPath, containerName, cmd)
 	return err
 }
 
-// executeDockerSocketExecOutput issues exec and captures output via Docker Unix Socket.
-func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName string, cmd []string) (string, error) {
-	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
-		return "", err
-	}
-	if _, err := os.Stat(sockPath); err != nil {
-		return "", fmt.Errorf("docker socket not accessible: %w", err)
+// executeDockerSocketExecOutput issues exec with two-stage tracking (create -> start).
+func (e *DefaultOperationExecutor) executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName string, cmd []string) (string, error) {
+	if sockPath == "" || !isDockerSocketAccessible(sockPath) {
+		return "", fmt.Errorf("docker socket not accessible: %s", sockPath)
 	}
 
 	tr := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+		DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+			return e.dialDocker(dCtx, sockPath)
 		},
 	}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
 	// 1. Create exec instance
+	trackerCreate := NewStageTracker("docker_socket", ActionDockerExec+".create", containerName)
+	trackerCreate.SetParentStep("exec.create")
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerCreate.SetOperationID(opID)
+	}
+	trackerCtx := WithStageTracker(ctx, trackerCreate)
+	if err := verifyContextLeaseBeforeSocket(trackerCtx); err != nil {
+		trackerCreate.RecordFailure(err)
+		return "", err
+	}
+
 	createPayload, err := json.Marshal(map[string]interface{}{
 		"AttachStdout": true,
 		"AttachStderr": true,
 		"Cmd":          cmd,
 	})
 	if err != nil {
+		trackerCreate.RecordFailure(err)
 		return "", err
 	}
 
 	createURL := fmt.Sprintf("http://localhost/containers/%s/exec", url.PathEscape(containerName))
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, strings.NewReader(string(createPayload)))
+	createReq, err := http.NewRequestWithContext(trackerCreate.BindHTTPTrace(trackerCtx), http.MethodPost, createURL, bytes.NewReader(createPayload))
 	if err != nil {
+		trackerCreate.RecordFailure(err)
 		return "", err
 	}
 	createReq.Header.Set("Content-Type", "application/json")
 
 	createResp, err := client.Do(createReq)
 	if err != nil {
-		return "", err
+		trackerCreate.RecordFailure(err)
+		if trackerCreate.Category() == OutcomeDispatchedUnknown || (trackerCreate.IsDispatched() && isAmbiguousExecutionError(err, trackerCtx.Err())) {
+			return "", fmt.Errorf("%w: docker exec create ambiguous (%v; attempt: %s)", ErrExecutionAmbiguous, err, trackerCreate.AttemptID())
+		}
+		return "", fmt.Errorf("docker exec create failed: %w", err)
 	}
 	defer createResp.Body.Close()
 
+	createBody, rErr := io.ReadAll(createResp.Body)
+	if rErr != nil {
+		trackerCreate.RecordResponse(createResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: reading exec create response failed: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerCreate.RecordResponse(createResp.StatusCode, nil)
+
 	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(createResp.Body)
-		return "", fmt.Errorf("docker exec create returned %d: %s", createResp.StatusCode, string(b))
+		if trackerCreate.Category() == OutcomeFailedConfirmed {
+			return "", fmt.Errorf("docker exec create failed (confirmed, status %d): %s", createResp.StatusCode, string(createBody))
+		}
+		return "", fmt.Errorf("%w: docker exec create returned %d: %s", ErrExecutionAmbiguous, createResp.StatusCode, string(createBody))
 	}
 
 	var createResult struct {
 		ID string `json:"Id"`
 	}
-	if err := json.NewDecoder(createResp.Body).Decode(&createResult); err != nil {
-		return "", fmt.Errorf("failed to decode exec id: %w", err)
+	if err := json.Unmarshal(createBody, &createResult); err != nil || createResult.ID == "" {
+		return "", fmt.Errorf("invalid exec id returned from docker socket: %w", err)
 	}
-	if createResult.ID == "" {
-		return "", fmt.Errorf("empty exec id returned from docker socket")
-	}
+	execID := createResult.ID
 
 	// 2. Start exec instance
+	trackerStart := NewStageTracker("docker_socket", ActionDockerExec+".start", containerName)
+	trackerStart.SetParentStep("exec.start")
+	trackerStart.SetContainerID(execID)
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerStart.SetOperationID(opID)
+	}
+	trackerStartCtx := WithStageTracker(ctx, trackerStart)
+	if err := verifyContextLeaseBeforeSocket(trackerStartCtx); err != nil {
+		trackerStart.RecordFailure(err)
+		return "", err
+	}
+
 	startPayload, _ := json.Marshal(map[string]interface{}{
 		"Detach": false,
 		"Tty":    false,
 	})
-	startURL := fmt.Sprintf("http://localhost/exec/%s/start", createResult.ID)
-	startReq, err := http.NewRequestWithContext(ctx, http.MethodPost, startURL, strings.NewReader(string(startPayload)))
+	startURL := fmt.Sprintf("http://localhost/exec/%s/start", url.PathEscape(execID))
+	startReq, err := http.NewRequestWithContext(trackerStart.BindHTTPTrace(trackerStartCtx), http.MethodPost, startURL, bytes.NewReader(startPayload))
 	if err != nil {
+		trackerStart.RecordFailure(err)
 		return "", err
 	}
 	startReq.Header.Set("Content-Type", "application/json")
 
 	startResp, err := client.Do(startReq)
 	if err != nil {
-		return "", err
+		trackerStart.RecordFailure(err)
+		if trackerStart.Category() == OutcomeDispatchedUnknown || (trackerStart.IsDispatched() && isAmbiguousExecutionError(err, trackerStartCtx.Err())) {
+			return "", fmt.Errorf("%w: docker exec start ambiguous (%v; attempt: %s)", ErrExecutionAmbiguous, err, trackerStart.AttemptID())
+		}
+		return "", fmt.Errorf("docker exec start failed: %w", err)
 	}
 	defer startResp.Body.Close()
 
-	outBytes, _ := io.ReadAll(startResp.Body)
+	startBody, rErr := io.ReadAll(startResp.Body)
+	if rErr != nil {
+		trackerStart.RecordResponse(startResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: reading exec start response failed: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerStart.RecordResponse(startResp.StatusCode, nil)
+
+	if startResp.StatusCode != http.StatusOK {
+		if trackerStart.Category() == OutcomeFailedConfirmed {
+			return "", fmt.Errorf("docker exec start failed (confirmed, status %d): %s", startResp.StatusCode, string(startBody))
+		}
+		return "", fmt.Errorf("%w: docker exec start returned status %d: %s", ErrExecutionAmbiguous, startResp.StatusCode, string(startBody))
+	}
+
 	log.Printf("[executor] docker exec %s in %s completed (status %d)", cmd, containerName, startResp.StatusCode)
-	return string(outBytes), nil
+	return string(startBody), nil
 }
 
 // ContainerInspectSafetyConfig decodes ALL runtime and security parameters from docker inspect.
@@ -3713,6 +3875,138 @@ type ContainerInspectSafetyConfig struct {
 }
 
 // executeVerifiedRollback performs the 5-stage real rollback and confirms container health:
+// Stage 1: Clean up failed candidate container if created (DELETE /containers/{containerName}?v=false&force=true).
+// Stage 2: Rename backup container back to original name (POST /containers/{backupName}/rename?name={containerName}).
+// Stage 3: Start original container (POST /containers/{containerName}/start).
+// Stage 4: Docker inspect verification (GET /containers/{containerName}/json, confirm Running == true).
+// Stage 5: Live health check probe.
+// executeSafeBackupRestore restores the renamed backup container back to its original name and starts it.
+// CRITICAL: It NEVER attempts to delete any container, ensuring the original container cannot be accidentally deleted.
+func (e *DefaultOperationExecutor) executeSafeBackupRestore(
+	ctx context.Context,
+	sockPath string,
+	containerName, backupName string,
+	triggerCause error,
+) error {
+	rbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Printf("[executor] initiating safe backup restore for %s (backup: %s, cause: %v)",
+		containerName, backupName, triggerCause)
+
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+			return e.dialDocker(dCtx, sockPath)
+		},
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	// Rename backup container back to original name (NEVER calls DELETE)
+	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", url.PathEscape(backupName), url.QueryEscape(containerName))
+	renameReq, err := http.NewRequestWithContext(rbCtx, http.MethodPost, renameURL, nil)
+	if err != nil {
+		return fmt.Errorf("backup restore failed to create rename request: %w (cause: %v)", err, triggerCause)
+	}
+	renameResp, err := client.Do(renameReq)
+	if err != nil || (renameResp != nil && renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK) {
+		status := 0
+		if renameResp != nil {
+			status = renameResp.StatusCode
+			_ = renameResp.Body.Close()
+		}
+		return fmt.Errorf("backup restore failed at rename (HTTP %d, err: %v); manual reconciliation required (cause: %v)", status, err, triggerCause)
+	}
+	if renameResp != nil {
+		_ = renameResp.Body.Close()
+	}
+
+	// Start original container
+	startURL := fmt.Sprintf("http://localhost/containers/%s/start", url.PathEscape(containerName))
+	startReq, err := http.NewRequestWithContext(rbCtx, http.MethodPost, startURL, nil)
+	if err != nil {
+		return fmt.Errorf("backup restore failed to create start request: %w (cause: %v)", err, triggerCause)
+	}
+	startResp, err := client.Do(startReq)
+	if err != nil || (startResp != nil && startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK && startResp.StatusCode != http.StatusNotModified) {
+		status := 0
+		if startResp != nil {
+			status = startResp.StatusCode
+			_ = startResp.Body.Close()
+		}
+		return fmt.Errorf("backup restore failed at start (HTTP %d, err: %v); manual reconciliation required (cause: %v)", status, err, triggerCause)
+	}
+	if startResp != nil {
+		_ = startResp.Body.Close()
+	}
+
+	// Verify Running state
+	inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(containerName))
+	insReq, err := http.NewRequestWithContext(rbCtx, http.MethodGet, inspectURL, nil)
+	if err != nil {
+		return fmt.Errorf("backup restore inspect request creation failed: %w", err)
+	}
+	insResp, err := client.Do(insReq)
+	if err != nil || insResp.StatusCode != http.StatusOK {
+		status := 0
+		if insResp != nil {
+			status = insResp.StatusCode
+			_ = insResp.Body.Close()
+		}
+		return fmt.Errorf("backup restore inspect failed (HTTP %d, err: %v); manual reconciliation required", status, err)
+	}
+	defer insResp.Body.Close()
+	var stateCheck struct {
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	if err := json.NewDecoder(insResp.Body).Decode(&stateCheck); err != nil || !stateCheck.State.Running {
+		return fmt.Errorf("restored original container is NOT running; manual reconciliation required")
+	}
+
+	log.Printf("[executor] safe backup restore completed successfully for %s", containerName)
+	return nil
+}
+
+// executeVerifiedCandidateRollback deletes the failed candidate container STRICTLY BY CONTAINER ID
+// (never by containerName), then restores and starts the backup container.
+func (e *DefaultOperationExecutor) executeVerifiedCandidateRollback(
+	ctx context.Context,
+	sockPath string,
+	containerName, backupName, candidateContainerID string,
+	triggerCause error,
+) error {
+	rbCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	log.Printf("[executor] initiating verified candidate rollback for %s (candidateID: %s, backup: %s, cause: %v)",
+		containerName, candidateContainerID, backupName, triggerCause)
+
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+			return e.dialDocker(dCtx, sockPath)
+		},
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+
+	// Clean up candidate container STRICTLY BY ID (never by containerName)
+	if candidateContainerID != "" && isValidDockerContainerID(candidateContainerID) {
+		delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(candidateContainerID))
+		delReq, _ := http.NewRequestWithContext(rbCtx, http.MethodDelete, delURL, nil)
+		if dResp, err := client.Do(delReq); err == nil {
+			_ = dResp.Body.Close()
+		}
+	}
+
+	// Restore backup
+	return e.executeSafeBackupRestore(ctx, sockPath, containerName, backupName, triggerCause)
+}
+
+// executeVerifiedRollback performs the 5-stage verified rollback and confirms container health:
 // Stage 1: Clean up failed candidate container if created (DELETE /containers/{containerName}?v=false&force=true).
 // Stage 2: Rename backup container back to original name (POST /containers/{backupName}/rename?name={containerName}).
 // Stage 3: Start original container (POST /containers/{containerName}/start).
@@ -3835,19 +4129,24 @@ func executeVerifiedRollback(
 
 // executeDockerSocketRecreate inspects existing container, backs it up via rename,
 // creates & starts new container with new image, validates health probe, and only removes
-// the backup container if the new container is healthy. If anything fails, it automatically
-// restores the original container via 5-stage verified rollback.
-func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, newImage string) (string, error) {
+// the backup container if the new container is healthy.
+// In R14.1: If STOP, RENAME, CREATE, or START fails ambiguously (dispatched + timeout/5xx/RST),
+// execution STOPS IMMEDIATELY without deleting any container or attempting blind rollback.
+func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, newImage string) (string, error) {
+	if sockPath == "" || !isDockerSocketAccessible(sockPath) {
+		return "", fmt.Errorf("docker socket not accessible: %s", sockPath)
+	}
+
 	tr := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+		DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+			return e.dialDocker(dCtx, sockPath)
 		},
 	}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 45 * time.Second}
 
-	// 1. Inspect existing container
+	// 0. Inspect existing container (Stage: recreate.inspect)
 	inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(containerName))
 	inspectReq, err := http.NewRequestWithContext(ctx, http.MethodGet, inspectURL, nil)
 	if err != nil {
@@ -3882,57 +4181,111 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		return "", fmt.Errorf("%w: cannot recreate container %s: image not specified and not found in container inspect", ErrInvalidSpec, containerName)
 	}
 
-	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+	// 1. Stop container (Stage: recreate.stop)
+	trackerStop := NewStageTracker("docker_socket", ActionDockerRecreate+".stop", containerName)
+	trackerStop.SetParentStep("recreate.stop")
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerStop.SetOperationID(opID)
+	}
+	trackerStopCtx := WithStageTracker(ctx, trackerStop)
+	if err := verifyContextLeaseBeforeSocket(trackerStopCtx); err != nil {
+		trackerStop.RecordFailure(err)
 		return "", err
 	}
-	// 2. Stop container
-	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=10", containerName)
-	stopReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, stopURL, nil)
+
+	stopURL := fmt.Sprintf("http://localhost/containers/%s/stop?t=10", url.PathEscape(containerName))
+	stopReq, err := http.NewRequestWithContext(trackerStop.BindHTTPTrace(trackerStopCtx), http.MethodPost, stopURL, nil)
+	if err != nil {
+		trackerStop.RecordFailure(err)
+		return "", err
+	}
 	stopResp, err := client.Do(stopReq)
-	if err == nil {
-		_ = stopResp.Body.Close()
+	if err != nil {
+		trackerStop.RecordFailure(err)
+		if trackerStop.Category() == OutcomeDispatchedUnknown || (trackerStop.IsDispatched() && isAmbiguousExecutionError(err, trackerStopCtx.Err())) {
+			return "", fmt.Errorf("%w: recreate stop container %s ambiguous (%v; attempt: %s)", ErrExecutionAmbiguous, containerName, err, trackerStop.AttemptID())
+		}
+		return "", fmt.Errorf("recreate stop container %s failed: %w", containerName, err)
+	}
+	defer stopResp.Body.Close()
+	stopBody, rErr := io.ReadAll(stopResp.Body)
+	if rErr != nil {
+		trackerStop.RecordResponse(stopResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: reading stop response failed: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerStop.RecordResponse(stopResp.StatusCode, nil)
+	if stopResp.StatusCode != http.StatusNoContent && stopResp.StatusCode != http.StatusOK && stopResp.StatusCode != http.StatusNotModified {
+		if trackerStop.Category() == OutcomeFailedConfirmed {
+			return "", fmt.Errorf("recreate stop container %s failed (confirmed, status %d): %s", containerName, stopResp.StatusCode, string(stopBody))
+		}
+		return "", fmt.Errorf("%w: recreate stop container %s returned %d: %s", ErrExecutionAmbiguous, containerName, stopResp.StatusCode, string(stopBody))
 	}
 
-	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+	// 2. Rename old container to backup (Stage: recreate.rename)
+	backupName := fmt.Sprintf("%s_bak_%d", containerName, time.Now().UnixNano())
+	trackerRename := NewStageTracker("docker_socket", ActionDockerRecreate+".rename", containerName)
+	trackerRename.SetParentStep("recreate.rename")
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerRename.SetOperationID(opID)
+	}
+	trackerRenameCtx := WithStageTracker(ctx, trackerRename)
+	if err := verifyContextLeaseBeforeSocket(trackerRenameCtx); err != nil {
+		trackerRename.RecordFailure(err)
 		return "", err
 	}
-	// 3. Rename old container to backup (Blue-Green safety)
-	backupName := fmt.Sprintf("%s_bak_%d", containerName, time.Now().UnixNano())
-	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", containerName, backupName)
-	renameReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, renameURL, nil)
+
+	renameURL := fmt.Sprintf("http://localhost/containers/%s/rename?name=%s", url.PathEscape(containerName), url.QueryEscape(backupName))
+	renameReq, err := http.NewRequestWithContext(trackerRename.BindHTTPTrace(trackerRenameCtx), http.MethodPost, renameURL, nil)
+	if err != nil {
+		trackerRename.RecordFailure(err)
+		return "", err
+	}
 	renameResp, err := client.Do(renameReq)
-	if err != nil || (renameResp != nil && renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK) {
-		status := 0
-		if renameResp != nil {
-			status = renameResp.StatusCode
-			_ = renameResp.Body.Close()
+	if err != nil {
+		trackerRename.RecordFailure(err)
+		// CRITICAL: If rename was dispatched and timed out/failed ambiguously,
+		// DO NOT restart containerName, DO NOT delete! We do not know whether rename succeeded on daemon!
+		if trackerRename.Category() == OutcomeDispatchedUnknown || (trackerRename.IsDispatched() && isAmbiguousExecutionError(err, trackerRenameCtx.Err())) {
+			return "", fmt.Errorf("%w: recreate rename container %s to %s ambiguous (%v; attempt: %s)", ErrExecutionAmbiguous, containerName, backupName, err, trackerRename.AttemptID())
 		}
-		// Attempt to restart original container if rename failed
-		startURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
-		startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
-		if sResp, sErr := client.Do(startReq); sErr == nil {
-			_ = sResp.Body.Close()
-		}
-		return "", fmt.Errorf("failed to rename container %s to backup %s (status %d): %v", containerName, backupName, status, err)
+		return "", fmt.Errorf("failed to rename container %s to backup %s: %w", containerName, backupName, err)
 	}
-	if renameResp != nil {
-		_ = renameResp.Body.Close()
+	defer renameResp.Body.Close()
+	renameBody, rErr := io.ReadAll(renameResp.Body)
+	if rErr != nil {
+		trackerRename.RecordResponse(renameResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: reading rename response failed: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerRename.RecordResponse(renameResp.StatusCode, nil)
+	if renameResp.StatusCode != http.StatusNoContent && renameResp.StatusCode != http.StatusOK {
+		if trackerRename.Category() == OutcomeFailedConfirmed {
+			// Rename confirmed failed (e.g. 400 or 404). Original container still named containerName.
+			startOrigURL := fmt.Sprintf("http://localhost/containers/%s/start", url.PathEscape(containerName))
+			sReq, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, startOrigURL, nil)
+			if sResp, sErr := client.Do(sReq); sErr == nil {
+				_ = sResp.Body.Close()
+			}
+			return "", fmt.Errorf("recreate rename container %s to %s failed (confirmed, status %d): %s", containerName, backupName, renameResp.StatusCode, string(renameBody))
+		}
+		return "", fmt.Errorf("%w: recreate rename container %s returned %d: %s", ErrExecutionAmbiguous, containerName, renameResp.StatusCode, string(renameBody))
 	}
 
-	// Helper for 5-stage verified atomic restoration of backup container
-	restoreOriginal := func(cause error) (string, error) {
-		log.Printf("[executor] recreate failed (%v), restoring original container %s from %s", cause, containerName, backupName)
-		rbErr := executeVerifiedRollback(ctx, client, containerName, backupName, nil, containerName, cause)
+	// 3. Create container with new image (Stage: recreate.create)
+	trackerCreate := NewStageTracker("docker_socket", ActionDockerRecreate+".create", containerName)
+	trackerCreate.SetParentStep("recreate.create")
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerCreate.SetOperationID(opID)
+	}
+	trackerCreateCtx := WithStageTracker(ctx, trackerCreate)
+	if err := verifyContextLeaseBeforeSocket(trackerCreateCtx); err != nil {
+		trackerCreate.RecordFailure(err)
+		rbErr := e.executeSafeBackupRestore(context.Background(), sockPath, containerName, backupName, err)
 		if rbErr != nil {
-			return "", fmt.Errorf("recreate container %s failed and 5-stage rollback failed (%v): %w", containerName, rbErr, cause)
+			return "", fmt.Errorf("recreate aborted before create (%v) and backup restore failed: %w", err, rbErr)
 		}
-		return "", fmt.Errorf("recreate container %s failed and original container was restored (5-stage verified rollback): %w", containerName, cause)
+		return "", fmt.Errorf("recreate aborted before create due to lease guard: %w", err)
 	}
 
-	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
-		return restoreOriginal(fmt.Errorf("recreate aborted before container create due to lease guard: %w", err))
-	}
-	// 4. Create container with new image preserving full security and runtime configurations
 	createPayload := map[string]interface{}{
 		"Image":        targetImage,
 		"User":         inspectData.Config.User, // Non-root user strictly preserved!
@@ -3953,67 +4306,199 @@ func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, n
 		}
 	}
 	createBytes, _ := json.Marshal(createPayload)
-	createURL := fmt.Sprintf("http://localhost/containers/create?name=%s", containerName)
-	createReq, err := http.NewRequestWithContext(ctx, http.MethodPost, createURL, bytes.NewReader(createBytes))
+	createURL := fmt.Sprintf("http://localhost/containers/create?name=%s", url.PathEscape(containerName))
+	createReq, err := http.NewRequestWithContext(trackerCreate.BindHTTPTrace(trackerCreateCtx), http.MethodPost, createURL, bytes.NewReader(createBytes))
 	if err != nil {
-		return restoreOriginal(err)
+		trackerCreate.RecordFailure(err)
+		return "", err
 	}
 	createReq.Header.Set("Content-Type", "application/json")
 	createResp, err := client.Do(createReq)
 	if err != nil {
-		return restoreOriginal(fmt.Errorf("failed to create container %s with image %s: %w", containerName, targetImage, err))
+		trackerCreate.RecordFailure(err)
+		// CRITICAL SEV-0 GUARD:
+		// If CREATE is dispatched and times out/errors ambiguously (5xx, RST, EOF):
+		// WE DO NOT KNOW IF THE CANDIDATE CONTAINER WAS CREATED!
+		// DO NOT CALL restoreOriginal! DO NOT CALL DELETE!
+		// Return ErrExecutionAmbiguous directly!
+		if trackerCreate.Category() == OutcomeDispatchedUnknown || (trackerCreate.IsDispatched() && isAmbiguousExecutionError(err, trackerCreateCtx.Err())) {
+			return "", fmt.Errorf("%w: recreate container create ambiguous for %s (%v; attempt: %s)", ErrExecutionAmbiguous, containerName, err, trackerCreate.AttemptID())
+		}
+		// If request was never dispatched:
+		rbErr := e.executeSafeBackupRestore(context.Background(), sockPath, containerName, backupName, err)
+		if rbErr != nil {
+			return "", fmt.Errorf("recreate create failed (%v) and backup restore failed: %w", err, rbErr)
+		}
+		return "", fmt.Errorf("failed to create container %s: %w", containerName, err)
 	}
 	defer createResp.Body.Close()
+	createBody, rErr := io.ReadAll(createResp.Body)
+	if rErr != nil {
+		trackerCreate.RecordResponse(createResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: reading container create response failed: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerCreate.RecordResponse(createResp.StatusCode, nil)
+
 	if createResp.StatusCode != http.StatusCreated && createResp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(createResp.Body)
-		return restoreOriginal(fmt.Errorf("create container %s returned %d: %s", containerName, createResp.StatusCode, string(b)))
+		if trackerCreate.Category() == OutcomeFailedConfirmed {
+			// Confirmed failure (400, 404, etc.): Candidate container DEFINITELY DOES NOT EXIST.
+			// Safe to restore backupName -> containerName. NO DELETE call.
+			rbErr := e.executeSafeBackupRestore(context.Background(), sockPath, containerName, backupName, fmt.Errorf("create returned %d: %s", createResp.StatusCode, string(createBody)))
+			if rbErr != nil {
+				return "", fmt.Errorf("create container %s failed (status %d) and backup restore failed (%v): %s", containerName, createResp.StatusCode, rbErr, string(createBody))
+			}
+			return "", fmt.Errorf("create container %s failed (status %d): %s (original container restored)", containerName, createResp.StatusCode, string(createBody))
+		}
+		// 5xx or other non-4xx status: Ambiguous outcome!
+		return "", fmt.Errorf("%w: create container %s returned ambiguous status %d: %s", ErrExecutionAmbiguous, containerName, createResp.StatusCode, string(createBody))
 	}
 
-	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
-		return restoreOriginal(fmt.Errorf("recreate aborted before container start due to lease guard: %w", err))
+	var createData struct {
+		ID string `json:"Id"`
 	}
-	// 5. Start container
-	startURL := fmt.Sprintf("http://localhost/containers/%s/start", containerName)
-	startReq, _ := http.NewRequestWithContext(ctx, http.MethodPost, startURL, nil)
+	if err := json.Unmarshal(createBody, &createData); err != nil || createData.ID == "" {
+		return "", fmt.Errorf("%w: invalid container id in create response: %s", ErrExecutionAmbiguous, string(createBody))
+	}
+	candidateContainerID := createData.ID
+
+	// 4. Start new container (Stage: recreate.start)
+	trackerStart := NewStageTracker("docker_socket", ActionDockerRecreate+".start", containerName)
+	trackerStart.SetParentStep("recreate.start")
+	trackerStart.SetContainerID(candidateContainerID)
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerStart.SetOperationID(opID)
+	}
+	trackerStartCtx := WithStageTracker(ctx, trackerStart)
+	if err := verifyContextLeaseBeforeSocket(trackerStartCtx); err != nil {
+		trackerStart.RecordFailure(err)
+		rbErr := e.executeVerifiedCandidateRollback(context.Background(), sockPath, containerName, backupName, candidateContainerID, err)
+		if rbErr != nil {
+			return "", fmt.Errorf("recreate start aborted by lease guard (%v) and rollback failed: %w", err, rbErr)
+		}
+		return "", fmt.Errorf("recreate aborted before container start due to lease guard: %w", err)
+	}
+
+	startURL := fmt.Sprintf("http://localhost/containers/%s/start", url.PathEscape(candidateContainerID))
+	startReq, err := http.NewRequestWithContext(trackerStart.BindHTTPTrace(trackerStartCtx), http.MethodPost, startURL, nil)
+	if err != nil {
+		trackerStart.RecordFailure(err)
+		return "", err
+	}
 	startResp, err := client.Do(startReq)
 	if err != nil {
-		return restoreOriginal(fmt.Errorf("failed to start recreated container %s: %w", containerName, err))
+		trackerStart.RecordFailure(err)
+		// If start was dispatched and produced ambiguous outcome (timeout/500/RST):
+		// DO NOT delete candidate! Candidate may be halfway through starting.
+		// DO NOT roll back! Return ErrExecutionAmbiguous!
+		if trackerStart.Category() == OutcomeDispatchedUnknown || (trackerStart.IsDispatched() && isAmbiguousExecutionError(err, trackerStartCtx.Err())) {
+			return "", fmt.Errorf("%w: recreate container start ambiguous for %s (%v; attempt: %s)", ErrExecutionAmbiguous, containerName, err, trackerStart.AttemptID())
+		}
+		// If definitely not dispatched:
+		rbErr := e.executeVerifiedCandidateRollback(context.Background(), sockPath, containerName, backupName, candidateContainerID, err)
+		if rbErr != nil {
+			return "", fmt.Errorf("recreate start failed (%v) and candidate rollback failed: %w", err, rbErr)
+		}
+		return "", fmt.Errorf("failed to start recreated container %s: %w", containerName, err)
 	}
 	defer startResp.Body.Close()
+	startBody, rErr := io.ReadAll(startResp.Body)
+	if rErr != nil {
+		trackerStart.RecordResponse(startResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: reading container start response failed: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerStart.RecordResponse(startResp.StatusCode, nil)
+
 	if startResp.StatusCode != http.StatusNoContent && startResp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(startResp.Body)
-		return restoreOriginal(fmt.Errorf("start container %s returned %d: %s", containerName, startResp.StatusCode, string(b)))
+		if trackerStart.Category() == OutcomeFailedConfirmed {
+			// Confirmed failure starting candidate (e.g. entrypoint error 400).
+			// Safe to delete candidate BY ID, then restore backup container.
+			rbErr := e.executeVerifiedCandidateRollback(context.Background(), sockPath, containerName, backupName, candidateContainerID, fmt.Errorf("start returned %d: %s", startResp.StatusCode, string(startBody)))
+			if rbErr != nil {
+				return "", fmt.Errorf("start container %s failed (status %d) and rollback failed (%v): %s", containerName, startResp.StatusCode, rbErr, string(startBody))
+			}
+			return "", fmt.Errorf("start container %s failed (status %d): %s (original container restored)", containerName, startResp.StatusCode, string(startBody))
+		}
+		// Ambiguous start error:
+		return "", fmt.Errorf("%w: start container %s returned ambiguous status %d: %s", ErrExecutionAmbiguous, containerName, startResp.StatusCode, string(startBody))
 	}
 
-	// 6. Smoke probe / Running state verification
-	verifyInspectURL := fmt.Sprintf("http://localhost/containers/%s/json", containerName)
-	vReq, _ := http.NewRequestWithContext(ctx, http.MethodGet, verifyInspectURL, nil)
+	// 5. Smoke probe / Running state verification (Stage: recreate.verify)
+	trackerVerify := NewStageTracker("docker_socket", ActionDockerRecreate+".verify", containerName)
+	trackerVerify.SetParentStep("recreate.verify")
+	trackerVerify.SetContainerID(candidateContainerID)
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		trackerVerify.SetOperationID(opID)
+	}
+	trackerVerifyCtx := WithStageTracker(ctx, trackerVerify)
+
+	verifyInspectURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(candidateContainerID))
+	vReq, _ := http.NewRequestWithContext(trackerVerify.BindHTTPTrace(trackerVerifyCtx), http.MethodGet, verifyInspectURL, nil)
 	vResp, err := client.Do(vReq)
 	if err != nil {
-		return restoreOriginal(fmt.Errorf("failed to verify new container status: %w", err))
+		trackerVerify.RecordFailure(err)
+		return "", fmt.Errorf("%w: failed to verify new container status: %v", ErrExecutionAmbiguous, err)
 	}
 	defer vResp.Body.Close()
+	vBody, rErr := io.ReadAll(vResp.Body)
+	if rErr != nil {
+		trackerVerify.RecordResponse(vResp.StatusCode, rErr)
+		return "", fmt.Errorf("%w: failed reading inspect verification response: %v", ErrExecutionAmbiguous, rErr)
+	}
+	trackerVerify.RecordResponse(vResp.StatusCode, nil)
+	if vResp.StatusCode != http.StatusOK {
+		// Non-200 response on verification inspect (e.g. 500, 502, 503):
+		// MUST NOT trigger rollback or DELETE candidate! The container was already started in Stage 4!
+		return "", fmt.Errorf("%w: verify inspect container %s (%s) returned non-200 status %d: %s", ErrExecutionAmbiguous, containerName, candidateContainerID, vResp.StatusCode, string(vBody))
+	}
 	var vData struct {
 		State struct {
 			Running bool   `json:"Running"`
 			Status  string `json:"Status"`
 		} `json:"State"`
 	}
-	if err := json.NewDecoder(vResp.Body).Decode(&vData); err != nil || !vData.State.Running {
-		return restoreOriginal(fmt.Errorf("new container %s is not running (status: %s)", containerName, vData.State.Status))
+	if err := json.Unmarshal(vBody, &vData); err != nil {
+		return "", fmt.Errorf("%w: failed to decode inspect verification: %v", ErrExecutionAmbiguous, err)
+	}
+	if !vData.State.Running {
+		rbErr := e.executeVerifiedCandidateRollback(context.Background(), sockPath, containerName, backupName, candidateContainerID, fmt.Errorf("container not running (status: %s)", vData.State.Status))
+		if rbErr != nil {
+			return "", fmt.Errorf("recreated container %s is not running (%s) and rollback failed: %w", containerName, vData.State.Status, rbErr)
+		}
+		return "", fmt.Errorf("recreated container %s is not running (status: %s; original container restored)", containerName, vData.State.Status)
 	}
 
+	// 6. Success! New container is verified running. Remove old backup container. (Stage: recreate.remove_backup)
 	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
-		return "", fmt.Errorf("new container healthy, skipped backup cleanup because lease expired: %w", err)
+		return fmt.Sprintf("container %s recreated successfully with image %s (backup %s kept due to lease expiry)", containerName, targetImage, backupName), nil
 	}
-	// 7. Success! New container is verified running. Remove old backup container.
-	delBackupURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", backupName)
+	delBackupURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(backupName))
 	delBackupReq, _ := http.NewRequestWithContext(context.Background(), http.MethodDelete, delBackupURL, nil)
 	if dBResp, dBErr := client.Do(delBackupReq); dBErr == nil {
 		_ = dBResp.Body.Close()
 	}
 
 	return fmt.Sprintf("container %s recreated successfully with image %s", containerName, targetImage), nil
+}
+
+// executeDockerSocketRecreate is a package-level helper that invokes DefaultOperationExecutor.executeDockerSocketRecreate.
+func executeDockerSocketRecreate(ctx context.Context, sockPath, containerName, newImage string) (string, error) {
+	exec := NewOperationExecutor(nil, nil, nil, nil, WithDockerSocket(sockPath))
+	return exec.executeDockerSocketRecreate(ctx, sockPath, containerName, newImage)
+}
+
+func executeDockerSocketRestart(ctx context.Context, sockPath, containerName string, tracker *StageTracker) error {
+	exec := NewOperationExecutor(nil, nil, nil, nil, WithDockerSocket(sockPath))
+	return exec.executeDockerSocketRestart(ctx, sockPath, containerName, tracker)
+}
+
+func executeDockerSocketExec(ctx context.Context, sockPath, containerName string, cmd []string) error {
+	exec := NewOperationExecutor(nil, nil, nil, nil, WithDockerSocket(sockPath))
+	return exec.executeDockerSocketExec(ctx, sockPath, containerName, cmd)
+}
+
+func executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName string, cmd []string) (string, error) {
+	exec := NewOperationExecutor(nil, nil, nil, nil, WithDockerSocket(sockPath))
+	return exec.executeDockerSocketExecOutput(ctx, sockPath, containerName, cmd)
 }
 
 // ReconcileStartupProposals inspects proposals left in non-terminal transient states

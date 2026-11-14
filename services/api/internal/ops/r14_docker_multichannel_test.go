@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -140,6 +139,9 @@ func (s *LowLevelFaultServer) handleConn(c net.Conn) {
 
 // TestR14_DockerRestart_NoCrossChannelRetry verifies that when Docker socket encounters
 // an ambiguous failure (timeout, RST, 500), 1Panel is NEVER called, and the operation fails closed.
+// This test directly exercises DefaultOperationExecutor.Execute() through the full pipeline
+// and verifies that the Docker socket was called exactly once, 1Panel was called 0 times,
+// and HostFallback was called 0 times.
 func TestR14_DockerRestart_NoCrossChannelRetry(t *testing.T) {
 	t.Parallel()
 
@@ -172,6 +174,12 @@ func TestR14_DockerRestart_NoCrossChannelRetry(t *testing.T) {
 			fault:         LLFaultHTTP404,
 			expectUnknown: false,
 			expectErr:     "not found",
+		},
+		{
+			name:          "DockerSocket_HTTP204Success_NeverCalls1Panel",
+			fault:         LLFaultHTTP204Success,
+			expectUnknown: false,
+			expectErr:     "",
 		},
 	}
 
@@ -213,68 +221,81 @@ func TestR14_DockerRestart_NoCrossChannelRetry(t *testing.T) {
 			onePanelClient.lastLoginAt = time.Now()
 			onePanelClient.loginTTL = time.Hour
 
+			// 3. Setup DefaultOperationExecutor with real pipeline integration
 			exec := NewOperationExecutor(
 				db,
 				eventbus.New(),
 				onePanelClient,
 				nil,
 				WithDockerSocket(sockPath),
+				WithDockerDialContext(func(dCtx context.Context, _, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(dCtx, "tcp", dockerFaultServer.addr)
+				}),
+				WithHealthChecker(func(ctx context.Context, target string) error {
+					return nil
+				}),
 			)
 
-			// Redirect dial to our low-level TCP fault server using StageTracker
+			// 4. Execute the operation through the authoritative Execute() pipeline
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
 
-			tracker := NewStageTracker("docker_socket", ActionDockerRestart, "home-frigate")
-			trackerCtx := WithStageTracker(ctx, tracker)
+			res, err := exec.Execute(ctx, OperationSpec{
+				Action: ActionDockerRestart,
+				Target: ComponentFrigate,
+			})
 
-			// Test executeDockerSocketRestart directly with TCP loopback connection
-			tr := &http.Transport{
-				DisableKeepAlives: true,
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					tracker.MarkStage(StageDialing)
-					conn, err := net.Dial("tcp", dockerFaultServer.addr)
-					if err != nil {
-						tracker.RecordFailure(err)
-						return nil, err
-					}
-					tracker.MarkStage(StageConnected)
-					return conn, nil
-				},
-			}
-			client := &http.Client{Transport: tr, Timeout: 1 * time.Second}
-
-			reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", "home-frigate")
-			req, err := http.NewRequestWithContext(tracker.BindHTTPTrace(trackerCtx), http.MethodPost, reqURL, nil)
-			if err != nil {
-				t.Fatalf("failed to create request: %v", err)
-			}
-			resp, dErr := client.Do(req)
-			if dErr != nil {
-				tracker.RecordFailure(dErr)
-			} else {
-				defer resp.Body.Close()
-				b, _ := io.ReadAll(resp.Body)
-				tracker.RecordResponse(resp.StatusCode, nil)
-				if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent {
-					dErr = fmt.Errorf("docker restart status %d: %s", resp.StatusCode, string(b))
-				}
+			// 5. Strict verification of channel call counts
+			dockerCalls := dockerFaultServer.reqCount.Load()
+			if dockerCalls != 1 {
+				t.Fatalf("expected exactly 1 call to Docker Socket, got: %d", dockerCalls)
 			}
 
-			// Assert Docker Socket stage tracking outcome
+			onePanelCalls := onePanelRestartCalls.Load()
+			if onePanelCalls != 0 {
+				t.Fatalf("CRITICAL SECURITY VIOLATION: 1Panel was called %d times during Docker socket operation!", onePanelCalls)
+			}
+
+			// 6. Outcome and error verification
 			if tc.expectUnknown {
-				if !tracker.IsDispatched() {
-					t.Fatalf("expected tracker to mark request as dispatched, got stage: %s", tracker.Stage())
+				if err == nil {
+					t.Fatalf("expected error for ambiguous failure, got nil")
 				}
-				if tracker.Category() != OutcomeDispatchedUnknown {
-					t.Fatalf("expected OutcomeDispatchedUnknown, got: %s", tracker.Category())
+				if !errors.Is(err, ErrExecutionAmbiguous) {
+					t.Fatalf("expected ErrExecutionAmbiguous, got: %v", err)
 				}
-			}
-
-			// Verify that if ambiguous error occurred, 1Panel was never called
-			_ = exec
-			if calls := onePanelRestartCalls.Load(); calls != 0 {
-				t.Fatalf("CRITICAL SECURITY VIOLATION: 1Panel was called %d times during Docker socket ambiguous failure!", calls)
+				if res == nil {
+					t.Fatalf("expected non-nil ExecutionResult")
+				}
+				if res.Outcome != OutcomeDispatchedUnknown {
+					t.Fatalf("expected OutcomeDispatchedUnknown, got: %s", res.Outcome)
+				}
+			} else if tc.fault == LLFaultHTTP404 {
+				if err == nil {
+					t.Fatalf("expected 404 error, got nil")
+				}
+				if errors.Is(err, ErrExecutionAmbiguous) {
+					t.Fatalf("confirmed 404 must NOT be classified as ErrExecutionAmbiguous, got: %v", err)
+				}
+				if !strings.Contains(strings.ToLower(err.Error()), "not found") && !strings.Contains(err.Error(), "404") {
+					t.Fatalf("expected not found error message, got: %v", err)
+				}
+				if res == nil {
+					t.Fatalf("expected non-nil ExecutionResult")
+				}
+				if res.Outcome != OutcomeFailedConfirmed {
+					t.Fatalf("expected OutcomeFailedConfirmed, got: %s", res.Outcome)
+				}
+			} else if tc.fault == LLFaultHTTP204Success {
+				if err != nil {
+					t.Fatalf("expected success, got error: %v", err)
+				}
+				if res == nil || !res.Success {
+					t.Fatalf("expected successful ExecutionResult, got: %v", res)
+				}
+				if res.Outcome != OutcomeExecuted {
+					t.Fatalf("expected OutcomeExecuted, got: %s", res.Outcome)
+				}
 			}
 		})
 	}
@@ -681,6 +702,560 @@ func TestR14_HostFallback_EnforcesComponentWhitelist(t *testing.T) {
 	}
 	if !errors.Is(err, ErrComponentNotWhitelisted) {
 		t.Fatalf("expected ErrComponentNotWhitelisted, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// R14.1 Comprehensive Adversarial & Multi-Stage Tests
+// ---------------------------------------------------------------------------
+
+type mockDockerRecorder struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (r *mockDockerRecorder) log(call string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, call)
+}
+
+func (r *mockDockerRecorder) getCalls() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	res := make([]string, len(r.calls))
+	copy(res, r.calls)
+	return res
+}
+
+func (r *mockDockerRecorder) countPrefix(prefix string) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := 0
+	for _, call := range r.calls {
+		if strings.HasPrefix(call, prefix) {
+			c++
+		}
+	}
+	return c
+}
+
+// standardInspectResponse returns a valid container inspect JSON payload for home-frigate.
+func standardInspectResponse() []byte {
+	return []byte(`{
+		"Id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		"Name": "/home-frigate",
+		"Config": {
+			"Image": "ghcr.io/blakeblackshear/frigate:0.14.1",
+			"User": "1000:1000",
+			"Env": ["FRIGATE_RTSP_PASSWORD=secret"],
+			"Cmd": ["frigate"]
+		},
+		"HostConfig": {
+			"Privileged": false,
+			"RestartPolicy": {"Name": "unless-stopped"}
+		},
+		"State": {
+			"Running": true,
+			"Status": "running"
+		}
+	}`)
+}
+
+// TestR141_DockerRecreate_StopAmbiguous_HaltsWithoutRollbackOrDelete verifies that when
+// STOP produces an ambiguous timeout/500, recreate halts immediately without deleting
+// or modifying the original container.
+func TestR141_DockerRecreate_StopAmbiguous_HaltsWithoutRollbackOrDelete(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	recorder := &mockDockerRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.log(fmt.Sprintf("%s %s", r.Method, r.URL.RequestURI()))
+		path := r.URL.Path
+
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "/json"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(standardInspectResponse())
+		case r.Method == http.MethodPost && strings.Contains(path, "/stop"):
+			// Simulate ambiguous 500 on stop
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"daemon timeout stopping container"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerRecreate,
+		Target: ComponentFrigate,
+		Params: map[string]interface{}{"image": "ghcr.io/blakeblackshear/frigate:0.14.2"},
+	})
+
+	if err == nil || !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected ErrExecutionAmbiguous, got: %v", err)
+	}
+	if res == nil || res.Outcome != OutcomeDispatchedUnknown {
+		t.Fatalf("expected res.Outcome == OutcomeDispatchedUnknown, got: %v", res)
+	}
+
+	// CRITICAL ASSERTION: Zero DELETE calls, zero rename calls, zero create calls
+	if c := recorder.countPrefix("DELETE"); c != 0 {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: DELETE called %d times on stop failure!", c)
+	}
+	if c := recorder.countPrefix("POST /containers/create"); c != 0 {
+		t.Fatalf("create called %d times after stop failed!", c)
+	}
+}
+
+// TestR141_DockerRecreate_CreateAmbiguous_HaltsWithoutRollbackOrDelete verifies that when
+// CREATE produces an ambiguous 500, recreate STOPS IMMEDIATELY and DOES NOT call restoreOriginal
+// or DELETE /containers/home-frigate (preventing the SEV-0 original container deletion).
+func TestR141_DockerRecreate_CreateAmbiguous_HaltsWithoutRollbackOrDelete(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	recorder := &mockDockerRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.log(fmt.Sprintf("%s %s", r.Method, r.URL.RequestURI()))
+		path := r.URL.Path
+
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "/json"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(standardInspectResponse())
+		case r.Method == http.MethodPost && strings.Contains(path, "/stop"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/containers/create"):
+			// Simulate ambiguous 500 during create
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"docker daemon I/O error during create"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerRecreate,
+		Target: ComponentFrigate,
+		Params: map[string]interface{}{"image": "ghcr.io/blakeblackshear/frigate:0.14.2"},
+	})
+
+	if err == nil || !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected ErrExecutionAmbiguous on ambiguous create, got: %v", err)
+	}
+	if res == nil || res.Outcome != OutcomeDispatchedUnknown {
+		t.Fatalf("expected OutcomeDispatchedUnknown, got: %v", res)
+	}
+
+	// CRITICAL SEV-0 PREVENTION ASSERTION:
+	// Absolutely ZERO DELETE calls must be made!
+	if c := recorder.countPrefix("DELETE"); c != 0 {
+		t.Fatalf("SEV-0 VULNERABILITY DETECTED: DELETE was called %d times on ambiguous create! Calls: %v", c, recorder.getCalls())
+	}
+}
+
+// TestR141_DockerRecreate_CreateConfirmedFailure_SafeBackupRestoreWithoutDelete verifies that when
+// CREATE fails with a confirmed 400 Bad Request, the system safely restores the backup container
+// (renaming backup back to original and starting it) without ever calling DELETE.
+func TestR141_DockerRecreate_CreateConfirmedFailure_SafeBackupRestoreWithoutDelete(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	recorder := &mockDockerRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.log(fmt.Sprintf("%s %s", r.Method, r.URL.RequestURI()))
+		path := r.URL.Path
+
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "/json"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(standardInspectResponse())
+		case r.Method == http.MethodPost && strings.Contains(path, "/stop"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/containers/create"):
+			// Confirmed 400 failure (invalid spec)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"message":"invalid parameter in container configuration"}`))
+		case r.Method == http.MethodPost && strings.Contains(path, "/start"):
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerRecreate,
+		Target: ComponentFrigate,
+		Params: map[string]interface{}{"image": "ghcr.io/blakeblackshear/frigate:0.14.2"},
+	})
+
+	if err == nil {
+		t.Fatalf("expected error on confirmed create failure, got nil")
+	}
+	if errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("confirmed failure must not be classified as ErrExecutionAmbiguous")
+	}
+	if res == nil || res.Outcome != OutcomeFailedConfirmed {
+		t.Fatalf("expected res.Outcome == OutcomeFailedConfirmed, got: %v", res)
+	}
+
+	calls := recorder.getCalls()
+	hasRenameToBak := false
+	hasRenameBack := false
+	hasOrigRestart := false
+	hasDelete := false
+
+	for _, call := range calls {
+		if strings.Contains(call, "POST /containers/home-frigate/rename?name=home-frigate_bak_") {
+			hasRenameToBak = true
+		}
+		if strings.Contains(call, "POST /containers/home-frigate_bak_") && strings.Contains(call, "rename?name=home-frigate") {
+			hasRenameBack = true
+		}
+		if strings.Contains(call, "POST /containers/home-frigate/start") {
+			hasOrigRestart = true
+		}
+		if strings.HasPrefix(call, "DELETE") {
+			hasDelete = true
+		}
+	}
+
+	if !hasRenameToBak {
+		t.Fatalf("expected container to be renamed to backup, calls: %v", calls)
+	}
+	if !hasRenameBack {
+		t.Fatalf("expected backup container to be restored via rename back, calls: %v", calls)
+	}
+	if !hasOrigRestart {
+		t.Fatalf("expected original container to be restarted, calls: %v", calls)
+	}
+	if hasDelete {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: DELETE was called during safe backup restore! Calls: %v", calls)
+	}
+}
+
+// TestR141_DockerRecreate_StartConfirmedFailure_DeletesCandidateByIDAndRestoresBackup verifies that when
+// START returns a confirmed 400 failure, the candidate container is deleted STRICTLY BY ID (not by name),
+// and the backup container is restored safely.
+func TestR141_DockerRecreate_StartConfirmedFailure_DeletesCandidateByIDAndRestoresBackup(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	candidateID := "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+	recorder := &mockDockerRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.log(fmt.Sprintf("%s %s", r.Method, r.URL.RequestURI()))
+		path := r.URL.Path
+
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "/json"):
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(standardInspectResponse())
+		case r.Method == http.MethodPost && strings.Contains(path, "/stop"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/containers/create"):
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Warnings":[]}`, candidateID)))
+		case r.Method == http.MethodPost && strings.Contains(path, "/start"):
+			// Confirmed start failure
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"message":"entrypoint binary not found"}`))
+		case r.Method == http.MethodDelete && strings.Contains(path, candidateID):
+			// Candidate cleanup by ID
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerRecreate,
+		Target: ComponentFrigate,
+		Params: map[string]interface{}{"image": "ghcr.io/blakeblackshear/frigate:0.14.2"},
+	})
+
+	if err == nil {
+		t.Fatalf("expected error on start failure, got nil")
+	}
+	if res == nil || res.Outcome != OutcomeFailedConfirmed {
+		t.Fatalf("expected OutcomeFailedConfirmed, got: %v", res)
+	}
+
+	calls := recorder.getCalls()
+	hasCandidateDeleteByID := false
+	hasBlindDeleteByName := false
+
+	for _, call := range calls {
+		if strings.HasPrefix(call, "DELETE") {
+			if strings.Contains(call, candidateID) {
+				hasCandidateDeleteByID = true
+			}
+			if strings.Contains(call, "/containers/home-frigate?") || strings.Contains(call, "/containers/home-frigate ") {
+				hasBlindDeleteByName = true
+			}
+		}
+	}
+
+	if !hasCandidateDeleteByID {
+		t.Fatalf("expected candidate container to be deleted by ID %s, calls: %v", candidateID, calls)
+	}
+	if hasBlindDeleteByName {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: container deleted by name /home-frigate! Calls: %v", calls)
+	}
+}
+
+// TestR141_DockerRecreate_VerifyInspect500_HaltsWithoutCandidateDelete verifies that when
+// Stage 5 verify inspect returns a 500 error from Docker daemon, the candidate container
+// that was successfully started is NOT deleted, preventing the BLOCKER-1 SEV-0 bug.
+func TestR141_DockerRecreate_VerifyInspect500_HaltsWithoutCandidateDelete(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	candidateID := "cafebabecafebabecafebabecafebabecafebabecafebabecafebabecafebabe"
+	recorder := &mockDockerRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.log(fmt.Sprintf("%s %s", r.Method, r.URL.RequestURI()))
+		path := r.URL.Path
+
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(path, "/json"):
+			if strings.Contains(path, candidateID) {
+				// Stage 5 verify inspect returns 500 internal server error
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte(`{"message":"docker daemon transient error on inspect"}`))
+				return
+			}
+			// Stage 0 inspect of original container succeeds
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(standardInspectResponse())
+		case r.Method == http.MethodPost && strings.Contains(path, "/stop"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/rename"):
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && strings.Contains(path, "/containers/create"):
+			w.WriteHeader(http.StatusCreated)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"Id":%q,"Warnings":[]}`, candidateID)))
+		case r.Method == http.MethodPost && strings.Contains(path, "/start"):
+			// Start succeeds
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerRecreate,
+		Target: ComponentFrigate,
+		Params: map[string]interface{}{"image": "ghcr.io/blakeblackshear/frigate:0.14.2"},
+	})
+
+	if err == nil || !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected ErrExecutionAmbiguous on verify inspect 500, got: %v", err)
+	}
+	if res == nil || res.Outcome != OutcomeDispatchedUnknown {
+		t.Fatalf("expected OutcomeDispatchedUnknown, got: %v", res)
+	}
+
+	// CRITICAL SEV-0 PREVENTION ASSERTION:
+	// Candidate container was started. When inspect returned 500, candidate container must NOT be deleted!
+	if c := recorder.countPrefix("DELETE"); c != 0 {
+		t.Fatalf("CRITICAL BLOCKER REGRESSION: DELETE was called %d times on verify inspect 500! Calls: %v", c, recorder.getCalls())
+	}
+}
+
+// TestR141_DockerExec_CreateAmbiguous_HaltsWithoutExecStart verifies that when exec.create
+// encounters an ambiguous timeout/500, exec.start is NEVER called.
+func TestR141_DockerExec_CreateAmbiguous_HaltsWithoutExecStart(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	recorder := &mockDockerRecorder{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder.log(fmt.Sprintf("%s %s", r.Method, r.URL.RequestURI()))
+		path := r.URL.Path
+
+		switch {
+		case strings.Contains(path, "/exec") && r.Method == http.MethodPost && !strings.Contains(path, "/start"):
+			// Simulate ambiguous 500 on exec create
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"exec create daemon error"}`))
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionDockerExec,
+		Target: ComponentFrigate,
+		Params: map[string]interface{}{"command": []string{"python3", "-m", "frigate", "--validate-config"}},
+	})
+
+	if err == nil || !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected ErrExecutionAmbiguous, got: %v", err)
+	}
+	if res == nil || res.Outcome != OutcomeDispatchedUnknown {
+		t.Fatalf("expected OutcomeDispatchedUnknown, got: %v", res)
+	}
+
+	if c := recorder.countPrefix("POST /exec/"); c != 0 {
+		t.Fatalf("CRITICAL: exec.start was called %d times after exec.create failed! Calls: %v", c, recorder.getCalls())
+	}
+}
+
+// TestR141_CachePurge_BuilderPrune_AmbiguousHalts verifies that builder cache purge
+// correctly tracks ambiguous failures and sets OutcomeDispatchedUnknown.
+func TestR141_CachePurge_BuilderPrune_AmbiguousHalts(t *testing.T) {
+	t.Parallel()
+	db := setupR14TestDB(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/build/prune") {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"message":"builder prune daemon error"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	exec := NewOperationExecutor(
+		db,
+		eventbus.New(),
+		nil,
+		nil,
+		WithDockerSocket("tcp://" + server.Listener.Addr().String()),
+		WithHealthChecker(func(ctx context.Context, target string) error { return nil }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	res, err := exec.Execute(ctx, OperationSpec{
+		Action: ActionCachePurge,
+		Target: ComponentHomeAPI,
+		Params: map[string]interface{}{"cache_type": "docker_builder"},
+	})
+
+	if err == nil || !errors.Is(err, ErrExecutionAmbiguous) {
+		t.Fatalf("expected ErrExecutionAmbiguous, got: %v", err)
+	}
+	if res == nil || res.Outcome != OutcomeDispatchedUnknown {
+		t.Fatalf("expected OutcomeDispatchedUnknown, got: %v", res)
+	}
+}
+
+// TestR141_ExtractBaseline_ProductionSocketMissing_FailsClosed verifies that in production runtime
+// (OPS_STRICT_BASELINE=1), ExtractBaseline strictly fails closed when the Docker socket is inaccessible
+// and NEVER returns an offline placeholder or synthetic 1Panel ID.
+func TestR141_ExtractBaseline_ProductionSocketMissing_FailsClosed(t *testing.T) {
+	t.Setenv("OPS_STRICT_BASELINE", "1")
+	if !IsProductionRuntime() {
+		t.Fatal("expected IsProductionRuntime() to be true")
+	}
+
+	exec := NewOperationExecutor(
+		nil,
+		nil,
+		nil,
+		nil,
+		WithDockerSocket(filepath.Join(t.TempDir(), "nonexistent.sock")),
+	)
+
+	info := exec.ExtractBaseline("frigate")
+	if info.Hash != "" {
+		t.Fatalf("CRITICAL SECURITY VIOLATION: production baseline returned hash %q when socket is missing!", info.Hash)
+	}
+	if info.Error == "" {
+		t.Fatalf("expected non-empty Error when socket is missing in production mode")
+	}
+	if info.IsPlaceholder {
+		t.Fatalf("CRITICAL: production baseline returned placeholder when socket is missing!")
 	}
 }
 

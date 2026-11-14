@@ -483,9 +483,9 @@ func TestDockerRecreate_AtomicRollbackOnFailure(t *testing.T) {
 			w.WriteHeader(http.StatusNoContent)
 
 		case r.Method == http.MethodPost && strings.Contains(path, "/containers/create"):
-			// Simulate create failure
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"message": "simulated out of disk space during container create"}`))
+			// Simulate confirmed create failure (400 Bad Request)
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"message": "simulated invalid config during container create"}`))
 
 		case r.Method == http.MethodDelete && strings.Contains(path, "/containers/home-web"):
 			w.WriteHeader(http.StatusNoContent)

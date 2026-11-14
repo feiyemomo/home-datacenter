@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"sort"
 	"strconv"
@@ -795,8 +794,8 @@ func ComputeContainerBaselineFromInspect(component string, inspect map[string]in
 // inspectContainerViaDockerSocket lists containers to detect ambiguous alias matches,
 // then inspects /containers/{expectedDockerName}/json and verifies exact container Name match.
 func inspectContainerViaDockerSocket(ctx context.Context, sockPath, canonical string) (map[string]interface{}, error) {
-	if _, err := os.Stat(sockPath); err != nil {
-		return nil, err
+	if !isDockerSocketAccessible(sockPath) {
+		return nil, fmt.Errorf("docker socket not accessible: %s", sockPath)
 	}
 	expectedDockerName := canonicalContainerNames[canonical]
 	if expectedDockerName == "" {
@@ -806,6 +805,9 @@ func inspectContainerViaDockerSocket(ctx context.Context, sockPath, canonical st
 	tr := &http.Transport{
 		DisableKeepAlives: true,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			if strings.HasPrefix(sockPath, "tcp://") {
+				return (&net.Dialer{}).DialContext(ctx, "tcp", strings.TrimPrefix(sockPath, "tcp://"))
+			}
 			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
 		},
 	}

@@ -52,24 +52,31 @@ const (
 
 // ExecutionAttemptRecord records metadata for a single dispatch attempt across any execution channel.
 type ExecutionAttemptRecord struct {
-	AttemptID   string                   `json:"attempt_id"`
-	Channel     string                   `json:"channel"` // "docker_socket", "1panel_api", "host_fallback"
-	Action      string                   `json:"action"`
-	Target      string                   `json:"target"`
-	ContainerID string                   `json:"container_id,omitempty"`
-	Stage       DispatchStage            `json:"stage"`
-	Dispatched  bool                     `json:"dispatched"`
-	Category    ExecutionOutcomeCategory `json:"category"`
-	StatusCode  int                      `json:"status_code,omitempty"`
-	Error       string                   `json:"error,omitempty"`
-	DurationMs  int64                    `json:"duration_ms"`
-	Timestamp   time.Time                `json:"timestamp"`
+	AttemptID         string                   `json:"attempt_id"`
+	OperationID       string                   `json:"operation_id,omitempty"`
+	ParentStep        string                   `json:"parent_step,omitempty"`
+	Channel           string                   `json:"channel"` // "docker_socket", "1panel_api", "host_fallback"
+	Action            string                   `json:"action"`
+	Target            string                   `json:"target"`
+	ContainerID       string                   `json:"container_id,omitempty"`
+	FencingGeneration int64                    `json:"fencing_generation,omitempty"`
+	Stage             DispatchStage            `json:"stage"`
+	Dispatched        bool                     `json:"dispatched"`
+	Category          ExecutionOutcomeCategory `json:"category"`
+	StatusCode        int                      `json:"status_code,omitempty"`
+	Error             string                   `json:"error,omitempty"`
+	DurationMs        int64                    `json:"duration_ms"`
+	Timestamp         time.Time                `json:"timestamp"`
 }
 
 // StageTracker tracks the in-flight dispatch stage and determines whether the point-of-no-return has been crossed.
 type StageTracker struct {
 	mu             sync.Mutex
 	attemptID      string
+	operationID    string
+	parentStep     string
+	containerID    string
+	fencingGen     int64
 	channel        string
 	target         string
 	action         string
@@ -101,6 +108,76 @@ func GenerateAttemptID(channel string) string {
 	b := make([]byte, 8)
 	_, _ = rand.Read(b)
 	return fmt.Sprintf("att_%s_%d_%s", channel, time.Now().UnixNano(), hex.EncodeToString(b))
+}
+
+// Action returns the target action name.
+func (t *StageTracker) Action() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.action
+}
+
+// Target returns the target container/component name.
+func (t *StageTracker) Target() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.target
+}
+
+// SetOperationID sets the global operation ID.
+func (t *StageTracker) SetOperationID(opID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.operationID = opID
+}
+
+// OperationID returns the global operation ID.
+func (t *StageTracker) OperationID() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.operationID
+}
+
+// SetParentStep sets the multi-step parent stage name (e.g. "recreate.stop", "exec.start").
+func (t *StageTracker) SetParentStep(step string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.parentStep = step
+}
+
+// ParentStep returns the multi-step parent stage name.
+func (t *StageTracker) ParentStep() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.parentStep
+}
+
+// SetContainerID sets the resolved or inspected container ID.
+func (t *StageTracker) SetContainerID(cid string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.containerID = cid
+}
+
+// ContainerID returns the resolved or inspected container ID.
+func (t *StageTracker) ContainerID() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.containerID
+}
+
+// SetFencingGen sets the fencing generation.
+func (t *StageTracker) SetFencingGen(gen int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.fencingGen = gen
+}
+
+// FencingGen returns the fencing generation.
+func (t *StageTracker) FencingGen() int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.fencingGen
 }
 
 // AttemptID returns the unique attempt ID.
@@ -226,17 +303,21 @@ func (t *StageTracker) ToRecord() ExecutionAttemptRecord {
 	}
 
 	return ExecutionAttemptRecord{
-		AttemptID:  t.attemptID,
-		Channel:    t.channel,
-		Action:     t.action,
-		Target:     t.target,
-		Stage:      t.stage,
-		Dispatched: t.dispatched,
-		Category:   t.category,
-		StatusCode: t.statusCode,
-		Error:      errStr,
-		DurationMs: durationMs,
-		Timestamp:  t.startTime,
+		AttemptID:         t.attemptID,
+		OperationID:       t.operationID,
+		ParentStep:        t.parentStep,
+		Channel:           t.channel,
+		Action:            t.action,
+		Target:            t.target,
+		ContainerID:       t.containerID,
+		FencingGeneration: t.fencingGen,
+		Stage:             t.stage,
+		Dispatched:        t.dispatched,
+		Category:          t.category,
+		StatusCode:        t.statusCode,
+		Error:             errStr,
+		DurationMs:        durationMs,
+		Timestamp:         t.startTime,
 	}
 }
 
@@ -266,11 +347,41 @@ func (t *StageTracker) BindHTTPTrace(ctx context.Context) context.Context {
 
 type trackerCtxKey struct{}
 type trackerSinkKey struct{}
+type operationIDCtxKey struct{}
+
+// WithOperationID attaches an operation ID to the context.
+func WithOperationID(ctx context.Context, opID string) context.Context {
+	if opID == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, operationIDCtxKey{}, opID)
+}
+
+// OperationIDFromContext extracts the operation ID from the context if present.
+func OperationIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v := ctx.Value(operationIDCtxKey{}); v != nil {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
 
 // WithStageTracker attaches the StageTracker to the context and binds HTTP trace.
 func WithStageTracker(ctx context.Context, tracker *StageTracker) context.Context {
 	if tracker == nil {
 		return ctx
+	}
+	if tracker.OperationID() == "" {
+		if opID := OperationIDFromContext(ctx); opID != "" {
+			tracker.SetOperationID(opID)
+		}
+	}
+	if guard := RecoveryLeaseFromContext(ctx); guard != nil && tracker.FencingGen() == 0 {
+		tracker.SetFencingGen(guard.Grant.FencingGeneration)
 	}
 	ctx = context.WithValue(ctx, trackerCtxKey{}, tracker)
 	ReportTrackerToSink(ctx, tracker)

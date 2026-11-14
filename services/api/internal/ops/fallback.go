@@ -376,8 +376,8 @@ func (f *HostFallbackProvider) RestartContainerFallback(ctx context.Context, nam
 		return fmt.Errorf("fallback restart blocked by lease guard: %w", err)
 	}
 
-	if _, err := os.Stat(f.dockerSocket); err != nil {
-		tracker.RecordFailure(err)
+	if !isDockerSocketAccessible(f.dockerSocket) {
+		tracker.RecordFailure(fmt.Errorf("docker socket not accessible: %s", f.dockerSocket))
 		return fmt.Errorf("%w: docker socket unavailable for fallback restart", ErrOnePanelUnreachable)
 	}
 
@@ -385,7 +385,13 @@ func (f *HostFallbackProvider) RestartContainerFallback(ctx context.Context, nam
 		DisableKeepAlives: true,
 		DialContext: func(dCtx context.Context, network, addr string) (net.Conn, error) {
 			tracker.MarkStage(StageDialing)
-			conn, err := (&net.Dialer{}).DialContext(dCtx, "unix", f.dockerSocket)
+			var conn net.Conn
+			var err error
+			if strings.HasPrefix(f.dockerSocket, "tcp://") {
+				conn, err = (&net.Dialer{}).DialContext(dCtx, "tcp", strings.TrimPrefix(f.dockerSocket, "tcp://"))
+			} else {
+				conn, err = (&net.Dialer{}).DialContext(dCtx, "unix", f.dockerSocket)
+			}
 			if err != nil {
 				tracker.RecordFailure(err)
 				return nil, err
