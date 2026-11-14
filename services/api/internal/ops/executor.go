@@ -229,15 +229,21 @@ type HealthProbeResult struct {
 
 // ExecutionResult represents the structured execution output.
 type ExecutionResult struct {
-	Success      bool      `json:"success"`
-	Action       string    `json:"action"`
-	Target       string    `json:"target"`
-	Output       string    `json:"output"`
-	BaselineHash string    `json:"baseline_hash,omitempty"`
-	DurationMs   int64     `json:"duration_ms"`
-	RolledBack   bool      `json:"rolled_back,omitempty"`
-	Error        string    `json:"error,omitempty"`
-	ExecutedAt   time.Time `json:"executed_at"`
+	Success           bool                     `json:"success"`
+	Action            string                   `json:"action"`
+	Target            string                   `json:"target"`
+	Output            string                   `json:"output"`
+	BaselineHash      string                   `json:"baseline_hash,omitempty"`
+	DurationMs        int64                    `json:"duration_ms"`
+	RolledBack        bool                     `json:"rolled_back,omitempty"`
+	Error             string                   `json:"error,omitempty"`
+	ExecutedAt        time.Time                `json:"executed_at"`
+	Outcome           ExecutionOutcomeCategory `json:"outcome,omitempty"`
+	AttemptID         string                   `json:"attempt_id,omitempty"`
+	ExecutionChannel  string                   `json:"execution_channel,omitempty"`
+	DispatchStage     DispatchStage            `json:"dispatch_stage,omitempty"`
+	ContainerID       string                   `json:"container_id,omitempty"`
+	FencingGeneration int64                    `json:"fencing_generation,omitempty"`
 }
 
 // OperationExecutor defines the execution contract for datacenter operations.
@@ -605,10 +611,19 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 				}
 			} else if errors.Is(insErr, ErrBaselineAmbiguousContainer) {
 				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: insErr.Error()}
+			} else if errors.Is(insErr, context.DeadlineExceeded) ||
+				errors.Is(ctx.Err(), context.DeadlineExceeded) ||
+				isAmbiguousExecutionError(insErr, ctx.Err()) {
+				// Socket transport / timeout error: FAIL CLOSED. Never fall through on network failure.
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket transport error: %v", insErr)}
 			} else if sockPath != "/var/run/docker.sock" {
 				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker socket failed: %v", insErr)}
-			} else if IsProductionRuntime() && !clientConfigured {
-				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed: %v", insErr)}
+			} else if IsProductionRuntime() {
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect failed on authoritative socket: %v", insErr)}
+			} else if !strings.Contains(insErr.Error(), "not found in docker") {
+				// In non-production, only fall through if the container was genuinely not found on local docker daemon.
+				// Any other socket/inspection error fails closed.
+				return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("docker inspect error: %v", insErr)}
 			}
 			// In non-production or when 1Panel is configured, fall through if container not on local docker socket.
 		}
@@ -636,8 +651,9 @@ func (e *DefaultOperationExecutor) ExtractBaseline(target string) BaselineInfo {
 					return BaselineInfo{Canonical: canonical, Error: fmt.Sprintf("container %s has invalid state %q or empty image", canonical, tc.State)}
 				}
 				cid := strings.TrimSpace(tc.ContainerID)
-				if cid == "" {
-					cid = "1panel:" + strings.TrimPrefix(strings.TrimSpace(tc.Name), "/")
+				if cid == "" || !isValidDockerContainerID(cid) {
+					// 彻底废除 1panel:<name> 伪 ID，缺失合法 64 位或有效 Hex ContainerID 必须 Fail-Closed
+					return BaselineInfo{Canonical: canonical, ProtocolVersion: BaselineProtocolVersion, Error: fmt.Sprintf("container %s has missing or invalid container ID %q; cannot construct baseline: %v", canonical, cid, ErrBaselineIncompleteInspect)}
 				}
 				createdStr := strings.TrimSpace(tc.CreatedAt)
 				if createdStr != "" {
@@ -867,6 +883,30 @@ func isAllowedProductionAction(action string) bool {
 	}
 }
 
+func isValidDockerContainerID(cid string) bool {
+	cid = strings.TrimSpace(cid)
+	if cid == "" || strings.HasPrefix(cid, "1panel:") || strings.Contains(cid, "1panel:") {
+		return false
+	}
+	if strings.ContainsAny(cid, " \t\r\n:/\\") {
+		return false
+	}
+	if len(cid) < 4 || len(cid) > 64 {
+		return false
+	}
+	if IsProductionRuntime() || os.Getenv("OPS_REQUIRE_HEX_CID") == "1" {
+		if len(cid) < 12 {
+			return false
+		}
+		for _, r := range cid {
+			if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func isAmbiguousExecutionError(err error, ctxErr error) bool {
 	if errors.Is(err, ErrExecutionAmbiguous) ||
 		errors.Is(err, context.DeadlineExceeded) || errors.Is(ctxErr, context.DeadlineExceeded) ||
@@ -881,7 +921,14 @@ func isAmbiguousExecutionError(err error, ctxErr error) bool {
 		strings.Contains(msg, "timeout") ||
 		strings.Contains(msg, "connection reset") ||
 		strings.Contains(msg, "unexpected eof") ||
-		strings.Contains(msg, "broken pipe")
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "status 500") ||
+		strings.Contains(msg, "status 502") ||
+		strings.Contains(msg, "status 503") ||
+		strings.Contains(msg, "status 504") ||
+		strings.Contains(msg, "internal server error") ||
+		strings.Contains(msg, "bad gateway") ||
+		strings.Contains(msg, "gateway timeout")
 }
 
 // Execute executes an OperationSpec with whitelist validation, TOCTOU baseline check,
@@ -1248,9 +1295,13 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 	}
 
 	// 4. Dispatch the structured action
-	out, err := e.dispatchAction(ctx, spec, canonical)
+	var activeTracker *StageTracker
+	dispatchCtx := WithTrackerSink(ctx, func(t *StageTracker) {
+		activeTracker = t
+	})
+	out, err := e.dispatchAction(dispatchCtx, spec, canonical)
 	if err != nil {
-		if isAmbiguousExecutionError(err, ctx.Err()) {
+		if isAmbiguousExecutionError(err, ctx.Err()) || (activeTracker != nil && (activeTracker.IsDispatched() || activeTracker.Category() == OutcomeDispatchedUnknown)) {
 			GlobalSecurityMetrics.IncExecutionUnknown()
 			RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
 				OperationID: opID,
@@ -1259,6 +1310,16 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				Component:   canonical,
 				Message:     fmt.Sprintf("ambiguous mutation failure (%v); blocking automatic rollback/retry", err),
 			})
+			attID := ""
+			chName := ""
+			stg := StageCompleted
+			outc := OutcomeDispatchedUnknown
+			if activeTracker != nil {
+				attID = activeTracker.AttemptID()
+				chName = activeTracker.Channel()
+				stg = activeTracker.Stage()
+				outc = activeTracker.Category()
+			}
 			var unkAuditErr error
 			if ae != nil {
 				_, unkAuditErr = ae.RecordPostMutation(ctx, audit.EmitEventInput{
@@ -1275,9 +1336,16 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 					Result:            "EXECUTION_UNKNOWN",
 					ErrorCode:         err.Error(),
 					DurationMs:        time.Since(startTime).Milliseconds(),
-					Evidence:          map[string]interface{}{"output": redact.SensitiveString(out)},
-					FinalRunStatus:    model.AuditRunStatusExecutionUnknown,
-					MirrorLegacy:      true,
+					Evidence: map[string]interface{}{
+						"output":             redact.SensitiveString(out),
+						"attempt_id":         attID,
+						"channel":            chName,
+						"stage":              string(stg),
+						"outcome":            string(outc),
+						"fencing_generation": fencingGen,
+					},
+					FinalRunStatus: model.AuditRunStatusExecutionUnknown,
+					MirrorLegacy:   true,
 				}, func(cause error) {
 					RecordSecurityEvent(e.db, e.bus, OpsSecurityEvent{
 						OperationID: opID,
@@ -1295,15 +1363,20 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 				combErr = errors.Join(combErr, unkAuditErr, histErr, relErr)
 			}
 			return &ExecutionResult{
-				Success:      false,
-				Action:       spec.Action,
-				Target:       canonical,
-				Output:       redact.SensitiveString(out),
-				BaselineHash: effectiveBaselineHash,
-				DurationMs:   time.Since(startTime).Milliseconds(),
-				RolledBack:   false,
-				Error:        combErr.Error(),
-				ExecutedAt:   startTime,
+				Success:           false,
+				Action:            spec.Action,
+				Target:            canonical,
+				Output:            redact.SensitiveString(out),
+				BaselineHash:      effectiveBaselineHash,
+				DurationMs:        time.Since(startTime).Milliseconds(),
+				RolledBack:        false,
+				Error:             combErr.Error(),
+				ExecutedAt:        startTime,
+				Outcome:           outc,
+				AttemptID:         attID,
+				ExecutionChannel:  chName,
+				DispatchStage:     stg,
+				FencingGeneration: fencingGen,
 			}, combErr
 		}
 
@@ -1653,15 +1726,30 @@ func (e *DefaultOperationExecutor) Execute(ctx context.Context, spec OperationSp
 		}, combinedErr
 	}
 
+	succAttID := ""
+	succChannel := ""
+	succStage := StageCompleted
+	succOutcome := OutcomeExecuted
+	if activeTracker != nil {
+		succAttID = activeTracker.AttemptID()
+		succChannel = activeTracker.Channel()
+		succStage = activeTracker.Stage()
+		succOutcome = activeTracker.Category()
+	}
 	return &ExecutionResult{
-		Success:      true,
-		Action:       spec.Action,
-		Target:       canonical,
-		Output:       redact.SensitiveString(out),
-		BaselineHash: effectiveBaselineHash,
-		DurationMs:   duration,
-		RolledBack:   false,
-		ExecutedAt:   startTime,
+		Success:           true,
+		Action:            spec.Action,
+		Target:            canonical,
+		Output:            redact.SensitiveString(out),
+		BaselineHash:      effectiveBaselineHash,
+		DurationMs:        duration,
+		RolledBack:        false,
+		ExecutedAt:        startTime,
+		Outcome:           succOutcome,
+		AttemptID:         succAttID,
+		ExecutionChannel:  succChannel,
+		DispatchStage:     succStage,
+		FencingGeneration: fencingGen,
 	}, nil
 }
 
@@ -2248,7 +2336,7 @@ func (e *DefaultOperationExecutor) ExecuteProposal(ctx context.Context, proposal
 	proposal.ExecutedAt = utils.NullTime{Time: now, Valid: true}
 
 	if execErr != nil || (res != nil && !res.Success) {
-		if errors.Is(execErr, ErrExecutionAmbiguous) || errors.Is(execErr, audit.ErrAuditCommitFailed) || isAmbiguousExecutionError(execErr, ctx.Err()) {
+		if errors.Is(execErr, ErrExecutionAmbiguous) || errors.Is(execErr, audit.ErrAuditCommitFailed) || isAmbiguousExecutionError(execErr, ctx.Err()) || (res != nil && res.Outcome == OutcomeDispatchedUnknown) {
 			proposal.Status = model.ProposalStatusExecutionUnknown
 			proposal.ExecutionLog = fmt.Sprintf("execution timed out or produced unknown state (%v); manual reconciliation required", execErr)
 			if e.db != nil {
@@ -2683,37 +2771,69 @@ func (e *DefaultOperationExecutor) executeHostPackageUpgrade(ctx context.Context
 }
 
 // executeDockerRestart restarts a whitelisted container via a single deterministic provider
-// without blind multi-provider retries after an ambiguous transport/timeout failure (R4-03).
+// without blind multi-provider retries after an ambiguous transport/timeout failure (R4-03, R14).
 func (e *DefaultOperationExecutor) executeDockerRestart(ctx context.Context, canonical string) (string, error) {
 	containerName := canonicalContainerNames[canonical]
 	if containerName == "" {
 		containerName = canonical
 	}
 
-	// Deterministic channel selection: prefer direct Docker socket when accessible (lowest latency,
-	// atomic fencing before write), otherwise 1Panel OpenAPI if configured.
+	// Channel 1: Prefer direct Docker socket when accessible
 	if strings.TrimSpace(e.dockerSocket) != "" {
 		if _, statErr := os.Stat(e.dockerSocket); statErr == nil {
-			if err := executeDockerSocketRestart(ctx, e.dockerSocket, containerName); err == nil {
-				return fmt.Sprintf("container %s restarted via direct Docker socket", containerName), nil
-			} else if e.client == nil || strings.TrimSpace(e.client.baseURL) == "" {
+			tracker := NewStageTracker("docker_socket", ActionDockerRestart, containerName)
+			trackerCtx := WithStageTracker(ctx, tracker)
+			err := executeDockerSocketRestart(trackerCtx, e.dockerSocket, containerName, tracker)
+			if err == nil {
+				return fmt.Sprintf("container %s restarted via direct Docker socket (attempt: %s)", containerName, tracker.AttemptID()), nil
+			}
+
+			// Point-of-no-return check: if request was dispatched, timeout occurred, or daemon returned error after dispatch,
+			// STRICTLY FAIL-CLOSED: absolutely NO fallback to 1Panel or HostFallback!
+			if tracker.IsDispatched() || tracker.Category() == OutcomeDispatchedUnknown || isAmbiguousExecutionError(err, ctx.Err()) {
+				return "", fmt.Errorf("%w: docker socket restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
+					ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
+			}
+
+			// If daemon confirmed container does not exist (404) or parameter rejected, fail confirmed (no blind fallback)
+			if tracker.Category() == OutcomeFailedConfirmed {
+				return "", fmt.Errorf("docker socket restart failed (confirmed): %w", err)
+			}
+
+			// Only if NOT_DISPATCHED (e.g. dial refused before sending any byte) and 1Panel is not available:
+			if e.client == nil || strings.TrimSpace(e.client.baseURL) == "" {
 				return "", err
 			}
+			// Only when OutcomeNotDispatched is guaranteed, allow fallback to Channel 2 below.
 		}
 	}
 
+	// Channel 2: 1Panel API (only reached when Channel 1 was NOT_DISPATCHED)
 	if e.client != nil && strings.TrimSpace(e.client.baseURL) != "" {
-		if err := e.client.RestartContainer(ctx, containerName); err != nil {
+		tracker := NewStageTracker("1panel_api", ActionDockerRestart, containerName)
+		trackerCtx := WithStageTracker(ctx, tracker)
+		if err := e.client.RestartContainer(trackerCtx, containerName); err != nil {
+			if tracker.IsDispatched() || tracker.Category() == OutcomeDispatchedUnknown || isAmbiguousExecutionError(err, ctx.Err()) {
+				return "", fmt.Errorf("%w: 1panel restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
+					ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
+			}
 			return "", err
 		}
-		return fmt.Sprintf("container %s restarted via 1Panel API", containerName), nil
+		return fmt.Sprintf("container %s restarted via 1Panel API (attempt: %s)", containerName, tracker.AttemptID()), nil
 	}
 
+	// Channel 3: HostFallback (only reached when Channel 1 & 2 were NOT_DISPATCHED)
 	if e.fallback != nil {
-		if err := e.fallback.RestartContainerFallback(ctx, containerName); err != nil {
+		tracker := NewStageTracker("host_fallback", ActionDockerRestart, containerName)
+		trackerCtx := WithStageTracker(ctx, tracker)
+		if err := e.fallback.RestartContainerFallback(trackerCtx, containerName); err != nil {
+			if tracker.IsDispatched() || tracker.Category() == OutcomeDispatchedUnknown || isAmbiguousExecutionError(err, ctx.Err()) {
+				return "", fmt.Errorf("%w: host fallback restart ambiguous (%v; attempt: %s, stage: %s, category: %s)",
+					ErrExecutionAmbiguous, err, tracker.AttemptID(), tracker.Stage(), tracker.Category())
+			}
 			return "", err
 		}
-		return fmt.Sprintf("container %s restarted via Docker socket fallback", containerName), nil
+		return fmt.Sprintf("container %s restarted via Docker socket fallback (attempt: %s)", containerName, tracker.AttemptID()), nil
 	}
 
 	return "", fmt.Errorf("failed to restart container %s: no restart provider available", containerName)
@@ -3380,7 +3500,11 @@ func (e *DefaultOperationExecutor) publishEvent(severity string, eventType strin
 // evaluate fencing tokens on an in-flight daemon syscall; pre-write verification + context deadlines
 // minimize that external race window to sub-millisecond transport commit time (R4-06).
 func verifyContextLeaseBeforeSocket(ctx context.Context) error {
-	if guard := RecoveryLeaseFromContext(ctx); guard != nil {
+	guard := RecoveryLeaseFromContext(ctx)
+	if guard == nil && IsProductionRuntime() {
+		return fmt.Errorf("%w: direct socket mutation strictly requires active recovery lease guard in production", ErrInvalidLeaseToken)
+	}
+	if guard != nil {
 		if err := guard.VerifyBeforeMutation(time.Duration(DefaultLeaseSafetyGuardMs) * time.Millisecond); err != nil {
 			return err
 		}
@@ -3388,38 +3512,62 @@ func verifyContextLeaseBeforeSocket(ctx context.Context) error {
 	return ctx.Err()
 }
 
-// executeDockerSocketRestart issues a container restart via Docker Unix Socket HTTP API.
-func executeDockerSocketRestart(ctx context.Context, sockPath, containerName string) error {
+// executeDockerSocketRestart issues a container restart via Docker Unix Socket HTTP API with stage tracking.
+func executeDockerSocketRestart(ctx context.Context, sockPath, containerName string, tracker *StageTracker) error {
+	if tracker == nil {
+		tracker = NewStageTracker("docker_socket", ActionDockerRestart, containerName)
+	}
+	tracker.MarkStage(StagePreCheck)
 	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		tracker.RecordFailure(err)
 		return err
 	}
 	if _, err := os.Stat(sockPath); err != nil {
+		tracker.RecordFailure(err)
 		return fmt.Errorf("docker socket not accessible: %w", err)
 	}
 
 	tr := &http.Transport{
 		DisableKeepAlives: true,
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", sockPath)
+		DialContext: func(dCtx context.Context, network, addr string) (net.Conn, error) {
+			tracker.MarkStage(StageDialing)
+			conn, err := (&net.Dialer{}).DialContext(dCtx, "unix", sockPath)
+			if err != nil {
+				tracker.RecordFailure(err)
+				return nil, err
+			}
+			tracker.MarkStage(StageConnected)
+			return conn, nil
 		},
 	}
 	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
 	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", url.PathEscape(containerName))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
+	req, err := http.NewRequestWithContext(tracker.BindHTTPTrace(ctx), http.MethodPost, reqURL, nil)
 	if err != nil {
+		tracker.RecordFailure(err)
 		return err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
+		tracker.RecordFailure(err)
 		return err
 	}
 	defer resp.Body.Close()
 
+	b, rErr := io.ReadAll(resp.Body)
+	if rErr != nil {
+		tracker.RecordResponse(resp.StatusCode, rErr)
+		return fmt.Errorf("failed reading docker restart response body: %w", rErr)
+	}
+	tracker.RecordResponse(resp.StatusCode, nil)
+
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("docker restart: container %s not found (HTTP 404): %s", containerName, string(b))
+		}
 		return fmt.Errorf("docker restart returned status %d: %s", resp.StatusCode, string(b))
 	}
 	return nil

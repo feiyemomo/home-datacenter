@@ -448,8 +448,8 @@ func TestR5_PreApprovalBaselineAndPrefixedContainerResolution(t *testing.T) {
 				switch curMode {
 				case "prefixed":
 					items = []onePanelContainerItem{
-						{Name: "/home-frigate", Image: "ghcr.io/blakeblackshear/frigate:0.14.0", State: "running", Created: "2026-11-01T00:00:00Z"},
-						{Name: "/1Panel-openresty-WuDU", Image: "1panel/openresty:1.21", State: "running", Created: "2026-11-02T00:00:00Z"},
+						{ContainerID: "c1d0f8a9e2b4c6d8e0f2a4b6c8d0e2f4a6b8c0d2e4f6a8b0c2d4e6f8a0b2c4d6", Name: "/home-frigate", Image: "ghcr.io/blakeblackshear/frigate:0.14.0", State: "running", Created: "2026-11-01T00:00:00Z"},
+						{ContainerID: "b2c3d4e5f6a10123456789abcdef0123456789abcdef0123456789abcdef0124", Name: "/1Panel-openresty-WuDU", Image: "1panel/openresty:1.21", State: "running", Created: "2026-11-02T00:00:00Z"},
 					}
 				case "unknown_state":
 					items = []onePanelContainerItem{

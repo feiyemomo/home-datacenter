@@ -355,32 +355,74 @@ func (f *HostFallbackProvider) RestartContainerFallback(ctx context.Context, nam
 		return ErrInvalidContainer
 	}
 
+	canonical, err := ResolveComponent(name)
+	if err != nil {
+		return fmt.Errorf("%w: %s", ErrComponentNotWhitelisted, name)
+	}
+	containerName := canonicalContainerNames[canonical]
+	if containerName == "" {
+		containerName = canonical
+	}
+
+	tracker := StageTrackerFromContext(ctx)
+	if tracker == nil {
+		tracker = NewStageTracker("host_fallback", ActionDockerRestart, containerName)
+		ctx = WithStageTracker(ctx, tracker)
+	}
+	tracker.MarkStage(StagePreCheck)
+
+	if err := verifyContextLeaseBeforeSocket(ctx); err != nil {
+		tracker.RecordFailure(err)
+		return fmt.Errorf("fallback restart blocked by lease guard: %w", err)
+	}
+
 	if _, err := os.Stat(f.dockerSocket); err != nil {
+		tracker.RecordFailure(err)
 		return fmt.Errorf("%w: docker socket unavailable for fallback restart", ErrOnePanelUnreachable)
 	}
 
 	tr := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", f.dockerSocket)
+		DisableKeepAlives: true,
+		DialContext: func(dCtx context.Context, network, addr string) (net.Conn, error) {
+			tracker.MarkStage(StageDialing)
+			conn, err := (&net.Dialer{}).DialContext(dCtx, "unix", f.dockerSocket)
+			if err != nil {
+				tracker.RecordFailure(err)
+				return nil, err
+			}
+			tracker.MarkStage(StageConnected)
+			return conn, nil
 		},
 	}
+	defer tr.CloseIdleConnections()
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
-	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", url.PathEscape(name))
+	reqURL := fmt.Sprintf("http://localhost/containers/%s/restart?t=10", url.PathEscape(containerName))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, nil)
 	if err != nil {
+		tracker.RecordFailure(err)
 		return err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
+		tracker.RecordFailure(err)
 		return fmt.Errorf("fallback docker restart failed: %w", err)
 	}
 	defer resp.Body.Close()
 
+	body, rErr := io.ReadAll(resp.Body)
+	if rErr != nil {
+		tracker.RecordResponse(resp.StatusCode, rErr)
+		return fmt.Errorf("failed reading fallback docker response body: %w", rErr)
+	}
+	tracker.RecordResponse(resp.StatusCode, nil)
+
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("fallback docker restart returned %d: %s", resp.StatusCode, string(b))
+		if resp.StatusCode == http.StatusNotFound {
+			return fmt.Errorf("fallback docker restart: container %s not found (HTTP 404): %s", containerName, string(body))
+		}
+		return fmt.Errorf("fallback docker restart returned %d: %s", resp.StatusCode, string(body))
 	}
 	return nil
 }
