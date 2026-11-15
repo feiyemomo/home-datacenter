@@ -4083,7 +4083,17 @@ func (e *DefaultOperationExecutor) executeVerifiedCandidateRollback(
 	client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
 
 	// Clean up candidate container STRICTLY BY ID (never by containerName)
-	if candidateContainerID != "" && isValidDockerContainerID(candidateContainerID) {
+	if candidateContainerID != "" {
+		if !isValidDockerContainerID(candidateContainerID) {
+			corruptErr := fmt.Errorf("candidate container ID %q is malformed or invalid hex; aborting rollback restore to prevent 409 conflict and split-brain", candidateContainerID)
+			if recErr := e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_candidate_corrupt_id", "att-corrupt-id", "", backupName, candidateContainerID, corruptErr); recErr != nil {
+				log.Printf("[executor] CRITICAL: failed to persist corrupt candidate reconciliation task: %v", recErr)
+			}
+			return fmt.Errorf("%w: candidate container ID %q is invalid; aborting restore to prevent 409 conflict/volume corruption (original cause: %v)",
+				ErrExecutionAmbiguous, candidateContainerID, triggerCause)
+		}
+
 		trackerCandDel := NewStageTracker("docker_socket", ActionDockerRecreate+".rollback_delete_candidate", containerName)
 		trackerCandDel.SetParentStep("recreate.rollback_delete_candidate")
 		trackerCandDel.SetContainerID(candidateContainerID)
@@ -4133,6 +4143,16 @@ func (e *DefaultOperationExecutor) executeVerifiedCandidateRollback(
 				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, statusErr)
 			return fmt.Errorf("%w: candidate container delete failed (status %d: %s); restore aborted to prevent dual-container split (original cause: %v)",
 				ErrExecutionAmbiguous, dResp.StatusCode, string(dBody), triggerCause)
+		}
+
+		// P0-1 & P1-4: Independent Post-DELETE Inspect verification to confirm candidate is ABSENT
+		candPostPres := inspectContainerForReconcile(rbCtx, client, candidateContainerID)
+		if candPostPres.State != PresenceAbsent {
+			notAbsentErr := fmt.Errorf("candidate delete returned status %d but post-inspect state is %s (running: %v); aborting restore", dResp.StatusCode, candPostPres.State, candPostPres.Running)
+			_ = e.recordReconciliationTask(rbCtx, OperationIDFromContext(rbCtx), containerName, ActionDockerRecreate,
+				"rollback_delete_candidate", trackerCandDel.AttemptID(), "", backupName, candidateContainerID, notAbsentErr)
+			return fmt.Errorf("%w: candidate container %s not confirmed absent after delete (inspect state: %s); restore aborted to prevent 409 conflict (original cause: %v)",
+				ErrExecutionAmbiguous, candidateContainerID, candPostPres.State, triggerCause)
 		}
 	}
 
@@ -4702,6 +4722,13 @@ func (e *DefaultOperationExecutor) executeDockerSocketRecreate(ctx context.Conte
 	trackerBackupDel.RecordResponse(dBResp.StatusCode, nil)
 
 	if dBResp.StatusCode == http.StatusNoContent || dBResp.StatusCode == http.StatusOK || dBResp.StatusCode == http.StatusNotFound {
+		// P0-1 & P1-4: Independent Post-DELETE Inspect verification to confirm backup container is strictly ABSENT
+		postDelPres := inspectContainerForReconcile(ctx, client, backupContainerID)
+		if postDelPres.State != PresenceAbsent {
+			warnErr := fmt.Errorf("backup delete returned status %d but post-inspect state is %s (running: %v); reconciliation queued", dBResp.StatusCode, postDelPres.State, postDelPres.Running)
+			_ = e.recordReconciliationTask(ctx, OperationIDFromContext(ctx), containerName, ActionDockerRecreate, "recreate.remove_backup.post_inspect_not_absent", trackerBackupDel.AttemptID(), backupContainerID, backupName, candidateContainerID, warnErr)
+			return fmt.Sprintf("container %s recreated successfully with image %s (backup %s delete unconfirmed: inspect state %s; reconciliation queued)", containerName, targetImage, backupName, postDelPres.State), nil
+		}
 		return fmt.Sprintf("container %s recreated successfully with image %s (backup removed)", containerName, targetImage), nil
 	}
 

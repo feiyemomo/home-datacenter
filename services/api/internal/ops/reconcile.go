@@ -56,9 +56,13 @@ func (OpsReconciliationRecord) TableName() string {
 var (
 	memReconciliationMu      sync.RWMutex
 	memReconciliationRecords = make(map[string]*OpsReconciliationRecord)
+
+	reconcileTableMigratedMu sync.RWMutex
+	reconcileTableMigrated   = make(map[*gorm.DB]bool)
 )
 
 // RecordReconciliation persists an ambiguous or unverified mutation state.
+// When db != nil, errors are returned immediately and never silently degraded to in-memory store.
 func RecordReconciliation(db *gorm.DB, rec *OpsReconciliationRecord) error {
 	if rec == nil {
 		return errors.New("nil reconciliation record")
@@ -73,10 +77,23 @@ func RecordReconciliation(db *gorm.DB, rec *OpsReconciliationRecord) error {
 	rec.UpdatedAtMs = nowMs
 
 	if db != nil {
-		if err := db.AutoMigrate(&OpsReconciliationRecord{}); err != nil {
-			log.Printf("[reconcile] db automigrate failed: %v", err)
-			return fmt.Errorf("failed to automigrate reconciliation record table: %w", err)
+		// Optimize: AutoMigrate once per *gorm.DB handle to prevent SQLite DDL lock storms (R14.3)
+		reconcileTableMigratedMu.RLock()
+		migrated := reconcileTableMigrated[db]
+		reconcileTableMigratedMu.RUnlock()
+		if !migrated {
+			reconcileTableMigratedMu.Lock()
+			if !reconcileTableMigrated[db] {
+				if err := db.AutoMigrate(&OpsReconciliationRecord{}); err != nil {
+					reconcileTableMigratedMu.Unlock()
+					log.Printf("[reconcile] db automigrate failed: %v", err)
+					return fmt.Errorf("failed to automigrate reconciliation record table: %w", err)
+				}
+				reconcileTableMigrated[db] = true
+			}
+			reconcileTableMigratedMu.Unlock()
 		}
+
 		if err := db.Save(rec).Error; err != nil {
 			log.Printf("[reconcile] db save failed: %v", err)
 			return fmt.Errorf("failed to persist reconciliation record to database: %w", err)
@@ -91,14 +108,14 @@ func RecordReconciliation(db *gorm.DB, rec *OpsReconciliationRecord) error {
 }
 
 // GetPendingReconciliations loads all unresolved ambiguous records.
+// When db != nil, failures are strictly returned and never silently fallen back to memory.
 func GetPendingReconciliations(db *gorm.DB) ([]OpsReconciliationRecord, error) {
 	if db != nil {
-		_ = db.AutoMigrate(&OpsReconciliationRecord{})
 		var records []OpsReconciliationRecord
-		err := db.Where("state = ?", ReconciliationStatePending).Find(&records).Error
-		if err == nil {
-			return records, nil
+		if err := db.Where("state = ?", ReconciliationStatePending).Find(&records).Error; err != nil {
+			return nil, fmt.Errorf("failed to query pending reconciliations from database: %w", err)
 		}
+		return records, nil
 	}
 
 	memReconciliationMu.RLock()
@@ -113,13 +130,17 @@ func GetPendingReconciliations(db *gorm.DB) ([]OpsReconciliationRecord, error) {
 }
 
 // GetReconciliationByOperationID finds a record by operation ID.
+// When db != nil, failures are strictly returned and never silently fallen back to memory.
 func GetReconciliationByOperationID(db *gorm.DB, opID string) (*OpsReconciliationRecord, error) {
 	if db != nil {
-		_ = db.AutoMigrate(&OpsReconciliationRecord{})
 		var rec OpsReconciliationRecord
-		if err := db.Where("operation_id = ?", opID).First(&rec).Error; err == nil {
-			return &rec, nil
+		if err := db.Where("operation_id = ?", opID).First(&rec).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, gorm.ErrRecordNotFound
+			}
+			return nil, fmt.Errorf("failed to query reconciliation by operation id from database: %w", err)
 		}
+		return &rec, nil
 	}
 
 	memReconciliationMu.RLock()
@@ -200,6 +221,17 @@ func inspectContainerForReconcile(ctx context.Context, client *http.Client, targ
 			Err:   fmt.Errorf("failed to decode inspect response for %s: %v", target, err),
 		}
 	}
+
+	// Entity drift guard: If target is a Hex container ID, verify daemon returned matching ID
+	if isValidDockerContainerID(target) {
+		if data.ID != target && !strings.HasPrefix(data.ID, target) {
+			return ContainerPresence{
+				State: PresenceUnknown,
+				Err:   fmt.Errorf("inspect container ID mismatch: queried %s but daemon returned %s", target, data.ID),
+			}
+		}
+	}
+
 	return ContainerPresence{
 		State:   PresencePresent,
 		Running: data.State.Running,
@@ -222,11 +254,14 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 	var rec *OpsReconciliationRecord
 	if e.db != nil {
 		var r OpsReconciliationRecord
-		if err := e.db.Where("id = ?", recID).First(&r).Error; err == nil {
-			rec = &r
+		if err := e.db.Where("id = ?", recID).First(&r).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return nil, fmt.Errorf("reconciliation record %s not found in database: %w", recID, err)
+			}
+			return nil, fmt.Errorf("failed to query reconciliation record %s from database: %w", recID, err)
 		}
-	}
-	if rec == nil {
+		rec = &r
+	} else {
 		memReconciliationMu.RLock()
 		rec = memReconciliationRecords[recID]
 		memReconciliationMu.RUnlock()
@@ -265,7 +300,9 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 		rec.ResolutionPlan = fmt.Sprintf("ambiguous inspect discovery (cand: %s, backup: %s, named: %s); fail-closed to manual approval",
 			candPres.State, backupPres.State, namedPres.State)
 		rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-		_ = RecordReconciliation(e.db, rec)
+		if err := RecordReconciliation(e.db, rec); err != nil {
+			return nil, fmt.Errorf("failed to persist manual approval reconciliation state: %w", err)
+		}
 		return &ReconcileResult{
 			RecordID:        rec.ID,
 			ActionTaken:     "ESCALATED_MANUAL_APPROVAL",
@@ -287,7 +324,9 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 				rec.State = ReconciliationStateManualApproval
 				rec.ResolutionPlan = fmt.Sprintf("candidate container running but business health check failed: %v; retaining backup for manual recovery", hcErr)
 				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-				_ = RecordReconciliation(e.db, rec)
+				if err := RecordReconciliation(e.db, rec); err != nil {
+					return nil, fmt.Errorf("failed to persist manual approval state after health check failure: %w", err)
+				}
 				return &ReconcileResult{
 					RecordID:        rec.ID,
 					ActionTaken:     "HEALTH_CHECK_FAILED_ESCALATED",
@@ -300,12 +339,32 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 
 		// Clean up the stopped backup if it is PRESENT
 		if backupPres.State == PresencePresent && isValidDockerContainerID(backupPres.ID) && backupPres.ID != candPres.ID {
+			trackerPurge := NewStageTracker("docker_socket", ActionDockerRecreate+".reconcile_purge_backup", rec.Component)
+			trackerPurge.SetParentStep("reconcile.purge_backup")
+			trackerPurge.SetContainerID(backupPres.ID)
+			if rec.OperationID != "" {
+				trackerPurge.SetOperationID(rec.OperationID)
+			}
+			purgeCtx := WithStageTracker(ctx, trackerPurge)
+			if err := verifyContextLeaseBeforeSocket(purgeCtx); err != nil {
+				trackerPurge.RecordFailure(err)
+				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; backup purge aborted by lease guard: %v", err)
+				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+				if pErr := RecordReconciliation(e.db, rec); pErr != nil {
+					log.Printf("[reconcile] warning: failed to update resolution plan in DB: %v", pErr)
+				}
+				return nil, fmt.Errorf("reconcile backup purge lease verification failed: %w", err)
+			}
+
 			delURL := fmt.Sprintf("http://localhost/containers/%s?v=false&force=true", url.PathEscape(backupPres.ID))
-			delReq, err := http.NewRequestWithContext(ctx, http.MethodDelete, delURL, nil)
+			delReq, err := http.NewRequestWithContext(trackerPurge.BindHTTPTrace(purgeCtx), http.MethodDelete, delURL, nil)
 			if err != nil {
+				trackerPurge.RecordFailure(err)
 				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; failed to prepare backup purge request: %v", err)
 				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-				_ = RecordReconciliation(e.db, rec)
+				if pErr := RecordReconciliation(e.db, rec); pErr != nil {
+					log.Printf("[reconcile] warning: failed to update resolution plan in DB: %v", pErr)
+				}
 				return &ReconcileResult{
 					RecordID:        rec.ID,
 					ActionTaken:     "PURGE_FAILED_PENDING",
@@ -316,9 +375,12 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 			}
 			dResp, dErr := client.Do(delReq)
 			if dErr != nil {
+				trackerPurge.RecordFailure(dErr)
 				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; backup purge network error: %v", dErr)
 				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-				_ = RecordReconciliation(e.db, rec)
+				if pErr := RecordReconciliation(e.db, rec); pErr != nil {
+					log.Printf("[reconcile] warning: failed to update resolution plan in DB: %v", pErr)
+				}
 				return &ReconcileResult{
 					RecordID:        rec.ID,
 					ActionTaken:     "PURGE_FAILED_PENDING",
@@ -328,25 +390,50 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 				}, fmt.Errorf("delete backup container failed: %w", dErr)
 			}
 			defer dResp.Body.Close()
+			dBody, _ := io.ReadAll(dResp.Body)
+			trackerPurge.RecordResponse(dResp.StatusCode, nil)
+
 			if dResp.StatusCode != http.StatusNoContent && dResp.StatusCode != http.StatusOK && dResp.StatusCode != http.StatusNotFound {
-				b, _ := io.ReadAll(dResp.Body)
-				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; backup purge returned status %d: %s", dResp.StatusCode, string(b))
+				rec.ResolutionPlan = fmt.Sprintf("candidate verified running; backup purge returned status %d: %s", dResp.StatusCode, string(dBody))
 				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-				_ = RecordReconciliation(e.db, rec)
+				if pErr := RecordReconciliation(e.db, rec); pErr != nil {
+					log.Printf("[reconcile] warning: failed to update resolution plan in DB: %v", pErr)
+				}
 				return &ReconcileResult{
 					RecordID:        rec.ID,
 					ActionTaken:     "PURGE_FAILED_PENDING",
 					FinalState:      rec.State,
 					DiscoveredState: discState,
-					Error:           fmt.Sprintf("status %d: %s", dResp.StatusCode, string(b)),
+					Error:           fmt.Sprintf("status %d: %s", dResp.StatusCode, string(dBody)),
 				}, fmt.Errorf("delete backup returned unexpected status %d", dResp.StatusCode)
+			}
+
+			// P0-1 & P1-4: Independent Post-DELETE Inspect Verification
+			postInspectPres := inspectContainerForReconcile(ctx, client, backupPres.ID)
+			if postInspectPres.State != PresenceAbsent {
+				rec.State = ReconciliationStateManualApproval
+				rec.ResolutionPlan = fmt.Sprintf("backup container DELETE returned %d but independent post-inspect state is %s (running: %v); escalating to manual approval",
+					dResp.StatusCode, postInspectPres.State, postInspectPres.Running)
+				rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
+				if pErr := RecordReconciliation(e.db, rec); pErr != nil {
+					return nil, fmt.Errorf("backup container not absent (%s) and failed to persist manual approval state: %w", postInspectPres.State, pErr)
+				}
+				return &ReconcileResult{
+					RecordID:        rec.ID,
+					ActionTaken:     "BACKUP_NOT_ABSENT_ESCALATED",
+					FinalState:      ReconciliationStateManualApproval,
+					DiscoveredState: fmt.Sprintf("post_inspect_state:%s", postInspectPres.State),
+					Error:           fmt.Sprintf("backup container not confirmed absent after delete (state: %s)", postInspectPres.State),
+				}, nil
 			}
 		}
 
 		rec.State = ReconciliationStateResolved
-		rec.ResolutionPlan = "candidate verified running and business healthy; orphan backup safely purged"
+		rec.ResolutionPlan = "candidate verified running and business healthy; orphan backup safely purged and confirmed absent"
 		rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-		_ = RecordReconciliation(e.db, rec)
+		if err := RecordReconciliation(e.db, rec); err != nil {
+			return nil, fmt.Errorf("failed to persist resolved reconciliation state: %w", err)
+		}
 		return &ReconcileResult{
 			RecordID:        rec.ID,
 			ActionTaken:     "PURGED_BACKUP_AND_RESOLVED",
@@ -359,7 +446,9 @@ func (e *DefaultOperationExecutor) ReconcileOperation(ctx context.Context, recID
 	rec.State = ReconciliationStateManualApproval
 	rec.ResolutionPlan = "dual running or broken candidate detected; requiring manual operator inspection"
 	rec.UpdatedAtMs = time.Now().UTC().UnixMilli()
-	_ = RecordReconciliation(e.db, rec)
+	if err := RecordReconciliation(e.db, rec); err != nil {
+		return nil, fmt.Errorf("failed to persist manual approval reconciliation state: %w", err)
+	}
 
 	return &ReconcileResult{
 		RecordID:        rec.ID,

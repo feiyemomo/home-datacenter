@@ -473,6 +473,12 @@ func EnsureOpsSchema(db *gorm.DB) error {
 		return err
 	}
 
+	// Ensure OpsReconciliationRecord schema is ready for Docker mutation safety (R14.2/R14.3)
+	if err := db.AutoMigrate(&OpsReconciliationRecord{}); err != nil {
+		GlobalSecurityMetrics.IncDatabaseError()
+		return fmt.Errorf("ops reconciliation record migration failed: %w", err)
+	}
+
 	return VerifyOpsSchemaIntegrity(db)
 }
 
