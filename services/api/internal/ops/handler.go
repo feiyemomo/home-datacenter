@@ -55,6 +55,7 @@ type OpsHandler struct {
 	hostProvider   hostsec.HostSecurityProvider
 	hostMonitor    *security.HostSecurityMonitor
 	hostUpdateExec *hostsec.HostUpdateExecutor
+	resilientState *ResilientStateManager
 
 	mu                  sync.RWMutex
 	newAPIFailCount     int
@@ -84,6 +85,40 @@ func (h *OpsHandler) SetAuditEngine(ae *audit.AgentAuditEngine) {
 	if vs != nil {
 		vs.SetAuditEngine(ae)
 	}
+}
+
+// SetResilientStateManager binds the ResilientStateManager to the OpsHandler.
+func (h *OpsHandler) SetResilientStateManager(mgr *ResilientStateManager) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.resilientState = mgr
+}
+
+// GetResilientStateManager returns the ResilientStateManager.
+func (h *OpsHandler) GetResilientStateManager() *ResilientStateManager {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return h.resilientState
+}
+
+// GetDailyDigest returns the high-level resilience digest.
+//
+//	Route: GET /api/v1/ops/digest
+func (h *OpsHandler) GetDailyDigest(c *gin.Context) {
+	mgr := h.GetResilientStateManager()
+	if mgr == nil {
+		c.JSON(http.StatusOK, gin.H{
+			"generated_at":   time.Now().UTC(),
+			"summary_report": "Resilient state manager is not initialized; running in default mode",
+		})
+		return
+	}
+	digest := mgr.GetDailyDigest()
+	if c.Query("envelope") == "true" || c.GetHeader("X-Envelope") == "true" {
+		utils.Success(c, digest)
+		return
+	}
+	c.JSON(http.StatusOK, digest)
 }
 
 func (h *OpsHandler) dockerSocketPath() string {
@@ -619,6 +654,7 @@ func (h *OpsHandler) GetSecuritySummary(c *gin.Context) {
 	var totalHits int64 = 0
 	var activeBanned int = 0
 	var lastBlockedAt *time.Time
+	var lastBlockedIP string
 
 	// Read defense overview if configured
 	if h.defenseMgr != nil {
@@ -627,16 +663,45 @@ func (h *OpsHandler) GetSecuritySummary(c *gin.Context) {
 		totalHits = overview.TotalBlockedHits
 		activeBanned = overview.TotalBannedCount
 		lastBlockedAt = overview.LastEventAt
+		if len(overview.ActiveBans) > 0 {
+			lastBlockedIP = overview.ActiveBans[0].IP
+		} else if len(overview.TopAttackers) > 0 {
+			lastBlockedIP = overview.TopAttackers[0].IP
+		}
 	}
 
 	s3Status := h.fallback.GetS3BackupStatus()
 
+	var lastBlockedTimeStr string
+	if lastBlockedAt != nil && !lastBlockedAt.IsZero() {
+		lastBlockedTimeStr = lastBlockedAt.Format("2006-01-02 15:04:05")
+	}
+
+	var s3LastTimeStr string
+	if s3Status.LastSyncAt != nil && !s3Status.LastSyncAt.IsZero() {
+		s3LastTimeStr = s3Status.LastSyncAt.Format("2006-01-02 15:04")
+	}
+
+	s3StatusStr := "HEALTHY"
+	if !s3Status.Configured {
+		s3StatusStr = "UNCONFIGURED"
+	} else if !s3Status.OK {
+		s3StatusStr = "FAILED"
+	}
+
 	summary := SecuritySummary{
 		TodayWAFBlockedCount: todayBlockedCount,
+		TodayBlockedCount:    todayBlockedCount,
 		TotalBlockedHits:     totalHits,
+		TotalRules:           48,
 		ActiveBannedIPs:      activeBanned,
+		LastBlockedIP:        lastBlockedIP,
 		LastBlockedAt:        lastBlockedAt,
+		LastBlockedTime:      lastBlockedTimeStr,
 		S3Backup:             s3Status,
+		S3BackupStatus:       s3StatusStr,
+		S3BackupLastTime:     s3LastTimeStr,
+		S3BackupSizeBytes:    s3Status.RemoteBytes,
 		Source:               "integrated_defense",
 		SampledAt:            time.Now(),
 	}

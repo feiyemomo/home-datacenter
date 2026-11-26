@@ -212,3 +212,48 @@ func TestHostSecurityMonitor_DetectsAllR93DriftAndIntrusionSignals(t *testing.T)
 		}
 	}
 }
+
+func TestHostMonitorIgnoresBenignEphemeralUDPSockets(t *testing.T) {
+	snap := &hostsec.HostAssetSnapshot{
+		ListeningPorts: []hostsec.ListeningPort{
+			{Protocol: "tcp", LocalAddr: "0.0.0.0", LocalPort: 8080, IsWildcard: true, ProcessName: "server", PID: 1},
+		},
+	}
+	mon := NewHostSecurityMonitor(t.TempDir(), "", nil, nil)
+	mon.SetProvider(&fakeAssetProvider{snap: snap})
+	if _, err := mon.ScanOnce(context.Background()); err != nil {
+		t.Fatalf("baseline ScanOnce failed: %v", err)
+	}
+
+	// Ephemeral high UDP6 port by server (PID=1) must be ignored
+	snap.ListeningPorts = append(snap.ListeningPorts, hostsec.ListeningPort{
+		Protocol: "udp6", LocalAddr: "::", LocalPort: 43350, IsWildcard: true, ProcessName: "server", PID: 1,
+	})
+	findings, err := mon.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce pass 2 failed: %v", err)
+	}
+	for _, f := range findings {
+		if f.Category == CatAnomalousPort {
+			t.Fatalf("expected benign ephemeral udp6 socket to be ignored, got finding: %+v", f)
+		}
+	}
+
+	// Low UDP port (< 32768) or unknown process must still alert
+	snap.ListeningPorts = append(snap.ListeningPorts, hostsec.ListeningPort{
+		Protocol: "udp", LocalAddr: "0.0.0.0", LocalPort: 4444, IsWildcard: true, ProcessName: "nc", PID: 31337,
+	})
+	findings2, err := mon.ScanOnce(context.Background())
+	if err != nil {
+		t.Fatalf("ScanOnce pass 3 failed: %v", err)
+	}
+	foundPortAlert := false
+	for _, f := range findings2 {
+		if f.Category == CatAnomalousPort {
+			foundPortAlert = true
+		}
+	}
+	if !foundPortAlert {
+		t.Fatal("expected CatAnomalousPort alert for nc udp:4444")
+	}
+}

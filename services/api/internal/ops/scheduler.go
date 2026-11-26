@@ -44,17 +44,21 @@ func SchedulerClaimFromContext(ctx context.Context, proposalID string) (string, 
 	return c.ExecutionToken, true
 }
 
+// ActivityChecker validates whether active user traffic (such as WebRTC camera stream or alarm recording) is occurring.
+type ActivityChecker func(ctx context.Context, targetComponent string) (bool, error)
+
 // ProposalScheduler is the central background runner in Go Core for scheduled proposals.
 // It scans for SCHEDULED proposals, validates that their schedule window has arrived,
 // claims them via atomic CAS, and dispatches them to OperationExecutor.
 type ProposalScheduler struct {
-	db       *gorm.DB
-	executor OperationExecutor
-	interval time.Duration
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.Mutex
-	running  bool
+	db              *gorm.DB
+	executor        OperationExecutor
+	interval        time.Duration
+	stopCh          chan struct{}
+	wg              sync.WaitGroup
+	mu              sync.Mutex
+	running         bool
+	activityChecker ActivityChecker
 }
 
 // NewProposalScheduler creates a new ProposalScheduler with a 30-second default polling interval.
@@ -65,6 +69,13 @@ func NewProposalScheduler(db *gorm.DB, executor OperationExecutor) *ProposalSche
 		interval: 30 * time.Second,
 		stopCh:   make(chan struct{}),
 	}
+}
+
+// SetActivityChecker sets an activity verification callback to avoid disrupting active streaming sessions.
+func (s *ProposalScheduler) SetActivityChecker(checker ActivityChecker) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.activityChecker = checker
 }
 
 // SetInterval updates the polling interval (useful for tests).
@@ -167,6 +178,23 @@ func (s *ProposalScheduler) Tick() {
 					log.Printf("[ops-scheduler] deferring scheduled proposal %s due to safety precondition: %v", propKey, preErr)
 					continue
 				}
+			}
+		}
+
+		// 1.5 Real-time user business activity check (avoid disrupting live WebRTC camera streams)
+		s.mu.Lock()
+		checker := s.activityChecker
+		s.mu.Unlock()
+		if checker != nil {
+			actCtx, actCancel := context.WithTimeout(context.Background(), 2*time.Second)
+			isActive, aErr := checker(actCtx, prop.TargetComponent)
+			actCancel()
+			if aErr == nil && isActive {
+				log.Printf("[ops-scheduler] deferring scheduled proposal %s (target %s) by 5m due to active user streaming / critical activity", propKey, prop.TargetComponent)
+				nextTimeStr := time.Now().Add(5 * time.Minute).Format(time.RFC3339)
+				_ = s.db.Model(&model.OpsProposal{}).Where("id = ? AND status = ?", prop.ID, model.ProposalStatusScheduled).
+					Update("scheduled_at", nextTimeStr).Error
+				continue
 			}
 		}
 

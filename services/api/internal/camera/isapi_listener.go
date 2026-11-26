@@ -154,7 +154,7 @@ func (l *ISAPIAlertListener) syncCameras() {
 
 	activeIDs := make(map[uint]bool)
 	for _, cam := range cams {
-		if cam.Status == "offline" || cam.Host == "" {
+		if cam.Status == "offline" || cam.Host == "" || strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
 			continue
 		}
 		activeIDs[cam.ID] = true

@@ -2689,8 +2689,11 @@ func (e *DefaultOperationExecutor) dispatchAction(ctx context.Context, spec Oper
 	case ActionDockerRestart:
 		return e.executeDockerRestart(ctx, canonical)
 
-	case ActionDockerRecreate, ActionDockerUpdateImage:
+	case ActionDockerRecreate:
 		return e.executeDockerRecreate(ctx, canonical, spec.Params)
+
+	case ActionDockerUpdateImage:
+		return e.executeDockerUpdateImage(ctx, canonical, spec.Params)
 
 	case ActionDockerExec:
 		return e.executeDockerExec(ctx, canonical, spec.Params)
@@ -2940,6 +2943,168 @@ func (e *DefaultOperationExecutor) executeDockerRecreate(ctx context.Context, ca
 	return e.executeDockerSocketRecreate(ctx, e.dockerSocket, containerName, image)
 }
 
+// executeDockerUpdateImage pulls the latest (or specified) image via Docker socket API
+// and then safely recreates the target container with backup & rollback protection.
+func (e *DefaultOperationExecutor) executeDockerUpdateImage(ctx context.Context, canonical string, params map[string]interface{}) (string, error) {
+	containerName := canonicalContainerNames[canonical]
+	if containerName == "" {
+		containerName = canonical
+	}
+
+	if e.dockerSocket == "" || !isDockerSocketAccessible(e.dockerSocket) {
+		return "", fmt.Errorf("docker socket not accessible for image update: %s", e.dockerSocket)
+	}
+
+	var requestedImage string
+	if params != nil {
+		if img, ok := params["new_image"].(string); ok && strings.TrimSpace(img) != "" {
+			requestedImage = strings.TrimSpace(img)
+		} else if img, ok := params["image"].(string); ok && strings.TrimSpace(img) != "" {
+			requestedImage = strings.TrimSpace(img)
+		}
+	}
+
+	targetImage := requestedImage
+	if targetImage == "" {
+		tr := &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+				return e.dialDocker(dCtx, e.dockerSocket)
+			},
+		}
+		client := &http.Client{Transport: tr, Timeout: 15 * time.Second}
+		inspectURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(containerName))
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, inspectURL, nil)
+		if err != nil {
+			tr.CloseIdleConnections()
+			return "", err
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			tr.CloseIdleConnections()
+			return "", fmt.Errorf("failed to inspect container %s before image pull: %w", containerName, err)
+		}
+		var inspectData ContainerInspectSafetyConfig
+		decErr := json.NewDecoder(io.LimitReader(resp.Body, 4*1024*1024)).Decode(&inspectData)
+		_ = resp.Body.Close()
+		tr.CloseIdleConnections()
+		if resp.StatusCode != http.StatusOK || decErr != nil {
+			return "", fmt.Errorf("failed to inspect container %s image (status %d): %v", containerName, resp.StatusCode, decErr)
+		}
+		targetImage = strings.TrimSpace(inspectData.Config.Image)
+	}
+
+	if targetImage == "" {
+		return "", fmt.Errorf("%w: cannot update image for %s: image not specified and not found in container inspect", ErrInvalidSpec, containerName)
+	}
+
+	if err := e.pullDockerImage(ctx, e.dockerSocket, containerName, targetImage); err != nil {
+		return "", err
+	}
+
+	recreateOut, err := e.executeDockerSocketRecreate(ctx, e.dockerSocket, containerName, targetImage)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("pulled image %s; %s", targetImage, recreateOut), nil
+}
+
+func (e *DefaultOperationExecutor) pullDockerImage(ctx context.Context, sockPath, containerName, imageRef string) error {
+	tracker := NewStageTracker("docker_socket", ActionDockerUpdateImage+".pull", containerName)
+	tracker.SetParentStep("image.pull")
+	if opID := OperationIDFromContext(ctx); opID != "" {
+		tracker.SetOperationID(opID)
+	}
+	trackerCtx := WithStageTracker(ctx, tracker)
+	if err := verifyContextLeaseBeforeSocket(trackerCtx); err != nil {
+		tracker.RecordFailure(err)
+		return err
+	}
+
+	fromImage, tag := parseDockerImageRef(imageRef)
+	q := url.Values{}
+	q.Set("fromImage", fromImage)
+	if tag != "" {
+		q.Set("tag", tag)
+	}
+	pullURL := "http://localhost/images/create?" + q.Encode()
+
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+			tracker.MarkStage(StageDialing)
+			conn, err := e.dialDocker(dCtx, sockPath)
+			if err != nil {
+				tracker.RecordFailure(err)
+				return nil, err
+			}
+			tracker.MarkStage(StageConnected)
+			return conn, nil
+		},
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 3 * time.Minute}
+
+	req, err := http.NewRequestWithContext(tracker.BindHTTPTrace(trackerCtx), http.MethodPost, pullURL, nil)
+	if err != nil {
+		tracker.RecordFailure(err)
+		return err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		tracker.RecordFailure(err)
+		return fmt.Errorf("docker image pull %s failed: %w", imageRef, err)
+	}
+	defer resp.Body.Close()
+
+	body, rErr := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+	if rErr != nil {
+		tracker.RecordResponse(resp.StatusCode, rErr)
+		return fmt.Errorf("reading docker image pull stream failed: %w", rErr)
+	}
+	tracker.RecordResponse(resp.StatusCode, nil)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("docker image pull %s returned %d: %s", imageRef, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	// Docker /images/create returns NDJSON progress lines; inspect each line for error/errorDetail.
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var evt struct {
+			Error       string `json:"error"`
+			ErrorDetail struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+		}
+		if json.Unmarshal([]byte(line), &evt) == nil {
+			if evt.Error != "" || evt.ErrorDetail.Message != "" {
+				msg := evt.Error
+				if evt.ErrorDetail.Message != "" {
+					msg = evt.ErrorDetail.Message
+				}
+				return fmt.Errorf("docker image pull %s error: %s", imageRef, msg)
+			}
+		}
+	}
+	return nil
+}
+
+func parseDockerImageRef(ref string) (fromImage, tag string) {
+	ref = strings.TrimSpace(ref)
+	if strings.Contains(ref, "@") {
+		return ref, ""
+	}
+	lastSlash := strings.LastIndex(ref, "/")
+	lastColon := strings.LastIndex(ref, ":")
+	if lastColon > lastSlash {
+		return ref[:lastColon], ref[lastColon+1:]
+	}
+	return ref, "latest"
+}
+
 // executeCachePurge clears specific system caches or builder caches safely.
 func (e *DefaultOperationExecutor) executeCachePurge(ctx context.Context, params map[string]interface{}) (string, error) {
 	cacheType := "docker_builder"
@@ -3140,20 +3305,41 @@ func (e *DefaultOperationExecutor) executeDockerExec(ctx context.Context, canoni
 	return e.executeDockerSocketExecOutput(ctx, e.dockerSocket, containerName, cmd)
 }
 
-// executeWAFReload triggers OpenResty configuration reload without bare shell.
+// executeWAFReload triggers OpenResty configuration reload via Docker SIGHUP without shell or exec stream hang.
 func (e *DefaultOperationExecutor) executeWAFReload(ctx context.Context) (string, error) {
 	containerName := canonicalContainerNames[ComponentOpenResty]
 	if containerName == "" {
 		containerName = "1Panel-openresty-WuDU"
 	}
 
-	// Execute `nginx -s reload` directly via Docker Unix socket
-	cmd := []string{"nginx", "-s", "reload"}
-	err := e.executeDockerSocketExec(ctx, e.dockerSocket, containerName, cmd)
+	if e.dockerSocket == "" || !isDockerSocketAccessible(e.dockerSocket) {
+		return "", fmt.Errorf("docker socket not accessible: %s", e.dockerSocket)
+	}
+
+	tr := &http.Transport{
+		DisableKeepAlives: true,
+		DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+			return e.dialDocker(dCtx, e.dockerSocket)
+		},
+	}
+	defer tr.CloseIdleConnections()
+	client := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+
+	killURL := fmt.Sprintf("http://localhost/containers/%s/kill?signal=HUP", url.PathEscape(containerName))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, killURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("openresty HUP request build failed: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("openresty reload failed: %w", err)
 	}
-	return "openresty reloaded successfully", nil
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		return "", fmt.Errorf("openresty reload failed (status %d): %s", resp.StatusCode, string(body))
+	}
+	return "openresty reloaded successfully via SIGHUP", nil
 }
 
 // executeDBCreateIndex executes a CREATE INDEX statement with strictly validated identifiers.
@@ -3258,6 +3444,9 @@ func (e *DefaultOperationExecutor) pollHealth(ctx context.Context, canonical str
 
 		select {
 		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w: %v", ctx.Err(), lastErr)
+			}
 			return ctx.Err()
 		default:
 		}
@@ -3273,6 +3462,9 @@ func (e *DefaultOperationExecutor) pollHealth(ctx context.Context, canonical str
 
 		select {
 		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w: %v", ctx.Err(), lastErr)
+			}
 			return ctx.Err()
 		case <-time.After(interval):
 		}
@@ -3452,7 +3644,7 @@ func (e *DefaultOperationExecutor) CheckReadiness(ctx context.Context, target st
 			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
 		}
 		defer resp.Body.Close()
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 		if resp.StatusCode < 200 || resp.StatusCode >= 400 {
 			return HealthProbeResult{Component: canonical, Level: ReadinessPortOpen, Detail: fmt.Sprintf("http status %d", resp.StatusCode)}, fmt.Errorf("home-web health check returned %d", resp.StatusCode)
 		}
@@ -3491,7 +3683,7 @@ func (e *DefaultOperationExecutor) CheckReadiness(ctx context.Context, target st
 			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, err
 		}
 		defer resp.Body.Close()
-		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("status %d", resp.StatusCode)}, fmt.Errorf("frigate health check returned %d", resp.StatusCode)
 		}
@@ -3514,18 +3706,130 @@ func (e *DefaultOperationExecutor) CheckReadiness(ctx context.Context, target st
 		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "MQTT CONNECT/CONNACK verified"}, nil
 
 	case ComponentOpenResty, Component1PWAF:
-		host := getProbeHost(ComponentOpenResty)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:80/", host), nil)
-		resp, err := client.Do(req)
-		if err != nil {
+		// OpenResty runs on host network (not Docker bridge DNS), so probe the Docker gateway
+		// (172.18.0.1) and any explicit custom PROBE_HOST_* with short 500ms timeouts first,
+		// leaving plenty of budget inside pollHealth's 2s probeCtx for Docker socket fallback.
+		var probeHosts []string
+		if custom := strings.TrimSpace(os.Getenv("PROBE_HOST_OPENRESTY")); custom != "" {
+			probeHosts = append(probeHosts, custom)
+		}
+		if inDockerEnv() {
+			probeHosts = append(probeHosts, "172.18.0.1")
+		} else if h := getProbeHost(ComponentOpenResty); h != "" {
+			probeHosts = append(probeHosts, h)
+		}
+		var lastErr error
+		for _, host := range probeHosts {
+			if host == "" {
+				continue
+			}
+			pCtx, pCancel := context.WithTimeout(ctx, 500*time.Millisecond)
+			req, _ := http.NewRequestWithContext(pCtx, http.MethodGet, fmt.Sprintf("http://%s:80/", host), nil)
+			req.Header.Set("User-Agent", "home-datacenter-healthprobe/1.0")
+			resp, err := client.Do(req)
+			pCancel()
+			if err == nil {
+				_ = resp.Body.Close()
+				if resp.StatusCode < 500 {
+					return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: fmt.Sprintf("openresty HTTP status %d", resp.StatusCode)}, nil
+				}
+				lastErr = fmt.Errorf("openresty gateway/upstream returned %d", resp.StatusCode)
+			} else {
+				lastErr = err
+			}
+		}
+		// Fallback: verify 1Panel-openresty-WuDU container is running via Docker socket
+		if e.dockerSocket != "" && isDockerSocketAccessible(e.dockerSocket) {
+			dTr := &http.Transport{
+				DisableKeepAlives: true,
+				DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+					return e.dialDocker(dCtx, e.dockerSocket)
+				},
+			}
+			dClient := &http.Client{Transport: dTr, Timeout: 2 * time.Second}
+			dURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(canonicalContainerNames[ComponentOpenResty]))
+			dCtx, dCancel := context.WithTimeout(ctx, 1*time.Second)
+			dReq, dErr := http.NewRequestWithContext(dCtx, http.MethodGet, dURL, nil)
+			if dErr == nil {
+				if dResp, rErr := dClient.Do(dReq); rErr == nil {
+					var info struct {
+						State struct {
+							Running bool `json:"Running"`
+						} `json:"State"`
+					}
+					_ = json.NewDecoder(io.LimitReader(dResp.Body, 1024*1024)).Decode(&info)
+					_ = dResp.Body.Close()
+					dCancel()
+					dTr.CloseIdleConnections()
+					if info.State.Running {
+						return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: "openresty container running (verified via docker socket)"}, nil
+					}
+				} else {
+					lastErr = rErr
+				}
+			}
+			dCancel()
+			dTr.CloseIdleConnections()
+		}
+		GlobalSecurityMetrics.IncHealthUnknown()
+		return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: fmt.Sprintf("%v", lastErr)}, fmt.Errorf("openresty HTTP check failed: %w", lastErr)
+
+	case ComponentCloudflared, ComponentH3CKeepalive, ComponentNewAPI, ComponentOpsAgent, ComponentHomeBackup, ComponentMihomo, ComponentTailscale:
+		containerName := canonicalContainerNames[canonical]
+		if containerName == "" {
+			containerName = canonical
+		}
+		if e.dockerSocket == "" || !isDockerSocketAccessible(e.dockerSocket) {
 			GlobalSecurityMetrics.IncHealthUnknown()
-			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: err.Error()}, fmt.Errorf("openresty HTTP check failed: %w", err)
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: "docker socket unavailable for container readiness check"}, fmt.Errorf("docker socket unavailable for %s readiness check", canonical)
 		}
-		defer resp.Body.Close()
-		if resp.StatusCode >= 500 {
-			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("upstream error %d", resp.StatusCode)}, fmt.Errorf("openresty gateway/upstream returned %d", resp.StatusCode)
+		dTr := &http.Transport{
+			DisableKeepAlives: true,
+			DialContext: func(dCtx context.Context, _, _ string) (net.Conn, error) {
+				return e.dialDocker(dCtx, e.dockerSocket)
+			},
 		}
-		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: fmt.Sprintf("openresty HTTP status %d", resp.StatusCode)}, nil
+		defer dTr.CloseIdleConnections()
+		dClient := &http.Client{Transport: dTr, Timeout: 2 * time.Second}
+		dURL := fmt.Sprintf("http://localhost/containers/%s/json", url.PathEscape(containerName))
+		dCtx, dCancel := context.WithTimeout(ctx, 2*time.Second)
+		defer dCancel()
+		dReq, dErr := http.NewRequestWithContext(dCtx, http.MethodGet, dURL, nil)
+		if dErr != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: dErr.Error()}, dErr
+		}
+		dResp, rErr := dClient.Do(dReq)
+		if rErr != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: rErr.Error()}, fmt.Errorf("container %s readiness check failed: %w", containerName, rErr)
+		}
+		defer dResp.Body.Close()
+		var info struct {
+			State struct {
+				Running    bool   `json:"Running"`
+				Restarting bool   `json:"Restarting"`
+				Status     string `json:"Status"`
+				Health     *struct {
+					Status string `json:"Status"`
+				} `json:"Health"`
+			} `json:"State"`
+		}
+		if decErr := json.NewDecoder(io.LimitReader(dResp.Body, 1024*1024)).Decode(&info); decErr != nil {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: decErr.Error()}, decErr
+		}
+		if dResp.StatusCode != http.StatusOK {
+			GlobalSecurityMetrics.IncHealthUnknown()
+			return HealthProbeResult{Component: canonical, Level: ReadinessUnknown, Detail: fmt.Sprintf("docker inspect status %d", dResp.StatusCode)}, fmt.Errorf("container %s inspect returned %d", containerName, dResp.StatusCode)
+		}
+		if !info.State.Running || info.State.Restarting {
+			return HealthProbeResult{Component: canonical, Level: ReadinessProcessRunning, Detail: fmt.Sprintf("container %s state=%s restarting=%v", containerName, info.State.Status, info.State.Restarting)}, fmt.Errorf("container %s is not running (status=%s)", containerName, info.State.Status)
+		}
+		if info.State.Health != nil && strings.EqualFold(info.State.Health.Status, "unhealthy") {
+			return HealthProbeResult{Component: canonical, Level: ReadinessServiceReady, Detail: fmt.Sprintf("container %s health=unhealthy", containerName)}, fmt.Errorf("container %s reported unhealthy", containerName)
+		}
+		return HealthProbeResult{Component: canonical, Level: ReadinessBusinessHealthy, Detail: fmt.Sprintf("container %s running (verified via docker socket)", containerName)}, nil
 
 	case ComponentHostOS:
 		prov := e.GetHostSecurityProvider()
@@ -3689,12 +3993,16 @@ func (e *DefaultOperationExecutor) executeDockerSocketRestart(ctx context.Contex
 
 // executeDockerSocketExec issues a command execution in a container via Docker Unix Socket HTTP API without shell.
 func (e *DefaultOperationExecutor) executeDockerSocketExec(ctx context.Context, sockPath, containerName string, cmd []string) error {
-	_, err := e.executeDockerSocketExecOutput(ctx, sockPath, containerName, cmd)
+	_, err := e.executeDockerSocketExecWithDetach(ctx, sockPath, containerName, cmd, true)
 	return err
 }
 
 // executeDockerSocketExecOutput issues exec with two-stage tracking (create -> start).
 func (e *DefaultOperationExecutor) executeDockerSocketExecOutput(ctx context.Context, sockPath, containerName string, cmd []string) (string, error) {
+	return e.executeDockerSocketExecWithDetach(ctx, sockPath, containerName, cmd, false)
+}
+
+func (e *DefaultOperationExecutor) executeDockerSocketExecWithDetach(ctx context.Context, sockPath, containerName string, cmd []string, detach bool) (string, error) {
 	if sockPath == "" || !isDockerSocketAccessible(sockPath) {
 		return "", fmt.Errorf("docker socket not accessible: %s", sockPath)
 	}
@@ -3784,7 +4092,7 @@ func (e *DefaultOperationExecutor) executeDockerSocketExecOutput(ctx context.Con
 	}
 
 	startPayload, _ := json.Marshal(map[string]interface{}{
-		"Detach": false,
+		"Detach": detach,
 		"Tty":    false,
 	})
 	startURL := fmt.Sprintf("http://localhost/exec/%s/start", url.PathEscape(execID))

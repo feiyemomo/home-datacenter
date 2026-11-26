@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -27,16 +28,29 @@ type PostChatMessageRequest struct {
 	Scope     string `json:"scope"`   // "personal" (default) or "household"
 }
 
+// ActionProposalDraft represents an actionable proposal draft extracted from user intent.
+type ActionProposalDraft struct {
+	ProposalID      string                 `json:"proposal_id,omitempty"`
+	TargetComponent string                 `json:"target_component"`
+	Action          string                 `json:"action"`
+	Params          map[string]interface{} `json:"params,omitempty"`
+	RiskLevel       string                 `json:"risk_level"`
+	Title           string                 `json:"title"`
+	EstimatedSec    int                    `json:"estimated_sec"`
+	Status          string                 `json:"status"` // "draft" or "awaiting_approval"
+}
+
 // ChatMessageResponse represents the unified Copilot response payload.
 type ChatMessageResponse struct {
-	ID                  string   `json:"id"`
-	SessionID           string   `json:"session_id"`
-	Role                string   `json:"role"`
-	Content             string   `json:"content"`
-	Reply               string   `json:"reply"` // Mirror of Content for E2E contract compliance
-	Model               string   `json:"model"`
-	Timestamp           int64    `json:"timestamp"`
-	ProposalsReferenced []string `json:"proposals_referenced"`
+	ID                  string               `json:"id"`
+	SessionID           string               `json:"session_id"`
+	Role                string               `json:"role"`
+	Content             string               `json:"content"`
+	Reply               string               `json:"reply"` // Mirror of Content for E2E contract compliance
+	Model               string               `json:"model"`
+	Timestamp           int64                `json:"timestamp"`
+	ProposalsReferenced []string             `json:"proposals_referenced"`
+	ActionProposal      *ActionProposalDraft `json:"action_proposal,omitempty"`
 }
 
 // RegisterChatRoutes registers Ops Chat Copilot endpoints.
@@ -170,6 +184,16 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 	// 2. Query New API Gateway or intelligent domain fallback
 	replyText, usedModel, referencedProps := h.queryCopilotWithFallback(c.Request.Context(), prompt, sysContext, modelAlias)
 
+	// 2.5 Action intent extraction and draft proposal generation for administrators
+	var draft *ActionProposalDraft
+	if isAdmin || c.GetBool("is_internal_service") {
+		draft = h.detectActionProposal(prompt, hhID, currentUserID)
+		if draft != nil && draft.ProposalID != "" {
+			referencedProps = append(referencedProps, draft.ProposalID)
+			replyText += fmt.Sprintf("\n\n💡 **已为您自动推演并生成变更提案**【%s】(ID: `%s`)，您可直接在下方卡片点击确认执行或预约至低峰期。", draft.Title, draft.ProposalID)
+		}
+	}
+
 	now := time.Now()
 	msgID := fmt.Sprintf("msg-%d", now.UnixNano()/1e6)
 
@@ -224,6 +248,7 @@ func (h *OpsHandler) PostChatMessage(c *gin.Context) {
 		Model:               usedModel,
 		Timestamp:           now.UnixMilli(),
 		ProposalsReferenced: referencedProps,
+		ActionProposal:      draft,
 	}
 
 	if c.Query("envelope") == "true" || c.GetHeader("X-Envelope") == "true" {
@@ -583,18 +608,52 @@ func (h *OpsHandler) domainReasoningFallback(prompt string) (string, []string) {
 	// 6. Container Resource Ranking
 	if strings.Contains(p, "容器") || strings.Contains(p, "资源") || strings.Contains(p, "排行") || strings.Contains(p, "container") {
 		var containers []ContainerSummary
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
 		if h.client != nil {
-			if cList, err := h.client.ListContainers(ctx); err == nil && len(cList) > 0 {
+			cCtx, cCancel := context.WithTimeout(context.Background(), 8*time.Second)
+			if cList, err := h.client.ListContainers(cCtx); err == nil && len(cList) > 0 {
 				containers = cList
 			}
+			cCancel()
 		}
-		if len(containers) == 0 && h.fallback != nil {
-			containers = h.fallback.GetHostContainers(ctx)
+		// Fallback or supplement if 1Panel returned empty or zeroed stats
+		hasNonZeroStats := false
+		for _, ct := range containers {
+			if ct.CPUPercent > 0 || ct.MemoryUsageMB > 0 {
+				hasNonZeroStats = true
+				break
+			}
+		}
+		if (len(containers) == 0 || !hasNonZeroStats) && h.fallback != nil {
+			fbCtx, fbCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			fbList := h.fallback.GetHostContainers(fbCtx)
+			fbCancel()
+			if len(containers) == 0 {
+				containers = fbList
+			} else if len(fbList) > 0 {
+				fbMap := make(map[string]ContainerSummary, len(fbList))
+				for _, f := range fbList {
+					fbMap[strings.TrimPrefix(f.Name, "/")] = f
+				}
+				for i := range containers {
+					if f, ok := fbMap[strings.TrimPrefix(containers[i].Name, "/")]; ok {
+						if containers[i].CPUPercent == 0 {
+							containers[i].CPUPercent = f.CPUPercent
+						}
+						if containers[i].MemoryUsageMB == 0 {
+							containers[i].MemoryUsageMB = f.MemoryUsageMB
+							containers[i].MemoryMB = f.MemoryMB
+						}
+					}
+				}
+			}
 		}
 
 		sort.Slice(containers, func(i, j int) bool {
+			iRun := strings.EqualFold(containers[i].State, "running") || strings.HasPrefix(strings.ToLower(containers[i].Status), "up")
+			jRun := strings.EqualFold(containers[j].State, "running") || strings.HasPrefix(strings.ToLower(containers[j].Status), "up")
+			if iRun != jRun {
+				return iRun
+			}
 			if containers[i].CPUPercent != containers[j].CPUPercent {
 				return containers[i].CPUPercent > containers[j].CPUPercent
 			}
@@ -603,48 +662,117 @@ func (h *OpsHandler) domainReasoningFallback(prompt string) (string, []string) {
 
 		var sb strings.Builder
 		sb.WriteString("【Docker 核心容器资源消耗大盘 (CPU/内存排行)】\n\n")
-		for _, c := range containers {
-			sb.WriteString(fmt.Sprintf("• %-16s: CPU %5.1f%%, 内存 %6.1f MB [%s]\n", c.Name, c.CPUPercent, c.MemoryUsageMB, c.Status))
+		if len(containers) == 0 {
+			sb.WriteString("• 暂未获取到容器实时列表，请检查 1Panel 服务或 Docker Socket 状态。")
+			return sb.String(), referenced
 		}
+		runningCnt := 0
+		var totalMem float64
+		for _, c := range containers {
+			if strings.EqualFold(c.State, "running") || strings.HasPrefix(strings.ToLower(c.Status), "up") {
+				runningCnt++
+			}
+			totalMem += c.MemoryUsageMB
+			sb.WriteString(fmt.Sprintf("• %-18s: CPU %5.1f%%, 内存 %6.1f MB [%s]\n", c.Name, c.CPUPercent, c.MemoryUsageMB, c.Status))
+		}
+		sb.WriteString(fmt.Sprintf("\n汇总: 共 %d 个容器 (%d 个运行中)，累计内存占用 %.1f MB。", len(containers), runningCnt, totalMem))
 		return sb.String(), referenced
 	}
 
-	// 7. General Default System Fallback
-	var containers []ContainerSummary
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	if h.client != nil {
-		if cList, err := h.client.ListContainers(ctx); err == nil && len(cList) > 0 {
-			containers = cList
+	// 7. Simple Arithmetic / Expression Evaluation (offline convenience)
+	if ans, ok := tryEvalSimpleArithmetic(prompt); ok {
+		return ans, referenced
+	}
+
+	// 8. System / Architecture Status Summary (when user asks about system/host/mesh status)
+	if strings.Contains(p, "系统") || strings.Contains(p, "状态") || strings.Contains(p, "架构") ||
+		strings.Contains(p, "网格") || strings.Contains(p, "整体") || strings.Contains(p, "宿主机") ||
+		strings.Contains(p, "内存") || strings.Contains(p, "cpu") || strings.Contains(p, "存储") ||
+		strings.Contains(p, "运行") || strings.Contains(p, "健康") || strings.Contains(p, "status") || strings.Contains(p, "health") {
+		var containers []ContainerSummary
+		if h.client != nil {
+			cCtx, cCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if cList, err := h.client.ListContainers(cCtx); err == nil && len(cList) > 0 {
+				containers = cList
+			}
+			cCancel()
 		}
-	}
-	if len(containers) == 0 && h.fallback != nil {
-		containers = h.fallback.GetHostContainers(ctx)
-	}
-
-	runningCount := 0
-	for _, ct := range containers {
-		if strings.ToLower(ct.State) == "running" || strings.HasPrefix(strings.ToLower(ct.Status), "up") {
-			runningCount++
+		if len(containers) == 0 && h.fallback != nil {
+			fbCtx, fbCancel := context.WithTimeout(context.Background(), 4*time.Second)
+			containers = h.fallback.GetHostContainers(fbCtx)
+			fbCancel()
 		}
+
+		runningCount := 0
+		for _, ct := range containers {
+			if strings.ToLower(ct.State) == "running" || strings.HasPrefix(strings.ToLower(ct.Status), "up") {
+				runningCount++
+			}
+		}
+
+		containerStatusStr := "容器状态未知 (Docker 守护进程不可达)"
+		if len(containers) > 0 {
+			containerStatusStr = fmt.Sprintf("共检测到 %d 个容器 (%d 个正常运行)", len(containers), runningCount)
+		}
+
+		status := h.fallback.GetHostStatus()
+		return fmt.Sprintf("主动协作 Ops Copilot 已分析您的指令：「%s」。\n\n"+
+			"当前系统状态：\n"+
+			"• 宿主机 CPU: %.1f%% (负载: %.2f/%.2f/%.2f), 内存: %dMB/%dMB (%.1f%%)\n"+
+			"• 存储池健康: %s 水位 (已用 %.1fGB/%.1fGB)\n"+
+			"• 微服务网格: %s。\n\n"+
+			"如需执行任何高危运维操作（如镜像版本升级、表结构重构），请随时吩咐我协助推演提案。",
+			prompt, status.CPU.Percent, status.CPU.LoadAverage[0], status.CPU.LoadAverage[1], status.CPU.LoadAverage[2],
+			status.Memory.UsedMB, status.Memory.TotalMB, status.Memory.UsedPercent,
+			status.DiskPool.Watermark, status.DiskPool.UsedGB, status.DiskPool.TotalGB,
+			containerStatusStr), referenced
 	}
 
-	containerStatusStr := "容器状态未知 (Docker 守护进程不可达)"
-	if len(containers) > 0 {
-		containerStatusStr = fmt.Sprintf("共检测到 %d 个容器 (%d 个正常运行)", len(containers), runningCount)
-	}
+	// 9. Honest Offline Engine Response (when external LLM API key is not configured)
+	return "当前服务端尚未配置外部大模型 API Key（`NEW_API_URL` / `GEMINI_API_KEY` / `GROQ_API_KEY`），因此 Copilot 正运行在【本地确定性运维引擎】模式下，暂无法解答通用开放式问答。\n\n" +
+		"您可以向我提问以下运维指令（由本地实时总线直接响应）：\n" +
+		"• 「查询容器资源消耗排行」\n" +
+		"• 「分析过去 24 小时 SSH 攻击」\n" +
+		"• 「当前有哪些高危待批提案？」\n" +
+		"• 「检查 S3 异地备份状态」\n" +
+		"• 「为什么昨天凌晨 vision 重启了？」\n" +
+		"• 或直接下达重启/刷新指令（如「重启 vision」）生成变更提案。\n\n" +
+		"如需启用完整大模型自由对话，请在 NAS `.env` 中配置 `GEMINI_API_KEY` 或 `NEW_API_URL` / `NEW_API_TOKEN` 并重启 `home-api`。", referenced
+}
 
-	status := h.fallback.GetHostStatus()
-	return fmt.Sprintf("主动协作 Ops Copilot 已分析您的指令：「%s」。\n\n"+
-		"当前系统状态：\n"+
-		"• 宿主机 CPU: %.1f%% (负载: %.2f/%.2f/%.2f), 内存: %dMB/%dMB (%.1f%%)\n"+
-		"• 存储池健康: %s 水位 (已用 %.1fGB/%.1fGB)\n"+
-		"• 微服务网格: %s。\n\n"+
-		"如需执行任何高危运维操作（如镜像版本升级、表结构重构），请随时吩咐我协助推演提案。",
-		prompt, status.CPU.Percent, status.CPU.LoadAverage[0], status.CPU.LoadAverage[1], status.CPU.LoadAverage[2],
-		status.Memory.UsedMB, status.Memory.TotalMB, status.Memory.UsedPercent,
-		status.DiskPool.Watermark, status.DiskPool.UsedGB, status.DiskPool.TotalGB,
-		containerStatusStr), referenced
+var simpleMathRegex = regexp.MustCompile(`^\s*(-?\d+(?:\.\d+)?)\s*([+\-*/×÷])\s*(-?\d+(?:\.\d+)?)\s*[=＝?？\s]*$`)
+
+func tryEvalSimpleArithmetic(prompt string) (string, bool) {
+	cleaned := strings.TrimSpace(prompt)
+	m := simpleMathRegex.FindStringSubmatch(cleaned)
+	if len(m) != 4 {
+		return "", false
+	}
+	a, err1 := strconv.ParseFloat(m[1], 64)
+	b, err2 := strconv.ParseFloat(m[3], 64)
+	if err1 != nil || err2 != nil {
+		return "", false
+	}
+	op := m[2]
+	var res float64
+	switch op {
+	case "+":
+		res = a + b
+	case "-":
+		res = a - b
+	case "*", "×":
+		res = a * b
+	case "/", "÷":
+		if b == 0 {
+			return "计算结果未定义：除数不能为 0。", true
+		}
+		res = a / b
+	default:
+		return "", false
+	}
+	// Format cleanly without trailing .0 for integers
+	resStr := strconv.FormatFloat(res, 'f', -1, 64)
+	return fmt.Sprintf("%s %s %s = **%s**", m[1], op, m[3], resStr), true
 }
 
 func (h *OpsHandler) generateCVEReport() (string, []string) {
@@ -722,6 +850,176 @@ func truncateTitle(s string, maxRunes int) string {
 		return s
 	}
 	return string(runes[:maxRunes]) + "..."
+}
+
+// detectActionProposal identifies actionable operations in user query and generates a safe OpsProposal.
+func (h *OpsHandler) detectActionProposal(prompt string, hhID uint, userID uint) *ActionProposalDraft {
+	p := strings.ToLower(prompt)
+
+	var target, action, title, risk string
+	var estSec int
+	params := make(map[string]interface{})
+
+	// 0. Docker image update intents (before restart, since "升级/更新镜像" may not say "重启")
+	isImageUpdateIntent := strings.Contains(p, "更新镜像") || strings.Contains(p, "升级镜像") ||
+		strings.Contains(p, "镜像更新") || strings.Contains(p, "镜像升级") ||
+		strings.Contains(p, "拉取最新") || strings.Contains(p, "update image") ||
+		strings.Contains(p, "upgrade image") ||
+		((strings.Contains(p, "更新") || strings.Contains(p, "升级") || strings.Contains(p, "upgrade")) &&
+			(strings.Contains(p, "镜像") || strings.Contains(p, "版本") || strings.Contains(p, "image") || strings.Contains(p, "latest")))
+	if isImageUpdateIntent {
+		switch {
+		case strings.Contains(p, "vision") || strings.Contains(p, "视觉"):
+			target = ComponentHomeVision
+		case strings.Contains(p, "frigate") || strings.Contains(p, "监控"):
+			target = ComponentFrigate
+		case strings.Contains(p, "web") || strings.Contains(p, "前端"):
+			target = ComponentHomeWeb
+		case strings.Contains(p, "mosquitto") || strings.Contains(p, "mqtt"):
+			target = ComponentMosquitto
+		case strings.Contains(p, "gateway") || strings.Contains(p, "网关") || strings.Contains(p, "openresty"):
+			target = ComponentOpenResty
+		case strings.Contains(p, "clash") || strings.Contains(p, "mihomo") || strings.Contains(p, "代理"):
+			target = ComponentMihomo
+		case strings.Contains(p, "tailscale"):
+			target = ComponentTailscale
+		case strings.Contains(p, "cloudflared"):
+			target = ComponentCloudflared
+		case strings.Contains(p, "new-api") || strings.Contains(p, "newapi"):
+			target = ComponentNewAPI
+		case strings.Contains(p, "backup") || strings.Contains(p, "备份"):
+			target = ComponentHomeBackup
+		case strings.Contains(p, "home-api") || strings.Contains(p, "后端"):
+			target = ComponentHomeAPI
+		}
+		if target != "" {
+			action = ActionDockerUpdateImage
+			title = fmt.Sprintf("拉取最新镜像并滚动更新 %s", target)
+			risk = model.RiskLevelMedium
+			if target == ComponentHomeAPI || target == ComponentOpenResty || target == ComponentMosquitto {
+				risk = model.RiskLevelHigh
+			}
+			estSec = 45
+			// Extract optional explicit image reference (e.g. repo/name:tag)
+			for _, tok := range strings.Fields(prompt) {
+				tok = strings.Trim(tok, "`\"'(),，。；;")
+				if strings.Contains(tok, ":") && (strings.Contains(tok, "/") || !strings.HasPrefix(tok, "http")) && !strings.ContainsAny(tok, " \t") {
+					if idx := strings.LastIndex(tok, ":"); idx > 0 && idx < len(tok)-1 {
+						params["new_image"] = tok
+						break
+					}
+				}
+			}
+		}
+	}
+
+	// 1. Container restart intents
+	if target == "" && (strings.Contains(p, "重启") || strings.Contains(p, "restart")) {
+		if strings.Contains(p, "vision") || strings.Contains(p, "视觉") {
+			target = ComponentHomeVision
+			action = ActionDockerRestart
+			title = "快速重启 home-vision 视觉计算服务"
+			risk = model.RiskLevelLow
+			estSec = 10
+		} else if strings.Contains(p, "frigate") || strings.Contains(p, "监控") {
+			target = ComponentFrigate
+			action = ActionDockerRestart
+			title = "快速重启 frigate 监控与推流服务"
+			risk = model.RiskLevelMedium
+			estSec = 15
+		} else if strings.Contains(p, "web") || strings.Contains(p, "前端") {
+			target = ComponentHomeWeb
+			action = ActionDockerRestart
+			title = "快速重启 home-web 控制台服务"
+			risk = model.RiskLevelLow
+			estSec = 10
+		} else if strings.Contains(p, "mosquitto") || strings.Contains(p, "mqtt") {
+			target = ComponentMosquitto
+			action = ActionDockerRestart
+			title = "快速重启 mosquitto 消息中间件"
+			risk = model.RiskLevelMedium
+			estSec = 10
+		} else if strings.Contains(p, "gateway") || strings.Contains(p, "网关") || strings.Contains(p, "openresty") {
+			target = ComponentOpenResty
+			action = ActionDockerRestart
+			title = "快速重启 openresty 反向代理与 WAF 网关"
+			risk = model.RiskLevelMedium
+			estSec = 15
+		} else if strings.Contains(p, "clash") || strings.Contains(p, "mihomo") || strings.Contains(p, "代理") {
+			target = ComponentMihomo
+			action = ActionDockerRestart
+			title = "快速重启 mihomo 网络代理服务"
+			risk = model.RiskLevelLow
+			estSec = 10
+		}
+	}
+
+	// 2. Network reset intents
+	if strings.Contains(p, "dns") || strings.Contains(p, "解析") {
+		if strings.Contains(p, "刷新") || strings.Contains(p, "清理") || strings.Contains(p, "flush") || strings.Contains(p, "reset") {
+			target = "network-dns"
+			action = "net.service_reset"
+			params["reset_scope"] = "dns_flush"
+			title = "刷新系统 DNS 缓存"
+			risk = model.RiskLevelLow
+			estSec = 5
+		}
+	} else if (strings.Contains(p, "穿透") || strings.Contains(p, "h3c") || strings.Contains(p, "隧道")) && (strings.Contains(p, "重载") || strings.Contains(p, "重置") || strings.Contains(p, "reset") || strings.Contains(p, "重启")) {
+		target = "network-tunnel"
+		action = "net.service_reset"
+		params["reset_scope"] = "tunnel_reload"
+		title = "重载 H3C 外网穿透服务"
+		risk = model.RiskLevelLow
+		estSec = 10
+	}
+
+	if target == "" || action == "" {
+		return nil
+	}
+
+	draft := &ActionProposalDraft{
+		TargetComponent: target,
+		Action:          action,
+		Params:          params,
+		RiskLevel:       risk,
+		Title:           title,
+		EstimatedSec:    estSec,
+		Status:          model.ProposalStatusAwaitingApproval,
+	}
+
+	if h.db != nil {
+		propID := fmt.Sprintf("prop-chat-%d", time.Now().UnixNano()/1e6)
+		actionSpecJSON, _ := json.Marshal(map[string]interface{}{
+			"action":      action,
+			"target":      target,
+			"params":      params,
+			"timeout_sec": 30,
+		})
+		baseline := h.ComputeFingerprint(target)
+		if baseline == "" {
+			baseline = "host-v1:chat-auto-baseline"
+		}
+		prop := model.OpsProposal{
+			HouseholdID:      hhID,
+			ProposalID:       propID,
+			Title:            title,
+			Description:      fmt.Sprintf("由 Ops Copilot 对话根据用户指令自动推演生成: %q", prompt),
+			TargetComponent:  target,
+			RiskLevel:        risk,
+			Status:           model.ProposalStatusAwaitingApproval,
+			EstimatedSeconds: estSec,
+			ActionSpec:       string(actionSpecJSON),
+			BaselineHash:     baseline,
+			Version:          1,
+			Revision:         1,
+			CreatedAt:        time.Now(),
+		}
+		if err := h.db.Create(&prop).Error; err == nil {
+			draft.ProposalID = propID
+		}
+	}
+
+	return draft
 }
 
 type openAIChatCompletionResponse struct {

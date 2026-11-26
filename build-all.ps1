@@ -1,4 +1,4 @@
-# build-all.ps1 — Orchestrate build + deploy for all three home-datacenter tiers.
+﻿# build-all.ps1 — Orchestrate build + deploy for all three home-datacenter tiers.
 #
 # Each tier keeps its own toolchain & build system; this script is a thin
 # orchestrator that runs them in order and fails fast on error. Nothing is
@@ -48,6 +48,12 @@ param(
     # NAS password for deploy / push when no SSH key is installed.
     [string]$Password,
 
+    # Force acquiring an H3C Oasis Cloud relay tunnel even if LAN is reachable.
+    [switch]$ForceH3C,
+
+    # Keep the H3C relay tunnel alive after script completes (do not auto-delete).
+    [switch]$KeepTunnel,
+
     # Preview commands without touching the NAS or running heavy builds.
     [switch]$DryRun
 )
@@ -88,6 +94,8 @@ if (-not $SkipAndroid) {
         if ($Notes) { $pushArgs.Notes = $Notes }
         if ($Password) { $pushArgs.Password = $Password }
         if ($DryRun) { $pushArgs.DryRun = $true }
+        if ($ForceH3C) { $pushArgs.ForceH3C = $true }
+        if ($KeepTunnel) { $pushArgs.KeepTunnel = $true }
         & "$AndroidRoot\push-apk.ps1" @pushArgs
         if ($LASTEXITCODE -ne 0) {
             Write-Error "ERROR: push-apk.ps1 failed (exit $LASTEXITCODE)"
@@ -111,6 +119,8 @@ if (-not $SkipDeploy) {
     $deployArgs = @{}
     if ($Password) { $deployArgs.Password = $Password }
     if ($DryRun) { $deployArgs.DryRun = $true }
+    if ($ForceH3C) { $deployArgs.ForceH3C = $true }
+    if ($KeepTunnel) { $deployArgs.KeepTunnel = $true }
     & "$RepoRoot\deploy-nas.ps1" @deployArgs
     if ($LASTEXITCODE -ne 0) {
         Write-Error "ERROR: deploy-nas.ps1 failed (exit $LASTEXITCODE)"

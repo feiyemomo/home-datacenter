@@ -206,6 +206,9 @@ func (m *HostSecurityMonitor) ScanOnce(ctx context.Context) ([]HostSecurityFindi
 	// 2. Anomalous listening ports
 	for key, port := range portMap {
 		if _, existed := m.baseline.ListeningPorts[key]; !existed {
+			if isBenignEphemeralUDPSocket(port) {
+				continue
+			}
 			sev := "medium"
 			if port.IsWildcard {
 				sev = "high"
@@ -521,11 +524,22 @@ func (m *HostSecurityMonitor) inspectDockerContainers(ctx context.Context, findi
 		}
 
 		var reasons []string
-		if ins.HostConfig.Privileged {
+		isV2RayA := cName == "v2raya"
+		if ins.HostConfig.Privileged && !isV2RayA {
 			reasons = append(reasons, "Privileged=true")
 		}
+		isNetInfra := cName == "tailscale" || cName == "mihomo" || isV2RayA
 		for _, capName := range ins.HostConfig.CapAdd {
-			if dangerousCaps[strings.ToUpper(strings.TrimPrefix(capName, "CAP_"))] {
+			normCap := strings.ToUpper(strings.TrimPrefix(capName, "CAP_"))
+			if isNetInfra && normCap == "NET_ADMIN" && (!ins.HostConfig.Privileged || isV2RayA) {
+				// tailscale, mihomo, and v2raya legitimately require NET_ADMIN for TUN/tproxy routing
+				continue
+			}
+			if isV2RayA && normCap == "SYS_MODULE" {
+				// v2raya legitimately uses SYS_MODULE for tproxy kernel module loading
+				continue
+			}
+			if dangerousCaps[normCap] {
 				reasons = append(reasons, "CapAdd="+capName)
 			}
 		}
@@ -733,6 +747,21 @@ func diffFileHashes(prev, curr map[string]string, cat HostSecurityCategory, sev,
 			})
 		}
 	}
+}
+
+func isBenignEphemeralUDPSocket(p hostsec.ListeningPort) bool {
+	proto := strings.ToLower(strings.TrimSpace(p.Protocol))
+	if proto != "udp" && proto != "udp6" {
+		return false
+	}
+	if p.LocalPort < 32768 {
+		return false
+	}
+	proc := strings.ToLower(strings.TrimSpace(p.ProcessName))
+	if (proc == "server" && p.PID == 1) || proc == "tailscaled" || proc == "mihomo" || proc == "go2rtc" || proc == "frigate" {
+		return true
+	}
+	return false
 }
 
 func indexListeningPorts(ports []hostsec.ListeningPort) map[string]hostsec.ListeningPort {

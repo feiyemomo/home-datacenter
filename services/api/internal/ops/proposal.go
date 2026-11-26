@@ -59,6 +59,8 @@ func (h *OpsHandler) ListProposals(c *gin.Context) {
 	query := h.db.Model(&model.OpsProposal{}).Where("household_id = ?", hid)
 	if status := c.Query("status"); status != "" {
 		query = query.Where("status = ?", status)
+	} else if c.Query("include_archived") != "true" {
+		query = query.Where("status != ?", model.ProposalStatusArchived)
 	}
 
 	if err := query.Order("id DESC").Find(&proposals).Error; err != nil {
@@ -490,7 +492,19 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		exec := h.GetExecutor()
 		if exec != nil {
 			if c.Query("sync") == "true" {
-				res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
+				execCtx := c.Request.Context()
+	if strings.Contains(proposal.ActionSpec, ActionDockerUpdateImage) {
+		_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(4 * time.Minute))
+		sessCopy, hasSess := audit.SessionFromContext(c.Request.Context())
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithTimeout(context.Background(), 4*time.Minute)
+		defer cancel()
+		if hasSess {
+			execCtx = audit.ContextWithSession(execCtx, sessCopy)
+		}
+	}
+
+	res, err := exec.ExecuteProposal(execCtx, &proposal)
 				if err != nil {
 					log.Printf("[ops] synchronous proposal %s execution failed: %v", proposal.ProposalID, err)
 					if errors.Is(err, ErrProposalNotExecutable) ||
@@ -512,7 +526,11 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 			} else {
 				sessCopy, hasSess := audit.SessionFromContext(c.Request.Context())
 				go func(prop model.OpsProposal) {
-					ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+					execTimeout := 60 * time.Second
+					if strings.Contains(prop.ActionSpec, ActionDockerUpdateImage) {
+						execTimeout = 4 * time.Minute
+					}
+					ctx, cancel := context.WithTimeout(context.Background(), execTimeout)
 					defer cancel()
 					if hasSess {
 						ctx = audit.ContextWithSession(ctx, sessCopy)
@@ -597,7 +615,19 @@ func (h *OpsHandler) ExecuteProposalEndpoint(c *gin.Context) {
 		return
 	}
 
-	res, err := exec.ExecuteProposal(c.Request.Context(), &proposal)
+	execCtx := c.Request.Context()
+	if strings.Contains(proposal.ActionSpec, ActionDockerUpdateImage) {
+		_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(4 * time.Minute))
+		sessCopy, hasSess := audit.SessionFromContext(c.Request.Context())
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithTimeout(context.Background(), 4*time.Minute)
+		defer cancel()
+		if hasSess {
+			execCtx = audit.ContextWithSession(execCtx, sessCopy)
+		}
+	}
+
+	res, err := exec.ExecuteProposal(execCtx, &proposal)
 	if err != nil {
 		if errors.Is(err, ErrProposalUnauthorized) || errors.Is(err, ErrScheduledWindowNotReached) || errors.Is(err, ErrEmptyBaseline) ||
 			errors.Is(err, ErrInvalidSpec) || errors.Is(err, model.ErrApprovalUnknownField) || errors.Is(err, ErrComponentNotWhitelisted) {
@@ -1237,5 +1267,164 @@ func (h *OpsHandler) validateProposalSpec(p *model.OpsProposal) (OperationSpec, 
 	}
 	defExec := &DefaultOperationExecutor{}
 	return defExec.parseProposalSpec(p)
+}
+
+// ArchiveProposal handles POST /api/v1/ops/proposals/:id/archive
+// Transitions a completed or terminated proposal to ARCHIVED status.
+func (h *OpsHandler) ArchiveProposal(c *gin.Context) {
+	if !c.GetBool("is_admin") || c.GetBool("is_internal_service") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: administrator privileges required"})
+		return
+	}
+
+	idParam := strings.TrimSpace(c.Param("id"))
+	if idParam == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Proposal ID is required"})
+		return
+	}
+
+	operator := getOperatorName(c)
+	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	fsm.SetAuditEngine(h.getAuditEngine())
+
+	var prop model.OpsProposal
+	if err := h.db.Where("id = ? OR proposal_id = ?", idParam, idParam).First(&prop).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	callerHouseholdID := c.GetUint("household_id")
+	if !sameHouseholdAccess(callerHouseholdID, prop.HouseholdID) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Proposal not found"})
+		return
+	}
+
+	allowedStatuses := []string{
+		model.ProposalStatusExecuted,
+		model.ProposalStatusSuccess,
+		model.ProposalStatusFailed,
+		model.ProposalStatusCancelled,
+		model.ProposalStatusRejected,
+		model.ProposalStatusExpired,
+		model.ProposalStatusRolledBack,
+		model.ProposalStatusFailedRolledback,
+		model.ProposalStatusRollbackFailed,
+	}
+
+	reqVer := prop.Version
+	reqRev := prop.Revision
+	now := time.Now().UTC()
+
+	won, err := fsm.TransitionStrict(ProposalTransitionParams{
+		ProposalID:       prop.ProposalID,
+		ExpectedStatuses: allowedStatuses,
+		TargetStatus:     model.ProposalStatusArchived,
+		RequireVersion:   &reqVer,
+		RequireRevision:  &reqRev,
+		Updates: map[string]interface{}{
+			"execution_log": fmt.Sprintf("%s\n[Archived by %s at %s]", strings.TrimSpace(prop.ExecutionLog), operator, now.Format(time.RFC3339)),
+		},
+		Audit: &ProposalTransitionAudit{
+			Context:     c.Request.Context(),
+			OperationID: GenerateOperationID("archive"),
+			EventType:   "ops.proposal.archived",
+			Actor:       operator,
+			Level:       model.LevelInfo,
+			Message:     fmt.Sprintf("管理员 %s 归档系统提案 [%s] (原状态: %s)", operator, prop.ProposalID, prop.Status),
+			Metadata: map[string]interface{}{
+				"previous_status": prop.Status,
+				"target":          prop.TargetComponent,
+			},
+		},
+	})
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("无法归档提案: %v", err)})
+		return
+	}
+	if !won {
+		c.JSON(http.StatusConflict, gin.H{"error": "提案状态并发变更或非已终止状态，无法归档"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":     "Proposal archived successfully",
+		"proposal_id": prop.ProposalID,
+		"status":      model.ProposalStatusArchived,
+	})
+}
+
+// BatchArchiveProposals handles POST /api/v1/ops/proposals/archive
+// Batch archives completed or terminated proposals. If ids is empty, archives all terminal proposals.
+func (h *OpsHandler) BatchArchiveProposals(c *gin.Context) {
+	if !c.GetBool("is_admin") || c.GetBool("is_internal_service") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Permission denied: administrator privileges required"})
+		return
+	}
+
+	var req struct {
+		IDs []string `json:"ids"`
+	}
+	_ = c.ShouldBindJSON(&req)
+
+	operator := getOperatorName(c)
+	fsm := NewProposalFSMWithBus(h.db, h.bus)
+	fsm.SetAuditEngine(h.getAuditEngine())
+
+	allowedStatuses := []string{
+		model.ProposalStatusExecuted,
+		model.ProposalStatusSuccess,
+		model.ProposalStatusFailed,
+		model.ProposalStatusCancelled,
+		model.ProposalStatusRejected,
+		model.ProposalStatusExpired,
+		model.ProposalStatusRolledBack,
+		model.ProposalStatusFailedRolledback,
+		model.ProposalStatusRollbackFailed,
+	}
+
+	q := h.db.Model(&model.OpsProposal{}).Where("status IN (?)", allowedStatuses)
+	if len(req.IDs) > 0 {
+		q = q.Where("proposal_id IN (?) OR id IN (?)", req.IDs, req.IDs)
+	}
+
+	var targetProps []model.OpsProposal
+	if err := q.Find(&targetProps).Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	archivedCount := 0
+	now := time.Now().UTC()
+	for _, prop := range targetProps {
+		reqVer := prop.Version
+		reqRev := prop.Revision
+		won, err := fsm.TransitionStrict(ProposalTransitionParams{
+			ProposalID:       prop.ProposalID,
+			ExpectedStatuses: allowedStatuses,
+			TargetStatus:     model.ProposalStatusArchived,
+			RequireVersion:   &reqVer,
+			RequireRevision:  &reqRev,
+			Updates: map[string]interface{}{
+				"execution_log": fmt.Sprintf("%s\n[Archived by %s at %s]", strings.TrimSpace(prop.ExecutionLog), operator, now.Format(time.RFC3339)),
+			},
+			Audit: &ProposalTransitionAudit{
+				Context:     c.Request.Context(),
+				OperationID: GenerateOperationID("archive"),
+				EventType:   "ops.proposal.archived",
+				Actor:       operator,
+				Level:       model.LevelInfo,
+				Message:     fmt.Sprintf("管理员 %s 批量归档提案 [%s]", operator, prop.ProposalID),
+			},
+		})
+		if err == nil && won {
+			archivedCount++
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":        fmt.Sprintf("Successfully archived %d proposals", archivedCount),
+		"archived_count": archivedCount,
+		"total_eligible": len(targetProps),
+	})
 }
 

@@ -29,7 +29,10 @@ func (h *OpsHandler) RegisterProposalRoutes(rg *gin.RouterGroup) {
 	rg.POST("/proposals/:id/reject", middleware.RequireAdmin(h.db), h.RejectProposal)
 	rg.POST("/proposals/:id/execute", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalExecute), h.ExecuteProposalEndpoint)
 	rg.POST("/proposals/:id/cancel", middleware.RequireAdminOrInternalScope(middleware.ScopeOpsProposalExecute), h.CancelProposal)
+	rg.POST("/proposals/:id/archive", middleware.RequireAdmin(h.db), h.ArchiveProposal)
+	rg.POST("/proposals/archive", middleware.RequireAdmin(h.db), h.BatchArchiveProposals)
 	rg.POST("/proposals/:id/reconcile", middleware.RequireAdmin(h.db), h.ReconcileProposalEndpoint)
+	rg.GET("/digest", h.GetDailyDigest)
 
 	// Automatically mount FSM & Maintenance Lock routes alongside proposal endpoints
 	h.RegisterFSMRoutes(rg)

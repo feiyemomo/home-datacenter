@@ -2,6 +2,20 @@
 
 ## 更新日志
 
+### Agent 运维闭环、Docker 镜像自动更新与安全降噪 (2026-11-26)
+
+- **Docker 镜像版本巡检与受控更新闭环**（`services/api/internal/ops/image_updater.go`、`executor.go`、`fsm.go`、`proposal.go`、`chat.go`、`cmd/main.go`）：
+  - 新增 `CheckDockerImageUpdates`，通过 Docker Socket `/containers/json` 动态扫描运行中容器，直连 Registry v2（`HEAD /v2/.../manifests/...`，自动回退国内镜像源 `docker.1ms.run` / `docker.xuanyuan.me` 及 Docker `/distribution/`）比对远端 Digest，自动生成幂等 `docker.update_image` 待批提案。
+  - 在 `executor.go` 补全 `executeDockerUpdateImage`（拉取新镜像 + 备份容器安全重建）及 `CheckReadiness` 全组件容器就绪探针；在 `fsm.go` 补全 `mihomo`、`tailscale`、`home-new-api`、`home-backup` 拓扑注册；在 `proposal.go` 为镜像更新放宽执行超时至 4 分钟；新增 `POST /api/v1/ops/check-image-updates` 接口并在 `chat.go` 支持 Copilot 镜像更新意图识别。
+- **1Panel WAF `waf.ipblack.sync` 超时修复**（`services/api/internal/ops/executor.go`）：
+  - `executeWAFReload` 改用 Docker Socket `SIGHUP` 热重载；`CheckReadiness` 针对 `host` 网络的 OpenResty 优先短超时探测 `172.18.0.1:80` 并支持 Docker Socket 容器状态兜底，耗时从 15s 超时降至 ~85ms。
+- **1Panel 虚拟终端 403 修复**（`web/nginx.conf`）：
+  - 在 `location /api/v2/` 反代补齐 `Host 172.18.0.1:10000` 与 `Origin http://172.18.0.1:10000`，解决 WebSocket 终端握手 403。
+- **宿主机安全监控降噪**（`services/api/internal/security/host_monitor.go`）：
+  - 白名单豁免 `v2raya` 正常运行所需的 `Privileged` / `CAP_NET_ADMIN` / `CAP_SYS_MODULE`；豁免 `server (PID=1)` 等核心守护进程的高位临时 UDP 端口（`>= 32768`），消除 `anomalous_listening_port` 误报。
+- **大谷云摄像头适配与看门狗增强**（`services/api/internal/camera/dagu.go`、`dagu_recordings.go`、`cmd/watchdog/`、`tools/h3c_relay.py`）：
+  - 新增 `dagu` 摄像头云端缩略图/录像适配、独立 `watchdog` 进程与 `h3c_relay.py` 传输工具。
+
 ### 录像配额增量 FIFO 淘汰 + Frigate 90 天留存联动 (2026-10-31)
 
 > **背景**：NAS 录像存储设定了 400 GiB 配额。在云端归档暂停（蓝奏云接口变动）的情况下，旧机制直接将 Frigate 的全局留存天数从 4 天强制压减至 3 天甚至更短，导致第 4 天的录像被全量淘汰，策略过于激进，无法精细化平衡磁盘空间与监控回放需求。

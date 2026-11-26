@@ -323,8 +323,27 @@ export function LiveVideo({ camera, isAdmin, onWsMessage, onRefresh, targetTime 
     // poll keeps it warm while the card is on screen — eliminating the
     // fast/slow variance in time-to-first-frame. Fire-and-forget; the
     // next real SDP/MP4 request warms the source anyway on failure.
+    // (3) 页面切后台自动断流: 监听 visibilitychange，标签页不可见时立即退回 preview 释放流连接与电池
+    useEffect(() => {
+        const onVisibilityChange = () => {
+            if (document.hidden && mode === "live") {
+                setMode("preview");
+            }
+        };
+        document.addEventListener("visibilitychange", onVisibilityChange);
+        return () => {
+            document.removeEventListener("visibilitychange", onVisibilityChange);
+        };
+    }, [mode]);
+
     useEffect(() => {
         if (mode !== "preview" || transport === "hls") return;
+
+        // (4) 夜间禁流 (22:00-06:00): 仅允许主动手动点击点播，禁止任何后台自动预热/唤醒
+        const currentHour = new Date().getHours();
+        if (currentHour >= 22 || currentHour < 6) {
+            return;
+        }
 
         preheatCamera(camera.id).catch(() => {});
 

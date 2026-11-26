@@ -44,6 +44,7 @@ const (
 	ProposalStatusExecutionUnknown       = "EXECUTION_UNKNOWN"       // Network timeout / unknown response
 	ProposalStatusReconciliationRequired = "RECONCILIATION_REQUIRED" // Process crash or ambiguous state
 	ProposalStatusExpired                = "EXPIRED"                 // Scheduled window missed
+	ProposalStatusArchived               = "ARCHIVED"                // Terminated & archived proposal
 )
 
 // Risk level constants.

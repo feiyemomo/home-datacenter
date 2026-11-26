@@ -457,3 +457,39 @@ func TestOpsLLMClient_LifecycleAndInjectionNoClobber(t *testing.T) {
 	}
 }
 
+func TestOpsChat_ActionIntentExtraction(t *testing.T) {
+	_, r := setupMockChatHandler(t, nil, nil)
+
+	// Post chat query requesting restart of vision service
+	reqBody, _ := json.Marshal(PostChatMessageRequest{
+		SessionID: "sess-test-action",
+		Content:   "请帮我重启一下 home-vision 视觉计算服务",
+	})
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/ops/chat/messages", bytes.NewBuffer(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp ChatMessageResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+
+	if resp.ActionProposal == nil {
+		t.Fatalf("expected action proposal to be generated from user intent, got nil")
+	}
+	if resp.ActionProposal.TargetComponent != ComponentHomeVision {
+		t.Fatalf("expected target %s, got %s", ComponentHomeVision, resp.ActionProposal.TargetComponent)
+	}
+	if resp.ActionProposal.Action != ActionDockerRestart {
+		t.Fatalf("expected action %s, got %s", ActionDockerRestart, resp.ActionProposal.Action)
+	}
+	if resp.ActionProposal.ProposalID == "" {
+		t.Fatalf("expected proposal_id to be populated in DB")
+	}
+}
+

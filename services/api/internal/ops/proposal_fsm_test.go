@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -240,5 +241,137 @@ func TestCancelProposal_ConcurrentRaceCondition(t *testing.T) {
 	}
 	if executeWon && finalProp.Status != model.ProposalStatusExecuting {
 		t.Fatalf("expected status EXECUTING, got %s", finalProp.Status)
+	}
+}
+
+func TestArchiveProposal_Endpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupProposalFSMTestDB(t)
+	bus := eventbus.New()
+	handler := NewOpsHandler(nil, nil, db, bus, nil)
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(1))
+		c.Set("user_name", "admin")
+		c.Set("is_admin", true)
+		c.Set("household_id", uint(1))
+		c.Next()
+	})
+	handler.RegisterProposalRoutes(r.Group("/api/v1/ops"))
+
+	// Seed proposals
+	activeProp := model.OpsProposal{
+		ProposalID:   "prop-active-001",
+		Status:       model.ProposalStatusAwaitingApproval,
+		HouseholdID:  1,
+		Title:        "Active Proposal",
+		Version:      1,
+		Revision:     1,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	executedProp := model.OpsProposal{
+		ProposalID:   "prop-exec-001",
+		Status:       model.ProposalStatusExecuted,
+		HouseholdID:  1,
+		Title:        "Executed Proposal",
+		Version:      1,
+		Revision:     1,
+		CreatedAt:    time.Now(),
+		UpdatedAt:    time.Now(),
+	}
+	db.Create(&activeProp)
+	db.Create(&executedProp)
+
+	// Test 1: Archiving active proposal must fail (HTTP 409 Conflict from CAS guard)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/ops/proposals/prop-active-001/archive", nil)
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict && w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 409 Conflict / 400 Bad Request for active proposal archive, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Test 2: Archiving executed proposal must succeed (HTTP 200)
+	w2 := httptest.NewRecorder()
+	req2, _ := http.NewRequest(http.MethodPost, "/api/v1/ops/proposals/prop-exec-001/archive", nil)
+	r.ServeHTTP(w2, req2)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for executed proposal archive, got %d: %s", w2.Code, w2.Body.String())
+	}
+
+	var checked model.OpsProposal
+	if err := db.Where("proposal_id = ?", "prop-exec-001").First(&checked).Error; err != nil {
+		t.Fatalf("failed to query archived proposal: %v", err)
+	}
+	if checked.Status != model.ProposalStatusArchived {
+		t.Fatalf("expected status ARCHIVED, got %s", checked.Status)
+	}
+
+	// Test 3: ListProposals excludes ARCHIVED by default
+	w3 := httptest.NewRecorder()
+	req3, _ := http.NewRequest(http.MethodGet, "/api/v1/ops/proposals", nil)
+	r.ServeHTTP(w3, req3)
+	if w3.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for list, got %d: %s", w3.Code, w3.Body.String())
+	}
+	if strings.Contains(w3.Body.String(), "prop-exec-001") {
+		t.Fatalf("expected archived proposal to be excluded by default, but it was present: %s", w3.Body.String())
+	}
+
+	// Test 4: ListProposals includes ARCHIVED when include_archived=true
+	w4 := httptest.NewRecorder()
+	req4, _ := http.NewRequest(http.MethodGet, "/api/v1/ops/proposals?include_archived=true", nil)
+	r.ServeHTTP(w4, req4)
+	if w4.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for list with include_archived, got %d: %s", w4.Code, w4.Body.String())
+	}
+	if !strings.Contains(w4.Body.String(), "prop-exec-001") {
+		t.Fatalf("expected archived proposal to be included when include_archived=true: %s", w4.Body.String())
+	}
+}
+
+func TestBatchArchiveProposals_Endpoint(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := setupProposalFSMTestDB(t)
+	bus := eventbus.New()
+	handler := NewOpsHandler(nil, nil, db, bus, nil)
+
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", uint(1))
+		c.Set("user_name", "admin")
+		c.Set("is_admin", true)
+		c.Set("household_id", uint(1))
+		c.Next()
+	})
+	handler.RegisterProposalRoutes(r.Group("/api/v1/ops"))
+
+	// Seed 3 terminal proposals and 1 active proposal
+	db.Create(&model.OpsProposal{ProposalID: "batch-1", Status: model.ProposalStatusExecuted, HouseholdID: 1, Title: "P1", Version: 1, Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+	db.Create(&model.OpsProposal{ProposalID: "batch-2", Status: model.ProposalStatusRejected, HouseholdID: 1, Title: "P2", Version: 1, Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+	db.Create(&model.OpsProposal{ProposalID: "batch-3", Status: model.ProposalStatusCancelled, HouseholdID: 1, Title: "P3", Version: 1, Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+	db.Create(&model.OpsProposal{ProposalID: "batch-active", Status: model.ProposalStatusAwaitingApproval, HouseholdID: 1, Title: "PA", Version: 1, Revision: 1, CreatedAt: time.Now(), UpdatedAt: time.Now()})
+
+	// Call batch archive with empty body (all eligible terminal proposals)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/ops/proposals/archive", strings.NewReader("{}"))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK from batch archive, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var count int64
+	db.Model(&model.OpsProposal{}).Where("status = ?", model.ProposalStatusArchived).Count(&count)
+	if count != 3 {
+		t.Fatalf("expected exactly 3 proposals archived, got %d", count)
+	}
+
+	var activeProp model.OpsProposal
+	db.Where("proposal_id = ?", "batch-active").First(&activeProp)
+	if activeProp.Status != model.ProposalStatusAwaitingApproval {
+		t.Fatalf("expected batch-active to remain AWAITING_APPROVAL, got %s", activeProp.Status)
 	}
 }

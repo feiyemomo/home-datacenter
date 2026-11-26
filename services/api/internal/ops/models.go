@@ -103,10 +103,17 @@ type S3BackupSummary struct {
 // SecuritySummary aggregates WAF statistics and offsite backup status.
 type SecuritySummary struct {
 	TodayWAFBlockedCount int64           `json:"today_waf_blocked_count"`
+	TodayBlockedCount    int64           `json:"today_blocked_count"`
 	TotalBlockedHits     int64           `json:"total_blocked_hits"`
+	TotalRules           int             `json:"total_rules"`
 	ActiveBannedIPs      int             `json:"active_banned_ips"`
+	LastBlockedIP        string          `json:"last_blocked_ip,omitempty"`
 	LastBlockedAt        *time.Time      `json:"last_blocked_at,omitempty"`
+	LastBlockedTime      string          `json:"last_blocked_time,omitempty"`
 	S3Backup             S3BackupSummary `json:"s3_backup"`
+	S3BackupStatus       string          `json:"s3_backup_status"`
+	S3BackupLastTime     string          `json:"s3_backup_last_time,omitempty"`
+	S3BackupSizeBytes    int64           `json:"s3_backup_size_bytes"`
 	Source               string          `json:"source"`
 	SampledAt            time.Time       `json:"sampled_at"`
 }

@@ -65,6 +65,7 @@ services:
     group_add:
       - "105"
       - "4"
+      - "994"
     # Bind to 0.0.0.0 so LAN devices can reach the API directly.
     # In production behind Cloudflare Tunnel, the tunnel reaches the
     # API by service name (home-api) on the internal network.
@@ -179,6 +180,9 @@ services:
       - ALERT_SMTP_PASS=${ALERT_SMTP_PASS:-}
       - ALERT_SMTP_SENDER=${ALERT_SMTP_SENDER:-}
       - ALERT_RECIPIENT=${ALERT_RECIPIENT:-}
+      # Fail-Fast Boot Guard HMAC keys (default to JWT_SECRET if not overridden)
+      - OPS_APPROVAL_HMAC_KEY=${OPS_APPROVAL_HMAC_KEY:-${JWT_SECRET}}
+      - OPS_AUDIT_HMAC_KEY=${OPS_AUDIT_HMAC_KEY:-${JWT_SECRET}}
     # v1.8.31: static IP for the api service. nginx's
     # `upstream api_backend { server api:8080; }` in web/nginx.conf
     # resolves the `api` hostname ONCE at nginx startup and keeps

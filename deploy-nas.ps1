@@ -1,4 +1,4 @@
-# deploy-nas.ps1 — Push home-datacenter to the NAS and (re)deploy via docker compose.
+﻿# deploy-nas.ps1 — Push home-datacenter to the NAS and (re)deploy via docker compose.
 #
 # Native Windows 11 tools only: ssh, scp, tar (bsdtar 3.x), PowerShell.
 # No rsync, no WSL, no Git Bash, no scoop install needed.
@@ -54,7 +54,11 @@ param(
     # ssh/scp non-interactively (Windows OpenSSH has no sshpass). When
     # omitted, falls back to default ssh behavior (publickey, or
     # interactive password prompt if no key is installed).
-    [string]$Password
+    [string]$Password,
+    # Force acquiring an H3C Oasis Cloud relay tunnel even if LAN is reachable.
+    [switch]$ForceH3C,
+    # Keep the H3C relay tunnel alive after script completes (do not auto-delete).
+    [switch]$KeepTunnel
 )
 
 # ============== CONFIG (edit to match your NAS) ==============
@@ -107,26 +111,74 @@ function Remove-Askpass {
         Remove-Item $script:AskpassFile -ErrorAction SilentlyContinue
     }
 }
-# Always clean up askpass on exit (normal exit, Ctrl-C, uncaught error).
-trap { Remove-Askpass; break }
-Register-EngineEvent PowerShell.Exiting -Action { Remove-Askpass } | Out-Null
+
+# ---- H3C Relay & Endpoint Management ----
+$RelayScript = Join-Path $ProjectRoot "tools\h3c_relay.py"
+$RelayTunnelId = $null
+$RelayCreatedNew = $false
+
+function Cleanup-RelayTunnel {
+    if ($script:RelayCreatedNew -and $script:RelayTunnelId -and (-not $KeepTunnel)) {
+        Write-Host "==> Cleaning up temporary H3C relay tunnel: $($script:RelayTunnelId)..." -ForegroundColor Cyan
+        & python $RelayScript release $script:RelayTunnelId 2>$null | Out-Null
+        $script:RelayTunnelId = $null
+        $script:RelayCreatedNew = $false
+    }
+}
+
+function Cleanup-All {
+    Remove-Askpass
+    Cleanup-RelayTunnel
+}
+
+# Always clean up on exit (normal exit, Ctrl-C, uncaught error).
+trap { Cleanup-All; break }
+Register-EngineEvent PowerShell.Exiting -Action { Cleanup-All } | Out-Null
+
+function Resolve-NasEndpoint {
+    if ($env:SKIP_H3C -eq "1" -or $NoH3C) {
+        Write-Host "==> Direct endpoint requested: $script:NAS_USER@$script:NAS_HOST`:$script:NAS_PORT" -ForegroundColor Yellow
+        return
+    }
+    if (Test-Path $RelayScript) {
+        try {
+            $relayArgs = @("$RelayScript", "acquire", "--json")
+            if ($ForceH3C) { $relayArgs += "--force-h3c" }
+            $jsonOut = & python @relayArgs 2>$null
+            if ($LASTEXITCODE -eq 0 -and $jsonOut) {
+                $ep = $jsonOut | ConvertFrom-Json
+                if ($ep -and $ep.host -and $ep.port) {
+                    $script:NAS_HOST = $ep.host
+                    $script:NAS_PORT = [int]$ep.port
+                    $script:NAS_USER = if ($ep.user) { $ep.user } else { $script:NAS_USER }
+                    $script:RelayTunnelId = $ep.tunnel_id
+                    $script:RelayCreatedNew = [bool]$ep.created_new
+                    Write-Host "==> Connected via Tier [$(($ep.tier).ToUpper())]: $($script:NAS_USER)@$($script:NAS_HOST):$($script:NAS_PORT)" -ForegroundColor Green
+                    return
+                }
+            }
+        } catch {
+            Write-Warning "Failed to query H3C relay resolver: $_"
+        }
+    }
+    Write-Host "==> Using default NAS endpoint: $script:NAS_USER@$script:NAS_HOST`:$script:NAS_PORT" -ForegroundColor Yellow
+}
 
 # ---- SSH/SCP wrappers (apply common options consistently) ----
 # Common options:
-#   -o StrictHostKeyChecking=no  — don't fail on first connect (no known_hosts entry)
-#   -o UserKnownHostsFile=NUL    — don't pollute known_hosts with the NAS entry
-#   -o ConnectTimeout=10         — fail fast if NAS is unreachable
-# When $Password is set, also force password auth and disable pubkey
-# (avoids "Permission denied (publickey)" when no key is installed).
+#   -o StrictHostKeyChecking=accept-new
+#   -o ConnectTimeout=10 — fail fast if NAS is unreachable
+#   -o BatchMode=yes
 function Invoke-NasSSH {
     param([Parameter(Mandatory)][string]$RemoteCmd)
-    $sshOpts = @("-o", "BatchMode=yes",
+    $sshOpts = @("-p", "$script:NAS_PORT",
+                 "-o", "BatchMode=yes",
                  "-o", "ConnectTimeout=10",
                  "-o", "StrictHostKeyChecking=accept-new")
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & ssh @sshOpts "nas" $RemoteCmd 2>&1 | Out-Host
+        & ssh @sshOpts "$script:NAS_USER@$script:NAS_HOST" $RemoteCmd 2>&1 | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -137,47 +189,21 @@ function Invoke-NasSSH {
 function Invoke-NasSCP {
     param([Parameter(Mandatory)][string]$LocalPath,
           [Parameter(Mandatory)][string]$RemoteDest)
-    $scpOpts = @("-q",
+    $scpOpts = @("-P", "$script:NAS_PORT",
+                 "-q",
+                 "-C",
                  "-o", "BatchMode=yes",
                  "-o", "ConnectTimeout=10",
                  "-o", "StrictHostKeyChecking=accept-new")
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & scp @scpOpts $LocalPath "nas:$RemoteDest" 2>&1 | Out-Host
+        & scp @scpOpts $LocalPath "$script:NAS_USER@$script:NAS_HOST`:$RemoteDest" 2>&1 | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEAP
     }
     return $code
-}
-
-# ---- SSH key setup (one-time, -SetupKeys flag) ----
-if ($SetupKeys) {
-    Write-Host "==> Setting up SSH key auth to $NAS_USER@$NAS_HOST" -ForegroundColor Cyan
-    $keyPath = "$env:USERPROFILE\.ssh\id_ed25519"
-    if (-not (Test-Path $keyPath)) {
-        Write-Host "    Generating ed25519 key pair..."
-        ssh-keygen -t ed25519 -f $keyPath -N '""' | Out-Null
-    }
-    $pubKey = Get-Content "$keyPath.pub"
-    if ($Password) {
-        Write-Host "    Installing public key on NAS (using -Password for auth)..."
-    } else {
-        Write-Host "    Installing public key on NAS (will prompt for NAS password one last time)..."
-    }
-    # Windows OpenSSH has no ssh-copy-id; do it manually.
-    $installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$pubKey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
-    $exitCode = Invoke-NasSSH -RemoteCmd $installCmd
-    if ($exitCode -ne 0) {
-        Write-Error "ERROR: failed to install SSH key. Check NAS password / network."
-        Remove-Askpass
-        exit 1
-    }
-    Write-Host "==> SSH key installed. Test with: ssh -p $NAS_PORT $NAS_USER@$NAS_HOST 'echo ok'" -ForegroundColor Green
-    Write-Host "    Subsequent deploys won't prompt for password."
-    Remove-Askpass
-    exit 0
 }
 
 $BuildFlag = if ($NoBuild) { "" } else { "--build" }
@@ -245,12 +271,43 @@ if ($DryRun) {
     exit 0
 }
 
+# ---- Resolve fastest NAS endpoint (LAN -> H3C Relay -> Tailscale) ----
+Resolve-NasEndpoint
+
+# ---- SSH key setup (one-time, -SetupKeys flag) ----
+if ($SetupKeys) {
+    Write-Host "==> Setting up SSH key auth to $script:NAS_USER@$script:NAS_HOST`:$script:NAS_PORT" -ForegroundColor Cyan
+    $keyPath = "$env:USERPROFILE\.ssh\id_ed25519"
+    if (-not (Test-Path $keyPath)) {
+        Write-Host "    Generating ed25519 key pair..."
+        ssh-keygen -t ed25519 -f $keyPath -N '""' | Out-Null
+    }
+    $pubKey = Get-Content "$keyPath.pub"
+    if ($Password) {
+        Write-Host "    Installing public key on NAS (using -Password for auth)..."
+    } else {
+        Write-Host "    Installing public key on NAS (will prompt for NAS password one last time)..."
+    }
+    # Windows OpenSSH has no ssh-copy-id; do it manually.
+    $installCmd = "mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo '$pubKey' >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys"
+    $exitCode = Invoke-NasSSH -RemoteCmd $installCmd
+    if ($exitCode -ne 0) {
+        Write-Error "ERROR: failed to install SSH key. Check NAS password / network."
+        Cleanup-All
+        exit 1
+    }
+    Write-Host "==> SSH key installed. Test with: ssh -p $script:NAS_PORT $script:NAS_USER@$script:NAS_HOST 'echo ok'" -ForegroundColor Green
+    Write-Host "    Subsequent deploys won't prompt for password."
+    Cleanup-All
+    exit 0
+}
+
 # ---- Step 1: ensure remote dir exists ----
 Write-Host "==> [1/5] Ensuring remote directory: $REMOTE_PATH" -ForegroundColor Cyan
 $exitCode = Invoke-NasSSH -RemoteCmd "mkdir -p '$REMOTE_PATH'"
 if ($exitCode -ne 0) {
     Write-Error "ERROR: cannot mkdir on NAS via SSH. Check host/user/port and run .\deploy-nas.ps1 -SetupKeys first (or pass -Password)."
-    Remove-Askpass
+    Cleanup-All
     exit 1
 }
 
@@ -283,7 +340,7 @@ $exitCode = Invoke-NasSCP -LocalPath $tmpTar -RemoteDest "$REMOTE_PATH/deploy.ta
 if ($exitCode -ne 0) {
     Write-Error "ERROR: scp failed."
     Remove-Item $tmpTar -ErrorAction SilentlyContinue
-    Remove-Askpass
+    Cleanup-All
     exit 1
 }
 Remove-Item $tmpTar -ErrorAction SilentlyContinue
@@ -295,7 +352,7 @@ Remove-Item $tmpTar -ErrorAction SilentlyContinue
 $exitCode = Invoke-NasSSH -RemoteCmd "cd '$REMOTE_PATH' && tar -xzf deploy.tar.gz --overwrite --no-same-owner && rm deploy.tar.gz && chmod +x deploy/mosquitto/docker-entrypoint.sh"
 if ($exitCode -ne 0) {
     Write-Error "ERROR: remote tar extract failed."
-    Remove-Askpass
+    Cleanup-All
     exit 1
 }
 
@@ -308,14 +365,14 @@ if ($exitCode -ne 0) {
     Write-Host "ERROR: $REMOTE_PATH/.env NOT found on NAS." -ForegroundColor Red
     Write-Host ""
     Write-Host "First-time deploy — create it manually on the NAS:"
-    Write-Host "  ssh -p $NAS_PORT $NAS_USER@$NAS_HOST"
+    Write-Host "  ssh -p $script:NAS_PORT $script:NAS_USER@$script:NAS_HOST"
     Write-Host "  cd $REMOTE_PATH"
     Write-Host "  cp .env.example .env"
     Write-Host "  # edit .env: JWT_SECRET=`$(openssl rand -hex 32), MQTT_PASSWORD=..."
     Write-Host "  # regenerate mosquitto passwd to match (see README section 2)"
     Write-Host ""
     Write-Host "Then re-run .\deploy-nas.ps1"
-    Remove-Askpass
+    Cleanup-All
     exit 1
 }
 
@@ -324,7 +381,7 @@ $frigateVerifyCmd = "bash -c 'if [ ! -s ""{0}/deploy/frigate/config.yml"" ]; the
 $exitCode = Invoke-NasSSH -RemoteCmd $frigateVerifyCmd
 if ($exitCode -ne 0) {
     Write-Error "ERROR: Frigate config validation failed on NAS."
-    Remove-Askpass
+    Cleanup-All
     exit 1
 }
 
@@ -339,7 +396,7 @@ $composeCmd = "cd '$REMOTE_PATH' && ${buildCmd}docker compose up -d $BuildFlag 2
 $exitCode = Invoke-NasSSH -RemoteCmd $composeCmd
 if ($exitCode -ne 0) {
     Write-Error "ERROR: docker compose up failed on NAS. Check the output above."
-    Remove-Askpass
+    Cleanup-All
     exit 1
 }
 
@@ -350,24 +407,16 @@ Invoke-NasSSH -RemoteCmd "cd '$REMOTE_PATH' && docker compose ps" | Out-Host
 
 Write-Host ""
 Write-Host "==> Deploy complete." -ForegroundColor Green
-Write-Host "    Web UI:  http://$NAS_HOST/"
-Write-Host "    API:     http://$NAS_HOST`:8080/health"
-Write-Host "    Logs:    ssh -p $NAS_PORT $NAS_USER@$NAS_HOST 'cd $REMOTE_PATH && docker compose logs -f api'"
-
-Remove-Askpass
+Write-Host "    Web UI:  http://$script:NAS_HOST/"
+Write-Host "    API:     http://$script:NAS_HOST`:8080/health"
+Write-Host "    Logs:    ssh -p $script:NAS_PORT $script:NAS_USER@$script:NAS_HOST 'cd $REMOTE_PATH && docker compose logs -f api'"
 
 # ---- Optional: tail api logs ----
-# Re-setup askpass for the log tail (was cleaned up above).
+# Keep askpass/tunnel open if tailing logs
 if ($Logs) {
-    if ($Password) {
-        $script:AskpassFile = [System.IO.Path]::GetTempFileName() + "-askpass.bat"
-        "@echo $Password" | Set-Content $script:AskpassFile -Encoding ASCII
-        $env:SSH_ASKPASS = $script:AskpassFile
-        $env:SSH_ASKPASS_REQUIRE = "force"
-        $env:DISPLAY = "1"
-    }
     Write-Host ""
     Write-Host "==> Tailing api logs (Ctrl-C to exit)..." -ForegroundColor Cyan
     Invoke-NasSSH -RemoteCmd "cd '$REMOTE_PATH' && docker compose logs -f api" | Out-Host
-    Remove-Askpass
 }
+
+Cleanup-All

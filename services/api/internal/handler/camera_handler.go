@@ -1,12 +1,17 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
 	"io"
 	"log"
 	"net/http"
@@ -26,6 +31,29 @@ import (
 	"home-datacenter-api/internal/model"
 	"home-datacenter-api/internal/utils"
 )
+
+var (
+	standbyJpegOnce  sync.Once
+	standbyJpegBytes []byte
+)
+
+func getStandbyJpeg() []byte {
+	standbyJpegOnce.Do(func() {
+		img := image.NewRGBA(image.Rect(0, 0, 640, 360))
+		bg := color.RGBA{R: 26, G: 26, B: 26, A: 255}
+		draw.Draw(img, img.Bounds(), &image.Uniform{C: bg}, image.Point{}, draw.Src)
+		var buf bytes.Buffer
+		if err := jpeg.Encode(&buf, img, &jpeg.Options{Quality: 80}); err == nil {
+			standbyJpegBytes = buf.Bytes()
+		}
+	})
+	return standbyJpegBytes
+}
+
+func isNightHours() bool {
+	h := time.Now().Hour()
+	return h >= 22 || h < 6
+}
 
 // CameraHandler exposes platformized camera endpoints.
 //
@@ -84,7 +112,16 @@ type UserResolver interface {
 }
 
 func NewCameraHandler(reg *camera.Registry, onvif *camera.ONVIFController, rec *camera.Recorder, publicBase, rawIce string, userSvc UserResolver, bus *eventbus.Bus) *CameraHandler {
-	return &CameraHandler{Reg: reg, ONVIF: onvif, Rec: rec, PublicBase: publicBase, RawIce: rawIce, UserSvc: userSvc, bus: bus, transcodeSem: make(chan struct{}, 1)}
+	h := &CameraHandler{Reg: reg, ONVIF: onvif, Rec: rec, PublicBase: publicBase, RawIce: rawIce, UserSvc: userSvc, bus: bus, transcodeSem: make(chan struct{}, 1)}
+	if reg != nil && reg.Go2 != nil {
+		camera.GetGlobalDaguManager().SetConsumerChecker(func(streamName string) bool {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			has, err := reg.Go2.HasConsumers(ctx, streamName)
+			return err == nil && has
+		})
+	}
+	return h
 }
 
 // callerIsAdmin returns (userID, isAdmin, ok) for the current request.
@@ -700,6 +737,36 @@ func (h *CameraHandler) ListRecordings(c *gin.Context) {
 	if before < after {
 		before, after = after, before
 	}
+
+	// v1.12.11: Dagu 4G camera cloud recordings (direct from Dagu cloud storage, no camera wakeup)
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		sn := cam.Host
+		if sn == "" {
+			sn = "6912200023929742"
+		}
+		recs, err := camera.GetGlobalDaguManager().ListRecordings(c.Request.Context(), sn, after, before)
+		if err != nil {
+			log.Printf("[handler] failed to list dagu recordings: %v", err)
+		}
+		views := make([]gin.H, 0, len(recs))
+		for _, r := range recs {
+			views = append(views, gin.H{
+				"id":               r.StartUnix,
+				"camera_id":        cam.ID,
+				"start_at":         time.Unix(r.StartUnix, 0).UTC().Format(time.RFC3339),
+				"end_at":           time.Unix(r.EndUnix, 0).UTC().Format(time.RFC3339),
+				"duration_seconds": r.DurationSeconds,
+				"segment_count":    1,
+				"storage":          "cloud",
+				"size_bytes":       r.SizeBytes,
+				"size_human":       fmt.Sprintf("%d KB", r.SizeBytes/1024),
+				"file_path":        r.URL,
+			})
+		}
+		utils.Success(c, views)
+		return
+	}
+
 	buckets, err := h.Reg.ListRecordingMinutesFromDisk(cam, after, before)
 	if err != nil {
 		log.Printf("[handler] failed to list recordings from disk: %v", err)
@@ -1271,6 +1338,85 @@ func (h *CameraHandler) Frame(c *gin.Context) {
 		}
 	}
 
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		sn := cam.Host
+		if sn == "" {
+			sn = "6912200023929742"
+		}
+
+		// 1. If camera is actively being watched, capture frame from existing stream or return short-lived cache
+		mgr := camera.GetGlobalDaguManager()
+		addr, active := mgr.GetActiveSessionAddr(sn)
+
+		if active && addr != "" {
+			if v, ok := h.frameCache.Load(cam.StreamName); ok {
+				if entry, ok := v.(*frameCacheEntry); ok && len(entry.data) > 0 && time.Since(entry.ts) < 5*time.Second {
+					c.Header("X-Frame-Cache", "HIT")
+					c.Data(http.StatusOK, "image/jpeg", entry.data)
+					return
+				}
+			}
+
+			// Capture live frame directly from the already running stream
+			cmdCtx, cmdCancel := context.WithTimeout(c.Request.Context(), 3*time.Second)
+			ffmpegCmd := exec.CommandContext(cmdCtx, "/usr/bin/ffmpeg", "-y",
+				"-rw_timeout", "2000000",
+				"-analyzeduration", "1000000",
+				"-probesize", "1000000",
+				"-i", addr,
+				"-vframes", "1",
+				"-f", "image2",
+				"-c:v", "mjpeg",
+				"pipe:1",
+			)
+			out, cmdErr := ffmpegCmd.Output()
+			cmdCancel()
+
+			if cmdErr == nil && len(out) > 1000 {
+				h.frameCache.Store(cam.StreamName, &frameCacheEntry{
+					data:        out,
+					contentType: "image/jpeg",
+					ts:          time.Now(),
+				})
+				go func(serial string, jpg []byte) {
+					_ = os.MkdirAll("/data/sqlite/snapshots", 0755)
+					_ = os.WriteFile(fmt.Sprintf("/data/sqlite/snapshots/dagu_%s.jpg", serial), jpg, 0644)
+				}(sn, out)
+				c.Header("X-Frame-Source", "container-ffmpeg-live")
+				c.Data(http.StatusOK, "image/jpeg", out)
+				return
+			}
+			if cmdErr != nil {
+				log.Printf("[handler] dagu active stream ffmpeg capture error: %v", cmdErr)
+			}
+		}
+
+		// 2. Camera is dormant / standby: NEVER call AcquireStream to prevent battery drain.
+		// Return last known cached frame if available (RAM first, then persisted disk snapshot)
+		if v, ok := h.frameCache.Load(cam.StreamName); ok {
+			if entry, ok := v.(*frameCacheEntry); ok && len(entry.data) > 0 {
+				c.Header("X-Frame-Cache", "STANDBY-LAST-KNOWN")
+				c.Data(http.StatusOK, "image/jpeg", entry.data)
+				return
+			}
+		}
+		if diskBytes, dErr := os.ReadFile(fmt.Sprintf("/data/sqlite/snapshots/dagu_%s.jpg", sn)); dErr == nil && len(diskBytes) > 1000 {
+			h.frameCache.Store(cam.StreamName, &frameCacheEntry{
+				data:        diskBytes,
+				contentType: "image/jpeg",
+				ts:          time.Now().Add(-1 * time.Hour),
+			})
+			c.Header("X-Frame-Cache", "STANDBY-LAST-KNOWN")
+			c.Data(http.StatusOK, "image/jpeg", diskBytes)
+			return
+		}
+
+		// 3. Standby placeholder (valid JPEG for universal Coil/Web/iOS compatibility)
+		c.Header("X-Frame-Cache", "STANDBY")
+		c.Data(http.StatusOK, "image/jpeg", getStandbyJpeg())
+		return
+	}
+
 	var body io.ReadCloser
 	var contentType string
 	var fetchErr error
@@ -1360,6 +1506,37 @@ func (h *CameraHandler) StreamMP4(c *gin.Context) {
 		targetStream = targetStream + "_1080p"
 	}
 
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		sn := cam.Host
+		if sn == "" {
+			sn = "6912200023929742"
+		}
+		// Night stream restriction (22:00-06:00): forbid automatic/passive reconnects to preserve battery
+		if isNightHours() && (c.Query("passive") == "1" || c.Query("auto") == "1" || c.Query("retry") == "1") {
+			utils.Fail(c, http.StatusLocked, "夜间低功耗时段 (22:00-06:00 仅允许主动手动点播，禁止自动重连)")
+			return
+		}
+
+		// (1) 改走子码流: 默认使用 streamID: 1，大幅降低 4G 流量与编码发热耗电。
+		// 仅在明确指定 1080p 时才允许使用 streamID: 0 主码流。
+		streamID := 1
+		if c.Query("quality") == "1080p" || c.Query("stream") == "0" {
+			streamID = 0
+		}
+		mgr := camera.GetGlobalDaguManager()
+		addr, err := mgr.AcquireStream(c.Request.Context(), sn, streamID)
+		if err != nil {
+			log.Printf("[handler] dagu acquire stream failed: %v", err)
+			utils.Fail(c, http.StatusBadGateway, "failed to acquire dagu stream")
+			return
+		}
+		defer mgr.ReleaseStream(sn)
+		mgr.TouchSession(sn, cam.StreamName)
+
+		h.streamDaguDirectMP4(c, addr)
+		return
+	}
+
 	// Use the request's context so the upstream connection is
 	// cancelled when the client disconnects (ExoPlayer stops, the
 	// user navigates away, etc.) — without this go2rtc would keep
@@ -1382,6 +1559,279 @@ func (h *CameraHandler) StreamMP4(c *gin.Context) {
 	// Content-Length header). This is what we want for a stream
 	// of unknown length.
 	c.DataFromReader(http.StatusOK, -1, contentType, body, nil)
+}
+
+// streamDaguDirectMP4 pipes Dagu's live RTMP stream into a fragmented MP4
+// stream via FFmpeg stream-copy, providing low-latency progressive playback for ExoPlayer.
+func (h *CameraHandler) streamDaguDirectMP4(c *gin.Context, addr string) {
+	cmdCtx, cmdCancel := context.WithCancel(c.Request.Context())
+	defer cmdCancel()
+
+	ffmpegCmd := exec.CommandContext(cmdCtx, "/usr/bin/ffmpeg",
+		"-rw_timeout", "10000000",
+		"-analyzeduration", "2000000",
+		"-probesize", "2000000",
+		"-i", addr,
+		"-c:v", "copy",
+		"-c:a", "aac",
+		"-f", "mp4",
+		"-movflags", "empty_moov+frag_keyframe+default_base_moof",
+		"pipe:1",
+	)
+
+	stdout, err := ffmpegCmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[handler] dagu stream direct mp4 stdout pipe error: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to create stream pipe")
+		return
+	}
+	ffmpegCmd.Stderr = nil
+
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Printf("[handler] dagu stream direct mp4 ffmpeg start error: %v", err)
+		utils.Fail(c, http.StatusInternalServerError, "failed to start stream")
+		return
+	}
+	defer func() {
+		if ffmpegCmd.Process != nil {
+			_ = ffmpegCmd.Process.Kill()
+		}
+		_ = ffmpegCmd.Wait()
+	}()
+
+	c.Header("Content-Type", "video/mp4")
+	c.Header("Cache-Control", "no-cache, no-store")
+	c.Writer.Flush()
+
+	c.DataFromReader(http.StatusOK, -1, "video/mp4", stdout, nil)
+}
+
+// InternalStreamTS provides a real-time, low-latency MPEG-TS stream (H.264 + AAC)
+// specifically for go2rtc to ingest and republish via WebRTC.
+// It uses home-api's native FFmpeg 8.1.3 + VAAPI Intel hardware acceleration.
+func (h *CameraHandler) InternalStreamTS(c *gin.Context) {
+	if rc := http.NewResponseController(c.Writer); rc != nil {
+		_ = rc.SetWriteDeadline(time.Time{})
+	}
+
+	camID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.String(http.StatusBadRequest, "invalid camera id")
+		return
+	}
+
+	cam, err := h.Reg.Get(uint(camID))
+	if err != nil {
+		c.String(http.StatusNotFound, "camera not found")
+		return
+	}
+
+	sn := cam.Host
+	if sn == "" {
+		sn = "6912200023929742"
+	}
+
+	mgr := camera.GetGlobalDaguManager()
+	streamID := 1
+	if c.Query("quality") == "1080p" || c.Query("stream") == "0" {
+		streamID = 0
+	}
+	addr, err := mgr.AcquireStream(c.Request.Context(), sn, streamID)
+	if err != nil {
+		log.Printf("[handler] InternalStreamTS: failed to acquire dagu stream for %s: %v", sn, err)
+		c.String(http.StatusBadGateway, "failed to acquire dagu stream: "+err.Error())
+		return
+	}
+	defer mgr.ReleaseStream(sn)
+
+	cmdCtx, cmdCancel := context.WithCancel(c.Request.Context())
+	defer cmdCancel()
+
+	// Fast probe & ultra-low latency flags
+	var ffmpegArgs []string
+	if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
+		ffmpegArgs = []string{
+			"-y",
+			"-fflags", "nobuffer+fastseek",
+			"-flags", "low_delay",
+			"-rw_timeout", "10000000",
+			"-analyzeduration", "500000",
+			"-probesize", "500000",
+			"-i", addr,
+			"-vaapi_device", "/dev/dri/renderD128",
+			"-vf", "format=nv12,hwupload",
+			"-c:v", "h264_vaapi",
+			"-b:v", "2000k",
+			"-maxrate", "2500k",
+			"-bufsize", "1000k",
+			"-g", "25",
+			"-bf", "0",
+			"-tune", "zerolatency",
+			"-c:a", "aac",
+			"-b:a", "64k",
+			"-ar", "48000",
+			"-ac", "1",
+			"-f", "mpegts",
+			"-mpegts_flags", "latm+resend_headers",
+			"pipe:1",
+		}
+	} else {
+		ffmpegArgs = []string{
+			"-y",
+			"-fflags", "nobuffer+fastseek",
+			"-flags", "low_delay",
+			"-rw_timeout", "10000000",
+			"-analyzeduration", "500000",
+			"-probesize", "500000",
+			"-i", addr,
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-tune", "zerolatency",
+			"-g", "25",
+			"-bf", "0",
+			"-c:a", "aac",
+			"-b:a", "64k",
+			"-ar", "48000",
+			"-ac", "1",
+			"-f", "mpegts",
+			"-mpegts_flags", "latm+resend_headers",
+			"pipe:1",
+		}
+	}
+
+	ffmpegCmd := exec.CommandContext(cmdCtx, "/usr/bin/ffmpeg", ffmpegArgs...)
+	stdout, err := ffmpegCmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[handler] InternalStreamTS: failed to create stdout pipe: %v", err)
+		c.String(http.StatusInternalServerError, "failed to start transcoder pipe")
+		return
+	}
+	ffmpegCmd.Stderr = os.Stderr
+
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Printf("[handler] InternalStreamTS: failed to start ffmpeg: %v", err)
+		c.String(http.StatusInternalServerError, "failed to start ffmpeg")
+		return
+	}
+
+	go func() {
+		<-cmdCtx.Done()
+		if ffmpegCmd.Process != nil {
+			_ = ffmpegCmd.Process.Kill()
+		}
+		_ = ffmpegCmd.Wait()
+	}()
+
+	c.Header("Content-Type", "video/mp2t")
+	c.Header("Cache-Control", "no-cache, no-store")
+	c.Writer.Flush()
+
+	c.DataFromReader(http.StatusOK, -1, "video/mp2t", stdout, nil)
+}
+
+// InternalStreamFLV provides a real-time, low-latency HTTP-FLV stream (H.264 + PCMA)
+// as an alternative format for go2rtc.
+func (h *CameraHandler) InternalStreamFLV(c *gin.Context) {
+	camID, err := strconv.ParseUint(c.Param("id"), 10, 64)
+	if err != nil {
+		c.String(http.StatusBadRequest, "invalid camera id")
+		return
+	}
+
+	cam, err := h.Reg.Get(uint(camID))
+	if err != nil {
+		c.String(http.StatusNotFound, "camera not found")
+		return
+	}
+
+	sn := cam.Host
+	if sn == "" {
+		sn = "6912200023929742"
+	}
+
+	mgr := camera.GetGlobalDaguManager()
+	streamID := 1
+	if c.Query("quality") == "1080p" || c.Query("stream") == "0" {
+		streamID = 0
+	}
+	addr, err := mgr.AcquireStream(c.Request.Context(), sn, streamID)
+	if err != nil {
+		log.Printf("[handler] InternalStreamFLV: failed to acquire dagu stream for %s: %v", sn, err)
+		c.String(http.StatusBadGateway, "failed to acquire dagu stream: "+err.Error())
+		return
+	}
+	defer mgr.ReleaseStream(sn)
+
+	cmdCtx, cmdCancel := context.WithCancel(c.Request.Context())
+	defer cmdCancel()
+
+	var ffmpegArgs []string
+	if _, err := os.Stat("/dev/dri/renderD128"); err == nil {
+		ffmpegArgs = []string{
+			"-y",
+			"-rw_timeout", "10000000",
+			"-analyzeduration", "1500000",
+			"-probesize", "1500000",
+			"-i", addr,
+			"-vaapi_device", "/dev/dri/renderD128",
+			"-vf", "format=nv12,hwupload",
+			"-c:v", "h264_vaapi",
+			"-b:v", "2000k",
+			"-maxrate", "2500k",
+			"-bufsize", "1000k",
+			"-g", "25",
+			"-bf", "0",
+			"-tune", "zerolatency",
+			"-c:a", "copy",
+			"-f", "flv",
+			"pipe:1",
+		}
+	} else {
+		ffmpegArgs = []string{
+			"-y",
+			"-rw_timeout", "10000000",
+			"-analyzeduration", "1500000",
+			"-probesize", "1500000",
+			"-i", addr,
+			"-c:v", "libx264",
+			"-preset", "ultrafast",
+			"-tune", "zerolatency",
+			"-g", "25",
+			"-bf", "0",
+			"-c:a", "copy",
+			"-f", "flv",
+			"pipe:1",
+		}
+	}
+
+	ffmpegCmd := exec.CommandContext(cmdCtx, "/usr/bin/ffmpeg", ffmpegArgs...)
+	stdout, err := ffmpegCmd.StdoutPipe()
+	if err != nil {
+		log.Printf("[handler] InternalStreamFLV: failed to create stdout pipe: %v", err)
+		c.String(http.StatusInternalServerError, "failed to start transcoder pipe")
+		return
+	}
+	ffmpegCmd.Stderr = nil
+
+	if err := ffmpegCmd.Start(); err != nil {
+		log.Printf("[handler] InternalStreamFLV: failed to start ffmpeg: %v", err)
+		c.String(http.StatusInternalServerError, "failed to start ffmpeg")
+		return
+	}
+
+	go func() {
+		<-cmdCtx.Done()
+		if ffmpegCmd.Process != nil {
+			_ = ffmpegCmd.Process.Kill()
+		}
+		_ = ffmpegCmd.Wait()
+	}()
+
+	c.Header("Content-Type", "video/x-flv")
+	c.Header("Cache-Control", "no-cache, no-store")
+	c.Writer.Flush()
+
+	c.DataFromReader(http.StatusOK, -1, "video/x-flv", stdout, nil)
 }
 
 // PlayRecording — GET /api/v1/cameras/:id/recordings/:recId/file
@@ -1420,6 +1870,11 @@ func (h *CameraHandler) PlayRecording(c *gin.Context) {
 	minuteStart, err := strconv.ParseInt(c.Param("recId"), 10, 64)
 	if err != nil {
 		utils.Fail(c, http.StatusBadRequest, "invalid recId (expected unix timestamp)")
+		return
+	}
+
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		h.playDaguRecording(c, cam, minuteStart)
 		return
 	}
 
@@ -1478,6 +1933,11 @@ func (h *CameraHandler) PlayRecordingStream(c *gin.Context) {
 	minuteStart, err := strconv.ParseInt(c.Param("recId"), 10, 64)
 	if err != nil {
 		utils.Fail(c, http.StatusBadRequest, "invalid recId (expected unix timestamp)")
+		return
+	}
+
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		h.playDaguRecording(c, cam, minuteStart)
 		return
 	}
 	paths, err := h.Reg.RecordingSegmentsForMinute(cam, minuteStart)
@@ -1636,6 +2096,28 @@ func (h *CameraHandler) streamRecording(c *gin.Context, cam *model.Camera, minut
 			}
 		}
 	}
+}
+
+// playDaguRecording handles playback and download for Dagu 4G cameras by fetching
+// and serving the recording clips directly from Dagu cloud storage without waking the camera.
+func (h *CameraHandler) playDaguRecording(c *gin.Context, cam *model.Camera, recId int64) {
+	sn := cam.Host
+	if sn == "" {
+		sn = "6912200023929742"
+	}
+
+	filePath, err := camera.GetGlobalDaguManager().GetRecordingPathOrDownload(c.Request.Context(), sn, cam.ID, recId)
+	if err != nil {
+		log.Printf("[handler] playDaguRecording error for cam %d (rec %d): %v", cam.ID, recId, err)
+		utils.Fail(c, http.StatusNotFound, "recording not found on cloud")
+		return
+	}
+
+	c.Header("Cache-Control", "no-store")
+	if c.Query("download") == "1" {
+		c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"camera_%s_%d.mp4\"", cam.Name, recId))
+	}
+	http.ServeFile(c.Writer, c.Request, filePath)
 }
 
 // buildFMP4Cmd returns the ffmpeg command that concatenates the segments
@@ -2250,6 +2732,14 @@ func (h *CameraHandler) WebRTC(c *gin.Context) {
 		streamName = cam.StreamName + "_1080p"
 	}
 
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		// Register internal hardware-transcoded stream bridge into go2rtc with Opus/AAC audio transcode
+		bridgeURL := fmt.Sprintf("http://home-api:8080/internal/cameras/%d/live.ts#audio=opus#audio=aac", cam.ID)
+		if err := h.Reg.Go2.AddStream(c.Request.Context(), streamName, bridgeURL); err != nil {
+			log.Printf("[handler] webrtc: failed to register dagu stream %s in go2rtc: %v", streamName, err)
+		}
+	}
+
 	answer, err := h.Reg.Go2.ExchangeSDP(c.Request.Context(), streamName, body)
 	if err != nil && streamName != cam.StreamName {
 		// Fallback to standard 720p stream if 1080p stream fails
@@ -2620,6 +3110,62 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 		utils.Fail(c, http.StatusBadRequest, "invalid request body")
 		return
 	}
+
+	speed := 0.25
+	if req.Speed != 0 {
+		speed = req.Speed
+	}
+
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		sn := cam.Host
+		if sn == "" {
+			sn = "6912200023929742"
+		}
+		// Map command to Dagu motor direction
+		// 1: UP(上), 2: DOWN(下), 3: LEFT(左), 0: RIGHT(右)
+		var dir int
+		action := "start"
+		switch strings.ToLower(req.Command) {
+		case "up":
+			dir = 1
+		case "down":
+			dir = 2
+		case "left":
+			dir = 3
+		case "right":
+			dir = 0
+		case "stop":
+			// Dagu physical motor is step-pulsed; acknowledge stop gracefully
+			utils.Success(c, gin.H{
+				"id":      cam.ID,
+				"command": req.Command,
+				"speed":   speed,
+			})
+			return
+		default:
+			dir = 1
+		}
+
+		dSpeed := int(speed * 10)
+		if dSpeed <= 0 {
+			dSpeed = 5
+		}
+
+		mgr := camera.GetGlobalDaguManager()
+		if err := mgr.PTZ(c.Request.Context(), sn, dir, action, dSpeed); err != nil {
+			log.Printf("[handler] failed to execute Dagu PTZ command: %v", err)
+			utils.Fail(c, http.StatusBadGateway, "failed to execute Dagu PTZ command")
+			return
+		}
+
+		utils.Success(c, gin.H{
+			"id":      cam.ID,
+			"command": req.Command,
+			"speed":   speed,
+		})
+		return
+	}
+
 	if cam.Credentials == nil {
 		utils.Fail(c, http.StatusFailedDependency, "no credentials on file")
 		return
@@ -2655,9 +3201,8 @@ func (h *CameraHandler) PTZ(c *gin.Context) {
 		return
 	}
 
-	speed := req.Speed
-	if speed == 0 {
-		speed = 0.25
+	if req.Speed != 0 {
+		speed = req.Speed
 	}
 
 	if err := h.ONVIF.ContinuousMove(

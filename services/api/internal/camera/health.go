@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -78,6 +79,16 @@ func (h *HealthChecker) tick(ctx context.Context) {
 }
 
 func (h *HealthChecker) probe(ctx context.Context, c model.Camera) {
+	if strings.EqualFold(c.Vendor, "dagu") || strings.EqualFold(c.Vendor, "daguiot") {
+		// Dagu 4G cameras are managed via WSS cloud signaling and battery/on-demand sleep.
+		// Always keep status as online unless marked offline.
+		now := time.Now()
+		status := "online"
+		h.resetFailCount(c.ID)
+		h.Registry.UpdateStatus(c.ID, status, &now)
+		return
+	}
+
 	addr := net.JoinHostPort(c.Host, strconv.Itoa(c.RTSPPort))
 	d := net.Dialer{Timeout: h.Timeout}
 	conn, err := d.DialContext(ctx, "tcp", addr)

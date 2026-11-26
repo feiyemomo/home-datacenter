@@ -96,16 +96,17 @@ var AllowedProposalTransitions = map[string]map[string]bool{
 		model.ProposalStatusRolledBack: true,
 		model.ProposalStatusCancelled:  true,
 	},
-	// Terminal states: strictly empty (immutable)
-	model.ProposalStatusExecuted:        {},
-	model.ProposalStatusSuccess:         {},
-	model.ProposalStatusFailed:          {},
-	model.ProposalStatusCancelled:       {},
-	model.ProposalStatusRejected:        {},
-	model.ProposalStatusExpired:         {},
-	model.ProposalStatusRolledBack:      {},
-	model.ProposalStatusFailedRolledback: {},
-	model.ProposalStatusRollbackFailed:  {},
+	// Terminal states: can be permanently archived
+	model.ProposalStatusExecuted:        {model.ProposalStatusArchived: true},
+	model.ProposalStatusSuccess:         {model.ProposalStatusArchived: true},
+	model.ProposalStatusFailed:          {model.ProposalStatusArchived: true},
+	model.ProposalStatusCancelled:       {model.ProposalStatusArchived: true},
+	model.ProposalStatusRejected:        {model.ProposalStatusArchived: true},
+	model.ProposalStatusExpired:         {model.ProposalStatusArchived: true},
+	model.ProposalStatusRolledBack:      {model.ProposalStatusArchived: true},
+	model.ProposalStatusFailedRolledback: {model.ProposalStatusArchived: true},
+	model.ProposalStatusRollbackFailed:  {model.ProposalStatusArchived: true},
+	model.ProposalStatusArchived:        {},
 }
 
 // IsProposalTransitionAllowed returns true if from -> to is permitted by the unified matrix.

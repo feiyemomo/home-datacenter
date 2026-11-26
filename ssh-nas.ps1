@@ -1,4 +1,4 @@
-# ssh-nas.ps1 — Interactive SSH toolbox for the home-datacenter NAS.
+﻿# ssh-nas.ps1 — Interactive SSH toolbox for the home-datacenter NAS.
 #
 # A convenient wrapper around ssh/scp for the daily NAS operations that
 # deploy-nas.ps1 doesn't cover: quick command execution, service status,
@@ -28,7 +28,11 @@ param(
     [string]$Command,
     [switch]$Menu,
     # NAS password. Same mechanism as deploy-nas.ps1 (SSH_ASKPASS).
-    [string]$Password
+    [string]$Password,
+    # Force acquiring an H3C Oasis Cloud relay tunnel even if LAN is reachable.
+    [switch]$ForceH3C,
+    # Keep the H3C relay tunnel alive after script completes (do not auto-delete).
+    [switch]$KeepTunnel
 )
 
 # ============== CONFIG (keep in sync with deploy-nas.ps1) ==============
@@ -37,6 +41,55 @@ $NAS_USER   = if ($env:NAS_USER) { $env:NAS_USER } else { "momo" }
 $NAS_PORT   = if ($env:NAS_PORT) { [int]$env:NAS_PORT } else { 22 }
 $REMOTE_PATH = "/vol1/docker/home-datacenter"
 # =======================================================================
+
+$ProjectRoot = $PSScriptRoot
+
+# ---- H3C Relay & Endpoint Management ----
+$RelayScript = Join-Path $ProjectRoot "tools\h3c_relay.py"
+$RelayTunnelId = $null
+$RelayCreatedNew = $false
+
+function Cleanup-RelayTunnel {
+    if ($script:RelayCreatedNew -and $script:RelayTunnelId -and (-not $KeepTunnel)) {
+        Write-Host "==> Cleaning up temporary H3C relay tunnel: $($script:RelayTunnelId)..." -ForegroundColor Cyan
+        & python $RelayScript release $script:RelayTunnelId 2>$null | Out-Null
+        $script:RelayTunnelId = $null
+        $script:RelayCreatedNew = $false
+    }
+}
+
+function Cleanup-All {
+    Remove-Askpass
+    Cleanup-RelayTunnel
+}
+
+trap { Cleanup-All; break }
+Register-EngineEvent PowerShell.Exiting -Action { Cleanup-All } | Out-Null
+
+function Resolve-NasEndpoint {
+    if (Test-Path $RelayScript) {
+        try {
+            $relayArgs = @("$RelayScript", "acquire", "--json")
+            if ($ForceH3C) { $relayArgs += "--force-h3c" }
+            $jsonOut = & python @relayArgs 2>$null
+            if ($LASTEXITCODE -eq 0 -and $jsonOut) {
+                $ep = $jsonOut | ConvertFrom-Json
+                if ($ep -and $ep.host -and $ep.port) {
+                    $script:NAS_HOST = $ep.host
+                    $script:NAS_PORT = [int]$ep.port
+                    $script:NAS_USER = if ($ep.user) { $ep.user } else { $script:NAS_USER }
+                    $script:RelayTunnelId = $ep.tunnel_id
+                    $script:RelayCreatedNew = [bool]$ep.created_new
+                    Write-Host "==> Connected via Tier [$(($ep.tier).ToUpper())]: $($script:NAS_USER)@$($script:NAS_HOST):$($script:NAS_PORT)" -ForegroundColor Green
+                    return
+                }
+            }
+        } catch {
+            Write-Warning "Failed to query H3C relay resolver: $_"
+        }
+    }
+    Write-Host "==> Using default NAS endpoint: $script:NAS_USER@$script:NAS_HOST`:$script:NAS_PORT" -ForegroundColor Yellow
+}
 
 $ErrorActionPreference = "Stop"
 
@@ -54,14 +107,12 @@ function Remove-Askpass {
         Remove-Item $script:AskpassFile -ErrorAction SilentlyContinue
     }
 }
-trap { Remove-Askpass; break }
-Register-EngineEvent PowerShell.Exiting -Action { Remove-Askpass } | Out-Null
 
 function Invoke-NasSSH {
     param([Parameter(Mandatory)][string]$RemoteCmd)
-    $sshOpts = @("-p", "$NAS_PORT",
-                 "-o", "StrictHostKeyChecking=no",
-                 "-o", "UserKnownHostsFile=NUL",
+    $sshOpts = @("-p", "$script:NAS_PORT",
+                 "-o", "StrictHostKeyChecking=accept-new",
+                 "-o", "BatchMode=yes",
                  "-o", "ConnectTimeout=10")
     if ($Password) {
         $sshOpts += @("-o", "PreferredAuthentications=password",
@@ -71,7 +122,7 @@ function Invoke-NasSSH {
     $prevEAP = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     try {
-        & ssh @sshOpts "$NAS_USER@$NAS_HOST" $RemoteCmd 2>&1 | Out-Host
+        & ssh @sshOpts "$script:NAS_USER@$script:NAS_HOST" $RemoteCmd 2>&1 | Out-Host
         $code = $LASTEXITCODE
     } finally {
         $ErrorActionPreference = $prevEAP
@@ -79,9 +130,11 @@ function Invoke-NasSSH {
     return $code
 }
 
+Resolve-NasEndpoint
+
 function Show-Menu {
     Write-Host ""
-    Write-Host "========== NAS SSH 工具箱 ($NAS_HOST) ==========" -ForegroundColor Cyan
+    Write-Host "========== NAS SSH 工具箱 ($script:NAS_USER@$script:NAS_HOST`:$script:NAS_PORT) ==========" -ForegroundColor Cyan
     Write-Host "  1) 服务状态        docker compose ps"
     Write-Host "  2) 查看日志        docker compose logs -f api"
     Write-Host "  3) 容器列表        docker ps"

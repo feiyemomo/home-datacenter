@@ -469,6 +469,10 @@ func (r *Registry) PreheatStream(cameraID uint) error {
 	if err != nil {
 		return err
 	}
+	if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+		// 4G battery camera: strictly prohibited from background preheating to preserve battery and avoid waking
+		return nil
+	}
 	if cam.StreamName == "" {
 		return fmt.Errorf("camera %d has no stream name", cameraID)
 	}
@@ -795,7 +799,7 @@ func (r *Registry) pushFrigateConfigWithRecording(ctx context.Context, targetCam
 	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
 	go2rtcStreams := make(map[string]any)
 	for _, c := range cams {
-		if c.StreamName == "" {
+		if c.StreamName == "" || strings.EqualFold(c.Vendor, "dagu") || strings.EqualFold(c.Vendor, "daguiot") {
 			continue
 		}
 		u, p, err := r.DecryptCredentials(&c)
@@ -895,7 +899,7 @@ func (r *Registry) computeUniqueSlugs() map[uint]string {
 	slugs := make(map[uint]string, len(cams))
 	for i := range cams {
 		c := &cams[i]
-		if c.StreamName == "" {
+		if c.StreamName == "" || strings.EqualFold(c.Vendor, "dagu") || strings.EqualFold(c.Vendor, "daguiot") {
 			continue
 		}
 		slug := uniqueSlug(slugifyName(c.StreamName), taken)
@@ -1308,6 +1312,9 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 	migrated := 0
 	for i := range cams {
 		c := &cams[i]
+		if strings.EqualFold(c.Vendor, "dagu") || strings.EqualFold(c.Vendor, "daguiot") {
+			continue
+		}
 		if !cameraHasAudio(c) {
 			if c.Capabilities == nil {
 				c.Capabilities = model.JSON{}
@@ -1344,7 +1351,7 @@ func (r *Registry) BootReplay(ctx context.Context) error {
 
 		var failed int
 		for _, c := range cams {
-			if c.StreamName == "" {
+			if c.StreamName == "" || strings.EqualFold(c.Vendor, "dagu") || strings.EqualFold(c.Vendor, "daguiot") {
 				continue
 			}
 			u, p, err := r.DecryptCredentials(&c)
@@ -1438,6 +1445,9 @@ func (r *Registry) preheatAllCamerasInBackground(cams []model.Camera) {
 	time.Sleep(2 * time.Second)
 	log.Printf("camera: preheating %d camera streams for zero-delay WebRTC...", len(cams))
 	for _, cam := range cams {
+		if strings.EqualFold(cam.Vendor, "dagu") || strings.EqualFold(cam.Vendor, "daguiot") {
+			continue // 4G 电池摄像头不参与开机预热，严防开机常开偷跑流量和电量
+		}
 		go func(id uint, name string) {
 			if err := r.PreheatStream(id); err == nil {
 				log.Printf("camera: preheated stream for %s (id=%d)", name, id)
@@ -1533,7 +1543,7 @@ func (r *Registry) pushFrigateConfig(ctx context.Context) error {
 	frigateCams := make([]FrigateCameraConfig, 0, len(cams))
 	go2rtcStreams := make(map[string]any)
 	for _, c := range cams {
-		if c.StreamName == "" {
+		if c.StreamName == "" || strings.EqualFold(c.Vendor, "dagu") || strings.EqualFold(c.Vendor, "daguiot") {
 			continue
 		}
 		u, p, err := r.DecryptCredentials(&c)
@@ -1968,20 +1978,20 @@ func (r *Registry) rtsp1080pURL(cam *model.Camera, user, pass string) string {
 	audioOn := cameraHasAudio(cam)
 	audioFrag := ""
 	if audioOn {
-		audioFrag = "#audio=opus#audio=aac#async=3000"
+		audioFrag = "#audio=copy#audio=opus#audio=aac"
 	}
 	codec := effectiveCodec(cam)
 	// If the camera is on passthrough (native H.264), pass video through untouched with #video=copy.
 	// This uses ZERO GPU/CPU transcoding, avoids J4125 bottleneck, and provides buttery-smooth 1080p stream!
 	if codec == "passthrough" {
 		if audioOn {
-			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=3000" + stopFrag
+			return "ffmpeg:" + raw + "#video=copy#audio=copy#audio=opus#audio=aac" + stopFrag
 		}
 		return raw + "#audio=0" + stopFrag
 	}
 	// For cameras requiring H.264 transcoding (native HEVC sources):
-	// v1.13.30: async=3000 absorbs network jitter to eliminate stuttering, stop=0 avoids cold-start delay
-	return "ffmpeg:" + raw + "#video=h264#width=1920#hardware=vaapi#async=3000" + audioFrag + stopFrag
+	// v1.18.17: remove async=3000 to prevent ffmpeg aresample from dropping audio frames during RTSP clock drift
+	return "ffmpeg:" + raw + "#video=h264#width=1920#hardware=vaapi" + audioFrag + stopFrag
 }
 
 // add1080pStream registers the camera's 1080p H.264 stream (<name>_1080p).
@@ -2143,13 +2153,13 @@ func (r *Registry) rtspURL(cam *model.Camera, user, pass string) string {
 	}
 	if codec == "passthrough" || cam.TranscodeUseSubstream {
 		if audioOn {
-			return "ffmpeg:" + raw + "#video=copy#audio=opus#audio=aac#async=3000" + stopFrag
+			return "ffmpeg:" + raw + "#video=copy#audio=copy#audio=opus#audio=aac" + stopFrag
 		}
 		return raw + "#audio=0" + stopFrag
 	}
 	audioFrag := ""
 	if audioOn {
-		audioFrag = "#audio=opus#audio=aac#async=3000"
+		audioFrag = "#audio=copy#audio=opus#audio=aac"
 	}
 	if codec == "h265" {
 		return "ffmpeg:" + raw + "#video=h265#hardware=vaapi" + audioFrag + stopFrag

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -282,11 +284,23 @@ func main() {
 	hostWatcher := security.NewHostLogWatcher(defenseMgr, cfg.Security.Defense.HostAuthLogPath, cfg.Security.Defense.ExportRulesPath)
 	securityHandler := handler.NewSecurityHandler(guardMgr, defenseMgr, alertMgr, hostWatcher)
 
+	onePanelUser := os.Getenv("ONEPANEL_USERNAME")
+	if strings.TrimSpace(onePanelUser) == "" {
+		onePanelUser = "feiyemomo"
+	}
+	onePanelPass := os.Getenv("ONEPANEL_PASSWORD")
+	if strings.TrimSpace(onePanelPass) == "" {
+		onePanelPass = "@Momo324"
+	}
+	onePanelEntrance := os.Getenv("ONEPANEL_ENTRANCE")
+	if strings.TrimSpace(onePanelEntrance) == "" {
+		onePanelEntrance = "btpanel"
+	}
 	onePanelClient := ops.NewOnePanelClient(
 		os.Getenv("ONEPANEL_URL"),
-		os.Getenv("ONEPANEL_ENTRANCE"),
-		os.Getenv("ONEPANEL_USERNAME"),
-		os.Getenv("ONEPANEL_PASSWORD"),
+		onePanelEntrance,
+		onePanelUser,
+		onePanelPass,
 	)
 	fallbackProvider := ops.NewHostFallbackProvider(
 		cfg.Maintenance.DiskPath,
@@ -353,6 +367,24 @@ func main() {
 		defExec.SetRecoveryFSM(recoveryFSM)
 	}
 
+	// Initialize ResilientStateManager with snapshot and audit log paths
+	opsStateDir := filepath.Dir(cfg.Database.Path)
+	if opsStateDir == "" || opsStateDir == "." {
+		opsStateDir = "data"
+	}
+	opsStatePath := filepath.Join(opsStateDir, "ops_snapshot.json")
+	opsLogPath := filepath.Join(opsStateDir, "ops.log")
+	resilientStateMgr, rErr := ops.NewResilientStateManager(ops.ResilientStateConfig{
+		SnapshotPath: opsStatePath,
+		LogPath:      opsLogPath,
+	})
+	if rErr == nil {
+		opsHandler.SetResilientStateManager(resilientStateMgr)
+		log.Printf("[ops] ResilientStateManager initialized (snapshot: %s, log: %s)", opsStatePath, opsLogPath)
+	} else {
+		log.Printf("[ops] warning: failed to initialize ResilientStateManager: %v", rErr)
+	}
+
 	// Startup proposal reconciliation (replacing blind sweeper)
 	if err := ops.ReconcileStartupProposals(database.DB, opsHandler.GetExecutor()); err != nil {
 		log.Printf("[ops] warning: failed to reconcile startup proposals: %v", err)
@@ -360,6 +392,19 @@ func main() {
 
 	// Go Core ProposalScheduler as sole background authority for SCHEDULED proposals
 	proposalScheduler := ops.NewProposalScheduler(database.DB, opsHandler.GetExecutor())
+	proposalScheduler.SetActivityChecker(func(ctx context.Context, target string) (bool, error) {
+		// When target touches live video streaming components, check if any active consumers exist
+		if target == "frigate" || target == "home-frigate" || target == "openresty" || target == "home-api" {
+			if go2 != nil {
+				hasConsumers, err := go2.HasAnyConsumers(ctx)
+				if err == nil && hasConsumers {
+					log.Printf("[ops-scheduler] active WebRTC stream consumers detected on go2rtc; deferring mutation on %s", target)
+					return true, nil
+				}
+			}
+		}
+		return false, nil
+	})
 	if opsSchemaErr == nil {
 		proposalScheduler.Start()
 	} else {
@@ -706,6 +751,38 @@ func main() {
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(200, gin.H{"status": "ok"})
 	})
+
+	// Internal streaming bridge for Frigate/go2rtc (no JWT, accessed within Docker bridge / localhost)
+	r.GET("/internal/cameras/:id/live.ts", camHandler.InternalStreamTS)
+	r.GET("/internal/cameras/:id/live.flv", camHandler.InternalStreamFLV)
+
+	// 1Panel Web Console & SPA Asset Reverse Proxy for in-app WebView
+	onePanelRawURL := os.Getenv("ONEPANEL_URL")
+	if onePanelRawURL == "" {
+		onePanelRawURL = "http://172.18.0.1:10000"
+	}
+	if opTarget, err := url.Parse(onePanelRawURL); err == nil && opTarget.Host != "" {
+		opProxy := httputil.NewSingleHostReverseProxy(opTarget)
+		originalDirector := opProxy.Director
+		opProxy.Director = func(req *http.Request) {
+			originalDirector(req)
+			req.Host = opTarget.Host
+		}
+		opHandler := func(c *gin.Context) {
+			opProxy.ServeHTTP(c.Writer, c.Request)
+		}
+		r.Any("/btpanel", opHandler)
+		r.Any("/btpanel/*filepath", opHandler)
+		r.Any("/assets/*filepath", opHandler)
+		r.Any("/api/v2/*filepath", opHandler)
+
+		entrance := strings.Trim(os.Getenv("ONEPANEL_ENTRANCE"), "/")
+		if entrance != "" && entrance != "btpanel" {
+			r.Any("/"+entrance, opHandler)
+			r.Any("/"+entrance+"/*filepath", opHandler)
+		}
+		log.Printf("[1panel-proxy] mounted reverse proxy to %s for /btpanel, /assets, /api/v2", opTarget.String())
+	}
 
 	// v1.8.41: readiness probe — distinguishes "process alive" (/health)
 	// from "ready to serve". Only the DB ping gates readiness; MQTT is
@@ -1105,6 +1182,18 @@ func main() {
 				}()
 				utils.Success(c, gin.H{
 					"message": "已触发宿主机 CVE 关联与 Google OSV 依赖漏洞全量扫描",
+					"ts":      time.Now().Unix(),
+				})
+			})
+
+			opsGroup.POST("/check-image-updates", middleware.RequireAdmin(database.DB), func(c *gin.Context) {
+				_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Now().Add(50 * time.Second))
+				checkCtx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
+				defer cancel()
+				created := vulnScanner.CheckDockerImageUpdates(checkCtx, "/var/run/docker.sock")
+				utils.Success(c, gin.H{
+					"created": created,
+					"message": fmt.Sprintf("已完成 Docker 镜像版本巡检，新生成 %d 条更新提案", created),
 					"ts":      time.Now().Unix(),
 				})
 			})

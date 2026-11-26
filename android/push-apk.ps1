@@ -1,4 +1,4 @@
-# push-apk.ps1 — Build the Android Gradle project and push the APK to the NAS.
+﻿# push-apk.ps1 — Build the Android Gradle project and push the APK to the NAS.
 #
 # Native Windows 11 tools only: ssh, scp, gradlew (via the repo's wrapper).
 #
@@ -30,7 +30,11 @@ param(
     # Build flavor to push: "release" (default, official keystore
     # signed) or "debug". Release chooses app-release.apk, assembles via assembleRelease.
     [ValidateSet("debug", "release")]
-    [string]$Flavor = "release"
+    [string]$Flavor = "release",
+    # Force acquiring an H3C Oasis Cloud relay tunnel even if LAN is reachable.
+    [switch]$ForceH3C,
+    # Keep the H3C relay tunnel alive after script completes (do not auto-delete).
+    [switch]$KeepTunnel
 )
 
 $ErrorActionPreference = "Stop"
@@ -41,13 +45,55 @@ function Write-Ok([string]$t) { Write-Host $t -ForegroundColor Green }
 function Write-Err([string]$t) { Write-Host $t -ForegroundColor Red }
 
 # ---- config (mirror deploy-nas.ps1) ----------------------------------------
-$NAS_HOST   = "192.168.31.235"
-$NAS_USER   = "fnos-momo"
+$NAS_HOST   = "100.90.67.71"
+$NAS_USER   = "momo"
 $NAS_PORT   = 22
 $REMOTE_DIR = "/vol1/docker/home-datacenter/data/releases"
 
 $RepoRoot   = Split-Path -Parent $PSScriptRoot
 $AndroidDir = Join-Path $RepoRoot "android"
+
+# ---- H3C Relay & Endpoint Management ----
+$RelayScript = Join-Path $RepoRoot "tools\h3c_relay.py"
+$RelayTunnelId = $null
+$RelayCreatedNew = $false
+
+function Cleanup-RelayTunnel {
+    if ($script:RelayCreatedNew -and $script:RelayTunnelId -and (-not $KeepTunnel)) {
+        Write-Host "==> Cleaning up temporary H3C relay tunnel: $($script:RelayTunnelId)..." -ForegroundColor Cyan
+        & python $RelayScript release $script:RelayTunnelId 2>$null | Out-Null
+        $script:RelayTunnelId = $null
+        $script:RelayCreatedNew = $false
+    }
+}
+
+trap { Cleanup-RelayTunnel; break }
+Register-EngineEvent PowerShell.Exiting -Action { Cleanup-RelayTunnel } | Out-Null
+
+function Resolve-NasEndpoint {
+    if (Test-Path $RelayScript) {
+        try {
+            $relayArgs = @("$RelayScript", "acquire", "--json")
+            if ($ForceH3C) { $relayArgs += "--force-h3c" }
+            $jsonOut = & python @relayArgs 2>$null
+            if ($LASTEXITCODE -eq 0 -and $jsonOut) {
+                $ep = $jsonOut | ConvertFrom-Json
+                if ($ep -and $ep.host -and $ep.port) {
+                    $script:NAS_HOST = $ep.host
+                    $script:NAS_PORT = [int]$ep.port
+                    $script:NAS_USER = if ($ep.user) { $ep.user } else { $script:NAS_USER }
+                    $script:RelayTunnelId = $ep.tunnel_id
+                    $script:RelayCreatedNew = [bool]$ep.created_new
+                    Write-Host "==> Connected via Tier [$(($ep.tier).ToUpper())]: $($script:NAS_USER)@$($script:NAS_HOST):$($script:NAS_PORT)" -ForegroundColor Green
+                    return
+                }
+            }
+        } catch {
+            Write-Warning "Failed to query H3C relay resolver: $_"
+        }
+    }
+    Write-Host "==> Using default NAS endpoint: $script:NAS_USER@$script:NAS_HOST`:$script:NAS_PORT" -ForegroundColor Yellow
+}
 $GradleFile = Join-Path $AndroidDir "app\build.gradle.kts"
 
 Set-Location $AndroidDir
@@ -119,6 +165,9 @@ if ($BuildOnly -or $DryRun) {
     exit 0
 }
 
+# Resolve fastest NAS endpoint (LAN -> H3C Relay -> Tailscale)
+Resolve-NasEndpoint
+
 # password auth via SSH_ASKPASS
 $script:AskpassFile = ""
 if ($Password) {
@@ -129,15 +178,20 @@ if ($Password) {
     $env:DISPLAY = "1"
 }
 try {
-    Write-Step "==> Pushing to NAS ($NAS_USER@$NAS_HOST`:$REMOTE_DIR)"
-    $target = "${NAS_USER}@${NAS_HOST}:${REMOTE_DIR}/"
+    Write-Step "==> Pushing to NAS ($script:NAS_USER@$script:NAS_HOST`:$REMOTE_DIR)"
+    $target = "${script:NAS_USER}@${script:NAS_HOST}:${REMOTE_DIR}/"
+    $scpArgs = @("-P", "$script:NAS_PORT", "-C",
+                 "-o", "ConnectTimeout=10",
+                 "-o", "BatchMode=yes",
+                 "-o", "StrictHostKeyChecking=accept-new")
     if ($Notes -and (Test-Path $versionedNotes)) {
-        scp -o ConnectTimeout=10 -P $NAS_PORT $versionedApk $versionedNotes $target
+        & scp @scpArgs $versionedApk $versionedNotes $target
     } else {
-        scp -o ConnectTimeout=10 -P $NAS_PORT $versionedApk $target
+        & scp @scpArgs $versionedApk $target
     }
     if ($LASTEXITCODE -ne 0) {
         Write-Err "ERROR: scp failed (exit $LASTEXITCODE)."
+        Cleanup-RelayTunnel
         exit 1
     }
 }
@@ -149,3 +203,5 @@ finally {
 
 Write-Ok "==> Pushed app-$Flavor-v$versionName.apk to NAS."
 if ($Notes) { Write-Ok "==> Pushed release-notes-v$versionName.txt to NAS." }
+Cleanup-RelayTunnel
+exit 0

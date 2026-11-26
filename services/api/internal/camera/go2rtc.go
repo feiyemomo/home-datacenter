@@ -143,6 +143,61 @@ func (c *Go2RTCClient) AddStreamSources(ctx context.Context, name string, source
 	return fmt.Errorf("go2rtc add stream sources: %s", resp.Status)
 }
 
+// HasConsumers checks if a given stream currently has any active consumers in go2rtc.
+func (c *Go2RTCClient) HasConsumers(ctx context.Context, name string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Base+"/api/streams", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return false, fmt.Errorf("go2rtc status %d", resp.StatusCode)
+	}
+	var streams map[string]struct {
+		Consumers []any `json:"consumers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&streams); err != nil {
+		return false, err
+	}
+	st, ok := streams[name]
+	if !ok {
+		return false, nil
+	}
+	return len(st.Consumers) > 0, nil
+}
+
+// HasAnyConsumers checks if ANY stream currently has any active consumers in go2rtc.
+func (c *Go2RTCClient) HasAnyConsumers(ctx context.Context) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Base+"/api/streams", nil)
+	if err != nil {
+		return false, err
+	}
+	resp, err := c.HC.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return false, fmt.Errorf("go2rtc status %d", resp.StatusCode)
+	}
+	var streams map[string]struct {
+		Consumers []any `json:"consumers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&streams); err != nil {
+		return false, err
+	}
+	for _, st := range streams {
+		if len(st.Consumers) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // streamExists checks whether a stream with the given name is
 // registered in go2rtc's in-memory state via GET /api/streams.
 func (c *Go2RTCClient) streamExists(ctx context.Context, name string) bool {

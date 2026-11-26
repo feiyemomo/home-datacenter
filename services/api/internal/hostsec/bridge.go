@@ -40,6 +40,10 @@ const (
 	HostActionRestoreConfig  HostActionType = "ssh.restore_config"
 	HostActionWatchdogArm    HostActionType = "ssh.watchdog_arm"
 	HostActionWatchdogDisarm HostActionType = "ssh.watchdog_disarm"
+	HostActionContainerRestart HostActionType = "docker.container_restart"
+	HostActionZombieReap       HostActionType = "proc.zombie_reap"
+	HostActionNetworkReset     HostActionType = "net.service_reset"
+	HostActionOrphanPrune      HostActionType = "docker.orphan_prune"
 )
 
 const (
@@ -62,7 +66,23 @@ var (
 	ErrBridgeBindingInvalid       = errors.New("host execution bridge binding validation failed")
 
 	reSafeSnapshotID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$`)
+	reSafeOrphanFilter = regexp.MustCompile(`^hdc-(tmp|test)-[a-zA-Z0-9._-]+$`)
 )
+
+// AllowedOpsContainerServices defines the strict whitelist of containerized services permitted for Host Helper lifecycle actions.
+var AllowedOpsContainerServices = map[string]bool{
+	"home-vision":        true,
+	"frigate":            true,
+	"mosquitto":          true,
+	"openresty":          true,
+	"home-cloudflared":   true,
+	"home-h3c-keepalive": true,
+	"home-new-api":       true,
+	"home-ops-agent":     true,
+	"mihomo":             true,
+	"tailscale":          true,
+	"home-api":           true,
+}
 
 // HostExecutionBinding cryptographically binds every host action invocation to an
 // approved proposal, approval digest/ID, operation ID, baseline hash, and fencing generation.
@@ -117,6 +137,11 @@ type HostActionRequest struct {
 	SnapshotID        string               `json:"snapshot_id,omitempty"`
 	GuardID           string               `json:"guard_id,omitempty"`
 	WatchdogTimeoutMs int64                `json:"watchdog_timeout_ms,omitempty"`
+	ServiceName       string               `json:"service_name,omitempty"`
+	TimeoutSeconds    int                  `json:"timeout_seconds,omitempty"`
+	TargetPID         int                  `json:"target_pid,omitempty"`
+	ResetScope        string               `json:"reset_scope,omitempty"`
+	PruneFilter       string               `json:"prune_filter,omitempty"`
 }
 
 // HostActionResult captures structured output from a bridge-mediated typed host action.
@@ -156,7 +181,11 @@ func IsAllowedHostAction(action HostActionType) bool {
 		HostActionSSHDRestart,
 		HostActionRestoreConfig,
 		HostActionWatchdogArm,
-		HostActionWatchdogDisarm:
+		HostActionWatchdogDisarm,
+		HostActionContainerRestart,
+		HostActionZombieReap,
+		HostActionNetworkReset,
+		HostActionOrphanPrune:
 		return true
 	default:
 		return false
@@ -240,6 +269,32 @@ func ValidateHostActionRequest(req HostActionRequest, allowedPkgs map[string]boo
 	case HostActionSSHDTest, HostActionSSHDRestart:
 		if len(req.Packages) > 0 || len(req.TargetVersions) > 0 || strings.TrimSpace(req.SnapshotID) != "" || strings.TrimSpace(req.GuardID) != "" {
 			return fmt.Errorf("%w: unexpected parameters for %s", ErrBridgeActionRejected, req.Action)
+		}
+	case HostActionContainerRestart:
+		svc := strings.TrimSpace(req.ServiceName)
+		if svc == "" || !AllowedOpsContainerServices[svc] {
+			return fmt.Errorf("%w: invalid or unauthorized container service name %q", ErrBridgeActionRejected, req.ServiceName)
+		}
+	case HostActionZombieReap:
+		svc := strings.TrimSpace(req.ServiceName)
+		if svc == "" || !AllowedOpsContainerServices[svc] {
+			return fmt.Errorf("%w: invalid or unauthorized container service name %q", ErrBridgeActionRejected, req.ServiceName)
+		}
+		if req.TargetPID <= 1 {
+			return fmt.Errorf("%w: target_pid must be > 1 for zombie reap", ErrBridgeActionRejected)
+		}
+	case HostActionNetworkReset:
+		scope := strings.TrimSpace(req.ResetScope)
+		switch scope {
+		case "wan_check", "dns_flush", "tunnel_reload", "ice_reload", "proxy_reload":
+			// valid
+		default:
+			return fmt.Errorf("%w: invalid reset_scope %q for net.service_reset", ErrBridgeActionRejected, req.ResetScope)
+		}
+	case HostActionOrphanPrune:
+		filter := strings.TrimSpace(req.PruneFilter)
+		if !reSafeOrphanFilter.MatchString(filter) {
+			return fmt.Errorf("%w: prune_filter %q does not match safety whitelist regex", ErrBridgeActionRejected, req.PruneFilter)
 		}
 	}
 	return nil
@@ -1188,6 +1243,10 @@ func NewHostBridgeHTTPHandler(cfg HostBridgeServerConfig) (http.Handler, error) 
 	}), nil
 }
 
+var readProcessCgroup = func(pid int) ([]byte, error) {
+	return os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+}
+
 func dispatchTypedBridgeAction(
 	ctx context.Context,
 	runner HostExecRunner,
@@ -1267,6 +1326,107 @@ func dispatchTypedBridgeAction(
 
 	case HostActionRestoreConfig:
 		return restoreSSHConfigsFromSnapshotID(detector, snapshotRoot, req.SnapshotID)
+
+	case HostActionContainerRestart:
+		svc := strings.TrimSpace(req.ServiceName)
+		timeoutSec := req.TimeoutSeconds
+		if timeoutSec <= 0 {
+			timeoutSec = 10
+		} else if timeoutSec > 60 {
+			timeoutSec = 60
+		}
+		out, errOut, err := runner.Run(ctx, nil, "docker", "restart", "-t", strconv.Itoa(timeoutSec), svc)
+		return HostActionResult{Stdout: out, Stderr: errOut}, err
+
+	case HostActionZombieReap:
+		svc := strings.TrimSpace(req.ServiceName)
+		pid := req.TargetPID
+		// Verify process cgroup membership on Linux (supporting cgroups v1 and v2)
+		if runtime.GOOS == "linux" {
+			cgroupData, cgErr := readProcessCgroup(pid)
+			if cgErr != nil {
+				// Fail-Closed: reading cgroup error MUST reject action rather than bypass check
+				return HostActionResult{Success: false, ExitError: "cgroup read failed"}, fmt.Errorf("%w: unable to verify cgroup for pid %d: %v", ErrBridgeActionRejected, pid, cgErr)
+			}
+			cgroupStr := string(cgroupData)
+			cidOut, _, _ := runner.Run(ctx, nil, "docker", "inspect", "-f", "{{.Id}}", svc)
+			cidTrimmed := strings.TrimSpace(cidOut)
+
+			// Strict matching: must match container full ID, short ID (12 chars), or scoped cgroup entry.
+			// Never permit loose strings.Contains(cgroupStr, "docker") which matches unrelated containers or dockerd!
+			matched := false
+			if cidTrimmed != "" && !strings.Contains(cidTrimmed, " ") && !strings.HasPrefix(cidTrimmed, "Error") {
+				shortID := cidTrimmed
+				if len(shortID) > 12 {
+					shortID = shortID[:12]
+				}
+				matched = strings.Contains(cgroupStr, cidTrimmed) ||
+					strings.Contains(cgroupStr, "docker-"+cidTrimmed) ||
+					strings.Contains(cgroupStr, "docker-"+shortID) ||
+					strings.Contains(cgroupStr, "/docker/"+cidTrimmed) ||
+					strings.Contains(cgroupStr, "/docker/"+shortID)
+			}
+			// Fallback: match service name specifically within docker slice e.g. docker-<svc>.scope or /docker/<svc>
+			if !matched && svc != "" {
+				matched = strings.Contains(cgroupStr, "docker-"+svc+".scope") ||
+					strings.Contains(cgroupStr, "/docker/"+svc) ||
+					strings.Contains(cgroupStr, "/"+svc+"/")
+			}
+			if !matched {
+				return HostActionResult{Success: false, ExitError: "cgroup mismatch"}, fmt.Errorf("%w: pid %d does not belong to service %s cgroup", ErrBridgeActionRejected, pid, svc)
+			}
+		}
+		out, errOut, err := runner.Run(ctx, nil, "kill", "-9", strconv.Itoa(pid))
+		return HostActionResult{Stdout: out, Stderr: errOut}, err
+
+	case HostActionNetworkReset:
+		scope := strings.TrimSpace(req.ResetScope)
+		switch scope {
+		case "wan_check":
+			// Two-tiered diagnostic probe: probe LAN gateway first, then public DNS
+			gwOut, _, gwErr := runner.Run(ctx, nil, "ping", "-c", "1", "-W", "1", "127.0.0.1")
+			wanOut, wanErrOut, wanErr := runner.Run(ctx, nil, "ping", "-c", "2", "-W", "2", "223.5.5.5")
+			if wanErr != nil {
+				if gwErr == nil {
+					// Gateway / local networking is responsive, but public DNS is unreachable.
+					// De-escalate to degraded status so proxy/DNS healing playbooks can run!
+					return HostActionResult{
+						Stdout:    "LAN_UP_WAN_DEGRADED: " + gwOut,
+						Stderr:    wanErrOut,
+						ExitError: "WAN degraded (local stack reachable)",
+					}, nil
+				}
+				// Both local stack and WAN unreachable -> physical network disconnected
+				return HostActionResult{Stdout: wanOut, Stderr: wanErrOut, ExitError: "WAN is unreachable"}, fmt.Errorf("WAN connectivity check failed: local network mutation aborted")
+			}
+			return HostActionResult{Stdout: "WAN reachable: " + wanOut}, nil
+		case "dns_flush":
+			out, errOut, err := runner.Run(ctx, nil, "systemd-resolve", "--flush-caches")
+			if err != nil {
+				out2, errOut2, err2 := runner.Run(ctx, nil, "resolvectl", "flush-caches")
+				if err2 == nil {
+					return HostActionResult{Stdout: out2, Stderr: errOut2}, nil
+				}
+				return HostActionResult{Stdout: out + out2, Stderr: errOut + "\n" + errOut2}, err2
+			}
+			return HostActionResult{Stdout: out, Stderr: errOut}, nil
+		case "tunnel_reload":
+			out, errOut, err := runner.Run(ctx, nil, "docker", "restart", "-t", "5", "home-h3c-keepalive")
+			return HostActionResult{Stdout: out, Stderr: errOut}, err
+		case "proxy_reload":
+			out, errOut, err := runner.Run(ctx, nil, "docker", "restart", "-t", "5", "mihomo")
+			return HostActionResult{Stdout: out, Stderr: errOut}, err
+		case "ice_reload":
+			out, errOut, err := runner.Run(ctx, nil, "docker", "kill", "-s", "HUP", "frigate")
+			return HostActionResult{Stdout: out, Stderr: errOut}, err
+		default:
+			return HostActionResult{}, fmt.Errorf("%w: unknown reset_scope %q", ErrBridgeActionRejected, scope)
+		}
+
+	case HostActionOrphanPrune:
+		filter := strings.TrimSpace(req.PruneFilter)
+		out, errOut, err := runner.Run(ctx, nil, "docker", "rm", "-f", filter)
+		return HostActionResult{Stdout: out, Stderr: errOut}, err
 
 	default:
 		return HostActionResult{}, fmt.Errorf("%w: %s", ErrBridgeActionRejected, req.Action)

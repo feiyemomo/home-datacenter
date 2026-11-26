@@ -213,3 +213,57 @@ func TestProposalScheduler_Tick_CASConflict(t *testing.T) {
 		t.Fatalf("cancelled proposal should not have been dispatched")
 	}
 }
+
+func TestProposalScheduler_ActivityAwareness_Deferred(t *testing.T) {
+	db := setupSchedulerTestDB(t)
+	now := time.Now().UTC()
+	pastTime := now.Add(-1 * time.Minute).Format(time.RFC3339)
+	prop := model.OpsProposal{
+		ProposalID:      "sched-prop-stream-001",
+		Title:           "Scheduled Restart While Streaming",
+		TargetComponent: "frigate",
+		Status:          model.ProposalStatusScheduled,
+		ScheduledAt:     &pastTime,
+		CreatedAt:       now.Add(-10 * time.Minute),
+	}
+	if err := db.Create(&prop).Error; err != nil {
+		t.Fatalf("create proposal: %v", err)
+	}
+
+	mockExec := &mockSchedulerExecutor{}
+	sched := NewProposalScheduler(db, mockExec)
+
+	activityChecked := false
+	sched.SetActivityChecker(func(ctx context.Context, target string) (bool, error) {
+		if target == "frigate" {
+			activityChecked = true
+			return true, nil // User is watching live stream!
+		}
+		return false, nil
+	})
+
+	sched.Tick()
+
+	if !activityChecked {
+		t.Fatalf("expected activity checker to be invoked for target frigate")
+	}
+
+	var res model.OpsProposal
+	if err := db.Where("proposal_id = ?", prop.ProposalID).First(&res).Error; err != nil {
+		t.Fatalf("query proposal: %v", err)
+	}
+
+	if res.Status != model.ProposalStatusScheduled {
+		t.Fatalf("expected status to remain SCHEDULED, got %s", res.Status)
+	}
+	if res.ScheduledAt == nil {
+		t.Fatalf("expected ScheduledAt to be updated")
+	}
+	parsed, err := time.Parse(time.RFC3339, *res.ScheduledAt)
+	if err != nil || !parsed.After(now) {
+		t.Fatalf("expected ScheduledAt to be deferred into future, got %v", *res.ScheduledAt)
+	}
+	if atomic.LoadInt32(&mockExec.executeCount) != 0 {
+		t.Fatalf("expected 0 execution calls for deferred active streaming proposal, got %d", mockExec.executeCount)
+	}
+}

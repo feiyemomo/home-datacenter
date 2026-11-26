@@ -805,6 +805,11 @@ func (s *VulnScanner) ScanHostAssets(ctx context.Context) (*hostsec.CorrelationR
 // ScanHostAndDependencies performs both workspace/compiled-Go dependency scanning AND
 // R9.2 host OS/OpenSSH/Kernel/OpenSSL/Docker Engine CVE correlation.
 func (s *VulnScanner) ScanHostAndDependencies(ctx context.Context, workspaceRoot string) (*hostsec.CorrelationReport, []OSVVuln, error) {
+	// Run fast Docker image update discovery first so slow OSV network calls never starve it.
+	if updated := s.CheckDockerImageUpdates(ctx, "/var/run/docker.sock"); updated > 0 {
+		log.Printf("[vuln-scanner] Created %d Docker image update proposal(s)", updated)
+	}
+
 	hostRep, hostErr := s.ScanHostAssets(ctx)
 
 	appVulns, appErr := s.ScanWorkspaceDependencies(ctx, workspaceRoot)
