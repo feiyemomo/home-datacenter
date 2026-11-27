@@ -475,7 +475,9 @@ func TestR5_PreApprovalBaselineAndPrefixedContainerResolution(t *testing.T) {
 		client.lastLoginAt = time.Now()
 		client.loginTTL = time.Hour
 
-		h := &OpsHandler{client: client, fallback: NewHostFallbackProvider("", ""), db: db, bus: bus}
+		fb := NewHostFallbackProvider("", "")
+		fb.dockerSocket = ""
+		h := &OpsHandler{client: client, fallback: fb, db: db, bus: bus}
 
 		// When 1Panel succeeds and omits the container in non-prod mode, do NOT fall back to static catalog
 		mu.Lock()

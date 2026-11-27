@@ -2,11 +2,15 @@ package camera
 
 import (
 	"context"
+	"os"
 	"testing"
 	"time"
 )
 
 func TestDaguEncryptAndLogin(t *testing.T) {
+	if testing.Short() || os.Getenv("DAGU_LIVE_TEST") == "" {
+		t.Skip("skipping live Dagu cloud test; set DAGU_LIVE_TEST=1 to run")
+	}
 	mgr := NewDaguManager("15291472514", "wm10050817")
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -22,6 +26,9 @@ func TestDaguEncryptAndLogin(t *testing.T) {
 }
 
 func TestDaguAcquireStreamAndRelease(t *testing.T) {
+	if testing.Short() || os.Getenv("DAGU_LIVE_TEST") == "" {
+		t.Skip("skipping live Dagu cloud stream test; set DAGU_LIVE_TEST=1 to run")
+	}
 	mgr := NewDaguManager("15291472514", "wm10050817")
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()

@@ -88,6 +88,11 @@ func TestHostBridge_Playbook_PB02_ZombieReap(t *testing.T) {
 	}
 
 	// 3. Execution test
+	origCgroupReader := readProcessCgroup
+	defer func() { readProcessCgroup = origCgroupReader }()
+	readProcessCgroup = func(pid int) ([]byte, error) {
+		return []byte("0::/user.slice/zombie-test\n"), nil
+	}
 	res, err := dispatchTypedBridgeAction(context.Background(), runner, nil, "/tmp", req)
 	if err != nil {
 		t.Fatalf("dispatch zombie reap error: %v", err)
@@ -100,8 +105,6 @@ func TestHostBridge_Playbook_PB02_ZombieReap(t *testing.T) {
 	}
 
 	// 4. Cgroup Fail-Closed and Strict Matching Verification
-	origCgroupReader := readProcessCgroup
-	defer func() { readProcessCgroup = origCgroupReader }()
 
 	// Test A: Fail-Closed on cgroup read error
 	readProcessCgroup = func(pid int) ([]byte, error) {
