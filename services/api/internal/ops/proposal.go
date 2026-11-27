@@ -353,6 +353,17 @@ func (h *OpsHandler) ApproveProposal(c *gin.Context) {
 		return
 	}
 	currentHash := h.ComputeFingerprint(proposal.TargetComponent)
+	// For docker.update_image proposals (already bound to target remote digest), a benign container restart
+	// between scan creation and human approval should re-anchor to the live baseline rather than dead-ending
+	// in 409, while still preserving strict post-approval TOCTOU protection via ApprovalDigest.
+	if currentHash != "" && currentHash != proposal.BaselineHash && strings.Contains(proposal.ActionSpec, ActionDockerUpdateImage) {
+		if !IsProductionRuntime() || (IsRealBaselineHash(currentHash, proposal.TargetComponent) && !IsOfflinePlaceholderBaseline(proposal.TargetComponent, currentHash)) {
+			proposal.BaselineHash = currentHash
+			_ = h.db.Model(&model.OpsProposal{}).
+				Where("id = ? AND status = ?", proposal.ID, model.ProposalStatusAwaitingApproval).
+				Update("baseline_hash", currentHash).Error
+		}
+	}
 	if currentHash == "" || currentHash != proposal.BaselineHash {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":         ErrBaselineMismatch.Error(),

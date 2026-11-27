@@ -136,9 +136,17 @@ func TestCheckDockerImageUpdatesCreatesProposal(t *testing.T) {
 	if created != 1 {
 		t.Fatalf("expected 1 proposal created, got %d", created)
 	}
-	// Second run must be idempotent
+	// Second run must be idempotent, and refresh stale baseline_hash on awaiting approval proposal
+	_ = db.Model(&model.OpsProposal{}).Where("target_component = ?", ComponentFrigate).Update("baseline_hash", "v1:stale-hash").Error
 	if created2 := scanner.CheckDockerImageUpdates(context.Background(), sockPath); created2 != 0 {
 		t.Fatalf("expected 0 duplicate proposals, got %d", created2)
+	}
+	var refreshed model.OpsProposal
+	if err := db.First(&refreshed, "target_component = ?", ComponentFrigate).Error; err != nil {
+		t.Fatalf("reload proposal: %v", err)
+	}
+	if refreshed.BaselineHash == "v1:stale-hash" || refreshed.BaselineHash == "" {
+		t.Fatalf("expected stale baseline_hash to be refreshed, got %q", refreshed.BaselineHash)
 	}
 }
 

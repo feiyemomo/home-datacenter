@@ -118,20 +118,25 @@ func (s *VulnScanner) CheckDockerImageUpdates(ctx context.Context, dockerSocket 
 		}
 
 		idemKey := fmt.Sprintf("imgupdate:%s:%s", item.Component, remoteDigest)
-		var existing model.OpsProposal
-		if err := s.db.Where("idempotency_key = ? AND status NOT IN ?",
-			idemKey,
-			[]string{model.ProposalStatusRejected, model.ProposalStatusCancelled, model.ProposalStatusExpired},
-		).First(&existing).Error; err == nil {
-			continue
-		}
-
 		baselineHash := ""
 		if s.baselineFn != nil {
 			baselineHash = s.baselineFn(item.Component)
 		}
 		if baselineHash == "" && !IsProductionRuntime() {
 			baselineHash = model.ComputeDefaultBaseline(item.Component)
+		}
+
+		var existing model.OpsProposal
+		if err := s.db.Where("idempotency_key = ? AND status NOT IN ?",
+			idemKey,
+			[]string{model.ProposalStatusRejected, model.ProposalStatusCancelled, model.ProposalStatusExpired},
+		).First(&existing).Error; err == nil {
+			if existing.Status == model.ProposalStatusAwaitingApproval && baselineHash != "" && existing.BaselineHash != baselineHash {
+				_ = s.db.Model(&model.OpsProposal{}).
+					Where("id = ?", existing.ID).
+					Update("baseline_hash", baselineHash).Error
+			}
+			continue
 		}
 
 		specBytes, _ := json.Marshal(OperationSpec{
