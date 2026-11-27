@@ -133,7 +133,7 @@ func (s *VulnScanner) CheckDockerImageUpdates(ctx context.Context, dockerSocket 
 		).First(&existing).Error; err == nil {
 			if existing.Status == model.ProposalStatusAwaitingApproval && baselineHash != "" && existing.BaselineHash != baselineHash {
 				_ = s.db.Model(&model.OpsProposal{}).
-					Where("id = ?", existing.ID).
+					Where("id = ? AND status = ?", existing.ID, model.ProposalStatusAwaitingApproval).
 					Update("baseline_hash", baselineHash).Error
 			}
 			continue

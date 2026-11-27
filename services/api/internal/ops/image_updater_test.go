@@ -10,7 +10,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 	"home-datacenter-api/internal/model"
@@ -233,5 +235,83 @@ func TestDiscoverRunningImageTargetsIncludesTailscale(t *testing.T) {
 	var prop model.OpsProposal
 	if err := db.First(&prop, "target_component = ?", ComponentTailscale).Error; err != nil {
 		t.Fatalf("expected tailscale proposal in DB: %v", err)
+	}
+}
+
+func TestApproveProposalReanchorsOnlyImageUpdate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatalf("open sqlite: %v", err)
+	}
+	if err := db.AutoMigrate(&model.OpsProposal{}, &model.OpsMaintenanceLock{}, &model.OpsCircuitBreakerState{}); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "/api/v2/containers/search") {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"code": 200, "message": "OK",
+				"data": map[string]any{
+					"items": []onePanelContainerItem{{
+						ContainerID: "a1b2c3d4e5f60123456789abcdef0123456789abcdef0123456789abcdef0123",
+						Name:        "/home-frigate",
+						Image:       "ghcr.io/blakeblackshear/frigate:stable",
+						State:       "running",
+						Created:     "2026-11-27T00:00:00Z",
+					}},
+					"total": 1,
+				},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	client := NewOnePanelClient(srv.URL, "btpanel", "u", "p")
+	client.psession = "tok"
+	client.lastLoginAt = time.Now()
+	client.loginTTL = time.Hour
+	fb := NewHostFallbackProvider("", "")
+	fb.dockerSocket = ""
+	h := &OpsHandler{client: client, fallback: fb, db: db}
+
+	// 1. docker.update_image AWAITING_APPROVAL with stale baseline -> re-anchors and succeeds (200)
+	imgSpec, _ := json.Marshal(OperationSpec{Action: ActionDockerUpdateImage, Target: ComponentFrigate})
+	if err := db.Create(&model.OpsProposal{
+		ProposalID: "prop-img-reanchor", TargetComponent: ComponentFrigate,
+		ActionSpec: string(imgSpec), BaselineHash: "v1:stale-frigate",
+		Status: model.ProposalStatusAwaitingApproval, RiskLevel: model.RiskLevelMedium, Version: 1, Revision: 1,
+	}).Error; err != nil {
+		t.Fatalf("seed img proposal: %v", err)
+	}
+	w1 := httptest.NewRecorder()
+	c1, _ := gin.CreateTestContext(w1)
+	c1.Params = gin.Params{{Key: "id", Value: "prop-img-reanchor"}}
+	c1.Set("is_admin", true)
+	c1.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ops/proposals/prop-img-reanchor/approve", nil)
+	h.ApproveProposal(c1)
+	if w1.Code != http.StatusOK {
+		t.Fatalf("expected 200 for re-anchored image update approval, got %d: %s", w1.Code, w1.Body.String())
+	}
+
+	// 2. docker.restart with stale baseline -> must still return 409 Conflict
+	rstSpec, _ := json.Marshal(OperationSpec{Action: ActionDockerRestart, Target: ComponentFrigate})
+	if err := db.Create(&model.OpsProposal{
+		ProposalID: "prop-rst-strict", TargetComponent: ComponentFrigate,
+		ActionSpec: string(rstSpec), BaselineHash: "v1:stale-frigate",
+		Status: model.ProposalStatusAwaitingApproval, RiskLevel: model.RiskLevelMedium, Version: 1, Revision: 1,
+	}).Error; err != nil {
+		t.Fatalf("seed restart proposal: %v", err)
+	}
+	w2 := httptest.NewRecorder()
+	c2, _ := gin.CreateTestContext(w2)
+	c2.Params = gin.Params{{Key: "id", Value: "prop-rst-strict"}}
+	c2.Set("is_admin", true)
+	c2.Request = httptest.NewRequest(http.MethodPost, "/api/v1/ops/proposals/prop-rst-strict/approve", nil)
+	h.ApproveProposal(c2)
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for stale docker.restart approval, got %d: %s", w2.Code, w2.Body.String())
 	}
 }
