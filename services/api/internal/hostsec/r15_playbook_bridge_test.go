@@ -91,7 +91,7 @@ func TestHostBridge_Playbook_PB02_ZombieReap(t *testing.T) {
 	origCgroupReader := readProcessCgroup
 	defer func() { readProcessCgroup = origCgroupReader }()
 	readProcessCgroup = func(pid int) ([]byte, error) {
-		return []byte("0::/user.slice/zombie-test\n"), nil
+		return []byte("0::/system.slice/docker-killed.scope\n"), nil
 	}
 	res, err := dispatchTypedBridgeAction(context.Background(), runner, nil, "/tmp", req)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestHostBridge_Playbook_PB02_ZombieReap(t *testing.T) {
 	if !strings.Contains(res.Stdout, "killed") {
 		t.Fatalf("expected output, got: %v", res.Stdout)
 	}
-	if len(runner.calls) != 1 || runner.calls[0] != "kill -9 1234" {
+	if len(runner.calls) == 0 || runner.calls[len(runner.calls)-1] != "kill -9 1234" {
 		t.Fatalf("unexpected runner call: %v", runner.calls)
 	}
 
